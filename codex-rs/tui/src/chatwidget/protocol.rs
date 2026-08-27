@@ -391,13 +391,10 @@ impl ChatWidget {
         notification: ItemCompletedNotification,
         replay_kind: Option<ReplayKind>,
     ) {
-        match notification.item {
-            item @ ThreadItem::CommandExecution { .. } => self.on_command_execution_completed(item),
-            item => self.handle_thread_item(
-                item,
-                notification.turn_id,
-                replay_kind.map_or(ThreadItemRenderSource::Live, ThreadItemRenderSource::Replay),
-            ),
-        }
+        self.handle_thread_item(
+            notification.item,
+            notification.turn_id,
+            replay_kind.map_or(ThreadItemRenderSource::Live, ThreadItemRenderSource::Replay),
+        );
     }
 }
