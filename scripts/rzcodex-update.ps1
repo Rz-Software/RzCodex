@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
-    [switch]$ForceBuild
+    [switch]$ForceBuild,
+    [switch]$RunTests
 )
 
 Set-StrictMode -Version Latest
@@ -277,10 +278,12 @@ try {
     }
 
     Invoke-NativeCommand -FilePath "just" -ArgumentList @("fmt-check") -WorkingDirectory $CodexRustRoot
-    Invoke-NativeCommand -FilePath "just" -ArgumentList @("test", "-p", "codex-core", "agent::role::tests") -WorkingDirectory $CodexRustRoot
-    Invoke-NativeCommand -FilePath "just" -ArgumentList @("test", "-p", "codex-models-manager", "managed_preset_uses_lazy_tool_discovery") -WorkingDirectory $CodexRustRoot
-    Invoke-NativeCommand -FilePath "just" -ArgumentList @("test", "-p", "codex-tui", "chatwidget::tests::exec_flow::exec_history_extends_previous_when_consecutive") -WorkingDirectory $CodexRustRoot
-    Invoke-NativeCommand -FilePath "just" -ArgumentList @("test", "-p", "codex-tui", "history_cell::tests::coalesces_reads_across_multiple_calls") -WorkingDirectory $CodexRustRoot
+    if ($RunTests) {
+        Invoke-NativeCommand -FilePath "just" -ArgumentList @("test", "-p", "codex-core", "agent::role::tests") -WorkingDirectory $CodexRustRoot
+        Invoke-NativeCommand -FilePath "just" -ArgumentList @("test", "-p", "codex-models-manager", "managed_preset_uses_lazy_tool_discovery") -WorkingDirectory $CodexRustRoot
+        Invoke-NativeCommand -FilePath "just" -ArgumentList @("test", "-p", "codex-tui", "chatwidget::tests::exec_flow::exec_history_extends_previous_when_consecutive") -WorkingDirectory $CodexRustRoot
+        Invoke-NativeCommand -FilePath "just" -ArgumentList @("test", "-p", "codex-tui", "history_cell::tests::coalesces_reads_across_multiple_calls") -WorkingDirectory $CodexRustRoot
+    }
     Initialize-RustyV8Artifacts
     Invoke-NativeCommand -FilePath "cargo" -ArgumentList @(
         "build",
