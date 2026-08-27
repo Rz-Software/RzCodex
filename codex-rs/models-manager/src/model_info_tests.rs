@@ -296,11 +296,11 @@ fn unknown_model_uses_builtin_instruction_template() {
 }
 
 #[test]
-fn managed_preset_uses_lazy_tool_discovery() {
+fn managed_preset_uses_lazy_tool_discovery_with_direct_tools() {
     let model = model_info_from_slug("@preset/subagents");
 
     assert!(model.supports_search_tool);
-    assert_eq!(model.tool_mode, Some(ToolMode::CodeModeOnly));
+    assert_eq!(model.tool_mode, Some(ToolMode::Direct));
     assert!(model.used_fallback_model_metadata);
 }
 

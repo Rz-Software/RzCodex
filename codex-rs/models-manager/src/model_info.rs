@@ -184,7 +184,7 @@ pub fn model_info_from_slug(slug: &str) -> ModelInfo {
         node_repl_disabled: false,
         auto_review_model_override: None,
         model_specialty: None,
-        tool_mode: is_managed_preset.then_some(ToolMode::CodeModeOnly),
+        tool_mode: is_managed_preset.then_some(ToolMode::Direct),
         multi_agent_version: None,
         multi_agent_reasoning_effort: None,
     }
