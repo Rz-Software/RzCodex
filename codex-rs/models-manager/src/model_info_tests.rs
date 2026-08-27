@@ -11,6 +11,7 @@ use codex_protocol::openai_models::MultiAgentMessages;
 use codex_protocol::openai_models::MultiAgentModeMessages;
 use codex_protocol::openai_models::MultiAgentRoleMessages;
 use codex_protocol::openai_models::PermissionMessages;
+use codex_protocol::openai_models::ToolMode;
 use pretty_assertions::assert_eq;
 
 fn config_with_personality(personality: Option<Personality>) -> ModelsManagerConfig {
@@ -291,6 +292,15 @@ fn unknown_model_uses_builtin_instruction_template() {
         model.get_model_instructions(/*personality*/ None),
         BASE_INSTRUCTIONS
     );
+    assert!(model.used_fallback_model_metadata);
+}
+
+#[test]
+fn managed_preset_uses_lazy_tool_discovery() {
+    let model = model_info_from_slug("@preset/subagents");
+
+    assert!(model.supports_search_tool);
+    assert_eq!(model.tool_mode, Some(ToolMode::CodeModeOnly));
     assert!(model.used_fallback_model_metadata);
 }
 
