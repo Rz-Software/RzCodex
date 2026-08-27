@@ -71,6 +71,29 @@ function Test-MergeInProgress {
     }
 }
 
+function Initialize-WindowsBuildEnvironment {
+    $logicalProcessorCount = [System.Environment]::ProcessorCount
+    if ($logicalProcessorCount -lt 1) {
+        throw "Could not determine the logical processor count."
+    }
+    $env:CARGO_BUILD_JOBS = $logicalProcessorCount.ToString()
+
+    $rustSysroot = (& rustc --print sysroot).Trim()
+    if ($LASTEXITCODE -ne 0 -or -not $rustSysroot) {
+        throw "Could not resolve the active Rust sysroot."
+    }
+    $hostLine = & rustc -vV | Select-String '^host: ' | Select-Object -First 1
+    if ($LASTEXITCODE -ne 0 -or -not $hostLine) {
+        throw "Could not resolve the active Rust host triple."
+    }
+    $hostTriple = $hostLine.Line.Substring(6).Trim()
+    $rustLld = Join-Path $rustSysroot "lib\rustlib\$hostTriple\bin\rust-lld.exe"
+    if (-not (Test-Path -LiteralPath $rustLld -PathType Leaf)) {
+        throw "Rust's bundled linker was not found: $rustLld"
+    }
+    $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER = $rustLld
+}
+
 function Initialize-RustyV8Artifacts {
     $cargoLockPath = Join-Path $CodexRustRoot "Cargo.lock"
     $cargoLock = [System.IO.File]::ReadAllText($cargoLockPath)
@@ -211,7 +234,7 @@ try {
     Start-Transcript -LiteralPath $logPath | Out-Null
     $transcriptStarted = $true
 
-    foreach ($requiredCommand in @("git", "cargo", "just")) {
+    foreach ($requiredCommand in @("git", "cargo", "just", "rustc")) {
         if (-not (Get-Command $requiredCommand -ErrorAction SilentlyContinue)) {
             throw "Required command is unavailable: $requiredCommand"
         }
@@ -229,6 +252,8 @@ try {
     if ($workingTreeChanges.Count -ne 0) {
         throw "RzCodex has working-tree changes; automatic update refused."
     }
+
+    Initialize-WindowsBuildEnvironment
 
     Invoke-NativeCommand -FilePath "git" -ArgumentList @("fetch", "upstream", "main", "--tags", "--prune") -WorkingDirectory $RepoRoot
 
