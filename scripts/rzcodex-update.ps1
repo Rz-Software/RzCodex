@@ -77,18 +77,31 @@ function Install-CodexBinary {
         [string]$Commit
     )
 
-    $sourceBinary = Join-Path $CodexRustRoot "target\release\codex.exe"
-    if (-not (Test-Path -LiteralPath $sourceBinary -PathType Leaf)) {
-        throw "Built Codex binary was not found: $sourceBinary"
+    $releaseRoot = Join-Path $CodexRustRoot "target\release"
+    $requiredBinaries = @(
+        "codex.exe",
+        "codex-code-mode-host.exe",
+        "codex-command-runner.exe",
+        "codex-windows-sandbox-setup.exe"
+    )
+    foreach ($binaryName in $requiredBinaries) {
+        $sourceBinary = Join-Path $releaseRoot $binaryName
+        if (-not (Test-Path -LiteralPath $sourceBinary -PathType Leaf)) {
+            throw "Built Codex binary was not found: $sourceBinary"
+        }
     }
 
     $versionRoot = Join-Path $InstallRoot $Commit
     $destinationBinary = Join-Path $versionRoot "codex.exe"
     New-Item -ItemType Directory -Path $versionRoot -Force | Out-Null
 
-    $temporaryBinary = "$destinationBinary.$PID.tmp"
-    Copy-Item -LiteralPath $sourceBinary -Destination $temporaryBinary -Force
-    Move-Item -LiteralPath $temporaryBinary -Destination $destinationBinary -Force
+    foreach ($binaryName in $requiredBinaries) {
+        $sourceBinary = Join-Path $releaseRoot $binaryName
+        $installedBinary = Join-Path $versionRoot $binaryName
+        $temporaryBinary = "$installedBinary.$PID.tmp"
+        Copy-Item -LiteralPath $sourceBinary -Destination $temporaryBinary -Force
+        Move-Item -LiteralPath $temporaryBinary -Destination $installedBinary -Force
+    }
 
     & $destinationBinary --version
     if ($LASTEXITCODE -ne 0) {
@@ -181,7 +194,13 @@ try {
     Invoke-NativeCommand -FilePath "just" -ArgumentList @("test", "-p", "codex-core", "agent::role::tests") -WorkingDirectory $CodexRustRoot
     Invoke-NativeCommand -FilePath "just" -ArgumentList @("test", "-p", "codex-tui", "chatwidget::tests::exec_flow::exec_history_extends_previous_when_consecutive") -WorkingDirectory $CodexRustRoot
     Invoke-NativeCommand -FilePath "just" -ArgumentList @("test", "-p", "codex-tui", "history_cell::tests::coalesces_reads_across_multiple_calls") -WorkingDirectory $CodexRustRoot
-    Invoke-NativeCommand -FilePath "cargo" -ArgumentList @("build", "--release", "-p", "codex-cli") -WorkingDirectory $CodexRustRoot
+    Invoke-NativeCommand -FilePath "cargo" -ArgumentList @(
+        "build",
+        "--release",
+        "-p", "codex-cli",
+        "-p", "codex-code-mode-host",
+        "-p", "codex-windows-sandbox"
+    ) -WorkingDirectory $CodexRustRoot
 
     if ($mergeStarted) {
         Invoke-NativeCommand -FilePath "git" -ArgumentList @("commit", "-m", "Merge upstream/main into rz-main") -WorkingDirectory $RepoRoot
