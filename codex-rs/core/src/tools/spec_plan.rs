@@ -1414,11 +1414,26 @@ impl ToolExecutor<ToolInvocation> for MultiAgentV2NamespaceOverride {
 
     fn spec(&self) -> ToolSpec {
         match self.handler.spec() {
-            ToolSpec::Function(tool) => ToolSpec::Namespace(ResponsesApiNamespace {
-                name: self.namespace.clone(),
-                description: MULTI_AGENT_V2_NAMESPACE_DESCRIPTION.to_string(),
-                tools: vec![ResponsesApiNamespaceTool::Function(tool)],
-            }),
+            ToolSpec::Function(mut tool) => {
+                if self.namespace != "collaboration"
+                    && matches!(
+                        tool.name.as_str(),
+                        "spawn_agent" | "send_message" | "followup_task"
+                    )
+                    && let Some(message) = tool
+                        .parameters
+                        .properties
+                        .as_mut()
+                        .and_then(|properties| properties.get_mut("message"))
+                {
+                    message.encrypted = None;
+                }
+                ToolSpec::Namespace(ResponsesApiNamespace {
+                    name: self.namespace.clone(),
+                    description: MULTI_AGENT_V2_NAMESPACE_DESCRIPTION.to_string(),
+                    tools: vec![ResponsesApiNamespaceTool::Function(tool)],
+                })
+            }
             spec => spec,
         }
     }

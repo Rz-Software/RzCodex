@@ -65,7 +65,7 @@ use crate::tools::router::ToolSuggestPresentation;
 use crate::tools::spec_plan::append_source_tools;
 use crate::tools::spec_plan::build_core_tool_registry;
 
-const MULTI_AGENT_V2_NAMESPACE: &str = "collaboration";
+const MULTI_AGENT_V2_NAMESPACE: &str = "rz_collaboration";
 
 #[derive(Default)]
 struct ToolPlanInputs {
@@ -2756,7 +2756,7 @@ async fn multi_agent_feature_selects_one_agent_tool_family() {
 }
 
 #[tokio::test]
-async fn multi_agent_v2_message_schemas_are_encrypted() {
+async fn multi_agent_v2_message_schemas_are_plaintext_in_fork_namespace() {
     let plan = probe(|turn| {
         set_feature(turn, Feature::MultiAgentV2, /*enabled*/ true);
     })
@@ -2781,6 +2781,38 @@ async fn multi_agent_v2_message_schemas_are_encrypted() {
         assert_eq!(
             properties
                 .get("message")
+                .and_then(|schema| schema.encrypted),
+            None
+        );
+    }
+}
+
+#[tokio::test]
+async fn reserved_collaboration_namespace_preserves_encrypted_messages() {
+    let plan = probe(|turn| {
+        set_feature(turn, Feature::MultiAgentV2, /*enabled*/ true);
+        update_config(turn, |config| {
+            config.multi_agent_v2.tool_namespace = Some("collaboration".to_string());
+        });
+    })
+    .await;
+    let ToolSpec::Namespace(namespace) = plan.visible_spec("collaboration") else {
+        panic!("expected collaboration namespace");
+    };
+    for tool_name in ["spawn_agent", "send_message", "followup_task"] {
+        let Some(ResponsesApiNamespaceTool::Function(tool)) = namespace.tools.iter().find(|tool| {
+            matches!(
+                tool,
+                ResponsesApiNamespaceTool::Function(tool) if tool.name == tool_name
+            )
+        }) else {
+            panic!("expected {tool_name} in collaboration namespace");
+        };
+        assert_eq!(
+            tool.parameters
+                .properties
+                .as_ref()
+                .and_then(|properties| properties.get("message"))
                 .and_then(|schema| schema.encrypted),
             Some(true)
         );
