@@ -60,6 +60,34 @@ fn tool_log_payload_redacts_plaintext_multi_agent_messages() {
     );
 }
 
+#[test]
+fn collaboration_calls_without_encrypted_arguments_use_plaintext_messages() {
+    let call = ToolCall {
+        tool_name: ToolName::namespaced("collaboration", "spawn_agent"),
+        call_id: "call-plaintext-spawn".to_string(),
+        payload: ToolPayload::Function {
+            arguments: r#"{"message":"inspect the repository"}"#.to_string(),
+        },
+        encrypted_function_args: None,
+    };
+
+    assert_eq!(call.direct_source(), ToolCallSource::DirectPlaintextMessage);
+}
+
+#[test]
+fn collaboration_calls_with_encrypted_arguments_preserve_encryption() {
+    let call = ToolCall {
+        tool_name: ToolName::namespaced("collaboration", "spawn_agent"),
+        call_id: "call-encrypted-spawn".to_string(),
+        payload: ToolPayload::Function {
+            arguments: r#"{"message":"encrypted payload"}"#.to_string(),
+        },
+        encrypted_function_args: Some(vec!["encrypted payload".to_string()]),
+    };
+
+    assert_eq!(call.direct_source(), ToolCallSource::Direct);
+}
+
 impl codex_extension_api::ToolContributor for ExtensionEchoContributor {
     fn tools(
         &self,
