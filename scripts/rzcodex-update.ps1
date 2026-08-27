@@ -290,7 +290,11 @@ try {
         "--release",
         "-p", "codex-cli",
         "-p", "codex-code-mode-host",
-        "-p", "codex-windows-sandbox"
+        "-p", "codex-windows-sandbox",
+        "--bin", "codex",
+        "--bin", "codex-code-mode-host",
+        "--bin", "codex-windows-sandbox-setup",
+        "--bin", "codex-command-runner"
     ) -WorkingDirectory $CodexRustRoot
 
     if ($mergeStarted) {
