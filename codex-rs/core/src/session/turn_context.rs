@@ -48,9 +48,13 @@ pub(crate) struct TurnEnvironment {
     pub(crate) selection: TurnEnvironmentSelection,
     pub(crate) config_origin: EnvironmentConfigOrigin,
     pub(crate) environment: Arc<Environment>,
+    /// Cached from the selected executor; `None` means it did not report one.
+    pub(crate) user_home_dir: Option<PathUri>,
     /// Cached from the selected executor; `None` means it did not report them.
     pub(crate) temporary_directories: Option<Vec<PathUri>>,
     pub(crate) shell: Option<shell::Shell>,
+    /// OS reported by the selected executor; `None` for legacy executors.
+    pub(crate) executor_platform_os: Option<String>,
     pub(crate) shell_snapshot: ShellSnapshotTask,
     pub(crate) shell_snapshot_v2_supported: bool,
 }
@@ -67,8 +71,10 @@ impl TurnEnvironment {
             selection,
             config_origin,
             environment,
+            user_home_dir: None,
             temporary_directories: None,
             shell,
+            executor_platform_os: None,
             shell_snapshot: futures::future::ready(None).boxed().shared(),
             shell_snapshot_v2_supported: false,
         }
@@ -131,6 +137,7 @@ impl TurnEnvironment {
             permissions: permissions.into(),
             cwd: Some(self.cwd().clone()),
             workspace_roots: self.workspace_roots().to_vec(),
+            user_home_dir: self.user_home_dir.clone(),
             temporary_directories: self.temporary_directories.clone(),
             windows_sandbox_level: executor_windows_sandbox_level(
                 config.windows_sandbox_level,
@@ -165,8 +172,10 @@ impl std::fmt::Debug for TurnEnvironment {
             .field("environment", &self.environment)
             .field("cwd", &self.selection.cwd)
             .field("workspace_roots", &self.config().workspace_roots)
+            .field("user_home_dir", &self.user_home_dir)
             .field("temporary_directories", &self.temporary_directories)
             .field("shell", &self.shell)
+            .field("executor_platform_os", &self.executor_platform_os)
             .field("config", self.config())
             .field("config_origin", &self.config_origin)
             .finish_non_exhaustive()
