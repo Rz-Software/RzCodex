@@ -71,6 +71,67 @@ function Test-MergeInProgress {
     }
 }
 
+function Initialize-RustyV8Artifacts {
+    $cargoLockPath = Join-Path $CodexRustRoot "Cargo.lock"
+    $cargoLock = [System.IO.File]::ReadAllText($cargoLockPath)
+    $versionMatches = [regex]::Matches(
+        $cargoLock,
+        '(?ms)^\[\[package\]\]\r?\nname = "v8"\r?\nversion = "([^"]+)"'
+    )
+    $versions = @($versionMatches | ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique)
+    if ($versions.Count -ne 1) {
+        throw "Expected exactly one v8 crate version in Cargo.lock; found $($versions.Count)."
+    }
+
+    $target = "x86_64-pc-windows-msvc"
+    $profile = "ptrcomp_sandbox_release"
+    $version = $versions[0]
+    $releaseTag = "rusty-v8-v$version"
+    $baseUrl = "https://github.com/openai/codex/releases/download/$releaseTag"
+    $artifactRoot = Join-Path $StateRoot "rusty-v8\$version"
+    $archiveName = "rusty_v8_${profile}_${target}.lib.gz"
+    $bindingName = "src_binding_${profile}_${target}.rs"
+    $checksumsName = "rusty_v8_${profile}_${target}.sha256"
+    $checksumsPath = Join-Path $artifactRoot $checksumsName
+    New-Item -ItemType Directory -Path $artifactRoot -Force | Out-Null
+
+    $temporaryChecksumsPath = "$checksumsPath.$PID.tmp"
+    Invoke-WebRequest -Uri "$baseUrl/$checksumsName" -OutFile $temporaryChecksumsPath
+    Move-Item -LiteralPath $temporaryChecksumsPath -Destination $checksumsPath -Force
+
+    $checksumEntries = @{}
+    foreach ($line in [System.IO.File]::ReadAllLines($checksumsPath)) {
+        if ($line -notmatch '^([0-9a-fA-F]{64})\s+\*?(.+)$') {
+            throw "Invalid rusty_v8 checksum entry: $line"
+        }
+        $checksumEntries[$Matches[2].Trim()] = $Matches[1].ToLowerInvariant()
+    }
+    if ($checksumEntries.Count -ne 2 -or
+        -not $checksumEntries.ContainsKey($archiveName) -or
+        -not $checksumEntries.ContainsKey($bindingName)) {
+        throw "The rusty_v8 checksum manifest must contain exactly the expected archive and binding."
+    }
+
+    foreach ($fileName in @($archiveName, $bindingName)) {
+        $artifactPath = Join-Path $artifactRoot $fileName
+        $expectedHash = $checksumEntries[$fileName]
+        $artifactValid = (Test-Path -LiteralPath $artifactPath -PathType Leaf) -and
+            ((Get-FileHash -LiteralPath $artifactPath -Algorithm SHA256).Hash.ToLowerInvariant() -eq $expectedHash)
+        if (-not $artifactValid) {
+            $temporaryArtifactPath = "$artifactPath.$PID.tmp"
+            Invoke-WebRequest -Uri "$baseUrl/$fileName" -OutFile $temporaryArtifactPath
+            $downloadedHash = (Get-FileHash -LiteralPath $temporaryArtifactPath -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($downloadedHash -ne $expectedHash) {
+                throw "Checksum mismatch for downloaded rusty_v8 artifact: $fileName"
+            }
+            Move-Item -LiteralPath $temporaryArtifactPath -Destination $artifactPath -Force
+        }
+    }
+
+    $env:RUSTY_V8_ARCHIVE = Join-Path $artifactRoot $archiveName
+    $env:RUSTY_V8_SRC_BINDING_PATH = Join-Path $artifactRoot $bindingName
+}
+
 function Install-CodexBinary {
     param(
         [Parameter(Mandatory)]
@@ -194,6 +255,7 @@ try {
     Invoke-NativeCommand -FilePath "just" -ArgumentList @("test", "-p", "codex-core", "agent::role::tests") -WorkingDirectory $CodexRustRoot
     Invoke-NativeCommand -FilePath "just" -ArgumentList @("test", "-p", "codex-tui", "chatwidget::tests::exec_flow::exec_history_extends_previous_when_consecutive") -WorkingDirectory $CodexRustRoot
     Invoke-NativeCommand -FilePath "just" -ArgumentList @("test", "-p", "codex-tui", "history_cell::tests::coalesces_reads_across_multiple_calls") -WorkingDirectory $CodexRustRoot
+    Initialize-RustyV8Artifacts
     Invoke-NativeCommand -FilePath "cargo" -ArgumentList @(
         "build",
         "--release",
