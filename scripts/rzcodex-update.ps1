@@ -83,11 +83,10 @@ function Initialize-WindowsBuildEnvironment {
     if ($LASTEXITCODE -ne 0 -or -not $rustSysroot) {
         throw "Could not resolve the active Rust sysroot."
     }
-    $hostLine = & rustc -vV | Select-String '^host: ' | Select-Object -First 1
-    if ($LASTEXITCODE -ne 0 -or -not $hostLine) {
+    $hostTriple = (& rustc --print host-tuple).Trim()
+    if ($LASTEXITCODE -ne 0 -or -not $hostTriple) {
         throw "Could not resolve the active Rust host triple."
     }
-    $hostTriple = $hostLine.Line.Substring(6).Trim()
     $rustLld = Join-Path $rustSysroot "lib\rustlib\$hostTriple\bin\rust-lld.exe"
     if (-not (Test-Path -LiteralPath $rustLld -PathType Leaf)) {
         throw "Rust's bundled linker was not found: $rustLld"
