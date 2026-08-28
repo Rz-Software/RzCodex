@@ -10,6 +10,7 @@ mod paginated_fork;
 mod pending_thread_metadata;
 mod projects;
 mod read_thread;
+mod retention;
 mod revert_thread;
 mod rollout_migration;
 // This lands before the reader PRs that consume the shared lineage resolver.
@@ -250,6 +251,11 @@ impl LocalThreadStore {
     /// Return the state DB handle used by local rollout writers.
     pub async fn state_db(&self) -> Option<StateDbHandle> {
         self.state_db.clone()
+    }
+
+    /// Deletes unreferenced local threads whose newest rollout has been idle for 30 days.
+    pub async fn prune_expired_rollouts(&self) -> ThreadStoreResult<()> {
+        retention::prune_expired_rollouts(self).await
     }
 
     async fn thread_history_db(&self) -> ThreadStoreResult<&sqlx::SqlitePool> {

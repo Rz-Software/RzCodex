@@ -89,6 +89,20 @@ impl RolloutReferenceIndex {
             .map(|(rollout_id, rollout)| (*rollout_id, rollout.path.as_path()))
     }
 
+    /// Iterates over every indexed rollout and its direct history-base edge.
+    pub fn rollouts(
+        &self,
+    ) -> impl Iterator<Item = (RolloutId, ThreadId, &Path, Option<&HistoryPosition>)> {
+        self.rollouts_by_id.iter().map(|(rollout_id, rollout)| {
+            (
+                *rollout_id,
+                rollout.thread_id,
+                rollout.path.as_path(),
+                rollout.history_base.as_ref(),
+            )
+        })
+    }
+
     async fn scan_with_deadline(
         codex_home: &Path,
         deadline: ScanDeadline,

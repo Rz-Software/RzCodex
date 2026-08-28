@@ -13,9 +13,15 @@ use super::SecurityRiskScore;
 use super::SessionMetaLine;
 use super::TurnContextItem;
 use super::WorldStateItem;
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::FunctionCallOutputBody;
+use codex_protocol::models::FunctionCallOutputContentItem;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
+
+const PRUNED_INLINE_IMAGE_TEXT: &str =
+    "[inline base64 image payload pruned after repeated context compaction]";
 
 /// Persisted rollout item used by core history and rollout storage.
 #[derive(Serialize, Deserialize, JsonSchema)]
@@ -154,6 +160,7 @@ pub(super) struct CompactedItemWire<'a> {
 
 impl<'a> From<&'a CompactedItem> for CompactedItemWire<'a> {
     fn from(item: &'a CompactedItem) -> Self {
+        let prune_repeated_inline_images = item.window_number.is_some_and(|number| number > 1);
         let replacement_history_metadata = item
             .replacement_history
             .as_ref()
@@ -173,7 +180,9 @@ impl<'a> From<&'a CompactedItem> for CompactedItemWire<'a> {
             replacement_history: item.replacement_history.as_ref().map(|items| {
                 items
                     .iter()
-                    .map(|envelope| Cow::Borrowed(&envelope.item))
+                    .map(|envelope| {
+                        persisted_response_item(&envelope.item, prune_repeated_inline_images)
+                    })
                     .collect()
             }),
             replacement_history_metadata,
@@ -187,6 +196,84 @@ impl<'a> From<&'a CompactedItem> for CompactedItemWire<'a> {
                 .map(|window_id| WindowIdWire::Id(Cow::Borrowed(window_id))),
         }
     }
+}
+
+fn persisted_response_item(
+    item: &ResponseItem,
+    prune_inline_images: bool,
+) -> Cow<'_, ResponseItem> {
+    if !prune_inline_images {
+        return Cow::Borrowed(item);
+    }
+    let mut persisted = item.clone();
+    if prune_inline_base64_images(&mut persisted) {
+        Cow::Owned(persisted)
+    } else {
+        Cow::Borrowed(item)
+    }
+}
+
+fn prune_inline_base64_images(item: &mut ResponseItem) -> bool {
+    match item {
+        ResponseItem::Message { content, .. } => {
+            let mut pruned = false;
+            for content_item in content {
+                if matches!(
+                    content_item,
+                    ContentItem::InputImage { image_url, .. }
+                        if is_inline_base64_image_url(image_url)
+                ) {
+                    *content_item = ContentItem::InputText {
+                        text: PRUNED_INLINE_IMAGE_TEXT.to_string(),
+                    };
+                    pruned = true;
+                }
+            }
+            pruned
+        }
+        ResponseItem::FunctionCallOutput { output, .. }
+        | ResponseItem::CustomToolCallOutput { output, .. } => {
+            let FunctionCallOutputBody::ContentItems(content) = &mut output.body else {
+                return false;
+            };
+            let mut pruned = false;
+            for content_item in content {
+                if matches!(
+                    content_item,
+                    FunctionCallOutputContentItem::InputImage { image_url, .. }
+                        if is_inline_base64_image_url(image_url)
+                ) {
+                    *content_item = FunctionCallOutputContentItem::InputText {
+                        text: PRUNED_INLINE_IMAGE_TEXT.to_string(),
+                    };
+                    pruned = true;
+                }
+            }
+            pruned
+        }
+        _ => false,
+    }
+}
+
+fn is_inline_base64_image_url(url: &str) -> bool {
+    if !url
+        .get(.."data:".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("data:"))
+    {
+        return false;
+    }
+    let Some((metadata, _)) = url.split_once(',') else {
+        return false;
+    };
+    let Some(metadata) = metadata.get("data:".len()..) else {
+        return false;
+    };
+    let mut parts = metadata.split(';');
+    let mime_type = parts.next().unwrap_or_default();
+    mime_type
+        .get(.."image/".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("image/"))
+        && parts.any(|part| part.eq_ignore_ascii_case("base64"))
 }
 
 impl TryFrom<CompactedItemWire<'_>> for CompactedItem {

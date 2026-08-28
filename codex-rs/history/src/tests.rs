@@ -463,6 +463,91 @@ fn compacted_item_serializes_window_number_and_id() -> Result<()> {
 }
 
 #[test]
+fn repeated_compaction_prunes_persisted_inline_images_only() -> Result<()> {
+    let inline_message_image = "data:image/png;base64,MESSAGE_PAYLOAD";
+    let inline_tool_image = "DATA:image/jpeg;BASE64,TOOL_PAYLOAD";
+    let remote_image = "https://example.com/retained.png";
+    let history = vec![
+        ResponseItemEnvelope {
+            item: ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![
+                    ContentItem::InputImage {
+                        image_url: inline_message_image.to_string(),
+                        detail: None,
+                    },
+                    ContentItem::InputImage {
+                        image_url: remote_image.to_string(),
+                        detail: None,
+                    },
+                ],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            },
+            metadata: Some(CodexHarnessMetadata {
+                client_authored: true,
+            }),
+        },
+        ResponseItemEnvelope::new(ResponseItem::CustomToolCallOutput {
+            id: None,
+            call_id: "call-1".to_string(),
+            name: Some("view_image".to_string()),
+            output: codex_protocol::models::FunctionCallOutputPayload::from_content_items(vec![
+                codex_protocol::models::FunctionCallOutputContentItem::InputImage {
+                    image_url: inline_tool_image.to_string(),
+                    detail: None,
+                },
+            ]),
+            internal_chat_message_metadata_passthrough: None,
+        }),
+    ];
+    let first = CompactedItem {
+        message: "summary".to_string(),
+        replacement_history: Some(history.clone()),
+        mcp_resource_origins: None,
+        window_number: Some(1),
+        first_window_id: None,
+        previous_window_id: None,
+        window_id: None,
+    };
+    let mut repeated = first.clone();
+    repeated.window_number = Some(2);
+
+    let first_json = serde_json::to_string(&first)?;
+    assert!(first_json.contains(inline_message_image));
+    assert!(first_json.contains(inline_tool_image));
+
+    let repeated_json = serde_json::to_value(&repeated)?;
+    let repeated_text = serde_json::to_string(&repeated_json)?;
+    assert!(!repeated_text.contains("MESSAGE_PAYLOAD"));
+    assert!(!repeated_text.contains("TOOL_PAYLOAD"));
+    assert!(repeated_text.contains(remote_image));
+    assert_eq!(
+        repeated_json["replacement_history_metadata"]
+            .as_array()
+            .map(Vec::len),
+        Some(history.len())
+    );
+    assert_eq!(repeated.replacement_history, Some(history));
+    assert_eq!(
+        repeated_json["replacement_history"][0]["content"][0],
+        json!({
+            "type": "input_text",
+            "text": "[inline base64 image payload pruned after repeated context compaction]",
+        })
+    );
+    assert_eq!(
+        repeated_json["replacement_history"][1]["output"][0],
+        json!({
+            "type": "input_text",
+            "text": "[inline base64 image payload pruned after repeated context compaction]",
+        })
+    );
+    Ok(())
+}
+
+#[test]
 /// Keeps legacy numeric window IDs readable in stored compacted items.
 fn compacted_item_migrates_legacy_numeric_window_id() -> Result<()> {
     let item = serde_json::from_value::<CompactedItem>(json!({
