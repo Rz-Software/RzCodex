@@ -13,6 +13,7 @@ use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
 use codex_protocol::config_types::ServiceTier;
+use codex_protocol::openai_models::InputModality;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AskForApproval;
@@ -173,6 +174,7 @@ impl ResolvedStepSettings {
 pub(crate) struct ModelInfoOverrides {
     pub(crate) context_window: Option<i64>,
     pub(crate) auto_compact_token_limit: Option<i64>,
+    pub(crate) input_modalities: Option<Vec<InputModality>>,
     pub(crate) tool_output_token_limit: Option<usize>,
     pub(crate) base_instructions: Option<String>,
 }
@@ -182,6 +184,7 @@ impl From<ModelsManagerConfig> for ModelInfoOverrides {
         Self {
             context_window: config.model_context_window,
             auto_compact_token_limit: config.model_auto_compact_token_limit,
+            input_modalities: config.model_input_modalities,
             tool_output_token_limit: config.tool_output_token_limit,
             base_instructions: config.base_instructions,
         }
@@ -197,6 +200,7 @@ impl ModelInfoOverrides {
         ModelsManagerConfig {
             model_context_window: self.context_window,
             model_auto_compact_token_limit: self.auto_compact_token_limit,
+            model_input_modalities: self.input_modalities.clone(),
             tool_output_token_limit: self.tool_output_token_limit,
             base_instructions: self.base_instructions.clone(),
             personality,

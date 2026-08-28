@@ -89,7 +89,7 @@ function configuredPort() {
   return port;
 }
 
-function resolveModel(requested) {
+function resolveRoute(requested) {
   if (requested !== MODEL_ALIAS) {
     throw new BridgeError(`CodeBuddy subagents must use the centrally managed ${MODEL_ALIAS} alias`);
   }
@@ -99,7 +99,22 @@ function resolveModel(requested) {
   } catch (error) {
     throw new BridgeError(`Subagent model routes are unreadable: ${error.message}`, 500);
   }
-  return requireString(routes[PROVIDER_ID], `${PROVIDER_ID} model route`);
+  const route = assertObject(routes[PROVIDER_ID], `${PROVIDER_ID} model route`);
+  const model = requireString(route.model, `${PROVIDER_ID} model route.model`);
+  if (!Array.isArray(route.inputModalities) || route.inputModalities.length === 0) {
+    throw new BridgeError(`${PROVIDER_ID} model route.inputModalities must be a non-empty array`, 500);
+  }
+  const inputModalities = [...new Set(route.inputModalities.map((value, index) => {
+    const modality = requireString(value, `${PROVIDER_ID} model route.inputModalities[${index}]`);
+    if (!["text", "image"].includes(modality)) {
+      throw new BridgeError(`Unsupported ${PROVIDER_ID} input modality ${JSON.stringify(modality)}`, 500);
+    }
+    return modality;
+  }))];
+  if (!inputModalities.includes("text")) {
+    throw new BridgeError(`${PROVIDER_ID} model route must support text input`, 500);
+  }
+  return { model, inputModalities };
 }
 
 function workingDirectoryFrom(body) {
@@ -151,6 +166,17 @@ function contentImages(value, label) {
     if (item.type === "input_image") images.push(codeBuddyImage(item, `${label}[${index}]`));
   }
   return images;
+}
+
+function rejectUnsupportedAudio(value, label) {
+  if (typeof value === "string") return;
+  if (!Array.isArray(value)) throw new BridgeError(`${label} must be a string or array`);
+  for (let index = 0; index < value.length; index += 1) {
+    const item = assertObject(value[index], `${label}[${index}]`);
+    if (item.type === "input_audio") {
+      throw new BridgeError("The managed CodeBuddy route does not support audio input", 500);
+    }
+  }
 }
 
 function outputText(value, label) {
@@ -218,7 +244,9 @@ function codexToolsFrom(body) {
     for (let index = 0; index < tools.length; index += 1) {
       const tool = assertObject(tools[index], `${labelPrefix}[${index}]`);
       const label = `${labelPrefix}[${index}]`;
-      if (tool.type === "web_search") continue;
+      if (tool.type === "web_search") {
+        throw new BridgeError(`${label} hosted web_search is unsupported by the CodeBuddy route`, 500);
+      }
       if (tool.type === "tool_search") {
         if (tool.execution !== undefined && tool.execution !== "client") throw new BridgeError(`${label}.execution must be client`);
         add(null, { ...tool, type: "function" }, label, true);
@@ -255,14 +283,16 @@ function codexToolsFrom(body) {
   return { definitions, byWire, byOriginal };
 }
 
-function validateManagedToolSurface(toolInfo) {
+function validateManagedToolSurface(toolInfo, inputModalities) {
   const requirements = [
     ["exec_command", (entry) => !entry.custom && !entry.toolSearch],
     ["write_stdin", (entry) => !entry.custom && !entry.toolSearch],
     ["apply_patch", (entry) => entry.custom && !entry.toolSearch],
-    ["view_image", (entry) => !entry.custom && !entry.toolSearch],
     [TEXT_TOOL_NAME, (entry) => entry.toolSearch],
   ];
+  if (inputModalities.includes("image")) {
+    requirements.push(["view_image", (entry) => !entry.custom && !entry.toolSearch]);
+  }
   const missing = requirements.filter(([name, matches]) => {
     const entry = toolInfo.byOriginal.get(toolLookupKey(null, name));
     return !entry || !matches(entry);
@@ -273,12 +303,19 @@ function validateManagedToolSurface(toolInfo) {
       500,
     );
   }
+  const hasViewImage = toolInfo.byOriginal.has(toolLookupKey(null, "view_image"));
+  if (hasViewImage !== inputModalities.includes("image")) {
+    throw new BridgeError(
+      `RzCodex image capability disagrees with the managed route: ${inputModalities.join(", ")}`,
+      500,
+    );
+  }
 }
 
 function promptFrom(body) {
   assertObject(body, "request body");
   if (body.stream !== true) throw new BridgeError("The CodeBuddy bridge requires stream=true");
-  const model = resolveModel(requireString(body.model, "model"));
+  const route = resolveRoute(requireString(body.model, "model"));
   const requestedEffort = body.reasoning?.effort;
   if (requestedEffort !== undefined && requestedEffort !== REQUIRED_EFFORT) {
     throw new BridgeError(`CodeBuddy subagents require reasoning effort ${REQUIRED_EFFORT}, got ${requestedEffort}`);
@@ -286,7 +323,7 @@ function promptFrom(body) {
   const input = typeof body.input === "string" ? [{ type: "message", role: "user", content: body.input }] : body.input;
   if (!Array.isArray(input)) throw new BridgeError("input must be a string or array");
   const toolInfo = codexToolsFrom(body);
-  validateManagedToolSurface(toolInfo);
+  validateManagedToolSurface(toolInfo, route.inputModalities);
   const sections = [
     "[Native delegation contract]\nWork as the delegated CodeBuddy sub-agent in the current workspace. Complete only the bounded task and return concise evidence to the parent. The MCP server named codex exposes exactly the client-executed tools Codex made available for this turn. CodeBuddy serves those schemas lazily: use ToolSearch with the exact mcp__codex__ tool name before invoking it through DeferExecuteTool. When its proxy reports DEFERRED_TO_CODEX_CLIENT, immediately end the turn without retrying, fabricating a result, or calling another tool; the parent will execute it and resume you with the real result.",
   ];
@@ -309,6 +346,7 @@ function promptFrom(body) {
     if (item.type === "message") {
       const role = requireString(item.role, `${label}.role`);
       if (role !== "system" && role !== "developer") {
+        rejectUnsupportedAudio(item.content, `${label}.content`);
         const text = contentText(item.content, `${label}.content`);
         const images = contentImages(item.content, `${label}.content`);
         pushHistory(`[${role}]\n${text || "[Image input]"}`, images);
@@ -334,6 +372,7 @@ function promptFrom(body) {
       pushHistory(`[Assistant requested Codex tool search; call_id=${callId}]\n${jsonString(item.arguments ?? {})}`);
     } else if (item.type === "function_call_output" || item.type === "custom_tool_call_output") {
       const callId = requireString(item.call_id, `${label}.call_id`);
+      rejectUnsupportedAudio(item.output, `${label}.output`);
       const text = outputText(item.output, `${label}.output`);
       const images = contentImages(item.output, `${label}.output`);
       pushHistory(`[Codex client tool result; call_id=${callId}]\n${text || "[Image output]"}`, images);
@@ -374,7 +413,10 @@ function promptFrom(body) {
   if (!isAbsolute(workingDirectory) || !existsSync(workingDirectory)) {
     throw new BridgeError(`CodeBuddy working directory does not exist: ${JSON.stringify(workingDirectory)}`);
   }
-  return { model, prompt: sections.join("\n\n"), images, workingDirectory, toolInfo };
+  if (images.length > 0 && !route.inputModalities.includes("image")) {
+    throw new BridgeError("The managed CodeBuddy route does not support image input", 500);
+  }
+  return { model: route.model, prompt: sections.join("\n\n"), images, workingDirectory, toolInfo };
 }
 
 function requestArtifacts(context) {
@@ -691,8 +733,7 @@ async function handleResponses(request, response) {
 }
 
 function selfTest() {
-  const routes = JSON.parse(readFileSync(MODEL_ROUTES_FILE, "utf8"));
-  if (typeof routes[PROVIDER_ID] !== "string" || routes[PROVIDER_ID].length === 0) throw new Error(`self-test requires ${PROVIDER_ID} in ${MODEL_ROUTES_FILE}`);
+  const route = resolveRoute(MODEL_ALIAS);
   const context = promptFrom({
     model: MODEL_ALIAS,
     stream: true,
@@ -704,21 +745,12 @@ function selfTest() {
       { type: "custom", name: "apply_patch", description: "Apply a patch" },
       { type: "function", name: "exec_command", description: "Run a command", parameters: { type: "object", properties: {} } },
       { type: "function", name: "write_stdin", description: "Continue a command", parameters: { type: "object", properties: {} } },
-      { type: "function", name: "view_image", description: "Inspect an image", parameters: { type: "object", properties: {} } },
       { type: "namespace", name: "mcp__rzmcp", tools: [{ type: "function", name: "search_project_index", parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } }] },
     ],
     input: [
       { type: "compaction", encrypted_content: "opaque" },
       { type: "agent_message", author: "/root", recipient: "/root/test", content: [{ type: "input_text", text: "inspect one file" }] },
       { type: "tool_search_call", call_id: "search-1", arguments: { query: "project index" } },
-      {
-        type: "function_call_output",
-        call_id: "image-1",
-        output: [
-          { type: "input_text", text: "Rendered image" },
-          { type: "input_image", image_url: "data:image/png;base64,aW1hZ2U=" },
-        ],
-      },
       {
         type: "tool_search_output",
         call_id: "search-1",
@@ -730,11 +762,11 @@ function selfTest() {
       },
     ],
   });
-  if (context.model !== routes[PROVIDER_ID] || !context.prompt.includes("inspect one file") || context.prompt.includes("opaque")) {
+  if (context.model !== route.model || !context.prompt.includes("inspect one file") || context.prompt.includes("opaque")) {
     throw new Error("self-test failed: request normalization");
   }
   if (
-    context.toolInfo.definitions.length !== 7 ||
+    context.toolInfo.definitions.length !== 6 ||
     !context.toolInfo.byWire.has("apply_patch") ||
     !context.toolInfo.byWire.has("mcp__rzmcp__search_project_index") ||
     !context.toolInfo.byWire.has("mcp__rzmcp__scan_project_index")
@@ -744,10 +776,22 @@ function selfTest() {
   const incompleteSurface = { ...context.toolInfo, byOriginal: new Map(context.toolInfo.byOriginal) };
   incompleteSurface.byOriginal.delete(toolLookupKey(null, "apply_patch"));
   try {
-    validateManagedToolSurface(incompleteSurface);
+    validateManagedToolSurface(incompleteSurface, route.inputModalities);
     throw new Error("self-test failed: incomplete native capabilities must be rejected");
   } catch (error) {
     if (!String(error.message).includes("apply_patch")) throw error;
+  }
+  try {
+    codexToolsFrom({ tools: [{ type: "web_search" }] });
+    throw new Error("self-test failed: silently dropping hosted tools is forbidden");
+  } catch (error) {
+    if (!String(error.message).includes("web_search is unsupported")) throw error;
+  }
+  try {
+    rejectUnsupportedAudio([{ type: "input_audio", audio: "opaque" }], "self-test audio");
+    throw new Error("self-test failed: silently dropping audio is forbidden");
+  } catch (error) {
+    if (!String(error.message).includes("does not support audio")) throw error;
   }
   const discoveryOnly = codexToolsFrom({
     input: [{
@@ -765,7 +809,11 @@ function selfTest() {
   const longPrompt = "x".repeat(35_000);
   const longPromptArgs = codeBuddyArguments(context, "mcp-config.json");
   const longPromptInput = JSON.parse(codeBuddyInput(longPrompt));
-  const imageInput = JSON.parse(codeBuddyInput(context.prompt, context.images));
+  const anonymousImage = codeBuddyImage(
+    { image_url: "data:image/png;base64,aW1hZ2U=" },
+    "self-test image",
+  );
+  const imageInput = JSON.parse(codeBuddyInput(context.prompt, [anonymousImage]));
   if (
     !longPromptArgs.includes("--input-format") ||
     !longPromptArgs.includes("stream-json") ||
@@ -775,7 +823,7 @@ function selfTest() {
     throw new Error("self-test failed: long prompts must be transported through stream-json stdin");
   }
   if (
-    context.images.length !== 1 ||
+    context.images.length !== 0 ||
     context.prompt.includes("aW1hZ2U=") ||
     imageInput.message?.content?.[1]?.type !== "input_image" ||
     imageInput.message.content[1].image !== "data:image/png;base64,aW1hZ2U="
@@ -826,7 +874,8 @@ function start() {
       if (request.method === "GET" && request.url === "/health") {
         jsonResponse(response, 200, {
           ok: true, provider: PROVIDER_ID, port, modelAlias: MODEL_ALIAS,
-          configuredModel: resolveModel(MODEL_ALIAS), effort: REQUIRED_EFFORT,
+          configuredModel: resolveRoute(MODEL_ALIAS).model, effort: REQUIRED_EFFORT,
+          inputModalities: resolveRoute(MODEL_ALIAS).inputModalities,
           authSourceRequired: REQUIRED_AUTH_SOURCE, fallbackModel: null,
           explicitCostRequiredUsd: 0, codexManagedLazyTools: true,
           promptTransport: "stream-json-stdin", runtime,

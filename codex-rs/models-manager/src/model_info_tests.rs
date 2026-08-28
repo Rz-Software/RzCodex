@@ -8,6 +8,7 @@ use codex_protocol::openai_models::CollaborationModeMessages;
 use codex_protocol::openai_models::ConfigShellToolType;
 use codex_protocol::openai_models::ConfirmationPolicies;
 use codex_protocol::openai_models::GuardianV2ModelConfig;
+use codex_protocol::openai_models::InputModality;
 use codex_protocol::openai_models::ModelTokenBudgetConfig;
 use codex_protocol::openai_models::MultiAgentMessages;
 use codex_protocol::openai_models::MultiAgentModeMessages;
@@ -310,6 +311,19 @@ fn managed_preset_uses_lazy_tool_discovery_with_direct_tools() {
     );
     assert_eq!(model.tool_mode, Some(ToolMode::Direct));
     assert!(model.used_fallback_model_metadata);
+}
+
+#[test]
+fn configured_input_modalities_override_managed_preset_defaults() {
+    let model = model_info_from_slug("@preset/subagents");
+    let config = ModelsManagerConfig {
+        model_input_modalities: Some(vec![InputModality::Text]),
+        ..Default::default()
+    };
+
+    let updated = with_config_overrides(model, &config);
+
+    assert_eq!(updated.input_modalities, vec![InputModality::Text]);
 }
 
 #[test]
