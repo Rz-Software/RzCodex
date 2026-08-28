@@ -111,8 +111,6 @@ pub(crate) fn without_notification_media(notification: ServerNotification) -> Se
         | ServerNotification::ContextCompacted(_)
         | ServerNotification::ModelRerouted(_)
         | ServerNotification::ModelVerification(_)
-        | ServerNotification::AuthRecoveryStarted(_)
-        | ServerNotification::AuthRecoveryCompleted(_)
         | ServerNotification::TurnModerationMetadata(_)
         | ServerNotification::ModelSafetyBufferingUpdated(_)
         | ServerNotification::Warning(_)
@@ -188,16 +186,6 @@ fn without_thread_item_media(mut item: ThreadItem) -> ThreadItem {
             });
         }
         ThreadItem::ImageGeneration(item) => item.result.clear(),
-        ThreadItem::FunctionCallOutput { output, .. } => {
-            if let FunctionCallOutputBody::ContentItems(items) = output {
-                items.retain(|item| match item {
-                    FunctionCallOutputContentItem::InputImage { .. }
-                    | FunctionCallOutputContentItem::InputAudio { .. } => false,
-                    FunctionCallOutputContentItem::InputText { .. }
-                    | FunctionCallOutputContentItem::EncryptedContent { .. } => true,
-                });
-            }
-        }
         ThreadItem::HookPrompt { .. }
         | ThreadItem::AgentMessage { .. }
         | ThreadItem::Plan { .. }
