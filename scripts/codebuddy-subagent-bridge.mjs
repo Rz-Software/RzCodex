@@ -384,6 +384,10 @@ function providerToolCall(part, context) {
   return { callId: typeof part.id === "string" ? part.id : `call_${randomUUID()}`, entry, args };
 }
 
+function providerToolCallKey(call) {
+  return `${toolLookupKey(call.entry.namespace, call.entry.originalName)}\u0000${jsonString(call.args)}`;
+}
+
 function codeBuddyArguments(context, mcpConfig) {
   return [
     CODEBUDDY_SCRIPT,
@@ -446,7 +450,10 @@ function runCodeBuddy(context, onSpawn) {
         if (text && !text.includes("DEFERRED_TO_CODEX_CLIENT")) finalText = text;
         for (const part of event.message.content.filter((item) => item?.type === "tool_use")) {
           const call = providerToolCall(part, context);
-          if (call) calls.set(call.callId, call);
+          if (call) {
+            const callKey = providerToolCallKey(call);
+            if (!calls.has(callKey)) calls.set(callKey, call);
+          }
         }
       }
       if (event.type === "result") resultEvent = event;
@@ -717,6 +724,13 @@ function selfTest() {
     patchItem.input !== "*** Begin Patch\n*** End Patch"
   ) {
     throw new Error("self-test failed: free-form Codex tool restoration");
+  }
+  const duplicatePatch = providerToolCall({
+    type: "tool_use", id: "call-4", name: "DeferExecuteTool",
+    input: { toolName: "mcp__codex__apply_patch", params: { input: "*** Begin Patch\n*** End Patch" } },
+  }, context);
+  if (!duplicatePatch || !patch || providerToolCallKey(duplicatePatch) !== providerToolCallKey(patch)) {
+    throw new Error("self-test failed: duplicate Codex tool calls must share a semantic key");
   }
   validateResult(context, { model: context.model, apiKeySource: REQUIRED_AUTH_SOURCE }, {
     subtype: "success", is_error: false, total_cost_usd: 0, modelUsage: { [context.model]: {} },
