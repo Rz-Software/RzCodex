@@ -665,6 +665,46 @@ function jsonResponse(response, status, value) {
   response.end(body);
 }
 
+function managedModelsResponse() {
+  const route = resolveRoute(MODEL_ALIAS);
+  return {
+    models: [{
+      slug: MODEL_ALIAS,
+      display_name: "Managed native subagent",
+      description: "Centrally managed native subagent route",
+      default_reasoning_level: REQUIRED_EFFORT,
+      supported_reasoning_levels: [{ effort: REQUIRED_EFFORT, description: "Maximum" }],
+      shell_type: "unified_exec",
+      visibility: "none",
+      supported_in_api: true,
+      priority: 0,
+      availability_nux: null,
+      upgrade: null,
+      include_skills_usage_instructions: false,
+      include_plugin_usage_instructions: false,
+      include_apps_usage_instructions: false,
+      supports_reasoning_summary_parameter: false,
+      default_reasoning_summary: "none",
+      support_verbosity: false,
+      default_verbosity: null,
+      apply_patch_tool_type: "freeform",
+      web_search_tool_type: "text",
+      truncation_policy: { mode: "tokens", limit: 10_000 },
+      supports_image_detail_original: false,
+      context_window: 131_072,
+      max_context_window: 131_072,
+      experimental_supported_tools: [],
+      input_modalities: route.inputModalities,
+      supports_search_tool: true,
+      use_responses_lite: false,
+      node_repl_auto_review_required: false,
+      node_repl_disabled: false,
+      tool_mode: "direct",
+      multi_agent_version: "v2",
+    }],
+  };
+}
+
 async function handleResponses(request, response) {
   const context = promptFrom(await readJsonRequest(request));
   runtime.requests += 1;
@@ -744,6 +784,15 @@ async function handleResponses(request, response) {
 
 function selfTest() {
   const route = resolveRoute(MODEL_ALIAS);
+  const catalogModel = managedModelsResponse().models[0];
+  if (
+    catalogModel.slug !== MODEL_ALIAS ||
+    catalogModel.default_reasoning_level !== REQUIRED_EFFORT ||
+    catalogModel.apply_patch_tool_type !== "freeform" ||
+    catalogModel.input_modalities.join(",") !== route.inputModalities.join(",")
+  ) {
+    throw new Error("self-test failed: managed model catalog disagrees with the route");
+  }
   const context = promptFrom({
     model: MODEL_ALIAS,
     stream: true,
@@ -892,12 +941,16 @@ function start() {
         });
         return;
       }
+      if (request.method === "GET" && request.url?.split("?", 1)[0] === "/v1/models") {
+        jsonResponse(response, 200, managedModelsResponse());
+        return;
+      }
       if (request.method === "POST" && request.url === "/v1/responses") {
         runtime.incomingRequests += 1;
         await handleResponses(request, response);
         return;
       }
-      jsonResponse(response, 404, { error: { type: "not_found", message: "Use GET /health or POST /v1/responses" } });
+      jsonResponse(response, 404, { error: { type: "not_found", message: "Use GET /health, GET /v1/models, or POST /v1/responses" } });
     } catch (error) {
       if (response.headersSent || response.destroyed) return;
       const status = error instanceof BridgeError ? error.status : 500;
