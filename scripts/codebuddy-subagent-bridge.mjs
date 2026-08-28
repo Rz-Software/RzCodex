@@ -15,7 +15,6 @@ const REQUIRED_EFFORT = "max";
 const DEFAULT_PORT = 54547;
 const MAX_REQUEST_BYTES = 32 * 1024 * 1024;
 const MAX_PROMPT_CHARS = 120_000;
-const PROMPT_ARGUMENT_LIMIT = 24_000;
 const STDERR_LIMIT = 16 * 1024;
 const REQUEST_TIMEOUT_MS = 30 * 60 * 1000;
 const TEXT_TOOL_NAME = "tool_search";
@@ -331,22 +330,14 @@ function requestArtifacts(context) {
   const definitionsPath = join(REQUEST_DIRECTORY, `${requestId}-tools.json`);
   const configPath = join(REQUEST_DIRECTORY, `${requestId}-mcp.json`);
   writeFileSync(definitionsPath, jsonString({ tools: context.toolInfo.definitions }), { encoding: "utf8", flag: "wx" });
-  let promptPath = null;
-  let promptArgument = context.prompt;
-  if (context.prompt.length > PROMPT_ARGUMENT_LIMIT) {
-    promptPath = join(REQUEST_DIRECTORY, `${requestId}-prompt.txt`);
-    writeFileSync(promptPath, context.prompt, { encoding: "utf8", flag: "wx" });
-    promptArgument = `Read the complete delegated task from ${JSON.stringify(promptPath)}. Treat it as authoritative and do not modify or delete the request file.`;
-  }
   const mcpConfig = {
     mcpServers: { codex: { command: process.execPath, args: [MCP_SERVER_SCRIPT, definitionsPath] } },
   };
   writeFileSync(configPath, jsonString(mcpConfig), { encoding: "utf8", flag: "wx" });
   return {
-    promptArgument,
     mcpConfig: configPath,
     cleanup: () => {
-      for (const path of [definitionsPath, configPath, promptPath].filter(Boolean)) {
+      for (const path of [definitionsPath, configPath]) {
         try { unlinkSync(path); } catch (error) {
           if (error?.code !== "ENOENT") process.stderr.write(`CodeBuddy request cleanup failed: ${redactSecrets(error.message)}\n`);
         }
@@ -393,23 +384,33 @@ function providerToolCall(part, context) {
   return { callId: typeof part.id === "string" ? part.id : `call_${randomUUID()}`, entry, args };
 }
 
+function codeBuddyArguments(context, mcpConfig) {
+  return [
+    CODEBUDDY_SCRIPT,
+    "--print", "--input-format", "stream-json", "--output-format", "stream-json", "--include-partial-messages",
+    "--dangerously-skip-permissions", "--tools", "ToolSearch,DeferExecuteTool",
+    "--model", context.model, "--effort", REQUIRED_EFFORT,
+    "--mcp-config", mcpConfig, "--strict-mcp-config", "--no-session-persistence",
+  ];
+}
+
+function codeBuddyInput(prompt) {
+  return `${jsonString({
+    type: "user",
+    message: { role: "user", content: [{ type: "text", text: prompt }] },
+  })}\n`;
+}
+
 function runCodeBuddy(context, onSpawn) {
   if (!existsSync(CODEBUDDY_SCRIPT)) throw new BridgeError(`CodeBuddy CLI is not installed at ${CODEBUDDY_SCRIPT}`, 502);
   if (!existsSync(MCP_SERVER_SCRIPT)) throw new BridgeError(`Codex tool MCP adapter is missing at ${MCP_SERVER_SCRIPT}`, 502);
   const artifacts = requestArtifacts(context);
-  const args = [
-    CODEBUDDY_SCRIPT,
-    "--print", "--output-format", "stream-json", "--include-partial-messages",
-    "--dangerously-skip-permissions", "--tools", "ToolSearch,DeferExecuteTool",
-    "--model", context.model, "--effort", REQUIRED_EFFORT,
-    "--mcp-config", artifacts.mcpConfig, "--strict-mcp-config", "--no-session-persistence",
-    artifacts.promptArgument,
-  ];
+  const args = codeBuddyArguments(context, artifacts.mcpConfig);
   const child = spawn(process.execPath, args, {
     cwd: context.workingDirectory,
     env: sanitizedEnvironment(),
     windowsHide: true,
-    stdio: ["ignore", "pipe", "pipe"],
+    stdio: ["pipe", "pipe", "pipe"],
   });
   onSpawn(child);
   return new Promise((resolve, reject) => {
@@ -466,6 +467,9 @@ function runCodeBuddy(context, onSpawn) {
     });
     child.stderr.setEncoding("utf8");
     child.stderr.on("data", (chunk) => { stderr = `${stderr}${chunk}`.slice(-STDERR_LIMIT); });
+    child.stdin.on("error", (error) => {
+      if (error?.code !== "EPIPE") finish(new BridgeError(`CodeBuddy stdin failed: ${error.message}`, 502));
+    });
     child.once("error", (error) => finish(new BridgeError(`CodeBuddy failed to start: ${error.message}`, 502)));
     child.once("close", (code, signal) => {
       parseLine(stdoutBuffer);
@@ -487,6 +491,7 @@ function runCodeBuddy(context, onSpawn) {
         maxTurnInputTokens,
       });
     });
+    child.stdin.end(codeBuddyInput(context.prompt));
   });
 }
 
@@ -676,6 +681,17 @@ function selfTest() {
   if (discoveryOnly.definitions.length !== 1 || !discoveryOnly.byWire.has("mcp__rzmcp__get_tool_info")) {
     throw new Error("self-test failed: discovered tools must survive without top-level tools");
   }
+  const longPrompt = "x".repeat(35_000);
+  const longPromptArgs = codeBuddyArguments(context, "mcp-config.json");
+  const longPromptInput = JSON.parse(codeBuddyInput(longPrompt));
+  if (
+    !longPromptArgs.includes("--input-format") ||
+    !longPromptArgs.includes("stream-json") ||
+    longPromptArgs.some((argument) => argument.includes(longPrompt)) ||
+    longPromptInput.message?.content?.[0]?.text !== longPrompt
+  ) {
+    throw new Error("self-test failed: long prompts must be transported through stream-json stdin");
+  }
   const search = providerToolCall({
     type: "tool_use", id: "call-1", name: "DeferExecuteTool",
     input: { toolName: "mcp__codex__search_tools", params: { query: "asset search" } },
@@ -703,7 +719,8 @@ function start() {
           ok: true, provider: PROVIDER_ID, port, modelAlias: MODEL_ALIAS,
           configuredModel: resolveModel(MODEL_ALIAS), effort: REQUIRED_EFFORT,
           authSourceRequired: REQUIRED_AUTH_SOURCE, fallbackModel: null,
-          explicitCostRequiredUsd: 0, codexManagedLazyTools: true, runtime,
+          explicitCostRequiredUsd: 0, codexManagedLazyTools: true,
+          promptTransport: "stream-json-stdin", runtime,
         });
         return;
       }
