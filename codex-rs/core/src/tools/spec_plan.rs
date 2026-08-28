@@ -1009,6 +1009,9 @@ fn add_core_tool_sources(context: &CoreToolPlanContext<'_>, registry: &mut ToolR
                         turn_context,
                         context.environments,
                     ),
+                    include_windows_shell_guidance: should_include_windows_shell_guidance(
+                        context.environments,
+                    ),
                 }));
                 registry.add(WriteStdinHandler);
             }
@@ -1055,6 +1058,25 @@ fn any_environment_allows_login_shell(environments: &TurnEnvironmentSnapshot) ->
         .any(|environment| environment.config().allow_login_shell)
 }
 
+fn should_include_windows_shell_guidance(environments: &TurnEnvironmentSnapshot) -> bool {
+    let mut environments = environments.turn_environments();
+    let Some(environment) = environments.next() else {
+        return false;
+    };
+    let executor_platform_os = if environments.next().is_none() {
+        environment.executor_platform_os.as_deref()
+    } else {
+        None
+    };
+
+    // One tool schema can target any ready environment. Multi-environment turns and legacy
+    // executors without platform OS information preserve the host-derived guidance.
+    match executor_platform_os {
+        Some(platform_os) => platform_os == "windows",
+        None => cfg!(windows),
+    }
+}
+
 #[instrument(level = "trace", skip_all)]
 fn add_shell_tools(context: &CoreToolPlanContext<'_>, registry: &mut ToolRegistry) {
     let turn_context = context.turn_context;
@@ -1062,7 +1084,6 @@ fn add_shell_tools(context: &CoreToolPlanContext<'_>, registry: &mut ToolRegistr
     let environment_mode = tool_environment_mode(context.environments);
     if !environment_mode.has_environment()
         || !features.enabled(Feature::ShellTool)
-        || !features.enabled(Feature::UnifiedExec)
         || matches!(context.model_info.shell_type, ConfigShellToolType::Disabled)
     {
         return;
@@ -1071,7 +1092,7 @@ fn add_shell_tools(context: &CoreToolPlanContext<'_>, registry: &mut ToolRegistr
     let allow_login_shell = any_environment_allows_login_shell(context.environments);
     let exec_permission_approvals_enabled = features.enabled(Feature::ExecPermissionApprovals);
     let include_environment_id = matches!(environment_mode, ToolEnvironmentMode::Multiple);
-    registry.add(ExecCommandHandler::new(ExecCommandHandlerOptions {
+    let options = ExecCommandHandlerOptions {
         allow_login_shell,
         exec_permission_approvals_enabled,
         include_environment_id,
@@ -1079,8 +1100,17 @@ fn add_shell_tools(context: &CoreToolPlanContext<'_>, registry: &mut ToolRegistr
             turn_context,
             context.environments,
         ),
-    }));
-    registry.add(WriteStdinHandler);
+        include_windows_shell_guidance: should_include_windows_shell_guidance(context.environments),
+    };
+    if features.enabled(Feature::UnifiedExec) {
+        registry.add(ExecCommandHandler::new(options));
+        registry.add(WriteStdinHandler);
+    } else {
+        // Managed requirements are the only configuration path that can keep
+        // unified exec disabled. Preserve command execution without exposing a
+        // resumable process or write_stdin authority prohibited by policy.
+        registry.add(ExecCommandHandler::one_shot(options));
+    }
 }
 
 fn unified_exec_should_include_shell_parameter(
