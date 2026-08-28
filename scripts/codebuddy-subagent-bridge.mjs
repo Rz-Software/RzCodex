@@ -38,9 +38,12 @@ class BridgeError extends Error {
 }
 
 const runtime = {
+  incomingRequests: 0,
   requests: 0,
   completed: 0,
   failed: 0,
+  rejected: 0,
+  lastRejectedError: null,
   lastModel: null,
   lastAuthSource: null,
   lastCostUsd: null,
@@ -215,6 +218,7 @@ function codexToolsFrom(body) {
   const definitions = [];
   const byWire = new Map();
   const byOriginal = new Map();
+  const hosted = new Set();
   const add = (namespace, tool, label, toolSearch = false) => {
     const originalName = toolSearch ? TEXT_TOOL_NAME : requireString(tool.name, `${label}.name`);
     const wireName = toolSearch ? WIRE_TEXT_TOOL_NAME : safeWireName(namespace, originalName);
@@ -245,7 +249,8 @@ function codexToolsFrom(body) {
       const tool = assertObject(tools[index], `${labelPrefix}[${index}]`);
       const label = `${labelPrefix}[${index}]`;
       if (tool.type === "web_search") {
-        throw new BridgeError(`${label} hosted web_search is unsupported by the CodeBuddy route`, 500);
+        hosted.add("web_search");
+        continue;
       }
       if (tool.type === "tool_search") {
         if (tool.execution !== undefined && tool.execution !== "client") throw new BridgeError(`${label}.execution must be client`);
@@ -280,7 +285,7 @@ function codexToolsFrom(body) {
       }
     }
   }
-  return { definitions, byWire, byOriginal };
+  return { definitions, byWire, byOriginal, hosted };
 }
 
 function validateManagedToolSurface(toolInfo, inputModalities) {
@@ -335,6 +340,9 @@ function promptFrom(body) {
       `[Codex client tools available this turn]\n${providerNames.join("\n")}\n` +
       "These are names only; load an exact name with ToolSearch before calling it.",
     );
+  }
+  if (toolInfo.hosted.has("web_search")) {
+    sections.push("[Provider-native tools mapped this turn]\nweb_search -> CodeBuddy WebSearch");
   }
   const history = [];
   const pushHistory = (text, images = []) => {
@@ -484,10 +492,12 @@ function providerToolCallKey(call) {
 }
 
 function codeBuddyArguments(context, mcpConfig) {
+  const tools = ["ToolSearch", "DeferExecuteTool"];
+  if (context.toolInfo.hosted.has("web_search")) tools.push("WebSearch");
   return [
     CODEBUDDY_SCRIPT,
     "--print", "--input-format", "stream-json", "--output-format", "stream-json", "--include-partial-messages",
-    "--dangerously-skip-permissions", "--tools", "ToolSearch,DeferExecuteTool",
+    "--dangerously-skip-permissions", "--tools", tools.join(","),
     "--model", context.model, "--effort", REQUIRED_EFFORT,
     "--mcp-config", mcpConfig, "--strict-mcp-config", "--no-session-persistence",
   ];
@@ -741,6 +751,7 @@ function selfTest() {
     client_metadata: { cwd: process.cwd() },
     instructions: "<external_cli_route_instructions>bounded role</external_cli_route_instructions>",
     tools: [
+      { type: "web_search" },
       { type: "tool_search", execution: "client", description: "Find tools", parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } },
       { type: "custom", name: "apply_patch", description: "Apply a patch" },
       { type: "function", name: "exec_command", description: "Run a command", parameters: { type: "object", properties: {} } },
@@ -781,11 +792,9 @@ function selfTest() {
   } catch (error) {
     if (!String(error.message).includes("apply_patch")) throw error;
   }
-  try {
-    codexToolsFrom({ tools: [{ type: "web_search" }] });
-    throw new Error("self-test failed: silently dropping hosted tools is forbidden");
-  } catch (error) {
-    if (!String(error.message).includes("web_search is unsupported")) throw error;
+  const hostedSurface = codexToolsFrom({ tools: [{ type: "web_search" }] });
+  if (!hostedSurface.hosted.has("web_search") || hostedSurface.definitions.length !== 0) {
+    throw new Error("self-test failed: hosted web search must map to the provider-native tool");
   }
   try {
     rejectUnsupportedAudio([{ type: "input_audio", audio: "opaque" }], "self-test audio");
@@ -817,6 +826,7 @@ function selfTest() {
   if (
     !longPromptArgs.includes("--input-format") ||
     !longPromptArgs.includes("stream-json") ||
+    !longPromptArgs.includes("ToolSearch,DeferExecuteTool,WebSearch") ||
     longPromptArgs.some((argument) => argument.includes(longPrompt)) ||
     longPromptInput.message?.content?.[0]?.text !== longPrompt
   ) {
@@ -883,6 +893,7 @@ function start() {
         return;
       }
       if (request.method === "POST" && request.url === "/v1/responses") {
+        runtime.incomingRequests += 1;
         await handleResponses(request, response);
         return;
       }
@@ -891,7 +902,12 @@ function start() {
       if (response.headersSent || response.destroyed) return;
       const status = error instanceof BridgeError ? error.status : 500;
       const message = error instanceof BridgeError ? error.message : `Bridge error: ${error.message}`;
-      jsonResponse(response, status, { error: { type: "bridge_error", message: redactSecrets(message) } });
+      const redactedMessage = redactSecrets(message);
+      if (request.method === "POST" && request.url === "/v1/responses") {
+        runtime.rejected += 1;
+        runtime.lastRejectedError = redactedMessage;
+      }
+      jsonResponse(response, status, { error: { type: "bridge_error", message: redactedMessage } });
     }
   });
   server.on("error", (error) => {

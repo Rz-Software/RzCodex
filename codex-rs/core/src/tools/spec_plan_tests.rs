@@ -1269,6 +1269,20 @@ async fn environment_count_controls_environment_backed_tools() {
 }
 
 #[tokio::test]
+async fn text_only_models_do_not_receive_view_image() {
+    let plan = probe(|turn| {
+        set_feature(turn, Feature::ViewImage, /*enabled*/ true);
+        update_turn_settings_for_test(turn, |settings| {
+            Arc::make_mut(&mut settings.model_info).input_modalities = vec![InputModality::Text];
+        });
+    })
+    .await;
+
+    plan.assert_visible_lacks(&["view_image"]);
+    plan.assert_registered_lacks(&["view_image"]);
+}
+
+#[tokio::test]
 async fn environment_tools_follow_the_step_context() {
     let (_session, mut turn) = make_session_and_context().await;
     update_turn_settings_for_test(&mut turn, |settings| {
