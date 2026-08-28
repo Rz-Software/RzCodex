@@ -641,6 +641,7 @@ function selfTest() {
     instructions: "<external_cli_route_instructions>bounded role</external_cli_route_instructions>",
     tools: [
       { type: "tool_search", execution: "client", description: "Find tools", parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } },
+      { type: "custom", name: "apply_patch", description: "Apply a patch" },
       { type: "namespace", name: "mcp__rzmcp", tools: [{ type: "function", name: "search_project_index", parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } }] },
     ],
     input: [
@@ -662,7 +663,8 @@ function selfTest() {
     throw new Error("self-test failed: request normalization");
   }
   if (
-    context.toolInfo.definitions.length !== 3 ||
+    context.toolInfo.definitions.length !== 4 ||
+    !context.toolInfo.byWire.has("apply_patch") ||
     !context.toolInfo.byWire.has("mcp__rzmcp__search_project_index") ||
     !context.toolInfo.byWire.has("mcp__rzmcp__scan_project_index")
   ) {
@@ -703,6 +705,18 @@ function selfTest() {
   }, context);
   if (call?.entry.namespace !== "mcp__rzmcp" || call.entry.originalName !== "search_project_index") {
     throw new Error("self-test failed: namespaced Codex tool restoration");
+  }
+  const patch = providerToolCall({
+    type: "tool_use", id: "call-3", name: "DeferExecuteTool",
+    input: { toolName: "mcp__codex__apply_patch", params: { input: "*** Begin Patch\n*** End Patch" } },
+  }, context);
+  const patchItem = patch && callItem(patch);
+  if (
+    patchItem?.type !== "custom_tool_call" ||
+    patchItem.name !== "apply_patch" ||
+    patchItem.input !== "*** Begin Patch\n*** End Patch"
+  ) {
+    throw new Error("self-test failed: free-form Codex tool restoration");
   }
   validateResult(context, { model: context.model, apiKeySource: REQUIRED_AUTH_SOURCE }, {
     subtype: "success", is_error: false, total_cost_usd: 0, modelUsage: { [context.model]: {} },

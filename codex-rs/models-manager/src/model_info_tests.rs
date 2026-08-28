@@ -1,9 +1,11 @@
 use super::*;
 use crate::ModelsManagerConfig;
 use codex_protocol::config_types::Personality;
+use codex_protocol::openai_models::ApplyPatchToolType;
 use codex_protocol::openai_models::ApprovalMessages;
 use codex_protocol::openai_models::AutoReviewMessages;
 use codex_protocol::openai_models::CollaborationModeMessages;
+use codex_protocol::openai_models::ConfigShellToolType;
 use codex_protocol::openai_models::ConfirmationPolicies;
 use codex_protocol::openai_models::GuardianV2ModelConfig;
 use codex_protocol::openai_models::ModelTokenBudgetConfig;
@@ -292,6 +294,7 @@ fn unknown_model_uses_builtin_instruction_template() {
         model.get_model_instructions(/*personality*/ None),
         BASE_INSTRUCTIONS
     );
+    assert_eq!(model.apply_patch_tool_type, None);
     assert!(model.used_fallback_model_metadata);
 }
 
@@ -300,6 +303,11 @@ fn managed_preset_uses_lazy_tool_discovery_with_direct_tools() {
     let model = model_info_from_slug("@preset/subagents");
 
     assert!(model.supports_search_tool);
+    assert_eq!(model.shell_type, ConfigShellToolType::UnifiedExec);
+    assert_eq!(
+        model.apply_patch_tool_type,
+        Some(ApplyPatchToolType::Freeform)
+    );
     assert_eq!(model.tool_mode, Some(ToolMode::Direct));
     assert!(model.used_fallback_model_metadata);
 }
