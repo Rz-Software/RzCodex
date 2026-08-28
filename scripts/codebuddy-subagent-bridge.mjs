@@ -130,12 +130,36 @@ function contentText(value, label) {
   }).join("");
 }
 
+function codeBuddyImage(item, label) {
+  const value = typeof item.image_url === "string" ? item.image_url : item.image_url?.url;
+  const imageUrl = requireString(value, `${label}.image_url`);
+  if (/^data:image\/(?:jpeg|png|gif|webp);base64,/i.test(imageUrl)) {
+    return { type: "input_image", image: imageUrl };
+  }
+  if (/^https?:\/\//i.test(imageUrl)) {
+    return { type: "image", source: { type: "url", url: imageUrl } };
+  }
+  throw new BridgeError(`${label}.image_url must be a supported image data URL or HTTP(S) URL`);
+}
+
+function contentImages(value, label) {
+  if (typeof value === "string") return [];
+  if (!Array.isArray(value)) throw new BridgeError(`${label} must be a string or array`);
+  const images = [];
+  for (let index = 0; index < value.length; index += 1) {
+    const item = assertObject(value[index], `${label}[${index}]`);
+    if (item.type === "input_image") images.push(codeBuddyImage(item, `${label}[${index}]`));
+  }
+  return images;
+}
+
 function outputText(value, label) {
   if (typeof value === "string") return value;
   if (!Array.isArray(value)) return jsonString(value);
   return value.map((entry, index) => {
     if (typeof entry === "string") return entry;
     const item = assertObject(entry, `${label}[${index}]`);
+    if (["input_image", "input_audio", "encrypted_content"].includes(item.type)) return "";
     return typeof item.text === "string" ? item.text : jsonString(item);
   }).join("");
 }
@@ -231,6 +255,26 @@ function codexToolsFrom(body) {
   return { definitions, byWire, byOriginal };
 }
 
+function validateManagedToolSurface(toolInfo) {
+  const requirements = [
+    ["exec_command", (entry) => !entry.custom && !entry.toolSearch],
+    ["write_stdin", (entry) => !entry.custom && !entry.toolSearch],
+    ["apply_patch", (entry) => entry.custom && !entry.toolSearch],
+    ["view_image", (entry) => !entry.custom && !entry.toolSearch],
+    [TEXT_TOOL_NAME, (entry) => entry.toolSearch],
+  ];
+  const missing = requirements.filter(([name, matches]) => {
+    const entry = toolInfo.byOriginal.get(toolLookupKey(null, name));
+    return !entry || !matches(entry);
+  }).map(([name]) => name);
+  if (missing.length > 0) {
+    throw new BridgeError(
+      `RzCodex managed preset omitted required native capabilities: ${missing.join(", ")}`,
+      500,
+    );
+  }
+}
+
 function promptFrom(body) {
   assertObject(body, "request body");
   if (body.stream !== true) throw new BridgeError("The CodeBuddy bridge requires stream=true");
@@ -242,6 +286,7 @@ function promptFrom(body) {
   const input = typeof body.input === "string" ? [{ type: "message", role: "user", content: body.input }] : body.input;
   if (!Array.isArray(input)) throw new BridgeError("input must be a string or array");
   const toolInfo = codexToolsFrom(body);
+  validateManagedToolSurface(toolInfo);
   const sections = [
     "[Native delegation contract]\nWork as the delegated CodeBuddy sub-agent in the current workspace. Complete only the bounded task and return concise evidence to the parent. The MCP server named codex exposes exactly the client-executed tools Codex made available for this turn. CodeBuddy serves those schemas lazily: use ToolSearch with the exact mcp__codex__ tool name before invoking it through DeferExecuteTool. When its proxy reports DEFERRED_TO_CODEX_CLIENT, immediately end the turn without retrying, fabricating a result, or calling another tool; the parent will execute it and resume you with the real result.",
   ];
@@ -255,6 +300,9 @@ function promptFrom(body) {
     );
   }
   const history = [];
+  const pushHistory = (text, images = []) => {
+    if (text || images.length > 0) history.push({ text, images });
+  };
   for (let index = 0; index < input.length; index += 1) {
     const item = assertObject(input[index], `input[${index}]`);
     const label = `input[${index}]`;
@@ -262,30 +310,33 @@ function promptFrom(body) {
       const role = requireString(item.role, `${label}.role`);
       if (role !== "system" && role !== "developer") {
         const text = contentText(item.content, `${label}.content`);
-        if (text) history.push(`[${role}]\n${text}`);
+        const images = contentImages(item.content, `${label}.content`);
+        pushHistory(`[${role}]\n${text || "[Image input]"}`, images);
       }
     } else if (item.type === "agent_message") {
       const author = typeof item.author === "string" ? item.author : "Codex";
       const recipient = typeof item.recipient === "string" ? item.recipient : "CodeBuddy worker";
       const text = contentText(item.content, `${label}.content`);
-      if (text) history.push(`[Delegated task ${author} -> ${recipient}]\n${text}`);
+      if (text) pushHistory(`[Delegated task ${author} -> ${recipient}]\n${text}`);
     } else if (item.type === "reasoning") {
       const summary = Array.isArray(item.summary)
         ? item.summary.filter((part) => part?.type === "summary_text" && typeof part.text === "string")
           .map((part) => part.text).join("") : "";
-      if (summary) history.push(`[Prior reasoning summary]\n${summary}`);
+      if (summary) pushHistory(`[Prior reasoning summary]\n${summary}`);
     } else if (item.type === "function_call" || item.type === "custom_tool_call") {
       const namespace = typeof item.namespace === "string" ? `${item.namespace}.` : "";
       const name = requireString(item.name, `${label}.name`);
       const callId = requireString(item.call_id, `${label}.call_id`);
       const inputValue = item.type === "custom_tool_call" ? item.input : item.arguments;
-      history.push(`[Assistant requested client tool ${namespace}${name}; call_id=${callId}]\n${typeof inputValue === "string" ? inputValue : jsonString(inputValue)}`);
+      pushHistory(`[Assistant requested client tool ${namespace}${name}; call_id=${callId}]\n${typeof inputValue === "string" ? inputValue : jsonString(inputValue)}`);
     } else if (item.type === "tool_search_call") {
       const callId = requireString(item.call_id, `${label}.call_id`);
-      history.push(`[Assistant requested Codex tool search; call_id=${callId}]\n${jsonString(item.arguments ?? {})}`);
+      pushHistory(`[Assistant requested Codex tool search; call_id=${callId}]\n${jsonString(item.arguments ?? {})}`);
     } else if (item.type === "function_call_output" || item.type === "custom_tool_call_output") {
       const callId = requireString(item.call_id, `${label}.call_id`);
-      history.push(`[Codex client tool result; call_id=${callId}]\n${outputText(item.output, `${label}.output`)}`);
+      const text = outputText(item.output, `${label}.output`);
+      const images = contentImages(item.output, `${label}.output`);
+      pushHistory(`[Codex client tool result; call_id=${callId}]\n${text || "[Image output]"}`, images);
     } else if (item.type === "tool_search_output") {
       const callId = requireString(item.call_id, `${label}.call_id`);
       const names = [];
@@ -301,7 +352,7 @@ function promptFrom(body) {
           }
         }
       }
-      history.push(`[Codex tool search result; call_id=${callId}]\n${names.length} tools discovered: ${names.join(", ")}`);
+      pushHistory(`[Codex tool search result; call_id=${callId}]\n${names.length} tools discovered: ${names.join(", ")}`);
     } else if (["compaction", "context_compaction", "compaction_trigger"].includes(item.type)) {
       // Codex compaction payloads are provider-opaque. The portable history remains authoritative.
     } else {
@@ -310,18 +361,20 @@ function promptFrom(body) {
   }
   let retainedChars = 0;
   const retained = [];
+  const images = [];
   for (let index = history.length - 1; index >= 0; index -= 1) {
     const section = history[index];
-    if (retainedChars + section.length > MAX_PROMPT_CHARS && retained.length > 0) break;
-    retained.unshift(section.slice(-MAX_PROMPT_CHARS));
-    retainedChars += section.length;
+    if (retainedChars + section.text.length > MAX_PROMPT_CHARS && retained.length > 0) break;
+    retained.unshift(section.text.slice(-MAX_PROMPT_CHARS));
+    images.unshift(...section.images);
+    retainedChars += section.text.length;
   }
   sections.push(...retained);
   const workingDirectory = workingDirectoryFrom(body);
   if (!isAbsolute(workingDirectory) || !existsSync(workingDirectory)) {
     throw new BridgeError(`CodeBuddy working directory does not exist: ${JSON.stringify(workingDirectory)}`);
   }
-  return { model, prompt: sections.join("\n\n"), workingDirectory, toolInfo };
+  return { model, prompt: sections.join("\n\n"), images, workingDirectory, toolInfo };
 }
 
 function requestArtifacts(context) {
@@ -398,10 +451,10 @@ function codeBuddyArguments(context, mcpConfig) {
   ];
 }
 
-function codeBuddyInput(prompt) {
+function codeBuddyInput(prompt, images = []) {
   return `${jsonString({
     type: "user",
-    message: { role: "user", content: [{ type: "text", text: prompt }] },
+    message: { role: "user", content: [{ type: "input_text", text: prompt }, ...images] },
   })}\n`;
 }
 
@@ -498,7 +551,7 @@ function runCodeBuddy(context, onSpawn) {
         maxTurnInputTokens,
       });
     });
-    child.stdin.end(codeBuddyInput(context.prompt));
+    child.stdin.end(codeBuddyInput(context.prompt, context.images));
   });
 }
 
@@ -649,12 +702,23 @@ function selfTest() {
     tools: [
       { type: "tool_search", execution: "client", description: "Find tools", parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } },
       { type: "custom", name: "apply_patch", description: "Apply a patch" },
+      { type: "function", name: "exec_command", description: "Run a command", parameters: { type: "object", properties: {} } },
+      { type: "function", name: "write_stdin", description: "Continue a command", parameters: { type: "object", properties: {} } },
+      { type: "function", name: "view_image", description: "Inspect an image", parameters: { type: "object", properties: {} } },
       { type: "namespace", name: "mcp__rzmcp", tools: [{ type: "function", name: "search_project_index", parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } }] },
     ],
     input: [
       { type: "compaction", encrypted_content: "opaque" },
       { type: "agent_message", author: "/root", recipient: "/root/test", content: [{ type: "input_text", text: "inspect one file" }] },
       { type: "tool_search_call", call_id: "search-1", arguments: { query: "project index" } },
+      {
+        type: "function_call_output",
+        call_id: "image-1",
+        output: [
+          { type: "input_text", text: "Rendered image" },
+          { type: "input_image", image_url: "data:image/png;base64,aW1hZ2U=" },
+        ],
+      },
       {
         type: "tool_search_output",
         call_id: "search-1",
@@ -670,12 +734,20 @@ function selfTest() {
     throw new Error("self-test failed: request normalization");
   }
   if (
-    context.toolInfo.definitions.length !== 4 ||
+    context.toolInfo.definitions.length !== 7 ||
     !context.toolInfo.byWire.has("apply_patch") ||
     !context.toolInfo.byWire.has("mcp__rzmcp__search_project_index") ||
     !context.toolInfo.byWire.has("mcp__rzmcp__scan_project_index")
   ) {
     throw new Error("self-test failed: lazy Codex tool translation");
+  }
+  const incompleteSurface = { ...context.toolInfo, byOriginal: new Map(context.toolInfo.byOriginal) };
+  incompleteSurface.byOriginal.delete(toolLookupKey(null, "apply_patch"));
+  try {
+    validateManagedToolSurface(incompleteSurface);
+    throw new Error("self-test failed: incomplete native capabilities must be rejected");
+  } catch (error) {
+    if (!String(error.message).includes("apply_patch")) throw error;
   }
   const discoveryOnly = codexToolsFrom({
     input: [{
@@ -693,6 +765,7 @@ function selfTest() {
   const longPrompt = "x".repeat(35_000);
   const longPromptArgs = codeBuddyArguments(context, "mcp-config.json");
   const longPromptInput = JSON.parse(codeBuddyInput(longPrompt));
+  const imageInput = JSON.parse(codeBuddyInput(context.prompt, context.images));
   if (
     !longPromptArgs.includes("--input-format") ||
     !longPromptArgs.includes("stream-json") ||
@@ -700,6 +773,14 @@ function selfTest() {
     longPromptInput.message?.content?.[0]?.text !== longPrompt
   ) {
     throw new Error("self-test failed: long prompts must be transported through stream-json stdin");
+  }
+  if (
+    context.images.length !== 1 ||
+    context.prompt.includes("aW1hZ2U=") ||
+    imageInput.message?.content?.[1]?.type !== "input_image" ||
+    imageInput.message.content[1].image !== "data:image/png;base64,aW1hZ2U="
+  ) {
+    throw new Error("self-test failed: image outputs must use native stream-json image content");
   }
   const search = providerToolCall({
     type: "tool_use", id: "call-1", name: "DeferExecuteTool",
