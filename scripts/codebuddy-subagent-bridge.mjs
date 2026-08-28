@@ -672,6 +672,7 @@ function managedModelsResponse() {
       slug: MODEL_ALIAS,
       display_name: "Managed native subagent",
       description: "Centrally managed native subagent route",
+      base_instructions: "You are a delegated coding sub-agent. Follow the supplied role and task instructions, use the available tools when needed, verify your work, and report concise evidence to the parent agent.",
       default_reasoning_level: REQUIRED_EFFORT,
       supported_reasoning_levels: [{ effort: REQUIRED_EFFORT, description: "Maximum" }],
       shell_type: "unified_exec",
@@ -787,6 +788,7 @@ function selfTest() {
   const catalogModel = managedModelsResponse().models[0];
   if (
     catalogModel.slug !== MODEL_ALIAS ||
+    !catalogModel.base_instructions.includes("delegated coding sub-agent") ||
     catalogModel.default_reasoning_level !== REQUIRED_EFFORT ||
     catalogModel.apply_patch_tool_type !== "freeform" ||
     catalogModel.input_modalities.join(",") !== route.inputModalities.join(",")
