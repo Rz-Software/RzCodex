@@ -6,6 +6,7 @@ use codex_config::test_support::CloudConfigBundleFixture;
 use codex_login::test_support::auth_manager_from_optional_auth;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::models::BaseInstructionsProvenance;
+use codex_protocol::openai_models::InputModality;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_skills_extension::HostSkillsService;
 use codex_utils_absolute_path::test_support::PathExt;
@@ -229,6 +230,35 @@ async fn apply_role_preserves_unspecified_keys() {
     );
     assert_eq!(config.base_instructions, base_instructions);
     assert_eq!(config.base_instructions_provenance, provenance);
+}
+
+#[tokio::test]
+async fn apply_role_applies_model_input_modalities() {
+    let (home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
+    config.model_input_modalities = Some(vec![InputModality::Text, InputModality::Image]);
+    let role_path = write_role_config(
+        &home,
+        "text-only-role.toml",
+        "model_input_modalities = [\"text\"]",
+    )
+    .await;
+    config.agent_roles.insert(
+        "custom".to_string(),
+        AgentRoleConfig {
+            description: None,
+            config_file: Some(role_path),
+            nickname_candidates: None,
+        },
+    );
+
+    apply_role_to_config(&mut config, Some("custom"))
+        .await
+        .expect("custom role should apply");
+
+    assert_eq!(
+        config.model_input_modalities,
+        Some(vec![InputModality::Text])
+    );
 }
 
 #[tokio::test]

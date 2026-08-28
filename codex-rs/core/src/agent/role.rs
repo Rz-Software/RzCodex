@@ -21,6 +21,7 @@ use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::Verbosity;
 use codex_protocol::models::BaseInstructionsProvenance;
+use codex_protocol::openai_models::InputModality;
 use codex_protocol::openai_models::ReasoningEffort;
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -39,6 +40,7 @@ struct AgentRoleOverrides {
     model: Option<String>,
     model_provider: Option<String>,
     model_reasoning_effort: Option<ReasoningEffort>,
+    model_input_modalities: Option<Vec<InputModality>>,
     model_reasoning_summary: Option<ReasoningSummary>,
     model_verbosity: Option<Verbosity>,
     personality: Option<Personality>,
@@ -83,6 +85,7 @@ async fn apply_role_to_config_inner(
         model: role_config.model,
         model_provider: role_config.model_provider,
         model_reasoning_effort: role_config.model_reasoning_effort,
+        model_input_modalities: role_config.model_input_modalities,
         model_reasoning_summary: role_config.model_reasoning_summary,
         model_verbosity: role_config.model_verbosity,
         personality: role_config.personality,
@@ -201,6 +204,9 @@ mod role_overrides {
         }
         if let Some(effort) = overrides.model_reasoning_effort.clone() {
             next_config.model_reasoning_effort = Some(effort);
+        }
+        if let Some(input_modalities) = &overrides.model_input_modalities {
+            next_config.model_input_modalities = Some(input_modalities.clone());
         }
         if let Some(summary) = overrides.model_reasoning_summary {
             next_config.model_reasoning_summary = Some(summary);
