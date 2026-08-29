@@ -18,7 +18,8 @@ import {
 
 const PROVIDER_ID = "devin";
 const MODEL_ALIAS = "@preset/codex-subagents";
-const REQUIRED_EFFORT = "max";
+const REQUIRED_EFFORT = "high";
+const LEGACY_REQUEST_EFFORTS = new Set(["max"]);
 const DEFAULT_PORT = 54548;
 const MAX_REQUEST_BYTES = 32 * 1024 * 1024;
 const MAX_PROMPT_CHARS = 100_000;
@@ -37,15 +38,6 @@ const ISOLATED_CONFIG = join(DEVIN_HOME, "config.json");
 const REQUEST_DIRECTORY = join(DEVIN_HOME, "requests");
 const DEVIN_EXE = join(process.env.LOCALAPPDATA || join(homedir(), "AppData", "Local"), "devin", "cli", "bin", "devin.exe");
 const DEVIN_DB = join(process.env.APPDATA || join(homedir(), "AppData", "Roaming"), "devin", "cli", "sessions.db");
-const COMPLEX_SIGNALS = [
-  /\bcomplex\b/i,
-  /\broot[- ]cause\b/i,
-  /\b(?:crash|deadlock|race condition|memory corruption|heisenbug)\b/i,
-  /\b(?:concurrency|lifetime|replication|distributed)\b/i,
-  /\b(?:architecture|protocol|transport)\b/i,
-  /\b(?:trace|profil(?:e|ing)|performance regression)\b/i,
-  /\b(?:security audit|vulnerability chain)\b/i,
-];
 const QUOTA_FAILURE = /(?:daily|weekly|included|usage)[\s\S]{0,100}quota[\s\S]{0,100}(?:exhaust|exceed|reach|limit)|quota[\s\S]{0,100}(?:exhaust|exceed|reach|limit)/i;
 const RESOURCE_EXHAUSTED = /cognition\.ai\/errorKind[\s\S]{0,100}resource_exhausted|resource_exhausted[\s\S]{0,100}cognition\.ai\/retryable[\s\S]{0,20}true/i;
 
@@ -74,7 +66,8 @@ function requireString(value, label) {
 function sanitizedEnvironment() {
   const env = { ...process.env, NO_COLOR: "1" };
   for (const key of [
-    "DEVIN_API_KEY", "DEVIN_ORG_ID", "COGNITION_API_KEY", "OPENROUTER_API_KEY",
+    "DEVIN_API_KEY", "DEVIN_ORG_ID", "COGNITION_API_KEY", "OPENAI_API_KEY",
+    "OPENAI_ORG_ID", "OPENAI_PROJECT_ID", "CODEX_API_KEY", "OPENROUTER_API_KEY",
     "TENCENT_API_KEY", "TENCENTCLOUD_SECRET_ID", "TENCENTCLOUD_SECRET_KEY",
     "CODEBUDDY_API_KEY", "OPENCODE_API_KEY", "COMMAND_CODE_API_KEY",
   ]) delete env[key];
@@ -96,7 +89,6 @@ function centralRoute() {
   return {
     primaryModel: requireString(route.primaryModel, "primaryModel"),
     quotaFallbackModel: requireString(route.quotaFallbackModel, "quotaFallbackModel"),
-    complexModel: requireString(route.complexModel, "complexModel"),
     inputModalities,
   };
 }
@@ -169,9 +161,8 @@ function catalogModel(uid, expectedLabel, mustBeFree) {
 }
 
 const models = {
-  primary: catalogModel(route.primaryModel, "SWE-1.7 Lightning Max", false),
-  fallback: catalogModel(route.quotaFallbackModel, "SWE-1.7 Max", true),
-  complex: catalogModel(route.complexModel, "SWE-1.7 Max", true),
+  primary: catalogModel(route.primaryModel, "GPT-5.6 Sol High Thinking", false),
+  fallback: catalogModel(route.quotaFallbackModel, "GLM-5.2 High", true),
 };
 
 const runtime = {
@@ -328,7 +319,9 @@ function promptFrom(body) {
   if (body.stream !== true) throw new BridgeError("The Devin bridge requires stream=true");
   if (requireString(body.model, "model") !== MODEL_ALIAS) throw new BridgeError(`Unknown managed model alias ${json(body.model)}`);
   const effort = body.reasoning?.effort;
-  if (effort !== undefined && effort !== REQUIRED_EFFORT) throw new BridgeError(`Devin subagents require effort ${REQUIRED_EFFORT}`);
+  if (effort !== undefined && effort !== REQUIRED_EFFORT && !LEGACY_REQUEST_EFFORTS.has(effort)) {
+    throw new BridgeError(`Devin subagents require centrally configured effort ${REQUIRED_EFFORT}`);
+  }
   const input = typeof body.input === "string" ? [{ type: "message", role: "user", content: body.input }] : body.input;
   if (!Array.isArray(input)) throw new BridgeError("input must be a string or array");
   let taskState;
@@ -406,13 +399,8 @@ function promptFrom(body) {
   return { requestId, prompt, workingDirectory, threadId, taskState, taskDiagnostics, toolSchemaBytes };
 }
 
-function chooseRoute(context) {
-  const payload = context.taskState.activeTask?.text || context.prompt;
-  const complexScore = COMPLEX_SIGNALS.filter((pattern) => pattern.test(payload)).length;
-  if (complexScore >= 2 || COMPLEX_SIGNALS[0].test(payload)) {
-    return { key: "complex", model: models.complex, reason: `complex_score_${complexScore}` };
-  }
-  return { key: "primary", model: models.primary, reason: "default" };
+function chooseRoute() {
+  return { key: "primary", model: models.primary, reason: "all_tasks_primary" };
 }
 
 function dimension(metadata, uid) {
@@ -763,7 +751,6 @@ function health() {
     routing: {
       primary: { uid: models.primary.model_uid, label: models.primary.label, cost: models.primary.cost_summary || models.primary.cost_tier },
       quotaFallback: { uid: models.fallback.model_uid, label: models.fallback.label, cost: models.fallback.cost_summary || models.fallback.cost_tier },
-      complex: { uid: models.complex.model_uid, label: models.complex.label, cost: models.complex.cost_summary || models.complex.cost_tier },
       quotaFallbackPolicy: "explicit_quota_failure_per_request",
     },
     apiKeysStripped: true, isolatedConfigImports: ["agents_standard"], lazyRzMcpProxyTools: 2,
@@ -779,10 +766,8 @@ function jsonResponse(response, status, value) {
 }
 
 async function selfTest() {
-  const simple = { taskState: { activeTask: { text: "Create a small fixture." } }, prompt: "" };
-  const complex = { taskState: { activeTask: { text: "Debug the root cause of a crash race condition." } }, prompt: "" };
-  if (chooseRoute(simple).key !== "primary") throw new Error("default route failed");
-  if (chooseRoute(complex).key !== "complex") throw new Error("complex route failed");
+  if (chooseRoute().key !== "primary") throw new Error("unified primary route failed");
+  if (!LEGACY_REQUEST_EFFORTS.has("max") || LEGACY_REQUEST_EFFORTS.has("xhigh")) throw new Error("legacy effort compatibility failed");
   if (!QUOTA_FAILURE.test("Daily usage quota reached")) throw new Error("quota detection failed");
   if (!RESOURCE_EXHAUSTED.test('{"cognition.ai/errorKind":"resource_exhausted","cognition.ai/retryable":true}')) throw new Error("resource exhaustion detection failed");
   const wrappedQuotaFailure = {
