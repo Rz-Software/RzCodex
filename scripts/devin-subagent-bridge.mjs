@@ -281,9 +281,23 @@ async function withRouteCapacity(selected, signal, callback) {
   }
 }
 
-function workingDirectoryFrom(body) {
+function environmentWorkingDirectoryFrom(input) {
+  for (let index = input.length - 1; index >= 0; index -= 1) {
+    const item = input[index];
+    if (!item || item.type !== "message") continue;
+    const text = contentText(item.content, `input[${index}].content`);
+    const matches = [...text.matchAll(/<environment_context>[\s\S]*?<cwd>\s*([^<\r\n]+?)\s*<\/cwd>[\s\S]*?<\/environment_context>/gi)];
+    const cwd = matches.at(-1)?.[1]?.trim();
+    if (cwd && isAbsolute(cwd) && existsSync(cwd)) return cwd;
+  }
+  return null;
+}
+
+function workingDirectoryFrom(body, input) {
   const cwd = body.client_metadata?.cwd;
   if (typeof cwd === "string" && isAbsolute(cwd) && existsSync(cwd)) return cwd;
+  const environmentCwd = environmentWorkingDirectoryFrom(input);
+  if (environmentCwd) return environmentCwd;
   return process.cwd();
 }
 
@@ -325,7 +339,7 @@ function promptFrom(body) {
     throw error;
   }
   const requestId = randomUUID();
-  const workingDirectory = workingDirectoryFrom(body);
+  const workingDirectory = workingDirectoryFrom(body, input);
   const threadId = typeof body.client_metadata?.thread_id === "string"
     ? body.client_metadata.thread_id
     : null;
@@ -510,6 +524,19 @@ function resourceBackoffMs(attempt) {
   return Math.min(RESOURCE_BACKOFF_BASE_MS * (2 ** Math.max(0, attempt - 1)), RESOURCE_BACKOFF_MAX_MS);
 }
 
+function cliFailed(cliResult) {
+  return cliResult.code !== 0 || !cliResult.stdout;
+}
+
+function isQuotaFailure(cliResult) {
+  return cliFailed(cliResult) && QUOTA_FAILURE.test(`${cliResult.stdout}\n${cliResult.stderr}`);
+}
+
+function isRetryableResourceFailure(cliResult) {
+  const combined = `${cliResult.stdout}\n${cliResult.stderr}`;
+  return cliFailed(cliResult) && !QUOTA_FAILURE.test(combined) && RESOURCE_EXHAUSTED.test(combined);
+}
+
 async function runCliWithResourceRetries(context, selectedModel, onSpawn, signal, deadline) {
   let attempt = 0;
   while (true) {
@@ -518,10 +545,7 @@ async function runCliWithResourceRetries(context, selectedModel, onSpawn, signal
     if (remainingMs <= 0) throw new BridgeError("Devin resource retry deadline exceeded", 504);
     const cliResult = await runCli(context, selectedModel, onSpawn, remainingMs);
     const session = await waitForSession(context.requestId);
-    const combined = `${cliResult.stdout}\n${cliResult.stderr}`;
-    const retryableResourceFailure = (cliResult.code !== 0 || !cliResult.stdout)
-      && RESOURCE_EXHAUSTED.test(combined);
-    if (!retryableResourceFailure) return { cliResult, session };
+    if (!isRetryableResourceFailure(cliResult)) return { cliResult, session };
     if (session) removeSession(session.id);
     attempt += 1;
     const backoffMs = resourceBackoffMs(attempt);
@@ -550,7 +574,7 @@ async function execute(context, initialRoute, onSpawn, signal) {
   let { cliResult, session } = routeResult;
   let combined = `${cliResult.stdout}\n${cliResult.stderr}`;
   let quotaFallback = false;
-  if (selected.key === "primary" && (cliResult.code !== 0 || !cliResult.stdout) && QUOTA_FAILURE.test(combined)) {
+  if (selected.key === "primary" && isQuotaFailure(cliResult)) {
     if (session) removeSession(session.id);
     selected = { key: "fallback", model: models.fallback, reason: "confirmed_quota_failure" };
     quotaFallback = true;
@@ -761,7 +785,31 @@ async function selfTest() {
   if (chooseRoute(complex).key !== "complex") throw new Error("complex route failed");
   if (!QUOTA_FAILURE.test("Daily usage quota reached")) throw new Error("quota detection failed");
   if (!RESOURCE_EXHAUSTED.test('{"cognition.ai/errorKind":"resource_exhausted","cognition.ai/retryable":true}')) throw new Error("resource exhaustion detection failed");
+  const wrappedQuotaFailure = {
+    code: 1,
+    stdout: "",
+    stderr: 'Your weekly usage quota has been exhausted. {"cognition.ai/errorKind":"resource_exhausted","cognition.ai/retryable":true}',
+  };
+  if (!isQuotaFailure(wrappedQuotaFailure)) throw new Error("wrapped quota failure detection failed");
+  if (isRetryableResourceFailure(wrappedQuotaFailure)) throw new Error("quota failure incorrectly classified as retryable capacity");
+  const transientResourceFailure = {
+    code: 1,
+    stdout: "",
+    stderr: '{"cognition.ai/errorKind":"resource_exhausted","cognition.ai/retryable":true}',
+  };
+  if (!isRetryableResourceFailure(transientResourceFailure)) throw new Error("transient capacity classification failed");
   if (resourceBackoffMs(1) !== 5_000 || resourceBackoffMs(6) !== 120_000 || resourceBackoffMs(20) !== 120_000) throw new Error("resource backoff schedule failed");
+  const environmentWorkspace = promptFrom({
+    stream: true,
+    model: MODEL_ALIAS,
+    reasoning: { effort: REQUIRED_EFFORT },
+    input: [{
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: `<environment_context><cwd>${process.cwd()}</cwd></environment_context>` }],
+    }],
+  }).workingDirectory;
+  if (environmentWorkspace !== process.cwd()) throw new Error("environment workspace detection failed");
   const uniqueCalls = uniqueToolCalls([
     { tool_calls: '[{"id":"call-1","name":"read"},{"id":"call-2","name":"edit"}]' },
     { tool_calls: '[{"id":"call-1","name":"read"},{"id":"call-2","name":"edit"}]' },
