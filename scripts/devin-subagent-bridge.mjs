@@ -402,6 +402,20 @@ function dimension(metadata, uid) {
   return kind.CumulativeMetric?.value ?? kind.Metric?.value ?? null;
 }
 
+function uniqueToolCalls(toolRows) {
+  const toolCalls = [];
+  const seenToolCallIds = new Set();
+  for (const row of toolRows) {
+    for (const call of JSON.parse(row.tool_calls || "[]")) {
+      const callId = typeof call?.id === "string" ? call.id : null;
+      if (callId && seenToolCallIds.has(callId)) continue;
+      if (callId) seenToolCallIds.add(callId);
+      toolCalls.push(call);
+    }
+  }
+  return toolCalls;
+}
+
 function inspectSession(requestId) {
   const db = new DatabaseSync(DEVIN_DB, { readOnly: true });
   try {
@@ -424,7 +438,7 @@ function inspectSession(requestId) {
       FROM message_nodes
       WHERE session_id = ? AND json_type(chat_message, '$.tool_calls') = 'array'
     `).all(session.id);
-    const toolCalls = toolRows.flatMap((row) => JSON.parse(row.tool_calls || "[]"));
+    const toolCalls = uniqueToolCalls(toolRows);
     return { id: session.id, model: session.model, metadata: JSON.parse(session.metadata || "{}"), metrics, toolCalls };
   } finally {
     db.close();
@@ -749,6 +763,11 @@ async function selfTest() {
   if (!QUOTA_FAILURE.test("Daily usage quota reached")) throw new Error("quota detection failed");
   if (!RESOURCE_EXHAUSTED.test('{"cognition.ai/errorKind":"resource_exhausted","cognition.ai/retryable":true}')) throw new Error("resource exhaustion detection failed");
   if (resourceBackoffMs(1) !== 5_000 || resourceBackoffMs(6) !== 120_000 || resourceBackoffMs(20) !== 120_000) throw new Error("resource backoff schedule failed");
+  const uniqueCalls = uniqueToolCalls([
+    { tool_calls: '[{"id":"call-1","name":"read"},{"id":"call-2","name":"edit"}]' },
+    { tool_calls: '[{"id":"call-1","name":"read"},{"id":"call-2","name":"edit"}]' },
+  ]);
+  if (uniqueCalls.length !== 2 || uniqueCalls[0].id !== "call-1" || uniqueCalls[1].id !== "call-2") throw new Error("tool call deduplication failed");
   const task = "Message Type: NEW_TASK\nTask name: /root/self_test\nPayload:\nImplement the bounded fixture now.";
   const checkpoint = "Message Type: MESSAGE\nTask name: /root/self_test\nPayload:\nReturn a checkpoint report immediately.";
   const prompt = promptFrom({
