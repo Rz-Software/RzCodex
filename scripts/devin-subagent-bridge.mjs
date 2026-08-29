@@ -25,6 +25,7 @@ const MAX_PROMPT_CHARS = 100_000;
 const MAX_ACTIVE_TASK_CHARS = 40_000;
 const OUTPUT_LIMIT = 2 * 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 30 * 60 * 1000;
+const SSE_HEARTBEAT_MS = 15 * 1000;
 const SCRIPT_DIRECTORY = dirname(fileURLToPath(import.meta.url));
 const CENTRAL_CONFIG = join(homedir(), ".codex", "subagent-models.json");
 const USER_DEVIN_CONFIG = join(process.env.APPDATA || join(homedir(), "AppData", "Roaming"), "devin", "config.json");
@@ -167,7 +168,7 @@ function catalogModel(uid, expectedLabel, mustBeFree) {
 const models = {
   primary: catalogModel(route.primaryModel, "SWE-1.7 Lightning Max", false),
   fallback: catalogModel(route.quotaFallbackModel, "SWE-1.7 Max", true),
-  complex: catalogModel(route.complexModel, "GLM-5.2 High", true),
+  complex: catalogModel(route.complexModel, "SWE-1.7 Max", true),
 };
 
 function loadRouteState() {
@@ -247,30 +248,28 @@ function promptFrom(body) {
   ];
   const roleInstructions = roleInstructionsFrom(body.instructions);
   if (roleInstructions) sections.push(`[Role instructions]\n${roleInstructions}`);
-  const activeTask = activeTaskPromptSection(taskState);
-  if (activeTask) sections.push(activeTask);
   const agentMessages = new Map(taskState.messages.map((message) => [message.index, message]));
   const history = [];
   for (let index = 0; index < input.length; index += 1) {
     const item = assertObject(input[index], `input[${index}]`);
     if (item.type === "message") {
-      if (!["system", "developer"].includes(item.role)) history.push(`[${item.role}]\n${contentText(item.content, `input[${index}].content`)}`);
+      if (!["system", "developer"].includes(item.role)) history.push({ index, text: `[${item.role}]\n${contentText(item.content, `input[${index}].content`)}` });
     } else if (item.type === "agent_message") {
       const message = agentMessages.get(index) ?? {
         ...normalizeAgentMessageContent(item.content, `input[${index}].content`),
         author: item.author || "Codex", recipient: item.recipient || "managed worker", newTask: false, checkpoint: false,
       };
       if (message.newTask && !message.checkpoint) continue;
-      history.push(`[Inter-agent message ${message.author} -> ${message.recipient}]\n${message.text}`);
+      history.push({ index, text: `[Inter-agent message ${message.author} -> ${message.recipient}]\n${message.text}` });
     } else if (["function_call", "custom_tool_call", "tool_search_call"].includes(item.type)) {
-      history.push(`[Prior Codex tool request ${item.name || "tool_search"}; call_id=${item.call_id}]`);
+      history.push({ index, text: `[Prior Codex tool request ${item.name || "tool_search"}; call_id=${item.call_id}]` });
     } else if (["function_call_output", "custom_tool_call_output"].includes(item.type)) {
-      history.push(`[Prior Codex tool result; call_id=${item.call_id}]\n${outputText(item.output)}`);
+      history.push({ index, text: `[Prior Codex tool result; call_id=${item.call_id}]\n${outputText(item.output)}` });
     } else if (item.type === "tool_search_output") {
-      history.push(`[Prior Codex tool search result; call_id=${item.call_id}]`);
+      history.push({ index, text: `[Prior Codex tool search result; call_id=${item.call_id}]` });
     } else if (item.type === "reasoning") {
       const summary = Array.isArray(item.summary) ? item.summary.map((part) => part?.text || "").join("") : "";
-      if (summary) history.push(`[Prior reasoning summary]\n${summary}`);
+      if (summary) history.push({ index, text: `[Prior reasoning summary]\n${summary}` });
     } else if (!["compaction", "context_compaction", "compaction_trigger"].includes(item.type)) {
       throw new BridgeError(`input[${index}] has unsupported type ${json(item.type)}`);
     }
@@ -278,12 +277,20 @@ function promptFrom(body) {
   let retainedChars = 0;
   const retained = [];
   for (let index = history.length - 1; index >= 0; index -= 1) {
-    const text = history[index];
+    const { text } = history[index];
     if (retainedChars + text.length > MAX_PROMPT_CHARS && retained.length > 0) break;
-    retained.unshift(text.slice(-MAX_PROMPT_CHARS));
+    retained.unshift({ ...history[index], text: text.slice(-MAX_PROMPT_CHARS) });
     retainedChars += text.length;
   }
-  sections.push(...retained);
+  const activeTask = activeTaskPromptSection(taskState);
+  if (activeTask) {
+    const activeTaskIndex = taskState.activeTask.index;
+    sections.push(...retained.filter((item) => item.index < activeTaskIndex).map((item) => item.text));
+    sections.push(activeTask);
+    sections.push(...retained.filter((item) => item.index > activeTaskIndex).map((item) => item.text));
+  } else {
+    sections.push(...retained.map((item) => item.text));
+  }
   const prompt = sections.join("\n\n");
   let taskDiagnostics;
   try {
@@ -479,6 +486,11 @@ function writeSse(response, type, payload) {
   response.write(`event: ${type}\ndata: ${json({ type, ...payload })}\n\n`);
 }
 
+function writeSseHeartbeat(response) {
+  if (response.destroyed || response.writableEnded) return;
+  response.write(": rzcodex-keepalive\n\n");
+}
+
 async function readJsonRequest(request) {
   const chunks = [];
   let size = 0;
@@ -512,6 +524,8 @@ async function handleResponses(request, response) {
   response.writeHead(200, { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache", connection: "keep-alive" });
   const responseId = `resp_${randomUUID()}`;
   writeSse(response, "response.created", { response: { id: responseId, object: "response", model: MODEL_ALIAS, status: "in_progress" } });
+  const heartbeat = setInterval(() => writeSseHeartbeat(response), SSE_HEARTBEAT_MS);
+  heartbeat.unref();
   try {
     const result = await execute(context, selected, (spawned) => { child = spawned; });
     runtime.completed += 1;
@@ -556,6 +570,8 @@ async function handleResponses(request, response) {
     runtime.failed += 1;
     writeSse(response, "response.failed", { response: { id: responseId, object: "response", model: MODEL_ALIAS, status: "failed", error: { code: "external_provider_error", message: error.message } } });
     response.end();
+  } finally {
+    clearInterval(heartbeat);
   }
 }
 
@@ -603,6 +619,26 @@ function selfTest() {
   if (chooseRoute(simple).key !== "primary" && chooseRoute(simple).key !== "fallback") throw new Error("default route failed");
   if (chooseRoute(complex).key !== "complex") throw new Error("complex route failed");
   if (!QUOTA_FAILURE.test("Daily usage quota reached")) throw new Error("quota detection failed");
+  const task = "Message Type: NEW_TASK\nTask name: /root/self_test\nPayload:\nImplement the bounded fixture now.";
+  const checkpoint = "Message Type: MESSAGE\nTask name: /root/self_test\nPayload:\nReturn a checkpoint report immediately.";
+  const prompt = promptFrom({
+    stream: true,
+    model: MODEL_ALIAS,
+    reasoning: { effort: REQUIRED_EFFORT },
+    input: [
+      { type: "message", role: "user", content: "Stale inherited instruction: only restate the task." },
+      { type: "agent_message", id: "self-test-task", author: "Codex", recipient: "/root/self_test", content: [{ type: "input_text", text: task }] },
+      { type: "agent_message", id: "self-test-checkpoint", author: "Codex", recipient: "/root/self_test", content: [{ type: "input_text", text: checkpoint }] },
+    ],
+  }).prompt;
+  const staleIndex = prompt.indexOf("Stale inherited instruction");
+  const taskIndex = prompt.indexOf(task);
+  const checkpointIndex = prompt.indexOf(checkpoint);
+  if (!(staleIndex >= 0 && staleIndex < taskIndex && taskIndex < checkpointIndex)) throw new Error("active task precedence failed");
+  if (prompt.indexOf(task, taskIndex + task.length) !== -1) throw new Error("active task duplication failed");
+  const heartbeatWrites = [];
+  writeSseHeartbeat({ destroyed: false, writableEnded: false, write: (value) => heartbeatWrites.push(value) });
+  if (heartbeatWrites.join("") !== ": rzcodex-keepalive\n\n") throw new Error("SSE heartbeat failed");
   process.stdout.write("devin-subagent-bridge self-test: ok\n");
 }
 
