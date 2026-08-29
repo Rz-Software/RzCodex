@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import test from "node:test";
 import {
+  ActiveTaskRoutePins,
   codeBuddyForwardBody,
   completedResponseFromSse,
   parseResponsesSse,
@@ -71,6 +72,20 @@ test("CodeBuddy forwarding preserves the request and upgrades only provider effo
   });
 });
 
+test("quota routing stays pinned only for the same active task and releases on its final response", () => {
+  const pins = new ActiveTaskRoutePins();
+  assert.equal(pins.pin(null, "task-a"), false);
+  assert.equal(pins.pin("thread-a", null), false);
+  assert.equal(pins.pin("thread-a", "task-a"), true);
+  assert.equal(pins.size, 1);
+  assert.equal(pins.has("thread-a", "task-a"), true);
+  assert.equal(pins.has("thread-a", "task-b"), false);
+  assert.equal(pins.releaseAfterFinalResponse("thread-a", "task-a", 1), false);
+  assert.equal(pins.has("thread-a", "task-a"), true);
+  assert.equal(pins.releaseAfterFinalResponse("thread-a", "task-a", 0), true);
+  assert.equal(pins.size, 0);
+});
+
 test("SSE parsing preserves completed tool-call output after heartbeats", () => {
   const completed = completion();
   const raw = [
@@ -84,16 +99,29 @@ test("SSE parsing preserves completed tool-call output after heartbeats", () => 
 });
 
 test("the loopback Responses client accepts chunked CodeBuddy completion", async () => {
-  const raw = sse("response.completed", { response: completion() });
+  const progress = sse("response.in_progress", { response: { status: "in_progress" } });
+  const completed = sse("response.completed", { response: completion() });
+  let serverEnded = false;
   await withServer((request, response) => {
     assert.equal(request.method, "POST");
     assert.equal(request.headers.authorization, undefined);
     response.writeHead(200, { "content-type": "text/event-stream; charset=utf-8" });
-    response.write(raw.slice(0, 37));
-    setImmediate(() => response.end(raw.slice(37)));
+    response.write(progress);
+    setTimeout(() => {
+      serverEnded = true;
+      response.end(completed);
+    }, 25);
   }, async (endpoint) => {
-    const result = await runResponsesBridge({ endpoint, body: { stream: true } });
+    let progressArrivedBeforeCompletion = false;
+    const result = await runResponsesBridge({
+      endpoint,
+      body: { stream: true },
+      onEvent: async (event) => {
+        if (event.type === "response.in_progress") progressArrivedBeforeCompletion = !serverEnded;
+      },
+    });
     assert.deepEqual(result, completion());
+    assert.equal(progressArrivedBeforeCompletion, true);
   });
 });
 
@@ -180,4 +208,17 @@ test("client abort never starts terminal fallback", async () => {
     runTerminal: async () => { terminalCalls += 1; },
   }), /aborted/);
   assert.equal(terminalCalls, 0);
+});
+
+test("a committed CodeBuddy stream fails explicitly instead of mixing in terminal output", async () => {
+  const failure = Object.assign(new Error("stream failed after output"), { routeCommitted: true });
+  const observed = [];
+  let terminalCalls = 0;
+  await assert.rejects(runQuotaFallbackChain({
+    runCodeBuddy: async () => { throw failure; },
+    runTerminal: async () => { terminalCalls += 1; },
+    onCodeBuddyFailure: (error) => observed.push(error),
+  }), /stream failed after output/);
+  assert.equal(terminalCalls, 0);
+  assert.deepEqual(observed, [failure]);
 });

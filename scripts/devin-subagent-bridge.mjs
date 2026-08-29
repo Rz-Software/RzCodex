@@ -2,7 +2,7 @@
 
 import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
@@ -16,6 +16,7 @@ import {
   taskStateFromInput,
 } from "./codebuddy-subagent-task-state.mjs";
 import {
+  ActiveTaskRoutePins,
   codeBuddyForwardBody,
   runQuotaFallbackChain,
   runResponsesBridge,
@@ -46,10 +47,12 @@ const USER_DEVIN_CONFIG = join(process.env.APPDATA || join(homedir(), "AppData",
 const DEVIN_HOME = join(process.env.LOCALAPPDATA || join(homedir(), "AppData", "Local"), "RzCodex", "devin-subagents");
 const ISOLATED_CONFIG = join(DEVIN_HOME, "config.json");
 const REQUEST_DIRECTORY = join(DEVIN_HOME, "requests");
+const QUOTA_STATE_FILE = join(DEVIN_HOME, "quota-state.json");
 const DEVIN_EXE = join(process.env.LOCALAPPDATA || join(homedir(), "AppData", "Local"), "devin", "cli", "bin", "devin.exe");
 const DEVIN_DB = join(process.env.APPDATA || join(homedir(), "AppData", "Roaming"), "devin", "cli", "sessions.db");
 const QUOTA_FAILURE = /(?:daily|weekly|included|usage)[\s\S]{0,100}quota[\s\S]{0,100}(?:exhaust|exceed|reach|limit)|quota[\s\S]{0,100}(?:exhaust|exceed|reach|limit)/i;
 const RESOURCE_EXHAUSTED = /cognition\.ai\/errorKind[\s\S]{0,100}resource_exhausted|resource_exhausted[\s\S]{0,100}cognition\.ai\/retryable[\s\S]{0,20}true/i;
+const QUOTA_STATE_VERSION = 1;
 
 class BridgeError extends Error {
   constructor(message, status = 400) {
@@ -71,6 +74,107 @@ function assertObject(value, label) {
 function requireString(value, label) {
   if (typeof value !== "string" || value.length === 0) throw new BridgeError(`${label} must be a non-empty string`);
   return value;
+}
+
+function quotaKindFromFailure(cliResult) {
+  const output = `${cliResult?.stdout || ""}\n${cliResult?.stderr || ""}`;
+  if (!QUOTA_FAILURE.test(output)) return null;
+  if (/\bweekly\b/i.test(output)) return "weekly";
+  if (/\bdaily\b/i.test(output)) return "daily";
+  return "calendar";
+}
+
+function nextCalendarQuotaProbeAt(kind, nowMs) {
+  const next = new Date(nowMs);
+  next.setHours(0, 0, 0, 0);
+  if (kind === "weekly") {
+    const daysUntilMonday = ((8 - next.getDay()) % 7) || 7;
+    next.setDate(next.getDate() + daysUntilMonday);
+  } else {
+    next.setDate(next.getDate() + 1);
+  }
+  return next.getTime();
+}
+
+class CalendarQuotaState {
+  constructor(statePath, now = () => Date.now()) {
+    this.statePath = statePath;
+    this.now = now;
+    this.state = null;
+    this.load();
+  }
+
+  load() {
+    if (!this.statePath || !existsSync(this.statePath)) return;
+    try {
+      const parsed = JSON.parse(readFileSync(this.statePath, "utf8"));
+      if (
+        parsed.version !== QUOTA_STATE_VERSION
+        || !["daily", "weekly", "calendar"].includes(parsed.kind)
+        || !Number.isFinite(parsed.confirmedAt)
+        || !Number.isFinite(parsed.retryAt)
+        || parsed.retryAt <= parsed.confirmedAt
+      ) {
+        throw new Error("invalid schema");
+      }
+      this.state = { kind: parsed.kind, confirmedAt: parsed.confirmedAt, retryAt: parsed.retryAt };
+      this.isActive();
+    } catch (error) {
+      throw new BridgeError(`Cannot read persisted Devin quota state: ${error.message}`, 500);
+    }
+  }
+
+  isActive(nowMs = this.now()) {
+    if (!this.state) return false;
+    if (this.state.retryAt > nowMs) return true;
+    this.clear();
+    return false;
+  }
+
+  record(cliResult, nowMs = this.now()) {
+    const kind = quotaKindFromFailure(cliResult);
+    if (!kind) return false;
+    const candidate = { kind, confirmedAt: nowMs, retryAt: nextCalendarQuotaProbeAt(kind, nowMs) };
+    if (this.state?.retryAt >= candidate.retryAt && this.state.retryAt > nowMs) return false;
+    this.state = candidate;
+    this.persist();
+    return true;
+  }
+
+  clear() {
+    const changed = this.state !== null || Boolean(this.statePath && existsSync(this.statePath));
+    this.state = null;
+    if (!this.statePath) return changed;
+    try {
+      unlinkSync(this.statePath);
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw new BridgeError(`Cannot clear persisted Devin quota state: ${error.message}`, 500);
+    }
+    return changed;
+  }
+
+  persist() {
+    if (!this.statePath) return;
+    const temporaryPath = `${this.statePath}.${process.pid}.tmp`;
+    try {
+      writeFileSync(temporaryPath, `${json({ version: QUOTA_STATE_VERSION, ...this.state })}\n`, "utf8");
+      renameSync(temporaryPath, this.statePath);
+    } catch (error) {
+      try { unlinkSync(temporaryPath); } catch (cleanupError) {
+        if (cleanupError?.code !== "ENOENT") {
+          throw new BridgeError(`Cannot persist Devin quota state and clean its temporary file: ${cleanupError.message}`, 500);
+        }
+      }
+      throw new BridgeError(`Cannot persist Devin quota state: ${error.message}`, 500);
+    }
+  }
+
+  snapshot(nowMs = this.now()) {
+    const active = this.isActive(nowMs);
+    return active
+      ? { active, kind: this.state.kind, confirmedAt: this.state.confirmedAt, retryAt: this.state.retryAt }
+      : { active, kind: null, confirmedAt: null, retryAt: null };
+  }
 }
 
 function sanitizedEnvironment(source = process.env) {
@@ -161,6 +265,7 @@ function ensureRuntimeConfig() {
 if (!existsSync(DEVIN_EXE)) throw new BridgeError(`Devin CLI is missing at ${DEVIN_EXE}`, 500);
 if (!existsSync(DEVIN_DB)) throw new BridgeError(`Devin session database is missing at ${DEVIN_DB}`, 500);
 ensureRuntimeConfig();
+const calendarQuotaState = new CalendarQuotaState(QUOTA_STATE_FILE);
 const route = centralRoute();
 const catalog = modelCatalog();
 const auth = authStatus();
@@ -193,6 +298,11 @@ const runtime = {
   lastActualProvider: null, lastModelLabel: null, lastQuotaFallback: false,
   lastTerminalFallback: false, lastFallbackReason: null,
   codeBuddyAttempts: 0, codeBuddyCompleted: 0, codeBuddyFailed: 0, terminalFallbacks: 0,
+  codeBuddyStreamCommits: 0, lastCodeBuddyStreamCommitted: false,
+  lastCodeBuddyStreamedMessageCount: 0,
+  quotaProbeSkips: 0, quotaPinsReleased: 0,
+  calendarQuotaSkips: 0, calendarQuotaActivations: 0, calendarQuotaClears: 0,
+  lastQuotaProbeSkipped: false, lastQuotaSkipScope: null, lastQuotaPinCreated: false,
   lastCodeBuddyError: null, lastCodeBuddyAuthSource: null, lastCodeBuddyCostUsd: null,
   lastCreditCost: null, lastAcuCost: null,
   lastInputTokens: null, lastCachedInputTokens: null, lastOutputTokens: null,
@@ -205,6 +315,7 @@ const runtime = {
 
 const terminalCapacity = { active: 0, waiters: [] };
 const activeThreadTurns = new Map();
+const quotaTaskPins = new ActiveTaskRoutePins();
 
 function syncFreeCapacityRuntime() {
   runtime.activeFreeRequests = terminalCapacity.active;
@@ -420,7 +531,33 @@ function promptFrom(body) {
   return { requestId, prompt, workingDirectory, threadId, taskState, taskDiagnostics, toolSchemaBytes };
 }
 
-function chooseRoute() {
+function codeBuddySelection(reason) {
+  return {
+    key: "codebuddy",
+    provider: route.quotaFallbackProvider,
+    model: { model_uid: route.codeBuddyModel, label: route.codeBuddyModel },
+    reason,
+  };
+}
+
+function chooseRoute(context, quotaState = calendarQuotaState, taskPins = quotaTaskPins) {
+  runtime.lastQuotaPinCreated = false;
+  runtime.lastQuotaProbeSkipped = taskPins.has(
+    context.threadId,
+    context.taskDiagnostics.taskHash,
+  );
+  runtime.lastQuotaSkipScope = runtime.lastQuotaProbeSkipped ? "active_task" : null;
+  if (runtime.lastQuotaProbeSkipped) {
+    runtime.quotaProbeSkips += 1;
+    return codeBuddySelection("active_task_confirmed_devin_quota_failure");
+  }
+  if (quotaState.isActive()) {
+    runtime.lastQuotaProbeSkipped = true;
+    runtime.lastQuotaSkipScope = "calendar_quota";
+    runtime.quotaProbeSkips += 1;
+    runtime.calendarQuotaSkips += 1;
+    return codeBuddySelection("persisted_calendar_devin_quota_failure");
+  }
   return { key: "primary", provider: "devin", model: models.primary, reason: "all_tasks_primary" };
 }
 
@@ -582,7 +719,7 @@ async function runCliWithResourceRetries(context, selectedModel, onSpawn, signal
   }
 }
 
-function codeBuddyResult(completion) {
+function codeBuddyResult(completion, reason) {
   const usage = completion.usage || {};
   const inputTokens = Number(usage.input_tokens || 0);
   const cachedTokens = Number(usage.input_tokens_details?.cached_tokens || 0);
@@ -598,12 +735,7 @@ function codeBuddyResult(completion) {
   return {
     output: completion.output,
     providerMetadata,
-    selected: {
-      key: "codebuddy",
-      provider: route.quotaFallbackProvider,
-      model: { model_uid: route.codeBuddyModel, label: route.codeBuddyModel },
-      reason: "devin_quota_codebuddy_available",
-    },
+    selected: codeBuddySelection(reason),
     quotaFallback: true,
     terminalFallback: false,
     fallbackReason: "confirmed_devin_quota_failure",
@@ -665,41 +797,37 @@ function finalizeDevinResult(selected, routeResult, fallbackState) {
   }
 }
 
-async function execute(context, requestBody, initialRoute, onSpawn, signal) {
+async function executeCodeBuddyFallback(
+  context,
+  requestBody,
+  initialRoute,
+  onSpawn,
+  signal,
+  codeBuddyRelay,
+) {
   let selected = initialRoute;
-  let routeResult = await withRouteCapacity(selected, signal, () =>
-    runCliWithResourceRetries(
-      context,
-      selected.model,
-      onSpawn,
-      signal,
-      Date.now() + REQUEST_TIMEOUT_MS,
-    ));
-  if (selected.key !== "primary" || !isQuotaFailure(routeResult.cliResult)) {
-    return finalizeDevinResult(selected, routeResult, {
-      quotaFallback: false,
-      terminalFallback: false,
-      fallbackReason: null,
-      codeBuddyFailure: null,
-    });
-  }
-
-  if (routeResult.session) removeSession(routeResult.session.id);
+  let routeResult;
   runtime.codeBuddyAttempts += 1;
   const fallback = await runQuotaFallbackChain({
     signal,
     runCodeBuddy: async () => {
-      const forwardedBody = codeBuddyForwardBody(requestBody, MODEL_ALIAS, CODEBUDDY_REQUIRED_EFFORT);
-      const completion = await runResponsesBridge({
-        endpoint: CODEBUDDY_BRIDGE_ENDPOINT,
-        body: forwardedBody,
-        signal,
-      });
-      validateCodeBuddyCompletion(completion, {
-        model: route.codeBuddyModel,
-        authSource: CODEBUDDY_REQUIRED_AUTH_SOURCE,
-      });
-      return codeBuddyResult(completion);
+      try {
+        const forwardedBody = codeBuddyForwardBody(requestBody, MODEL_ALIAS, CODEBUDDY_REQUIRED_EFFORT);
+        const completion = await runResponsesBridge({
+          endpoint: CODEBUDDY_BRIDGE_ENDPOINT,
+          body: forwardedBody,
+          signal,
+          onEvent: codeBuddyRelay.accept,
+        });
+        validateCodeBuddyCompletion(completion, {
+          model: route.codeBuddyModel,
+          authSource: CODEBUDDY_REQUIRED_AUTH_SOURCE,
+        });
+        return codeBuddyResult(completion, selected.reason);
+      } catch (error) {
+        if (codeBuddyRelay.committed) error.routeCommitted = true;
+        throw error;
+      }
     },
     runTerminal: async (codeBuddyError) => {
       runtime.terminalFallbacks += 1;
@@ -737,6 +865,54 @@ async function execute(context, requestBody, initialRoute, onSpawn, signal) {
   return fallback.value;
 }
 
+async function execute(context, requestBody, initialRoute, onSpawn, signal, codeBuddyRelay) {
+  if (initialRoute.key === "codebuddy") {
+    return executeCodeBuddyFallback(
+      context,
+      requestBody,
+      initialRoute,
+      onSpawn,
+      signal,
+      codeBuddyRelay,
+    );
+  }
+
+  const routeResult = await withRouteCapacity(initialRoute, signal, () =>
+    runCliWithResourceRetries(
+      context,
+      initialRoute.model,
+      onSpawn,
+      signal,
+      Date.now() + REQUEST_TIMEOUT_MS,
+    ));
+  if (!isQuotaFailure(routeResult.cliResult)) {
+    if (!cliFailed(routeResult.cliResult) && calendarQuotaState.clear()) {
+      runtime.calendarQuotaClears += 1;
+    }
+    return finalizeDevinResult(initialRoute, routeResult, {
+      quotaFallback: false,
+      terminalFallback: false,
+      fallbackReason: null,
+      codeBuddyFailure: null,
+    });
+  }
+
+  if (routeResult.session) removeSession(routeResult.session.id);
+  if (calendarQuotaState.record(routeResult.cliResult)) runtime.calendarQuotaActivations += 1;
+  runtime.lastQuotaPinCreated = quotaTaskPins.pin(
+    context.threadId,
+    context.taskDiagnostics.taskHash,
+  );
+  return executeCodeBuddyFallback(
+    context,
+    requestBody,
+    codeBuddySelection("devin_quota_codebuddy_available"),
+    onSpawn,
+    signal,
+    codeBuddyRelay,
+  );
+}
+
 function usageFrom(result) {
   return {
     input_tokens: result.inputTokens,
@@ -751,7 +927,7 @@ function responseMessageItem(id, text, status = "in_progress") {
   return { type: "message", id, status, role: "assistant", content: [{ type: "output_text", text, annotations: [] }] };
 }
 
-function emitOutputItems(response, result) {
+function emitOutputItems(response, result, streamedMessageIds = new Set()) {
   const output = result.output || [responseMessageItem(`msg_${randomUUID()}`, result.text, "completed")];
   output.forEach((item, outputIndex) => {
     if (item.type !== "message") {
@@ -763,22 +939,24 @@ function emitOutputItems(response, result) {
       .filter((part) => part?.type === "output_text" && typeof part.text === "string")
       .map((part) => part.text)
       .join("");
-    writeSse(response, "response.output_item.added", {
-      output_index: outputIndex,
-      item: responseMessageItem(itemId, ""),
-    });
-    writeSse(response, "response.content_part.added", {
-      item_id: itemId,
-      output_index: outputIndex,
-      content_index: 0,
-      part: { type: "output_text", text: "", annotations: [] },
-    });
-    writeSse(response, "response.output_text.delta", {
-      item_id: itemId,
-      output_index: outputIndex,
-      content_index: 0,
-      delta: text,
-    });
+    if (!streamedMessageIds.has(itemId)) {
+      writeSse(response, "response.output_item.added", {
+        output_index: outputIndex,
+        item: responseMessageItem(itemId, ""),
+      });
+      writeSse(response, "response.content_part.added", {
+        item_id: itemId,
+        output_index: outputIndex,
+        content_index: 0,
+        part: { type: "output_text", text: "", annotations: [] },
+      });
+      writeSse(response, "response.output_text.delta", {
+        item_id: itemId,
+        output_index: outputIndex,
+        content_index: 0,
+        delta: text,
+      });
+    }
     writeSse(response, "response.output_text.done", {
       item_id: itemId,
       output_index: outputIndex,
@@ -810,6 +988,44 @@ function writeSseHeartbeat(response, responseId) {
   });
 }
 
+function createCodeBuddyStreamRelay(response, responseId) {
+  const pendingMessages = new Map();
+  const streamedMessageIds = new Set();
+  let committed = false;
+  const accept = async (event) => {
+    const payload = event.payload || {};
+    if (event.type === "response.in_progress") {
+      writeSseHeartbeat(response, responseId);
+      return;
+    }
+    if (event.type === "response.output_item.added" && payload.item?.type === "message") {
+      const itemId = requireString(payload.item.id, "CodeBuddy streamed message id");
+      pendingMessages.set(itemId, { added: payload, part: null });
+      return;
+    }
+    if (event.type === "response.content_part.added") {
+      const pending = pendingMessages.get(payload.item_id);
+      if (pending) pending.part = payload;
+      return;
+    }
+    if (event.type !== "response.output_text.delta" || typeof payload.delta !== "string" || !payload.delta) return;
+    const pending = pendingMessages.get(payload.item_id);
+    if (!pending?.part) throw new BridgeError("CodeBuddy streamed text before its message lifecycle", 502);
+    if (!streamedMessageIds.has(payload.item_id)) {
+      writeSse(response, "response.output_item.added", pending.added);
+      writeSse(response, "response.content_part.added", pending.part);
+      streamedMessageIds.add(payload.item_id);
+      committed = true;
+    }
+    writeSse(response, "response.output_text.delta", payload);
+  };
+  return {
+    accept,
+    streamedMessageIds,
+    get committed() { return committed; },
+  };
+}
+
 async function readJsonRequest(request) {
   const chunks = [];
   let size = 0;
@@ -838,6 +1054,8 @@ async function handleResponses(request, response) {
   runtime.lastCompleteTaskDelivered = context.taskDiagnostics.completeTaskDelivered;
   const selected = chooseRoute(context);
   runtime.lastConfiguredRoute = selected.key;
+  runtime.lastCodeBuddyStreamCommitted = false;
+  runtime.lastCodeBuddyStreamedMessageCount = 0;
   let child = null;
   const abortController = new AbortController();
   const abort = () => {
@@ -851,6 +1069,7 @@ async function handleResponses(request, response) {
   response.writeHead(200, { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache", connection: "keep-alive" });
   const responseId = `resp_${randomUUID()}`;
   writeSse(response, "response.created", { response: { id: responseId, object: "response", model: MODEL_ALIAS, status: "in_progress" } });
+  const codeBuddyRelay = createCodeBuddyStreamRelay(response, responseId);
   const heartbeat = setInterval(() => writeSseHeartbeat(response, responseId), SSE_HEARTBEAT_MS);
   heartbeat.unref();
   try {
@@ -860,7 +1079,16 @@ async function handleResponses(request, response) {
       selected,
       (spawned) => { child = spawned; },
       abortController.signal,
+      codeBuddyRelay,
     );
+    if (quotaTaskPins.releaseAfterFinalResponse(
+      context.threadId,
+      context.taskDiagnostics.taskHash,
+      result.toolCalls.length,
+    )) runtime.quotaPinsReleased += 1;
+    runtime.lastCodeBuddyStreamCommitted = codeBuddyRelay.committed;
+    runtime.lastCodeBuddyStreamedMessageCount = codeBuddyRelay.streamedMessageIds.size;
+    if (codeBuddyRelay.committed) runtime.codeBuddyStreamCommits += 1;
     runtime.completed += 1;
     runtime.lastActualProvider = result.selected.provider;
     runtime.lastActualModel = result.selected.model.model_uid;
@@ -881,7 +1109,7 @@ async function handleResponses(request, response) {
     runtime.lastNativeToolCalls = result.toolCalls.length;
     runtime.lastNativeToolNames = [...new Set(result.toolCalls.map((call) => call.name))];
     runtime.lastRzMcpTools = [...new Set(result.rzMcpTools)];
-    const output = emitOutputItems(response, result);
+    const output = emitOutputItems(response, result, codeBuddyRelay.streamedMessageIds);
     writeSse(response, "response.completed", { response: {
       id: responseId, object: "response", created_at: Math.floor(Date.now() / 1000), status: "completed",
       model: MODEL_ALIAS, output, usage: usageFrom(result), error: null, incomplete_details: null,
@@ -958,11 +1186,12 @@ function health() {
         cost: models.terminal.cost_summary || models.terminal.cost_tier,
       },
       orderedPolicy: "devin_primary_then_codebuddy_on_quota_then_devin_free_on_codebuddy_failure",
-      quotaDetection: "explicit_daily_or_weekly_quota_failure_per_request",
+      quotaDetection: "explicit_daily_or_weekly_quota_failure_persisted_until_its_next_local_calendar_refresh",
     },
     apiKeysStripped: true, isolatedConfigImports: ["agents_standard"], lazyRzMcpProxyTools: 2,
     rawPromptFilesRetained: false, ephemeralSessionsRemoved: true,
-    activeThreadTurns: activeThreadTurns.size, runtime,
+    activeThreadTurns: activeThreadTurns.size, pinnedQuotaTasks: quotaTaskPins.size,
+    calendarQuotaState: calendarQuotaState.snapshot(), runtime,
   };
 }
 
@@ -973,7 +1202,42 @@ function jsonResponse(response, status, value) {
 }
 
 async function selfTest() {
-  if (chooseRoute().key !== "primary") throw new Error("unified primary route failed");
+  const fixedQuotaNow = new Date(2026, 7, 28, 12, 0, 0, 0).getTime();
+  const selfTestQuotaState = new CalendarQuotaState(null, () => fixedQuotaNow);
+  const selfTestTaskPins = new ActiveTaskRoutePins();
+  const selfTestRouteContext = { threadId: "thread-calendar", taskDiagnostics: { taskHash: "task-calendar" } };
+  if (chooseRoute(selfTestRouteContext, selfTestQuotaState, selfTestTaskPins).key !== "primary") {
+    throw new Error("unified primary route failed");
+  }
+  const dailyQuotaFailure = { code: 1, stdout: "", stderr: "Daily usage quota reached" };
+  const weeklyQuotaFailure = { code: 1, stdout: "", stderr: "Weekly usage quota exhausted" };
+  if (
+    !selfTestQuotaState.record(dailyQuotaFailure)
+    || selfTestQuotaState.snapshot().kind !== "daily"
+    || chooseRoute(selfTestRouteContext, selfTestQuotaState, selfTestTaskPins).key !== "codebuddy"
+    || runtime.lastQuotaSkipScope !== "calendar_quota"
+  ) {
+    throw new Error("daily calendar quota routing failed");
+  }
+  const dailyRetryAt = selfTestQuotaState.snapshot().retryAt;
+  if (!selfTestQuotaState.record(weeklyQuotaFailure) || selfTestQuotaState.snapshot().retryAt <= dailyRetryAt) {
+    throw new Error("weekly quota did not extend the calendar route pin");
+  }
+  const weeklyRetryAt = selfTestQuotaState.snapshot().retryAt;
+  if (selfTestQuotaState.isActive(weeklyRetryAt) || selfTestQuotaState.snapshot(weeklyRetryAt).active) {
+    throw new Error("calendar quota route did not reopen at its refresh boundary");
+  }
+  const quotaFixturePath = join(REQUEST_DIRECTORY, `quota-state-self-test-${process.pid}.json`);
+  try {
+    const persistentQuota = new CalendarQuotaState(quotaFixturePath, () => fixedQuotaNow);
+    persistentQuota.record(dailyQuotaFailure);
+    persistentQuota.record(weeklyQuotaFailure);
+    const reloadedQuota = new CalendarQuotaState(quotaFixturePath, () => fixedQuotaNow);
+    if (reloadedQuota.snapshot().kind !== "weekly") throw new Error("persisted quota state did not reload");
+  } finally {
+    try { unlinkSync(quotaFixturePath); } catch (error) { if (error?.code !== "ENOENT") throw error; }
+    try { unlinkSync(`${quotaFixturePath}.${process.pid}.tmp`); } catch (error) { if (error?.code !== "ENOENT") throw error; }
+  }
   if (route.quotaFallbackProvider !== "codebuddy" || !route.codeBuddyModel || !models.terminal.model_uid) {
     throw new Error("ordered provider configuration failed");
   }
@@ -1063,6 +1327,44 @@ async function selfTest() {
   writeSseHeartbeat({ destroyed: false, writableEnded: false, write: (value) => heartbeatWrites.push(value) }, "resp-self-test");
   const heartbeat = heartbeatWrites.join("");
   if (!heartbeat.includes("event: response.in_progress") || !heartbeat.includes('"id":"resp-self-test"')) throw new Error("SSE heartbeat failed");
+  const relayWrites = [];
+  const relayResponse = {
+    destroyed: false,
+    writableEnded: false,
+    write: (value) => relayWrites.push(value),
+  };
+  const relay = createCodeBuddyStreamRelay(relayResponse, "resp-relay");
+  await relay.accept({
+    type: "response.output_item.added",
+    payload: { output_index: 0, item: responseMessageItem("msg-relay", "") },
+  });
+  await relay.accept({
+    type: "response.content_part.added",
+    payload: {
+      item_id: "msg-relay",
+      output_index: 0,
+      content_index: 0,
+      part: { type: "output_text", text: "", annotations: [] },
+    },
+  });
+  if (relayWrites.length !== 0 || relay.committed) throw new Error("CodeBuddy relay committed before visible output");
+  await relay.accept({
+    type: "response.output_text.delta",
+    payload: { item_id: "msg-relay", output_index: 0, content_index: 0, delta: "streamed" },
+  });
+  if (!relay.committed || !relay.streamedMessageIds.has("msg-relay")) throw new Error("CodeBuddy relay did not commit visible output");
+  const streamedFixture = {
+    output: [responseMessageItem("msg-relay", "streamed", "completed")],
+  };
+  emitOutputItems(relayResponse, streamedFixture, relay.streamedMessageIds);
+  const relayOutput = relayWrites.join("");
+  if (
+    relayOutput.split("event: response.output_item.added").length - 1 !== 1
+    || !relayOutput.includes("event: response.output_text.done")
+    || !relayOutput.includes("event: response.output_item.done")
+  ) {
+    throw new Error("CodeBuddy streamed output lifecycle replay failed");
+  }
   const codeBuddyFixture = codeBuddyResult({
     status: "completed",
     output: [{ type: "function_call", id: "fc-test", call_id: "call-test", name: "exec_command", arguments: "{}" }],

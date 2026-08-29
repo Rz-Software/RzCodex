@@ -86,6 +86,10 @@ const runtime = {
   lastNoMutationReasonCategory: null,
   lastNoMutationReasonDetailHash: null,
   lastNoMutationReasonDetailLength: null,
+  lastProviderActivity: null,
+  lastProviderActivityAt: null,
+  lastProviderProgressEvents: 0,
+  lastStreamedTextChars: 0,
 };
 
 function assertObject(value, label) {
@@ -531,10 +535,14 @@ function sanitizedEnvironment() {
   return env;
 }
 
-function validateResult(context, initEvent, resultEvent) {
+function validateInit(context, initEvent) {
   if (!initEvent) throw new BridgeError("CodeBuddy completed without an init event", 502);
   if (initEvent.model !== context.model) throw new BridgeError(`CodeBuddy initialized unexpected model ${JSON.stringify(initEvent.model)}`, 502);
   if (initEvent.apiKeySource !== REQUIRED_AUTH_SOURCE) throw new BridgeError(`CodeBuddy used unexpected auth source ${JSON.stringify(initEvent.apiKeySource)}`, 502);
+}
+
+function validateResult(context, initEvent, resultEvent) {
+  validateInit(context, initEvent);
   if (!resultEvent || resultEvent.subtype !== "success" || resultEvent.is_error === true) {
     throw new BridgeError(`CodeBuddy failed: ${resultEvent?.result || "no successful result event"}`, 502);
   }
@@ -583,7 +591,17 @@ function codeBuddyInput(prompt, images = []) {
   })}\n`;
 }
 
-function runCodeBuddy(context, onSpawn) {
+function providerVisibleTextDelta(event) {
+  const providerEvent = event?.type === "stream_event" ? event.event : null;
+  if (
+    providerEvent?.type !== "content_block_delta"
+    || providerEvent.delta?.type !== "text_delta"
+    || typeof providerEvent.delta.text !== "string"
+  ) return null;
+  return providerEvent.delta.text;
+}
+
+function runCodeBuddy(context, onSpawn, onProviderEvent = () => {}) {
   if (!existsSync(CODEBUDDY_SCRIPT)) throw new BridgeError(`CodeBuddy CLI is not installed at ${CODEBUDDY_SCRIPT}`, 502);
   if (!existsSync(MCP_SERVER_SCRIPT)) throw new BridgeError(`Codex tool MCP adapter is missing at ${MCP_SERVER_SCRIPT}`, 502);
   const artifacts = requestArtifacts(context);
@@ -618,7 +636,16 @@ function runCodeBuddy(context, onSpawn) {
         stderr = `${stderr}${line}\n`.slice(-STDERR_LIMIT);
         return;
       }
-      if (event.type === "system" && event.subtype === "init") initEvent = event;
+      if (event.type === "system" && event.subtype === "init") {
+        try { validateInit(context, event); } catch (error) { child.kill(); finish(error); return; }
+        initEvent = event;
+      }
+      if ((event.type === "stream_event" || event.type === "assistant") && !initEvent) {
+        child.kill();
+        finish(new BridgeError("CodeBuddy emitted model output before authenticated initialization", 502));
+        return;
+      }
+      try { onProviderEvent(event); } catch (error) { child.kill(); finish(error); return; }
       if (event.type === "assistant" && Array.isArray(event.message?.content)) {
         const turnInput = event.message?.usage?.input_tokens;
         if (Number.isInteger(turnInput)) maxTurnInputTokens = Math.max(maxTurnInputTokens, turnInput);
@@ -803,6 +830,10 @@ async function handleResponses(request, response) {
   runtime.lastNoMutationReasonCategory = null;
   runtime.lastNoMutationReasonDetailHash = null;
   runtime.lastNoMutationReasonDetailLength = null;
+  runtime.lastProviderActivity = null;
+  runtime.lastProviderActivityAt = null;
+  runtime.lastProviderProgressEvents = 0;
+  runtime.lastStreamedTextChars = 0;
   let child = null;
   let clientGone = false;
   const abort = () => { clientGone = true; if (child && !child.killed) child.kill(); };
@@ -813,9 +844,94 @@ async function handleResponses(request, response) {
   });
   const responseId = `resp_${randomUUID()}`;
   writeSse(response, "response.created", { response: { id: responseId, object: "response", model: context.model, status: "in_progress" } });
+  const deferredMarker = "DEFERRED_TO_CODEX_CLIENT";
+  let streamedMessageId = null;
+  let streamedText = "";
+  let pendingText = "";
+  let rawVisibleText = "";
+  let deferredTextObserved = false;
+  let lastProgressAt = 0;
+  const emitText = (text) => {
+    if (!text || clientGone) return;
+    if (!streamedMessageId) {
+      streamedMessageId = `msg_${randomUUID()}`;
+      writeSse(response, "response.output_item.added", {
+        output_index: 0,
+        item: responseMessageItem(streamedMessageId, ""),
+      });
+      writeSse(response, "response.content_part.added", {
+        item_id: streamedMessageId,
+        output_index: 0,
+        content_index: 0,
+        part: { type: "output_text", text: "", annotations: [] },
+      });
+    }
+    streamedText += text;
+    runtime.lastStreamedTextChars = streamedText.length;
+    writeSse(response, "response.output_text.delta", {
+      item_id: streamedMessageId,
+      output_index: 0,
+      content_index: 0,
+      delta: text,
+    });
+  };
+  const acceptVisibleText = (text) => {
+    if (!text || deferredTextObserved) return;
+    rawVisibleText += text;
+    pendingText += text;
+    const markerIndex = pendingText.indexOf(deferredMarker);
+    if (markerIndex >= 0) {
+      emitText(pendingText.slice(0, markerIndex));
+      pendingText = "";
+      deferredTextObserved = true;
+      return;
+    }
+    const safeLength = Math.max(0, pendingText.length - deferredMarker.length + 1);
+    emitText(pendingText.slice(0, safeLength));
+    pendingText = pendingText.slice(safeLength);
+  };
+  const flushVisibleText = () => {
+    if (!deferredTextObserved) emitText(pendingText);
+    pendingText = "";
+  };
+  const onProviderEvent = (event) => {
+    if (event?.type !== "stream_event" || !event.event) return;
+    const providerEvent = event.event;
+    let activity = providerEvent.type;
+    if (providerEvent.type === "content_block_delta") {
+      const visibleText = providerVisibleTextDelta(event);
+      if (visibleText !== null) {
+        activity = "writing";
+        acceptVisibleText(visibleText);
+      } else if (providerEvent.delta?.type === "thinking_delta") {
+        activity = "reasoning";
+      } else if (providerEvent.delta?.type === "input_json_delta") {
+        activity = "preparing_tool";
+      }
+    }
+    const now = Date.now();
+    if (now - lastProgressAt < 1_000) return;
+    lastProgressAt = now;
+    runtime.lastProviderActivity = activity;
+    runtime.lastProviderActivityAt = now;
+    runtime.lastProviderProgressEvents += 1;
+    writeSse(response, "response.in_progress", {
+      response: {
+        id: responseId,
+        object: "response",
+        model: context.model,
+        status: "in_progress",
+        metadata: { provider_activity: activity },
+      },
+    });
+  };
   try {
-    const result = await runCodeBuddy(context, (spawned) => { child = spawned; });
+    const result = await runCodeBuddy(context, (spawned) => { child = spawned; }, onProviderEvent);
     if (clientGone) return;
+    flushVisibleText();
+    if (!deferredTextObserved && rawVisibleText && result.finalText && rawVisibleText !== result.finalText) {
+      throw new BridgeError("CodeBuddy streamed visible text that did not match its final assistant output", 502);
+    }
     runtime.completed += 1;
     runtime.lastModel = result.initEvent.model;
     runtime.lastAuthSource = result.initEvent.apiKeySource;
@@ -825,11 +941,12 @@ async function handleResponses(request, response) {
     runtime.lastDurationApiMs = result.resultEvent.duration_api_ms ?? null;
     runtime.lastMaxTurnInputTokens = result.maxTurnInputTokens;
     runtime.maxObservedTurnInputTokens = Math.max(runtime.maxObservedTurnInputTokens, result.maxTurnInputTokens);
+    const providerFinalText = result.finalText || (result.calls.length > 0 ? streamedText : "");
     let noMutationReason;
     try {
       noMutationReason = validateNoMutationCompletion(
         context.taskState,
-        result.finalText,
+        providerFinalText,
         result.calls,
       );
     } catch (error) {
@@ -842,16 +959,26 @@ async function handleResponses(request, response) {
       runtime.lastNoMutationReasonDetailLength = noMutationReason.detailLength;
     }
     const progressReport = authoritativeProgressReport(context.taskState, noMutationReason);
-    const finalText = result.finalText && progressReport
-      ? `${result.finalText}\n\n${progressReport}`
-      : result.finalText;
+    const finalText = providerFinalText && progressReport
+      ? `${providerFinalText}\n\n${progressReport}`
+      : providerFinalText;
     const output = [];
     let outputIndex = 0;
     if (finalText) {
-      const itemId = `msg_${randomUUID()}`;
-      writeSse(response, "response.output_item.added", { output_index: outputIndex, item: responseMessageItem(itemId, "") });
-      writeSse(response, "response.content_part.added", { item_id: itemId, output_index: outputIndex, content_index: 0, part: { type: "output_text", text: "", annotations: [] } });
-      writeSse(response, "response.output_text.delta", { item_id: itemId, output_index: outputIndex, content_index: 0, delta: finalText });
+      const itemId = streamedMessageId || `msg_${randomUUID()}`;
+      if (!streamedMessageId) {
+        writeSse(response, "response.output_item.added", { output_index: outputIndex, item: responseMessageItem(itemId, "") });
+        writeSse(response, "response.content_part.added", { item_id: itemId, output_index: outputIndex, content_index: 0, part: { type: "output_text", text: "", annotations: [] } });
+        writeSse(response, "response.output_text.delta", { item_id: itemId, output_index: outputIndex, content_index: 0, delta: finalText });
+      } else {
+        if (!finalText.startsWith(streamedText)) {
+          throw new BridgeError("CodeBuddy final assistant output diverged after streaming began", 502);
+        }
+        const remainingText = finalText.slice(streamedText.length);
+        if (remainingText) {
+          writeSse(response, "response.output_text.delta", { item_id: itemId, output_index: outputIndex, content_index: 0, delta: remainingText });
+        }
+      }
       writeSse(response, "response.output_text.done", { item_id: itemId, output_index: outputIndex, content_index: 0, text: finalText });
       writeSse(response, "response.content_part.done", { item_id: itemId, output_index: outputIndex, content_index: 0, part: { type: "output_text", text: finalText, annotations: [] } });
       const item = responseMessageItem(itemId, finalText, "completed");
@@ -919,6 +1046,20 @@ function selfTest() {
     catalogModel.input_modalities.join(",") !== route.inputModalities.join(",")
   ) {
     throw new Error("self-test failed: managed model catalog disagrees with the route");
+  }
+  const textDelta = {
+    type: "stream_event",
+    event: { type: "content_block_delta", delta: { type: "text_delta", text: "visible" } },
+  };
+  const thinkingDelta = {
+    type: "stream_event",
+    event: { type: "content_block_delta", delta: { type: "thinking_delta", thinking: "private" } },
+  };
+  if (
+    providerVisibleTextDelta(textDelta) !== "visible"
+    || providerVisibleTextDelta(thinkingDelta) !== null
+  ) {
+    throw new Error("self-test failed: provider stream exposed non-visible reasoning");
   }
   const selfTestTools = [
     { type: "web_search" },
@@ -1261,7 +1402,8 @@ function start() {
           inputModalities: resolveRoute(MODEL_ALIAS).inputModalities,
           authSourceRequired: REQUIRED_AUTH_SOURCE, fallbackModel: null,
           explicitCostRequiredUsd: 0, codexManagedLazyTools: true,
-          promptTransport: "stream-json-stdin", runtime,
+          promptTransport: "stream-json-stdin", incrementalVisibleOutput: true,
+          providerProgressHeartbeatMaxHz: 1, runtime,
         });
         return;
       }
