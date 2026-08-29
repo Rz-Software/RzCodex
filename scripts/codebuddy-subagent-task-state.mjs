@@ -4,7 +4,8 @@ const NEW_TASK_HEADER = /^Message Type:\s*NEW_TASK\s*$/m;
 const MESSAGE_HEADER = /^Message Type:\s*MESSAGE\s*$/m;
 const TASK_NAME_HEADER = /^Task name:\s*(.+?)\s*$/m;
 const PAYLOAD_HEADER = /(?:^|\n)Payload:\s*\n/;
-const MUTATION_INTENT = /\b(?:implement|fix|patch|edit|modify|create|write|replace|delete|repair|refactor|apply_patch)\b/i;
+const MUTATION_INTENT = /\b(?:implement|fix|patch|edit|modify|create|write|replace|delete|repair|refactor|apply_patch)\b/gi;
+const NEGATED_MUTATION_PREFIX = /\b(?:do not|don't|must not|never|cannot|can't|not allowed to)\s+(?:[a-z][a-z0-9_-]*\s+){0,4}$/i;
 const CHECKPOINT_REQUEST = /\b(?:checkpoint(?:\/report)?|status report|progress report)\b/i;
 const IMMEDIATE_RETURN = /\b(?:return|report|respond)\b[\s\S]{0,80}\b(?:immediately|now|current|where)\b/i;
 const NO_MUTATION_REASON = /(?:^|\n)NO_MUTATION_REASON:\s*(\{[^\r\n]+\})\s*(?:\r?\n|$)/;
@@ -88,7 +89,12 @@ export function normalizeAgentMessageContent(content, label) {
 }
 
 function taskIntent(text) {
-  return MUTATION_INTENT.test(payloadFrom(text)) ? "mutation" : "analysis";
+  const payload = payloadFrom(text);
+  for (const match of payload.matchAll(MUTATION_INTENT)) {
+    const prefix = payload.slice(Math.max(0, match.index - 80), match.index);
+    if (!NEGATED_MUTATION_PREFIX.test(prefix)) return "mutation";
+  }
+  return "analysis";
 }
 
 function taskName(text, fallback) {

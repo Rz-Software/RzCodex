@@ -1079,6 +1079,34 @@ function selfTest() {
     tools: selfTestTools,
     input,
   });
+  const readOnlyTask = normalizeSelfTestRequest([{
+    type: "agent_message",
+    id: "self-test-read-only",
+    author: "Codex",
+    recipient: "/root/read_only",
+    content: [{
+      type: "input_text",
+      text: "Message Type: NEW_TASK\nTask name: /root/read_only\nPayload:\nRead two files. Do not edit files. Never create files.",
+    }],
+  }]);
+  const boundedMutationTask = normalizeSelfTestRequest([{
+    type: "agent_message",
+    id: "self-test-bounded-mutation",
+    author: "Codex",
+    recipient: "/root/bounded_mutation",
+    content: [{
+      type: "input_text",
+      text: "Message Type: NEW_TASK\nTask name: /root/bounded_mutation\nPayload:\nFix the router. Do not modify G:\\QANGA.",
+    }],
+  }]);
+  if (
+    readOnlyTask.taskState.activeTask.intent !== "analysis"
+    || boundedMutationTask.taskState.activeTask.intent !== "mutation"
+  ) {
+    throw new Error(
+      `self-test failed: negated mutation intent classification read_only=${readOnlyTask.taskState.activeTask.intent} bounded_mutation=${boundedMutationTask.taskState.activeTask.intent}`,
+    );
+  }
   const context = normalizeSelfTestRequest([
       { type: "compaction", encrypted_content: "opaque" },
       { type: "agent_message", author: "/root", recipient: "/root/test", content: [{ type: "input_text", text: "inspect one file" }] },
