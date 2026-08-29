@@ -35,7 +35,6 @@ const USER_DEVIN_CONFIG = join(process.env.APPDATA || join(homedir(), "AppData",
 const DEVIN_HOME = join(process.env.LOCALAPPDATA || join(homedir(), "AppData", "Local"), "RzCodex", "devin-subagents");
 const ISOLATED_CONFIG = join(DEVIN_HOME, "config.json");
 const REQUEST_DIRECTORY = join(DEVIN_HOME, "requests");
-const ROUTE_STATE_PATH = join(DEVIN_HOME, "route-state.json");
 const DEVIN_EXE = join(process.env.LOCALAPPDATA || join(homedir(), "AppData", "Local"), "devin", "cli", "bin", "devin.exe");
 const DEVIN_DB = join(process.env.APPDATA || join(homedir(), "AppData", "Roaming"), "devin", "cli", "sessions.db");
 const COMPLEX_SIGNALS = [
@@ -174,21 +173,6 @@ const models = {
   fallback: catalogModel(route.quotaFallbackModel, "SWE-1.7 Max", true),
   complex: catalogModel(route.complexModel, "SWE-1.7 Max", true),
 };
-
-function loadRouteState() {
-  try {
-    const parsed = JSON.parse(readFileSync(ROUTE_STATE_PATH, "utf8"));
-    return { lightningFallbackUntil: Number(parsed.lightningFallbackUntil) || 0 };
-  } catch {
-    return { lightningFallbackUntil: 0 };
-  }
-}
-
-function saveRouteState(state) {
-  writeFileSync(ROUTE_STATE_PATH, `${json(state)}\n`, "utf8");
-}
-
-let routeState = loadRouteState();
 
 const runtime = {
   incomingRequests: 0, requests: 0, completed: 0, failed: 0, rejected: 0,
@@ -390,9 +374,6 @@ function chooseRoute(context) {
   if (complexScore >= 2 || COMPLEX_SIGNALS[0].test(payload)) {
     return { key: "complex", model: models.complex, reason: `complex_score_${complexScore}` };
   }
-  if (Date.now() < routeState.lightningFallbackUntil) {
-    return { key: "fallback", model: models.fallback, reason: "quota_latch" };
-  }
   return { key: "primary", model: models.primary, reason: "default" };
 }
 
@@ -537,14 +518,6 @@ async function runCliWithResourceRetries(context, selectedModel, onSpawn, signal
   }
 }
 
-function quotaLatch() {
-  const until = new Date();
-  until.setDate(until.getDate() + 1);
-  until.setHours(0, 5, 0, 0);
-  routeState = { lightningFallbackUntil: until.getTime() };
-  saveRouteState(routeState);
-}
-
 async function execute(context, initialRoute, onSpawn, signal) {
   const deadline = Date.now() + REQUEST_TIMEOUT_MS;
   let selected = initialRoute;
@@ -555,7 +528,6 @@ async function execute(context, initialRoute, onSpawn, signal) {
   let quotaFallback = false;
   if (selected.key === "primary" && (cliResult.code !== 0 || !cliResult.stdout) && QUOTA_FAILURE.test(combined)) {
     if (session) removeSession(session.id);
-    quotaLatch();
     selected = { key: "fallback", model: models.fallback, reason: "confirmed_quota_failure" };
     quotaFallback = true;
     routeResult = await withRouteCapacity(selected, signal, () =>
@@ -578,7 +550,6 @@ async function execute(context, initialRoute, onSpawn, signal) {
     if (selected.key !== "primary" && (creditCost !== 0 || acuCost !== 0)) {
       throw new BridgeError(`Free Devin route reported non-zero usage charge: credit=${creditCost}, acu=${acuCost}`, 502);
     }
-    if (selected.key === "primary" && creditCost > 0) quotaLatch();
     const inputTokens = Number(dimension(metadata, "input_tokens") || 0);
     const cachedTokens = Number(dimension(metadata, "cached_input_tokens") || 0);
     const outputTokens = Number(dimension(metadata, "output_tokens") || 0);
@@ -742,7 +713,7 @@ function health() {
       primary: { uid: models.primary.model_uid, label: models.primary.label, cost: models.primary.cost_summary || models.primary.cost_tier },
       quotaFallback: { uid: models.fallback.model_uid, label: models.fallback.label, cost: models.fallback.cost_summary || models.fallback.cost_tier },
       complex: { uid: models.complex.model_uid, label: models.complex.label, cost: models.complex.cost_summary || models.complex.cost_tier },
-      lightningFallbackUntil: routeState.lightningFallbackUntil || null,
+      quotaFallbackPolicy: "explicit_quota_failure_per_request",
     },
     apiKeysStripped: true, isolatedConfigImports: ["agents_standard"], lazyRzMcpProxyTools: 2,
     rawPromptFilesRetained: false, ephemeralSessionsRemoved: true, runtime,
@@ -758,7 +729,7 @@ function jsonResponse(response, status, value) {
 async function selfTest() {
   const simple = { taskState: { activeTask: { text: "Create a small fixture." } }, prompt: "" };
   const complex = { taskState: { activeTask: { text: "Debug the root cause of a crash race condition." } }, prompt: "" };
-  if (chooseRoute(simple).key !== "primary" && chooseRoute(simple).key !== "fallback") throw new Error("default route failed");
+  if (chooseRoute(simple).key !== "primary") throw new Error("default route failed");
   if (chooseRoute(complex).key !== "complex") throw new Error("complex route failed");
   if (!QUOTA_FAILURE.test("Daily usage quota reached")) throw new Error("quota detection failed");
   if (!RESOURCE_EXHAUSTED.test('{"cognition.ai/errorKind":"resource_exhausted","cognition.ai/retryable":true}')) throw new Error("resource exhaustion detection failed");
