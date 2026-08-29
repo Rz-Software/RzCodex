@@ -177,6 +177,7 @@ const models = {
 const runtime = {
   incomingRequests: 0, requests: 0, completed: 0, failed: 0, rejected: 0,
   activeRequests: 0, activeFreeRequests: 0, queuedFreeRequests: 0,
+  supersededTurns: 0,
   resourceRetries: 0, activeResourceBackoffs: 0,
   lastResourceModel: null, lastResourceRetryAttempt: 0,
   lastResourceBackoffMs: 0, lastResourceRetryAt: null,
@@ -191,10 +192,27 @@ const runtime = {
 };
 
 const freeCapacity = { active: 0, waiters: [] };
+const activeThreadTurns = new Map();
 
 function syncFreeCapacityRuntime() {
   runtime.activeFreeRequests = freeCapacity.active;
   runtime.queuedFreeRequests = freeCapacity.waiters.length;
+}
+
+function registerThreadTurn(threadId, registration) {
+  if (!threadId) return;
+  const previous = activeThreadTurns.get(threadId);
+  if (previous && previous !== registration) {
+    runtime.supersededTurns += 1;
+    previous.abort();
+  }
+  activeThreadTurns.set(threadId, registration);
+}
+
+function unregisterThreadTurn(threadId, registration) {
+  if (threadId && activeThreadTurns.get(threadId) === registration) {
+    activeThreadTurns.delete(threadId);
+  }
 }
 
 function abortError() {
@@ -308,6 +326,9 @@ function promptFrom(body) {
   }
   const requestId = randomUUID();
   const workingDirectory = workingDirectoryFrom(body);
+  const threadId = typeof body.client_metadata?.thread_id === "string"
+    ? body.client_metadata.thread_id
+    : null;
   const sections = [
     `[Native Devin delegation contract]\nRzCodex request ID: ${requestId}\nWork directly in the supplied workspace as the bounded native sub-agent. Use local Devin tools for files and commands. Do not spawn Devin subagents. For Unreal/RzMCP work, use only MCP server rzcodex-lazy: list that server's two proxy tools, call search_rzmcp_tools with an exact or focused query, then call only a discovered tool through call_rzmcp_tool. Never use or request the full RzMCP catalog. Return concise evidence as soon as the bounded task is complete or genuinely blocked.\nAuthoritative workspace: ${workingDirectory}`,
   ];
@@ -318,23 +339,23 @@ function promptFrom(body) {
   for (let index = 0; index < input.length; index += 1) {
     const item = assertObject(input[index], `input[${index}]`);
     if (item.type === "message") {
-      if (!["system", "developer"].includes(item.role)) history.push({ index, text: `[${item.role}]\n${contentText(item.content, `input[${index}].content`)}` });
+      if (!["system", "developer"].includes(item.role)) history.push({ index, checkpoint: false, text: `[${item.role}]\n${contentText(item.content, `input[${index}].content`)}` });
     } else if (item.type === "agent_message") {
       const message = agentMessages.get(index) ?? {
         ...normalizeAgentMessageContent(item.content, `input[${index}].content`),
         author: item.author || "Codex", recipient: item.recipient || "managed worker", newTask: false, checkpoint: false,
       };
       if (message.newTask && !message.checkpoint) continue;
-      history.push({ index, text: `[Inter-agent message ${message.author} -> ${message.recipient}]\n${message.text}` });
+      history.push({ index, checkpoint: message.checkpoint, text: `[Inter-agent message ${message.author} -> ${message.recipient}]\n${message.text}` });
     } else if (["function_call", "custom_tool_call", "tool_search_call"].includes(item.type)) {
-      history.push({ index, text: `[Prior Codex tool request ${item.name || "tool_search"}; call_id=${item.call_id}]` });
+      history.push({ index, checkpoint: false, text: `[Prior Codex tool request ${item.name || "tool_search"}; call_id=${item.call_id}]` });
     } else if (["function_call_output", "custom_tool_call_output"].includes(item.type)) {
-      history.push({ index, text: `[Prior Codex tool result; call_id=${item.call_id}]\n${outputText(item.output)}` });
+      history.push({ index, checkpoint: false, text: `[Prior Codex tool result; call_id=${item.call_id}]\n${outputText(item.output)}` });
     } else if (item.type === "tool_search_output") {
-      history.push({ index, text: `[Prior Codex tool search result; call_id=${item.call_id}]` });
+      history.push({ index, checkpoint: false, text: `[Prior Codex tool search result; call_id=${item.call_id}]` });
     } else if (item.type === "reasoning") {
       const summary = Array.isArray(item.summary) ? item.summary.map((part) => part?.text || "").join("") : "";
-      if (summary) history.push({ index, text: `[Prior reasoning summary]\n${summary}` });
+      if (summary) history.push({ index, checkpoint: false, text: `[Prior reasoning summary]\n${summary}` });
     } else if (!["compaction", "context_compaction", "compaction_trigger"].includes(item.type)) {
       throw new BridgeError(`input[${index}] has unsupported type ${json(item.type)}`);
     }
@@ -350,9 +371,12 @@ function promptFrom(body) {
   const activeTask = activeTaskPromptSection(taskState);
   if (activeTask) {
     const activeTaskIndex = taskState.activeTask.index;
-    sections.push(...retained.filter((item) => item.index < activeTaskIndex).map((item) => item.text));
+    const checkpoints = retained.filter((item) => item.checkpoint);
+    const ordinaryHistory = retained.filter((item) => !item.checkpoint);
+    sections.push(...ordinaryHistory.filter((item) => item.index < activeTaskIndex).map((item) => item.text));
     sections.push(activeTask);
-    sections.push(...retained.filter((item) => item.index > activeTaskIndex).map((item) => item.text));
+    sections.push(...ordinaryHistory.filter((item) => item.index > activeTaskIndex).map((item) => item.text));
+    sections.push(...checkpoints.map((item) => item.text));
   } else {
     sections.push(...retained.map((item) => item.text));
   }
@@ -365,7 +389,7 @@ function promptFrom(body) {
     throw error;
   }
   const toolSchemaBytes = Buffer.byteLength(json(body.tools || []));
-  return { requestId, prompt, workingDirectory, taskState, taskDiagnostics, toolSchemaBytes };
+  return { requestId, prompt, workingDirectory, threadId, taskState, taskDiagnostics, toolSchemaBytes };
 }
 
 function chooseRoute(context) {
@@ -631,6 +655,8 @@ async function handleResponses(request, response) {
     abortController.abort();
     if (child && !child.killed) child.kill();
   };
+  const threadTurn = { requestId: context.requestId, abort };
+  registerThreadTurn(context.threadId, threadTurn);
   request.once("aborted", abort);
   response.once("close", () => { if (!response.writableEnded) abort(); });
   response.writeHead(200, { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache", connection: "keep-alive" });
@@ -684,6 +710,7 @@ async function handleResponses(request, response) {
     response.end();
   } finally {
     clearInterval(heartbeat);
+    unregisterThreadTurn(context.threadId, threadTurn);
     runtime.activeRequests = Math.max(0, runtime.activeRequests - 1);
   }
 }
@@ -716,7 +743,8 @@ function health() {
       quotaFallbackPolicy: "explicit_quota_failure_per_request",
     },
     apiKeysStripped: true, isolatedConfigImports: ["agents_standard"], lazyRzMcpProxyTools: 2,
-    rawPromptFilesRetained: false, ephemeralSessionsRemoved: true, runtime,
+    rawPromptFilesRetained: false, ephemeralSessionsRemoved: true,
+    activeThreadTurns: activeThreadTurns.size, runtime,
   };
 }
 
@@ -756,6 +784,27 @@ async function selfTest() {
   const checkpointIndex = prompt.indexOf(checkpoint);
   if (!(staleIndex >= 0 && staleIndex < taskIndex && taskIndex < checkpointIndex)) throw new Error("active task precedence failed");
   if (prompt.indexOf(task, taskIndex + task.length) !== -1) throw new Error("active task duplication failed");
+  const reversedPrompt = promptFrom({
+    stream: true,
+    model: MODEL_ALIAS,
+    reasoning: { effort: REQUIRED_EFFORT },
+    input: [
+      { type: "agent_message", id: "self-test-checkpoint-first", author: "Codex", recipient: "/root/self_test", content: [{ type: "input_text", text: checkpoint }] },
+      { type: "agent_message", id: "self-test-task-last", author: "Codex", recipient: "/root/self_test", content: [{ type: "input_text", text: task }] },
+    ],
+  }).prompt;
+  const reversedTaskIndex = reversedPrompt.indexOf(task);
+  const reversedCheckpointIndex = reversedPrompt.indexOf(checkpoint);
+  if (!(reversedTaskIndex >= 0 && reversedTaskIndex < reversedCheckpointIndex)) throw new Error("checkpoint precedence failed");
+  let supersededAbortCalls = 0;
+  const firstTurn = { requestId: "first", abort: () => { supersededAbortCalls += 1; } };
+  const secondTurn = { requestId: "second", abort: () => {} };
+  registerThreadTurn("thread-self-test", firstTurn);
+  registerThreadTurn("thread-self-test", secondTurn);
+  unregisterThreadTurn("thread-self-test", firstTurn);
+  if (supersededAbortCalls !== 1 || activeThreadTurns.get("thread-self-test") !== secondTurn) throw new Error("thread turn replacement failed");
+  unregisterThreadTurn("thread-self-test", secondTurn);
+  if (activeThreadTurns.has("thread-self-test")) throw new Error("thread turn cleanup failed");
   const heartbeatWrites = [];
   writeSseHeartbeat({ destroyed: false, writableEnded: false, write: (value) => heartbeatWrites.push(value) }, "resp-self-test");
   const heartbeat = heartbeatWrites.join("");
