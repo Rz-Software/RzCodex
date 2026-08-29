@@ -15,6 +15,12 @@ import {
   taskDeliveryDiagnostics,
   taskStateFromInput,
 } from "./codebuddy-subagent-task-state.mjs";
+import {
+  codeBuddyForwardBody,
+  runQuotaFallbackChain,
+  runResponsesBridge,
+  validateCodeBuddyCompletion,
+} from "./native-subagent-provider-router.mjs";
 
 const PROVIDER_ID = "devin";
 const MODEL_ALIAS = "@preset/codex-subagents";
@@ -30,6 +36,10 @@ const SSE_HEARTBEAT_MS = 15 * 1000;
 const FREE_ROUTE_CONCURRENCY = 2;
 const RESOURCE_BACKOFF_BASE_MS = 5 * 1000;
 const RESOURCE_BACKOFF_MAX_MS = 2 * 60 * 1000;
+const CODEBUDDY_BRIDGE_ENDPOINT = "http://127.0.0.1:54547/v1/responses";
+const CODEBUDDY_REQUIRED_AUTH_SOURCE = "www.codebuddy.ai";
+const CODEBUDDY_REQUIRED_EFFORT = "max";
+const CODEBUDDY_CONTEXT_WINDOW = 131_072;
 const SCRIPT_DIRECTORY = dirname(fileURLToPath(import.meta.url));
 const CENTRAL_CONFIG = join(homedir(), ".codex", "subagent-models.json");
 const USER_DEVIN_CONFIG = join(process.env.APPDATA || join(homedir(), "AppData", "Roaming"), "devin", "config.json");
@@ -82,13 +92,20 @@ function centralRoute() {
     throw new BridgeError(`Cannot read central subagent configuration: ${error.message}`, 500);
   }
   const route = assertObject(parsed[PROVIDER_ID], `central route ${PROVIDER_ID}`);
+  const quotaFallbackProvider = requireString(route.quotaFallbackProvider, "quotaFallbackProvider");
+  if (quotaFallbackProvider !== "codebuddy") {
+    throw new BridgeError(`Devin quota fallback provider must be codebuddy, got ${json(quotaFallbackProvider)}`, 500);
+  }
+  const codeBuddyRoute = assertObject(parsed[quotaFallbackProvider], `central route ${quotaFallbackProvider}`);
   const inputModalities = route.inputModalities;
   if (!Array.isArray(inputModalities) || inputModalities.length !== 1 || inputModalities[0] !== "text") {
     throw new BridgeError("Devin managed route must declare exactly the text modality", 500);
   }
   return {
     primaryModel: requireString(route.primaryModel, "primaryModel"),
-    quotaFallbackModel: requireString(route.quotaFallbackModel, "quotaFallbackModel"),
+    quotaFallbackProvider,
+    codeBuddyModel: requireString(codeBuddyRoute.model, "codebuddy.model"),
+    terminalFallbackModel: requireString(route.terminalFallbackModel, "terminalFallbackModel"),
     inputModalities,
   };
 }
@@ -162,7 +179,7 @@ function catalogModel(uid, expectedLabel, mustBeFree) {
 
 const models = {
   primary: catalogModel(route.primaryModel, "GPT-5.6 Sol High Thinking", false),
-  fallback: catalogModel(route.quotaFallbackModel, "GLM-5.2 High", true),
+  terminal: catalogModel(route.terminalFallbackModel, "GLM-5.2 High", true),
 };
 
 const runtime = {
@@ -173,7 +190,11 @@ const runtime = {
   lastResourceModel: null, lastResourceRetryAttempt: 0,
   lastResourceBackoffMs: 0, lastResourceRetryAt: null,
   lastRejectedError: null, lastConfiguredRoute: null, lastActualModel: null,
-  lastModelLabel: null, lastQuotaFallback: false, lastCreditCost: null, lastAcuCost: null,
+  lastActualProvider: null, lastModelLabel: null, lastQuotaFallback: false,
+  lastTerminalFallback: false, lastFallbackReason: null,
+  codeBuddyAttempts: 0, codeBuddyCompleted: 0, codeBuddyFailed: 0, terminalFallbacks: 0,
+  lastCodeBuddyError: null, lastCodeBuddyAuthSource: null, lastCodeBuddyCostUsd: null,
+  lastCreditCost: null, lastAcuCost: null,
   lastInputTokens: null, lastCachedInputTokens: null, lastOutputTokens: null,
   lastPeakTurnContextTokens: null, lastOutputTokensPerSecond: null,
   lastNativeToolCalls: 0, lastNativeToolNames: [], lastRzMcpTools: [],
@@ -182,12 +203,12 @@ const runtime = {
   lastTaskPartLengths: [], lastCompleteTaskDelivered: false,
 };
 
-const freeCapacity = { active: 0, waiters: [] };
+const terminalCapacity = { active: 0, waiters: [] };
 const activeThreadTurns = new Map();
 
 function syncFreeCapacityRuntime() {
-  runtime.activeFreeRequests = freeCapacity.active;
-  runtime.queuedFreeRequests = freeCapacity.waiters.length;
+  runtime.activeFreeRequests = terminalCapacity.active;
+  runtime.queuedFreeRequests = terminalCapacity.waiters.length;
 }
 
 function registerThreadTurn(threadId, registration) {
@@ -207,7 +228,7 @@ function unregisterThreadTurn(threadId, registration) {
 }
 
 function abortError() {
-  return new BridgeError("Client disconnected while Devin work was active", 499);
+  return new BridgeError("Client disconnected while managed subagent work was active", 499);
 }
 
 function throwIfAborted(signal) {
@@ -230,32 +251,32 @@ function delayWithAbort(milliseconds, signal) {
 
 function acquireFreeCapacity(signal) {
   throwIfAborted(signal);
-  if (freeCapacity.active < FREE_ROUTE_CONCURRENCY) {
-    freeCapacity.active += 1;
+  if (terminalCapacity.active < FREE_ROUTE_CONCURRENCY) {
+    terminalCapacity.active += 1;
     syncFreeCapacityRuntime();
     return Promise.resolve();
   }
   return new Promise((resolve, reject) => {
     const waiter = { resolve, reject, signal, onAbort: null };
     waiter.onAbort = () => {
-      const index = freeCapacity.waiters.indexOf(waiter);
-      if (index !== -1) freeCapacity.waiters.splice(index, 1);
+      const index = terminalCapacity.waiters.indexOf(waiter);
+      if (index !== -1) terminalCapacity.waiters.splice(index, 1);
       syncFreeCapacityRuntime();
       reject(abortError());
     };
     signal?.addEventListener("abort", waiter.onAbort, { once: true });
-    freeCapacity.waiters.push(waiter);
+    terminalCapacity.waiters.push(waiter);
     syncFreeCapacityRuntime();
   });
 }
 
 function releaseFreeCapacity() {
-  freeCapacity.active = Math.max(0, freeCapacity.active - 1);
-  while (freeCapacity.waiters.length > 0) {
-    const waiter = freeCapacity.waiters.shift();
+  terminalCapacity.active = Math.max(0, terminalCapacity.active - 1);
+  while (terminalCapacity.waiters.length > 0) {
+    const waiter = terminalCapacity.waiters.shift();
     waiter.signal?.removeEventListener("abort", waiter.onAbort);
     if (waiter.signal?.aborted) continue;
-    freeCapacity.active += 1;
+    terminalCapacity.active += 1;
     waiter.resolve();
     break;
   }
@@ -263,7 +284,7 @@ function releaseFreeCapacity() {
 }
 
 async function withRouteCapacity(selected, signal, callback) {
-  if (selected.key === "primary") return callback();
+  if (selected.key !== "terminal") return callback();
   await acquireFreeCapacity(signal);
   try {
     return await callback();
@@ -400,7 +421,7 @@ function promptFrom(body) {
 }
 
 function chooseRoute() {
-  return { key: "primary", model: models.primary, reason: "all_tasks_primary" };
+  return { key: "primary", provider: "devin", model: models.primary, reason: "all_tasks_primary" };
 }
 
 function dimension(metadata, uid) {
@@ -525,6 +546,13 @@ function isRetryableResourceFailure(cliResult) {
   return cliFailed(cliResult) && !QUOTA_FAILURE.test(combined) && RESOURCE_EXHAUSTED.test(combined);
 }
 
+function sanitizedProviderFailure(error) {
+  return String(error?.message || error)
+    .replace(/(authorization\s*[:=]\s*bearer\s+)[^\s,;]+/gi, "$1[REDACTED]")
+    .replace(/\b(sk|or)-[a-z0-9_-]{12,}\b/gi, "[REDACTED]")
+    .slice(0, 2_000);
+}
+
 async function runCliWithResourceRetries(context, selectedModel, onSpawn, signal, deadline) {
   let attempt = 0;
   while (true) {
@@ -554,23 +582,46 @@ async function runCliWithResourceRetries(context, selectedModel, onSpawn, signal
   }
 }
 
-async function execute(context, initialRoute, onSpawn, signal) {
-  const deadline = Date.now() + REQUEST_TIMEOUT_MS;
-  let selected = initialRoute;
-  let routeResult = await withRouteCapacity(selected, signal, () =>
-    runCliWithResourceRetries(context, selected.model, onSpawn, signal, deadline));
-  let { cliResult, session } = routeResult;
-  let combined = `${cliResult.stdout}\n${cliResult.stderr}`;
-  let quotaFallback = false;
-  if (selected.key === "primary" && isQuotaFailure(cliResult)) {
-    if (session) removeSession(session.id);
-    selected = { key: "fallback", model: models.fallback, reason: "confirmed_quota_failure" };
-    quotaFallback = true;
-    routeResult = await withRouteCapacity(selected, signal, () =>
-      runCliWithResourceRetries(context, selected.model, onSpawn, signal, deadline));
-    ({ cliResult, session } = routeResult);
-    combined = `${cliResult.stdout}\n${cliResult.stderr}`;
-  }
+function codeBuddyResult(completion) {
+  const usage = completion.usage || {};
+  const inputTokens = Number(usage.input_tokens || 0);
+  const cachedTokens = Number(usage.input_tokens_details?.cached_tokens || 0);
+  const outputTokens = Number(usage.output_tokens || 0);
+  const providerMetadata = completion.metadata || {};
+  const toolCalls = completion.output
+    .filter((item) => ["function_call", "custom_tool_call", "tool_search_call"].includes(item?.type))
+    .map((item) => ({
+      id: item.call_id || item.id,
+      name: item.name || "tool_search",
+      arguments: item.arguments || item.input || null,
+    }));
+  return {
+    output: completion.output,
+    providerMetadata,
+    selected: {
+      key: "codebuddy",
+      provider: route.quotaFallbackProvider,
+      model: { model_uid: route.codeBuddyModel, label: route.codeBuddyModel },
+      reason: "devin_quota_codebuddy_available",
+    },
+    quotaFallback: true,
+    terminalFallback: false,
+    fallbackReason: "confirmed_devin_quota_failure",
+    codeBuddyFailure: null,
+    creditCost: 0,
+    acuCost: 0,
+    inputTokens,
+    cachedTokens,
+    outputTokens,
+    peakTurnContextTokens: Number(providerMetadata.codebuddy_max_turn_input_tokens || 0),
+    outputTokensPerSecond: null,
+    toolCalls,
+    rzMcpTools: [],
+  };
+}
+
+function finalizeDevinResult(selected, routeResult, fallbackState) {
+  const { cliResult, session } = routeResult;
   if (cliResult.code !== 0 || !cliResult.stdout) {
     if (session) removeSession(session.id);
     throw new BridgeError(`Devin failed: ${cliResult.stderr || cliResult.stdout || `exit ${cliResult.code}`}`, 502);
@@ -583,7 +634,7 @@ async function execute(context, initialRoute, onSpawn, signal) {
     const metadata = session.metadata;
     const creditCost = Number(metadata.total_credit_cost || 0);
     const acuCost = Number(metadata.total_acu_cost || 0);
-    if (selected.key !== "primary" && (creditCost !== 0 || acuCost !== 0)) {
+    if (selected.key === "terminal" && (creditCost !== 0 || acuCost !== 0)) {
       throw new BridgeError(`Free Devin route reported non-zero usage charge: credit=${creditCost}, acu=${acuCost}`, 502);
     }
     const inputTokens = Number(dimension(metadata, "input_tokens") || 0);
@@ -600,13 +651,90 @@ async function execute(context, initialRoute, onSpawn, signal) {
       .filter((call) => call.name === "mcp_call_tool" && call.arguments?.tool_name === "call_rzmcp_tool")
       .map((call) => call.arguments?.arguments?.name).filter((name) => typeof name === "string");
     return {
-      text: cliResult.stdout, selected, quotaFallback, creditCost, acuCost,
+      text: cliResult.stdout, selected, providerMetadata: {},
+      quotaFallback: fallbackState.quotaFallback,
+      terminalFallback: fallbackState.terminalFallback,
+      fallbackReason: fallbackState.fallbackReason,
+      codeBuddyFailure: fallbackState.codeBuddyFailure,
+      creditCost, acuCost,
       inputTokens, cachedTokens, outputTokens, peakTurnContextTokens, outputTokensPerSecond,
       toolCalls, rzMcpTools,
     };
   } finally {
     removeSession(session.id);
   }
+}
+
+async function execute(context, requestBody, initialRoute, onSpawn, signal) {
+  let selected = initialRoute;
+  let routeResult = await withRouteCapacity(selected, signal, () =>
+    runCliWithResourceRetries(
+      context,
+      selected.model,
+      onSpawn,
+      signal,
+      Date.now() + REQUEST_TIMEOUT_MS,
+    ));
+  if (selected.key !== "primary" || !isQuotaFailure(routeResult.cliResult)) {
+    return finalizeDevinResult(selected, routeResult, {
+      quotaFallback: false,
+      terminalFallback: false,
+      fallbackReason: null,
+      codeBuddyFailure: null,
+    });
+  }
+
+  if (routeResult.session) removeSession(routeResult.session.id);
+  runtime.codeBuddyAttempts += 1;
+  const fallback = await runQuotaFallbackChain({
+    signal,
+    runCodeBuddy: async () => {
+      const forwardedBody = codeBuddyForwardBody(requestBody, MODEL_ALIAS, CODEBUDDY_REQUIRED_EFFORT);
+      const completion = await runResponsesBridge({
+        endpoint: CODEBUDDY_BRIDGE_ENDPOINT,
+        body: forwardedBody,
+        signal,
+      });
+      validateCodeBuddyCompletion(completion, {
+        model: route.codeBuddyModel,
+        authSource: CODEBUDDY_REQUIRED_AUTH_SOURCE,
+      });
+      return codeBuddyResult(completion);
+    },
+    runTerminal: async (codeBuddyError) => {
+      runtime.terminalFallbacks += 1;
+      selected = {
+        key: "terminal",
+        provider: "devin",
+        model: models.terminal,
+        reason: "codebuddy_unavailable_after_devin_quota",
+      };
+      routeResult = await withRouteCapacity(selected, signal, () =>
+        runCliWithResourceRetries(
+          context,
+          selected.model,
+          onSpawn,
+          signal,
+          Date.now() + REQUEST_TIMEOUT_MS,
+        ));
+      return finalizeDevinResult(selected, routeResult, {
+        quotaFallback: true,
+        terminalFallback: true,
+        fallbackReason: "codebuddy_unavailable_after_confirmed_devin_quota_failure",
+        codeBuddyFailure: sanitizedProviderFailure(codeBuddyError),
+      });
+    },
+    onCodeBuddyFailure: (error) => {
+      runtime.codeBuddyFailed += 1;
+      runtime.lastCodeBuddyError = sanitizedProviderFailure(error);
+    },
+  });
+  if (fallback.stage === "codebuddy") {
+    runtime.codeBuddyCompleted += 1;
+    runtime.lastCodeBuddyError = null;
+    return fallback.value;
+  }
+  return fallback.value;
 }
 
 function usageFrom(result) {
@@ -621,6 +749,54 @@ function usageFrom(result) {
 
 function responseMessageItem(id, text, status = "in_progress") {
   return { type: "message", id, status, role: "assistant", content: [{ type: "output_text", text, annotations: [] }] };
+}
+
+function emitOutputItems(response, result) {
+  const output = result.output || [responseMessageItem(`msg_${randomUUID()}`, result.text, "completed")];
+  output.forEach((item, outputIndex) => {
+    if (item.type !== "message") {
+      writeSse(response, "response.output_item.done", { output_index: outputIndex, item });
+      return;
+    }
+    const itemId = item.id || `msg_${randomUUID()}`;
+    const text = (item.content || [])
+      .filter((part) => part?.type === "output_text" && typeof part.text === "string")
+      .map((part) => part.text)
+      .join("");
+    writeSse(response, "response.output_item.added", {
+      output_index: outputIndex,
+      item: responseMessageItem(itemId, ""),
+    });
+    writeSse(response, "response.content_part.added", {
+      item_id: itemId,
+      output_index: outputIndex,
+      content_index: 0,
+      part: { type: "output_text", text: "", annotations: [] },
+    });
+    writeSse(response, "response.output_text.delta", {
+      item_id: itemId,
+      output_index: outputIndex,
+      content_index: 0,
+      delta: text,
+    });
+    writeSse(response, "response.output_text.done", {
+      item_id: itemId,
+      output_index: outputIndex,
+      content_index: 0,
+      text,
+    });
+    writeSse(response, "response.content_part.done", {
+      item_id: itemId,
+      output_index: outputIndex,
+      content_index: 0,
+      part: { type: "output_text", text, annotations: [] },
+    });
+    writeSse(response, "response.output_item.done", {
+      output_index: outputIndex,
+      item: { ...item, id: itemId, status: "completed" },
+    });
+  });
+  return output;
 }
 
 function writeSse(response, type, payload) {
@@ -647,7 +823,8 @@ async function readJsonRequest(request) {
 }
 
 async function handleResponses(request, response) {
-  const context = promptFrom(await readJsonRequest(request));
+  const requestBody = await readJsonRequest(request);
+  const context = promptFrom(requestBody);
   runtime.requests += 1;
   runtime.activeRequests += 1;
   runtime.lastWorkingDirectory = context.workingDirectory;
@@ -677,11 +854,23 @@ async function handleResponses(request, response) {
   const heartbeat = setInterval(() => writeSseHeartbeat(response, responseId), SSE_HEARTBEAT_MS);
   heartbeat.unref();
   try {
-    const result = await execute(context, selected, (spawned) => { child = spawned; }, abortController.signal);
+    const result = await execute(
+      context,
+      requestBody,
+      selected,
+      (spawned) => { child = spawned; },
+      abortController.signal,
+    );
     runtime.completed += 1;
+    runtime.lastActualProvider = result.selected.provider;
     runtime.lastActualModel = result.selected.model.model_uid;
     runtime.lastModelLabel = result.selected.model.label;
     runtime.lastQuotaFallback = result.quotaFallback;
+    runtime.lastTerminalFallback = result.terminalFallback;
+    runtime.lastFallbackReason = result.fallbackReason;
+    runtime.lastCodeBuddyError = result.codeBuddyFailure;
+    runtime.lastCodeBuddyAuthSource = result.providerMetadata.codebuddy_auth_source || null;
+    runtime.lastCodeBuddyCostUsd = result.providerMetadata.codebuddy_total_cost_usd ?? null;
     runtime.lastCreditCost = result.creditCost;
     runtime.lastAcuCost = result.acuCost;
     runtime.lastInputTokens = result.inputTokens;
@@ -692,24 +881,23 @@ async function handleResponses(request, response) {
     runtime.lastNativeToolCalls = result.toolCalls.length;
     runtime.lastNativeToolNames = [...new Set(result.toolCalls.map((call) => call.name))];
     runtime.lastRzMcpTools = [...new Set(result.rzMcpTools)];
-    const itemId = `msg_${randomUUID()}`;
-    writeSse(response, "response.output_item.added", { output_index: 0, item: responseMessageItem(itemId, "") });
-    writeSse(response, "response.content_part.added", { item_id: itemId, output_index: 0, content_index: 0, part: { type: "output_text", text: "", annotations: [] } });
-    writeSse(response, "response.output_text.delta", { item_id: itemId, output_index: 0, content_index: 0, delta: result.text });
-    writeSse(response, "response.output_text.done", { item_id: itemId, output_index: 0, content_index: 0, text: result.text });
-    writeSse(response, "response.content_part.done", { item_id: itemId, output_index: 0, content_index: 0, part: { type: "output_text", text: result.text, annotations: [] } });
-    const item = responseMessageItem(itemId, result.text, "completed");
-    writeSse(response, "response.output_item.done", { output_index: 0, item });
+    const output = emitOutputItems(response, result);
     writeSse(response, "response.completed", { response: {
       id: responseId, object: "response", created_at: Math.floor(Date.now() / 1000), status: "completed",
-      model: MODEL_ALIAS, output: [item], usage: usageFrom(result), error: null, incomplete_details: null,
+      model: MODEL_ALIAS, output, usage: usageFrom(result), error: null, incomplete_details: null,
       metadata: {
+        ...result.providerMetadata,
         provider: PROVIDER_ID, route: result.selected.key, route_reason: result.selected.reason,
+        actual_provider: result.selected.provider,
         actual_model: result.selected.model.model_uid, actual_model_label: result.selected.model.label,
-        quota_fallback: result.quotaFallback, total_credit_cost: result.creditCost, total_acu_cost: result.acuCost,
+        quota_fallback: result.quotaFallback, terminal_fallback: result.terminalFallback,
+        fallback_reason: result.fallbackReason, codebuddy_failure: result.codeBuddyFailure,
+        total_credit_cost: result.creditCost, total_acu_cost: result.acuCost,
         peak_turn_context_tokens: result.peakTurnContextTokens, output_tokens_per_second: result.outputTokensPerSecond,
         native_tool_calls: result.toolCalls.length, native_tool_names: runtime.lastNativeToolNames,
-        rzmcp_tools_called: runtime.lastRzMcpTools, codex_tool_schema_bytes_ignored: context.toolSchemaBytes,
+        rzmcp_tools_called: runtime.lastRzMcpTools,
+        codex_tool_schema_bytes_ignored: result.selected.provider === "devin" ? context.toolSchemaBytes : 0,
+        codex_tool_schema_bytes_forwarded: result.selected.provider === "codebuddy" ? context.toolSchemaBytes : 0,
         active_task_id: context.taskDiagnostics.taskId, active_task_hash: context.taskDiagnostics.taskHash,
         active_task_delivery_mode: context.taskDiagnostics.taskDeliveryMode,
         complete_active_task_delivered: context.taskDiagnostics.completeTaskDelivered,
@@ -728,8 +916,13 @@ async function handleResponses(request, response) {
 }
 
 function managedModelsResponse() {
+  const contextWindow = Math.min(
+    models.primary.max_context_tokens,
+    models.terminal.max_context_tokens,
+    CODEBUDDY_CONTEXT_WINDOW,
+  );
   return { models: [{
-    slug: MODEL_ALIAS, display_name: "Managed native subagent", description: "Centrally routed Devin native subagent",
+    slug: MODEL_ALIAS, display_name: "Managed native subagent", description: "Centrally routed native subagent",
     base_instructions: "You are a bounded delegated coding sub-agent. Use local tools and return concise evidence.",
     default_reasoning_level: REQUIRED_EFFORT, supported_reasoning_levels: [{ effort: REQUIRED_EFFORT, description: "Maximum" }],
     shell_type: "unified_exec", visibility: "none", supported_in_api: true, priority: 0, availability_nux: null,
@@ -737,7 +930,7 @@ function managedModelsResponse() {
     include_apps_usage_instructions: false, supports_reasoning_summary_parameter: false, default_reasoning_summary: "none",
     support_verbosity: false, default_verbosity: null, apply_patch_tool_type: "freeform", web_search_tool_type: "text",
     truncation_policy: { mode: "tokens", limit: 10_000 }, supports_image_detail_original: false,
-    context_window: models.primary.max_context_tokens, max_context_window: models.primary.max_context_tokens,
+    context_window: contextWindow, max_context_window: contextWindow,
     experimental_supported_tools: [], input_modalities: route.inputModalities, supports_search_tool: true,
     use_responses_lite: false, node_repl_auto_review_required: false, node_repl_disabled: false,
     tool_mode: "direct", multi_agent_version: "v2",
@@ -750,8 +943,22 @@ function health() {
     auth, inputModalities: route.inputModalities,
     routing: {
       primary: { uid: models.primary.model_uid, label: models.primary.label, cost: models.primary.cost_summary || models.primary.cost_tier },
-      quotaFallback: { uid: models.fallback.model_uid, label: models.fallback.label, cost: models.fallback.cost_summary || models.fallback.cost_tier },
-      quotaFallbackPolicy: "explicit_quota_failure_per_request",
+      quotaFallback: {
+        provider: route.quotaFallbackProvider,
+        uid: route.codeBuddyModel,
+        effort: CODEBUDDY_REQUIRED_EFFORT,
+        authSource: CODEBUDDY_REQUIRED_AUTH_SOURCE,
+        explicitCostRequiredUsd: 0,
+        endpoint: CODEBUDDY_BRIDGE_ENDPOINT,
+      },
+      terminalFallback: {
+        provider: "devin",
+        uid: models.terminal.model_uid,
+        label: models.terminal.label,
+        cost: models.terminal.cost_summary || models.terminal.cost_tier,
+      },
+      orderedPolicy: "devin_primary_then_codebuddy_on_quota_then_devin_free_on_codebuddy_failure",
+      quotaDetection: "explicit_daily_or_weekly_quota_failure_per_request",
     },
     apiKeysStripped: true, isolatedConfigImports: ["agents_standard"], lazyRzMcpProxyTools: 2,
     rawPromptFilesRetained: false, ephemeralSessionsRemoved: true,
@@ -767,6 +974,9 @@ function jsonResponse(response, status, value) {
 
 async function selfTest() {
   if (chooseRoute().key !== "primary") throw new Error("unified primary route failed");
+  if (route.quotaFallbackProvider !== "codebuddy" || !route.codeBuddyModel || !models.terminal.model_uid) {
+    throw new Error("ordered provider configuration failed");
+  }
   if (!LEGACY_REQUEST_EFFORTS.has("max") || LEGACY_REQUEST_EFFORTS.has("xhigh")) throw new Error("legacy effort compatibility failed");
   const isolatedEnvironment = sanitizedEnvironment({
     OPENAI_API_KEY: "must-not-survive",
@@ -853,16 +1063,54 @@ async function selfTest() {
   writeSseHeartbeat({ destroyed: false, writableEnded: false, write: (value) => heartbeatWrites.push(value) }, "resp-self-test");
   const heartbeat = heartbeatWrites.join("");
   if (!heartbeat.includes("event: response.in_progress") || !heartbeat.includes('"id":"resp-self-test"')) throw new Error("SSE heartbeat failed");
+  const codeBuddyFixture = codeBuddyResult({
+    status: "completed",
+    output: [{ type: "function_call", id: "fc-test", call_id: "call-test", name: "exec_command", arguments: "{}" }],
+    usage: { input_tokens: 100, input_tokens_details: { cached_tokens: 10 }, output_tokens: 20 },
+    metadata: {
+      codebuddy_initialized_model: route.codeBuddyModel,
+      codebuddy_auth_source: CODEBUDDY_REQUIRED_AUTH_SOURCE,
+      codebuddy_total_cost_usd: 0,
+      codebuddy_max_turn_input_tokens: 110,
+    },
+  });
+  if (
+    codeBuddyFixture.selected.key !== "codebuddy"
+    || codeBuddyFixture.selected.provider !== "codebuddy"
+    || codeBuddyFixture.toolCalls[0]?.name !== "exec_command"
+    || codeBuddyFixture.peakTurnContextTokens !== 110
+  ) {
+    throw new Error("CodeBuddy result normalization failed");
+  }
+  const replayWrites = [];
+  const replayOutput = emitOutputItems({
+    destroyed: false,
+    writableEnded: false,
+    write: (value) => replayWrites.push(value),
+  }, codeBuddyFixture);
+  if (
+    replayOutput[0]?.call_id !== "call-test"
+    || !replayWrites.join("").includes('"type":"function_call"')
+  ) {
+    throw new Error("CodeBuddy tool-call replay failed");
+  }
+  if (!sanitizedProviderFailure(new Error("authorization: Bearer secret-value")).includes("[REDACTED]")) {
+    throw new Error("provider failure redaction failed");
+  }
   let concurrentFreeCalls = 0;
   let peakConcurrentFreeCalls = 0;
-  const freeRoute = { key: "fallback" };
+  const freeRoute = { key: "terminal" };
   await Promise.all(Array.from({ length: 4 }, () => withRouteCapacity(freeRoute, undefined, async () => {
     concurrentFreeCalls += 1;
     peakConcurrentFreeCalls = Math.max(peakConcurrentFreeCalls, concurrentFreeCalls);
     await delayWithAbort(5);
     concurrentFreeCalls -= 1;
   })));
-  if (peakConcurrentFreeCalls !== FREE_ROUTE_CONCURRENCY || freeCapacity.active !== 0 || freeCapacity.waiters.length !== 0) {
+  if (
+    peakConcurrentFreeCalls !== FREE_ROUTE_CONCURRENCY
+    || terminalCapacity.active !== 0
+    || terminalCapacity.waiters.length !== 0
+  ) {
     throw new Error("free route capacity failed");
   }
   process.stdout.write("devin-subagent-bridge self-test: ok\n");
