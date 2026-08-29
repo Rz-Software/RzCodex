@@ -26,6 +26,9 @@ const MAX_ACTIVE_TASK_CHARS = 40_000;
 const OUTPUT_LIMIT = 2 * 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 30 * 60 * 1000;
 const SSE_HEARTBEAT_MS = 15 * 1000;
+const FREE_ROUTE_CONCURRENCY = 2;
+const RESOURCE_BACKOFF_BASE_MS = 5 * 1000;
+const RESOURCE_BACKOFF_MAX_MS = 2 * 60 * 1000;
 const SCRIPT_DIRECTORY = dirname(fileURLToPath(import.meta.url));
 const CENTRAL_CONFIG = join(homedir(), ".codex", "subagent-models.json");
 const USER_DEVIN_CONFIG = join(process.env.APPDATA || join(homedir(), "AppData", "Roaming"), "devin", "config.json");
@@ -45,6 +48,7 @@ const COMPLEX_SIGNALS = [
   /\b(?:security audit|vulnerability chain)\b/i,
 ];
 const QUOTA_FAILURE = /(?:daily|weekly|included|usage)[\s\S]{0,100}quota[\s\S]{0,100}(?:exhaust|exceed|reach|limit)|quota[\s\S]{0,100}(?:exhaust|exceed|reach|limit)/i;
+const RESOURCE_EXHAUSTED = /cognition\.ai\/errorKind[\s\S]{0,100}resource_exhausted|resource_exhausted[\s\S]{0,100}cognition\.ai\/retryable[\s\S]{0,20}true/i;
 
 class BridgeError extends Error {
   constructor(message, status = 400) {
@@ -188,6 +192,10 @@ let routeState = loadRouteState();
 
 const runtime = {
   incomingRequests: 0, requests: 0, completed: 0, failed: 0, rejected: 0,
+  activeRequests: 0, activeFreeRequests: 0, queuedFreeRequests: 0,
+  resourceRetries: 0, activeResourceBackoffs: 0,
+  lastResourceModel: null, lastResourceRetryAttempt: 0,
+  lastResourceBackoffMs: 0, lastResourceRetryAt: null,
   lastRejectedError: null, lastConfiguredRoute: null, lastActualModel: null,
   lastModelLabel: null, lastQuotaFallback: false, lastCreditCost: null, lastAcuCost: null,
   lastInputTokens: null, lastCachedInputTokens: null, lastOutputTokens: null,
@@ -197,6 +205,79 @@ const runtime = {
   lastTaskIntent: null, lastTaskDeliveryMode: null, lastTaskPartTypes: [],
   lastTaskPartLengths: [], lastCompleteTaskDelivered: false,
 };
+
+const freeCapacity = { active: 0, waiters: [] };
+
+function syncFreeCapacityRuntime() {
+  runtime.activeFreeRequests = freeCapacity.active;
+  runtime.queuedFreeRequests = freeCapacity.waiters.length;
+}
+
+function abortError() {
+  return new BridgeError("Client disconnected while Devin work was active", 499);
+}
+
+function throwIfAborted(signal) {
+  if (signal?.aborted) throw abortError();
+}
+
+function delayWithAbort(milliseconds, signal) {
+  throwIfAborted(signal);
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(finish, milliseconds);
+    const onAbort = () => finish(abortError());
+    function finish(error) {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      error ? reject(error) : resolve();
+    }
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+function acquireFreeCapacity(signal) {
+  throwIfAborted(signal);
+  if (freeCapacity.active < FREE_ROUTE_CONCURRENCY) {
+    freeCapacity.active += 1;
+    syncFreeCapacityRuntime();
+    return Promise.resolve();
+  }
+  return new Promise((resolve, reject) => {
+    const waiter = { resolve, reject, signal, onAbort: null };
+    waiter.onAbort = () => {
+      const index = freeCapacity.waiters.indexOf(waiter);
+      if (index !== -1) freeCapacity.waiters.splice(index, 1);
+      syncFreeCapacityRuntime();
+      reject(abortError());
+    };
+    signal?.addEventListener("abort", waiter.onAbort, { once: true });
+    freeCapacity.waiters.push(waiter);
+    syncFreeCapacityRuntime();
+  });
+}
+
+function releaseFreeCapacity() {
+  freeCapacity.active = Math.max(0, freeCapacity.active - 1);
+  while (freeCapacity.waiters.length > 0) {
+    const waiter = freeCapacity.waiters.shift();
+    waiter.signal?.removeEventListener("abort", waiter.onAbort);
+    if (waiter.signal?.aborted) continue;
+    freeCapacity.active += 1;
+    waiter.resolve();
+    break;
+  }
+  syncFreeCapacityRuntime();
+}
+
+async function withRouteCapacity(selected, signal, callback) {
+  if (selected.key === "primary") return callback();
+  await acquireFreeCapacity(signal);
+  try {
+    return await callback();
+  } finally {
+    releaseFreeCapacity();
+  }
+}
 
 function workingDirectoryFrom(body) {
   const cwd = body.client_metadata?.cwd;
@@ -367,7 +448,7 @@ function removeSession(sessionId) {
   if (result.status !== 0) throw new BridgeError(`Failed to remove ephemeral Devin session ${sessionId}`, 502);
 }
 
-function runCli(context, selectedModel, onSpawn) {
+function runCli(context, selectedModel, onSpawn, timeoutMs = REQUEST_TIMEOUT_MS) {
   const promptPath = join(REQUEST_DIRECTORY, `${context.requestId}.txt`);
   writeFileSync(promptPath, context.prompt, { encoding: "utf8", flag: "wx" });
   const args = [
@@ -395,8 +476,8 @@ function runCli(context, selectedModel, onSpawn) {
     };
     const timer = setTimeout(() => {
       child.kill();
-      finish(new BridgeError(`Devin exceeded ${REQUEST_TIMEOUT_MS}ms`, 504));
-    }, REQUEST_TIMEOUT_MS);
+      finish(new BridgeError(`Devin exceeded ${timeoutMs}ms`, 504));
+    }, timeoutMs);
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (chunk) => { stdout = `${stdout}${chunk}`.slice(-OUTPUT_LIMIT); });
     child.stderr.setEncoding("utf8");
@@ -404,6 +485,42 @@ function runCli(context, selectedModel, onSpawn) {
     child.once("error", (error) => finish(new BridgeError(`Devin failed to start: ${error.message}`, 502)));
     child.once("close", (code) => finish(undefined, { code, stdout: stdout.trim(), stderr: stderr.trim() }));
   });
+}
+
+function resourceBackoffMs(attempt) {
+  return Math.min(RESOURCE_BACKOFF_BASE_MS * (2 ** Math.max(0, attempt - 1)), RESOURCE_BACKOFF_MAX_MS);
+}
+
+async function runCliWithResourceRetries(context, selectedModel, onSpawn, signal, deadline) {
+  let attempt = 0;
+  while (true) {
+    throwIfAborted(signal);
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) throw new BridgeError("Devin resource retry deadline exceeded", 504);
+    const cliResult = await runCli(context, selectedModel, onSpawn, remainingMs);
+    const session = await waitForSession(context.requestId);
+    const combined = `${cliResult.stdout}\n${cliResult.stderr}`;
+    const retryableResourceFailure = (cliResult.code !== 0 || !cliResult.stdout)
+      && RESOURCE_EXHAUSTED.test(combined);
+    if (!retryableResourceFailure) return { cliResult, session };
+    if (session) removeSession(session.id);
+    attempt += 1;
+    const backoffMs = resourceBackoffMs(attempt);
+    if (Date.now() + backoffMs >= deadline) {
+      throw new BridgeError("Devin remained resource exhausted until the request deadline", 504);
+    }
+    runtime.resourceRetries += 1;
+    runtime.lastResourceModel = selectedModel.model_uid;
+    runtime.lastResourceRetryAttempt = attempt;
+    runtime.lastResourceBackoffMs = backoffMs;
+    runtime.lastResourceRetryAt = Date.now() + backoffMs;
+    runtime.activeResourceBackoffs += 1;
+    try {
+      await delayWithAbort(backoffMs, signal);
+    } finally {
+      runtime.activeResourceBackoffs = Math.max(0, runtime.activeResourceBackoffs - 1);
+    }
+  }
 }
 
 function quotaLatch() {
@@ -414,19 +531,23 @@ function quotaLatch() {
   saveRouteState(routeState);
 }
 
-async function execute(context, initialRoute, onSpawn) {
+async function execute(context, initialRoute, onSpawn, signal) {
+  const deadline = Date.now() + REQUEST_TIMEOUT_MS;
   let selected = initialRoute;
-  let cliResult = await runCli(context, selected.model, onSpawn);
-  let session = await waitForSession(context.requestId);
-  const combined = `${cliResult.stdout}\n${cliResult.stderr}`;
+  let routeResult = await withRouteCapacity(selected, signal, () =>
+    runCliWithResourceRetries(context, selected.model, onSpawn, signal, deadline));
+  let { cliResult, session } = routeResult;
+  let combined = `${cliResult.stdout}\n${cliResult.stderr}`;
   let quotaFallback = false;
   if (selected.key === "primary" && (cliResult.code !== 0 || !cliResult.stdout) && QUOTA_FAILURE.test(combined)) {
     if (session) removeSession(session.id);
     quotaLatch();
     selected = { key: "fallback", model: models.fallback, reason: "confirmed_quota_failure" };
     quotaFallback = true;
-    cliResult = await runCli(context, selected.model, onSpawn);
-    session = await waitForSession(context.requestId);
+    routeResult = await withRouteCapacity(selected, signal, () =>
+      runCliWithResourceRetries(context, selected.model, onSpawn, signal, deadline));
+    ({ cliResult, session } = routeResult);
+    combined = `${cliResult.stdout}\n${cliResult.stderr}`;
   }
   if (cliResult.code !== 0 || !cliResult.stdout) {
     if (session) removeSession(session.id);
@@ -507,6 +628,7 @@ async function readJsonRequest(request) {
 async function handleResponses(request, response) {
   const context = promptFrom(await readJsonRequest(request));
   runtime.requests += 1;
+  runtime.activeRequests += 1;
   runtime.lastWorkingDirectory = context.workingDirectory;
   runtime.lastTaskId = context.taskDiagnostics.taskId;
   runtime.lastTaskName = context.taskDiagnostics.taskName;
@@ -519,7 +641,11 @@ async function handleResponses(request, response) {
   const selected = chooseRoute(context);
   runtime.lastConfiguredRoute = selected.key;
   let child = null;
-  const abort = () => { if (child && !child.killed) child.kill(); };
+  const abortController = new AbortController();
+  const abort = () => {
+    abortController.abort();
+    if (child && !child.killed) child.kill();
+  };
   request.once("aborted", abort);
   response.once("close", () => { if (!response.writableEnded) abort(); });
   response.writeHead(200, { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache", connection: "keep-alive" });
@@ -528,7 +654,7 @@ async function handleResponses(request, response) {
   const heartbeat = setInterval(() => writeSseHeartbeat(response, responseId), SSE_HEARTBEAT_MS);
   heartbeat.unref();
   try {
-    const result = await execute(context, selected, (spawned) => { child = spawned; });
+    const result = await execute(context, selected, (spawned) => { child = spawned; }, abortController.signal);
     runtime.completed += 1;
     runtime.lastActualModel = result.selected.model.model_uid;
     runtime.lastModelLabel = result.selected.model.label;
@@ -573,6 +699,7 @@ async function handleResponses(request, response) {
     response.end();
   } finally {
     clearInterval(heartbeat);
+    runtime.activeRequests = Math.max(0, runtime.activeRequests - 1);
   }
 }
 
@@ -614,12 +741,14 @@ function jsonResponse(response, status, value) {
   response.end(body);
 }
 
-function selfTest() {
+async function selfTest() {
   const simple = { taskState: { activeTask: { text: "Create a small fixture." } }, prompt: "" };
   const complex = { taskState: { activeTask: { text: "Debug the root cause of a crash race condition." } }, prompt: "" };
   if (chooseRoute(simple).key !== "primary" && chooseRoute(simple).key !== "fallback") throw new Error("default route failed");
   if (chooseRoute(complex).key !== "complex") throw new Error("complex route failed");
   if (!QUOTA_FAILURE.test("Daily usage quota reached")) throw new Error("quota detection failed");
+  if (!RESOURCE_EXHAUSTED.test('{"cognition.ai/errorKind":"resource_exhausted","cognition.ai/retryable":true}')) throw new Error("resource exhaustion detection failed");
+  if (resourceBackoffMs(1) !== 5_000 || resourceBackoffMs(6) !== 120_000 || resourceBackoffMs(20) !== 120_000) throw new Error("resource backoff schedule failed");
   const task = "Message Type: NEW_TASK\nTask name: /root/self_test\nPayload:\nImplement the bounded fixture now.";
   const checkpoint = "Message Type: MESSAGE\nTask name: /root/self_test\nPayload:\nReturn a checkpoint report immediately.";
   const prompt = promptFrom({
@@ -641,11 +770,23 @@ function selfTest() {
   writeSseHeartbeat({ destroyed: false, writableEnded: false, write: (value) => heartbeatWrites.push(value) }, "resp-self-test");
   const heartbeat = heartbeatWrites.join("");
   if (!heartbeat.includes("event: response.in_progress") || !heartbeat.includes('"id":"resp-self-test"')) throw new Error("SSE heartbeat failed");
+  let concurrentFreeCalls = 0;
+  let peakConcurrentFreeCalls = 0;
+  const freeRoute = { key: "fallback" };
+  await Promise.all(Array.from({ length: 4 }, () => withRouteCapacity(freeRoute, undefined, async () => {
+    concurrentFreeCalls += 1;
+    peakConcurrentFreeCalls = Math.max(peakConcurrentFreeCalls, concurrentFreeCalls);
+    await delayWithAbort(5);
+    concurrentFreeCalls -= 1;
+  })));
+  if (peakConcurrentFreeCalls !== FREE_ROUTE_CONCURRENCY || freeCapacity.active !== 0 || freeCapacity.waiters.length !== 0) {
+    throw new Error("free route capacity failed");
+  }
   process.stdout.write("devin-subagent-bridge self-test: ok\n");
 }
 
 if (process.argv.includes("--self-test")) {
-  selfTest();
+  await selfTest();
   process.exit(0);
 }
 
