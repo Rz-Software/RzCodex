@@ -11,6 +11,8 @@ use crate::compact::InitialContextInjection;
 use crate::compact::build_compaction_initial_context;
 use crate::compact::compaction_status_from_result;
 use crate::compact::insert_initial_context_before_last_real_user_or_summary;
+use crate::compact::latest_active_subagent_task;
+use crate::compact::pin_active_subagent_task;
 use crate::compact_model_fallback::record_model_fallback;
 use crate::compact_model_fallback::should_retry_with_current_model;
 use crate::compact_remote::should_keep_compacted_history_item;
@@ -494,6 +496,7 @@ fn build_v2_compacted_history(
         .zip(prompt_input_metadata)
         .map(|(item, metadata)| ResponseItemEnvelope { item, metadata })
         .collect::<Vec<_>>();
+    let active_subagent_task = latest_active_subagent_task(&prompt_input);
     let retained = v2_history_item_groups(prompt_input)
         .filter(|group| is_retained_for_remote_compaction_v2(&group.source.item))
         .filter(|group| {
@@ -510,7 +513,10 @@ fn build_v2_compacted_history(
         .map(|envelope| retained_input_image_count(&envelope.item))
         .sum::<usize>();
     retained.push(ResponseItemEnvelope::new(compaction_output));
-    (retained, retained_image_count)
+    (
+        pin_active_subagent_task(retained, active_subagent_task),
+        retained_image_count,
+    )
 }
 
 pub(crate) fn is_client_authored_developer_message(item: &ResponseItemEnvelope) -> bool {
@@ -749,6 +755,7 @@ fn truncate_message_text_to_token_budget(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_protocol::ResponseItemId;
     use codex_protocol::models::ContentItem;
     use codex_protocol::models::ContentItemKind;
     use codex_protocol::models::InternalChatMessageMetadataPassthrough;
@@ -765,6 +772,25 @@ mod tests {
                 text: text.to_string(),
             }],
             phase,
+            internal_chat_message_metadata_passthrough: None,
+        }
+    }
+
+    fn new_task(id: &str, payload: &str) -> ResponseItem {
+        ResponseItem::AgentMessage {
+            id: Some(ResponseItemId::with_suffix("amsg", id)),
+            author: "/root".to_string(),
+            recipient: "/root/worker".to_string(),
+            content: vec![
+                AgentMessageInputContent::InputText {
+                    text:
+                        "Message Type: NEW_TASK\nTask name: /root/worker\nSender: /root\nPayload:\n"
+                            .to_string(),
+                },
+                AgentMessageInputContent::EncryptedContent {
+                    encrypted_content: payload.to_string(),
+                },
+            ],
             internal_chat_message_metadata_passthrough: None,
         }
     }
@@ -850,6 +876,35 @@ mod tests {
             raw(history),
             vec![message("user", "user", /*phase*/ None), output]
         );
+    }
+
+    #[test]
+    fn build_v2_compacted_history_pins_latest_new_task_outside_retention_budget() {
+        let old_task = new_task("old", "old payload");
+        let latest_payload = "latest payload ".repeat(4_000);
+        let latest_task = new_task("latest", &latest_payload);
+        let output = ResponseItem::Compaction {
+            id: None,
+            encrypted_content: "new".to_string(),
+            internal_chat_message_metadata_passthrough: None,
+        };
+
+        let (history, _) = build_without_metadata(
+            vec![
+                old_task,
+                message("user", "recent", None),
+                latest_task.clone(),
+            ],
+            output.clone(),
+        );
+        let raw_history = raw(history);
+        let retained_tasks = raw_history
+            .iter()
+            .filter(|item| crate::compact::is_new_task_agent_message(item))
+            .collect::<Vec<_>>();
+
+        assert_eq!(retained_tasks, vec![&latest_task]);
+        assert_eq!(raw_history.last(), Some(&output));
     }
 
     #[test]

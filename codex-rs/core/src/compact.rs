@@ -351,12 +351,16 @@ async fn run_compact_task_inner_impl(
 
     let history_snapshot = sess.clone_history().await;
     let history_items = history_snapshot.annotated_items();
+    let active_subagent_task = latest_active_subagent_task(history_items);
     let summary_suffix =
         get_last_assistant_message_from_turn(history_snapshot.raw_items()).unwrap_or_default();
     let summary_text = format!("{SUMMARY_PREFIX}\n{summary_suffix}");
     let user_messages = collect_annotated_user_messages(history_items);
 
-    let mut new_history = build_compacted_history(Vec::new(), &user_messages, &summary_text);
+    let mut new_history = pin_active_subagent_task(
+        build_compacted_history(Vec::new(), &user_messages, &summary_text),
+        active_subagent_task,
+    );
     if let Some(summary_item) = new_history.last_mut() {
         // This replacement history skips `record_conversation_items`; only the appended summary
         // belongs to this compaction turn.
@@ -571,6 +575,57 @@ fn compacted_user_message(
 
 pub(crate) fn is_summary_message(message: &str) -> bool {
     message.starts_with(format!("{SUMMARY_PREFIX}\n").as_str())
+}
+
+pub(crate) fn is_new_task_agent_message(item: &ResponseItem) -> bool {
+    matches!(
+        item,
+        ResponseItem::AgentMessage { content, .. }
+            if matches!(
+                content.first(),
+                Some(AgentMessageInputContent::InputText { text })
+                    if text.starts_with("Message Type: NEW_TASK\n")
+            )
+    )
+}
+
+pub(crate) fn latest_active_subagent_task(
+    history: &[ResponseItemEnvelope],
+) -> Option<ResponseItemEnvelope> {
+    history
+        .iter()
+        .rev()
+        .find(|envelope| is_new_task_agent_message(&envelope.item))
+        .cloned()
+}
+
+pub(crate) fn pin_active_subagent_task(
+    mut compacted_history: Vec<ResponseItemEnvelope>,
+    active_task: Option<ResponseItemEnvelope>,
+) -> Vec<ResponseItemEnvelope> {
+    let Some(active_task) = active_task else {
+        return compacted_history;
+    };
+
+    compacted_history.retain(|envelope| !is_new_task_agent_message(&envelope.item));
+    let insertion_index = compacted_history
+        .iter()
+        .rposition(|envelope| match &envelope.item {
+            ResponseItem::Compaction { .. } | ResponseItem::ContextCompaction { .. } => true,
+            ResponseItem::Message { role, content, .. } if role == "user" => content
+                .iter()
+                .find_map(|item| match item {
+                    ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+                        Some(is_summary_message(text))
+                    }
+                    ContentItem::InputImage { .. } | ContentItem::InputAudio { .. } => None,
+                })
+                .unwrap_or(false),
+            _ => false,
+        })
+        .unwrap_or(compacted_history.len());
+    compacted_history.insert(insertion_index, active_task);
+    compacted_history
 }
 
 /// Inserts canonical initial context into compacted replacement history at the

@@ -72,6 +72,56 @@ fn compacted_user_message(text: &str) -> CompactedUserMessage {
     }
 }
 
+fn new_task_agent_message(id: &str, payload: &str) -> ResponseItem {
+    ResponseItem::AgentMessage {
+        id: Some(ResponseItemId::with_suffix("amsg", id)),
+        author: "/root".to_string(),
+        recipient: "/root/worker".to_string(),
+        content: vec![
+            AgentMessageInputContent::InputText {
+                text: "Message Type: NEW_TASK\nTask name: /root/worker\nSender: /root\nPayload:\n"
+                    .to_string(),
+            },
+            AgentMessageInputContent::EncryptedContent {
+                encrypted_content: payload.to_string(),
+            },
+        ],
+        internal_chat_message_metadata_passthrough: None,
+    }
+}
+
+#[test]
+fn pin_active_subagent_task_preserves_latest_complete_new_task_exactly_once() {
+    let old_task = new_task_agent_message("old-task", "old payload");
+    let latest_task = new_task_agent_message("latest-task", "complete replacement payload");
+    let latest_envelope = ResponseItemEnvelope {
+        item: latest_task.clone(),
+        metadata: Some(CodexHarnessMetadata {
+            client_authored: true,
+            ..Default::default()
+        }),
+    };
+    let source = vec![
+        ResponseItemEnvelope::new(old_task.clone()),
+        latest_envelope.clone(),
+    ];
+    let active_task = latest_active_subagent_task(&source);
+    let summary = user_message(&format!("{SUMMARY_PREFIX}\nsummary"));
+    let pinned = pin_active_subagent_task(
+        vec![
+            ResponseItemEnvelope::new(old_task),
+            ResponseItemEnvelope::new(latest_task),
+            ResponseItemEnvelope::new(summary.clone()),
+        ],
+        active_task,
+    );
+
+    assert_eq!(
+        pinned,
+        vec![latest_envelope, ResponseItemEnvelope::new(summary)]
+    );
+}
+
 #[test]
 fn content_items_to_text_joins_non_empty_segments() {
     let items = vec![

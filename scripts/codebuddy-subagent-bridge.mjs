@@ -4,13 +4,23 @@ import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join } from "node:path";
+import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import {
   TaskStateError,
   activeTaskPromptSection,
+  applyPatchSucceeded,
   authoritativeProgressReport,
+  changedPathsFromApplyPatch,
   checkpointPromptSection,
   mutationContractPromptSection,
   normalizeAgentMessageContent,
@@ -35,6 +45,9 @@ const WIRE_TEXT_TOOL_NAME = "search_tools";
 const CODEX_HOME = process.env.CODEX_HOME || join(homedir(), ".codex");
 const MODEL_ROUTES_FILE = join(CODEX_HOME, "subagent-models.json");
 const REQUEST_DIRECTORY = join(CODEX_HOME, "codebuddy-bridge", "requests");
+const SESSION_MARKER_DIRECTORY = join(CODEX_HOME, "codebuddy-bridge", "sessions");
+const CODEBUDDY_HOME = join(homedir(), ".codebuddy");
+const MANAGED_SESSION_PREFIX = "rzcodex-";
 const SCRIPT_DIRECTORY = dirname(fileURLToPath(import.meta.url));
 const MCP_SERVER_SCRIPT = join(SCRIPT_DIRECTORY, "codebuddy-codex-tools-mcp.mjs");
 const CODEBUDDY_SCRIPT = join(
@@ -78,6 +91,8 @@ const runtime = {
   lastTaskPartTypes: [],
   lastTaskPartLengths: [],
   lastCompleteTaskDelivered: false,
+  lastActiveTaskIncludedThisTurn: false,
+  lastActiveTaskRetainedInProviderSession: false,
   lastToolCallsSinceTask: 0,
   lastSuccessfulMutationCount: 0,
   lastChangedPaths: [],
@@ -90,6 +105,17 @@ const runtime = {
   lastProviderActivityAt: null,
   lastProviderProgressEvents: 0,
   lastStreamedTextChars: 0,
+  activeRequests: 0,
+  activeProviderSessions: 0,
+  providerSessionsStarted: 0,
+  providerSessionResumes: 0,
+  providerSessionsCleaned: 0,
+  lastProviderSessionHash: null,
+  lastProviderSessionResumed: false,
+  lastInputItemCount: 0,
+  lastDeltaItemCount: 0,
+  lastPromptChars: 0,
+  lastDeltaPromptChars: 0,
 };
 
 function assertObject(value, label) {
@@ -226,6 +252,302 @@ function outputText(value, label) {
   }).join("");
 }
 
+function sha256(value) {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function assertManagedSessionId(sessionId) {
+  if (
+    typeof sessionId !== "string"
+    || !sessionId.startsWith(MANAGED_SESSION_PREFIX)
+    || !/^[a-z0-9-]+$/.test(sessionId)
+  ) {
+    throw new Error(`Refusing unmanaged CodeBuddy session cleanup: ${JSON.stringify(sessionId)}`);
+  }
+}
+
+function removeWithin(root, target) {
+  const resolvedRoot = resolve(root);
+  const resolvedTarget = resolve(target);
+  if (!resolvedTarget.startsWith(`${resolvedRoot}${sep}`)) {
+    throw new Error(`Refusing CodeBuddy cleanup outside ${resolvedRoot}: ${resolvedTarget}`);
+  }
+  if (!existsSync(resolvedTarget)) return false;
+  rmSync(resolvedTarget, { recursive: true, force: true });
+  return true;
+}
+
+function cleanupManagedSessionArtifacts(sessionId) {
+  assertManagedSessionId(sessionId);
+  let removed = false;
+  const projectsRoot = join(CODEBUDDY_HOME, "projects");
+  if (existsSync(projectsRoot)) {
+    for (const entry of readdirSync(projectsRoot, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const projectRoot = join(projectsRoot, entry.name);
+      removed = removeWithin(projectRoot, join(projectRoot, `${sessionId}.jsonl`)) || removed;
+      removed = removeWithin(projectRoot, join(projectRoot, sessionId)) || removed;
+    }
+  }
+  const fileHistoryRoot = join(CODEBUDDY_HOME, "file-history");
+  removed = removeWithin(fileHistoryRoot, join(fileHistoryRoot, sessionId)) || removed;
+  const marker = join(SESSION_MARKER_DIRECTORY, `${sessionId}.json`);
+  removed = removeWithin(SESSION_MARKER_DIRECTORY, marker) || removed;
+  runtime.providerSessionsCleaned += 1;
+  return removed;
+}
+
+function cleanupCodeBuddyProcessArtifacts(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return;
+  for (const [root, name] of [
+    [join(CODEBUDDY_HOME, "sessions"), `${pid}.json`],
+    [join(CODEBUDDY_HOME, "traces"), String(pid)],
+  ]) {
+    try { removeWithin(root, join(root, name)); } catch (error) {
+      process.stderr.write(`CodeBuddy process cleanup failed: ${redactSecrets(error.message)}\n`);
+    }
+  }
+}
+
+function writeManagedSessionMarker(sessionId, threadId) {
+  assertManagedSessionId(sessionId);
+  mkdirSync(SESSION_MARKER_DIRECTORY, { recursive: true });
+  const marker = join(SESSION_MARKER_DIRECTORY, `${sessionId}.json`);
+  if (existsSync(marker)) return;
+  writeFileSync(marker, jsonString({
+    sessionId,
+    threadHash: sha256(threadId),
+    createdAt: new Date().toISOString(),
+  }), { encoding: "utf8", flag: "wx" });
+}
+
+function cleanupOrphanedManagedSessions() {
+  if (!existsSync(SESSION_MARKER_DIRECTORY)) return;
+  for (const entry of readdirSync(SESSION_MARKER_DIRECTORY, { withFileTypes: true })) {
+    if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+    const markerPath = join(SESSION_MARKER_DIRECTORY, entry.name);
+    try {
+      const marker = JSON.parse(readFileSync(markerPath, "utf8"));
+      cleanupManagedSessionArtifacts(marker.sessionId);
+    } catch (error) {
+      process.stderr.write(`CodeBuddy orphan cleanup failed for ${entry.name}: ${redactSecrets(error.message)}\n`);
+    }
+  }
+}
+
+function itemKeys(input) {
+  const occurrences = new Map();
+  return input.map((item) => {
+    let identity;
+    if (item && typeof item === "object" && typeof item.id === "string" && item.id) {
+      identity = `${item.type}:id:${item.id}`;
+    } else if (item && typeof item === "object" && typeof item.call_id === "string" && item.call_id) {
+      identity = `${item.type}:call:${item.call_id}`;
+    } else {
+      identity = `${item?.type ?? "unknown"}:hash:${sha256(jsonString(item))}`;
+    }
+    const occurrence = occurrences.get(identity) ?? 0;
+    occurrences.set(identity, occurrence + 1);
+    return `${identity}:occurrence:${occurrence}`;
+  });
+}
+
+function providerSessionId(threadId) {
+  return `${MANAGED_SESSION_PREFIX}${sha256(threadId).slice(0, 16)}-${randomUUID().slice(0, 8)}`;
+}
+
+function emptyProgress() {
+  return {
+    toolCallsSinceTask: 0,
+    successfulMutationCount: 0,
+    changedPaths: [],
+    lastCompletedTool: null,
+  };
+}
+
+function inputShouldReachResumedProvider(item, message) {
+  if (!item || typeof item !== "object") return false;
+  if (item.type === "agent_message") return !message?.newTask;
+  if (item.type === "message") return item.role === "user";
+  return ["function_call_output", "custom_tool_call_output", "tool_search_output"].includes(item.type);
+}
+
+class ProviderConversationRegistry {
+  #states = new Map();
+
+  prepare(threadId, input, incomingTaskState) {
+    if (typeof threadId !== "string" || threadId.length === 0) {
+      throw new BridgeError("client_metadata.thread_id must be a non-empty string");
+    }
+    let state = this.#states.get(threadId);
+    if (state?.inFlight) {
+      throw new BridgeError(`CodeBuddy thread ${sha256(threadId)} already has an active turn`, 409);
+    }
+    const incomingTask = incomingTaskState.activeTask;
+    if (!state) {
+      if (!incomingTask) {
+        throw new BridgeError(
+          "CodeBuddy received a subagent turn without an active NEW_TASK and has no retained provider session",
+        );
+      }
+      state = {
+        threadId,
+        sessionId: providerSessionId(threadId),
+        providerStarted: false,
+        inFlight: false,
+        activeTask: null,
+        checkpointRequested: false,
+        progress: emptyProgress(),
+        callNames: new Map(),
+        countedCalls: new Set(),
+        countedOutputs: new Set(),
+        seenInputKeys: new Set(),
+      };
+      this.#states.set(threadId, state);
+    }
+
+    const taskChanged = Boolean(
+      incomingTask && incomingTask.hash !== state.activeTask?.hash,
+    );
+    if (!state.activeTask || taskChanged) {
+      if (!incomingTask) {
+        throw new BridgeError("CodeBuddy provider state has no active task to retain", 500);
+      }
+      state.activeTask = {
+        ...incomingTask,
+        partTypes: [...incomingTask.partTypes],
+        partLengths: [...incomingTask.partLengths],
+      };
+      state.checkpointRequested = false;
+      state.progress = emptyProgress();
+      state.callNames.clear();
+      state.countedCalls.clear();
+      state.countedOutputs.clear();
+    }
+
+    const keys = itemKeys(input);
+    const messagesByIndex = new Map(incomingTaskState.messages.map((message) => [message.index, message]));
+    const relevantStart = incomingTask?.hash === state.activeTask.hash
+      ? incomingTask.index + 1
+      : 0;
+
+    for (const message of incomingTaskState.messages) {
+      if (message.index < relevantStart || state.seenInputKeys.has(keys[message.index])) continue;
+      state.checkpointRequested = message.checkpoint;
+    }
+
+    for (let index = relevantStart; index < input.length; index += 1) {
+      const item = input[index];
+      if (!item || typeof item !== "object") continue;
+      if (["function_call", "custom_tool_call", "tool_search_call"].includes(item.type)) {
+        const name = item.type === "tool_search_call" ? TEXT_TOOL_NAME : item.name;
+        if (typeof item.call_id === "string" && typeof name === "string") {
+          state.callNames.set(item.call_id, name);
+          if (!state.countedCalls.has(item.call_id)) {
+            state.countedCalls.add(item.call_id);
+            state.progress.toolCallsSinceTask += 1;
+          }
+        }
+        continue;
+      }
+      if (!["function_call_output", "custom_tool_call_output", "tool_search_output"].includes(item.type)) {
+        continue;
+      }
+      if (typeof item.call_id !== "string" || state.countedOutputs.has(item.call_id)) continue;
+      state.countedOutputs.add(item.call_id);
+      const name = state.callNames.get(item.call_id);
+      if (name) state.progress.lastCompletedTool = name;
+      if (name !== "apply_patch") continue;
+      const output = outputText(item.output, `input[${index}].output`);
+      if (!applyPatchSucceeded(output)) continue;
+      state.progress.successfulMutationCount += 1;
+      state.progress.changedPaths = [...new Set([
+        ...state.progress.changedPaths,
+        ...changedPathsFromApplyPatch(output),
+      ])];
+    }
+
+    const providerSessionStarted = state.providerStarted;
+    const activeTaskIncludedThisTurn = !providerSessionStarted || taskChanged;
+    const unseenIndexes = keys.flatMap((key, index) => (
+      state.seenInputKeys.has(key) ? [] : [index]
+    ));
+    const inputIndexes = providerSessionStarted
+      ? unseenIndexes.filter((index) => inputShouldReachResumedProvider(
+        input[index],
+        messagesByIndex.get(index),
+      ))
+      : input.map((_, index) => index);
+    return {
+      state,
+      threadId,
+      providerSessionId: state.sessionId,
+      providerSessionStarted,
+      activeTaskIncludedThisTurn,
+      retainedInProviderSession: providerSessionStarted && !taskChanged,
+      inputIndexes,
+      inputKeys: keys,
+      inputItemCount: input.length,
+      deltaItemCount: inputIndexes.length,
+      taskState: {
+        activeTask: state.activeTask,
+        checkpointRequested: state.checkpointRequested,
+        messages: incomingTaskState.messages,
+        progress: {
+          ...state.progress,
+          changedPaths: [...state.progress.changedPaths],
+        },
+      },
+    };
+  }
+
+  begin(context) {
+    const { state } = context.conversation;
+    if (state.inFlight) throw new BridgeError("CodeBuddy provider session is already active", 409);
+    state.inFlight = true;
+    writeManagedSessionMarker(state.sessionId, state.threadId);
+    runtime.activeProviderSessions = this.#states.size;
+  }
+
+  commit(context) {
+    const conversation = context.conversation;
+    const { state } = conversation;
+    for (const key of conversation.inputKeys) state.seenInputKeys.add(key);
+    state.providerStarted = true;
+    state.inFlight = false;
+    if (conversation.providerSessionStarted) runtime.providerSessionResumes += 1;
+    else runtime.providerSessionsStarted += 1;
+    runtime.activeProviderSessions = this.#states.size;
+  }
+
+  resetProvider(context) {
+    const { state } = context.conversation;
+    try { cleanupManagedSessionArtifacts(state.sessionId); } catch (error) {
+      process.stderr.write(`CodeBuddy provider reset cleanup failed: ${redactSecrets(error.message)}\n`);
+    }
+    state.sessionId = providerSessionId(state.threadId);
+    state.providerStarted = false;
+    state.inFlight = false;
+    state.seenInputKeys.clear();
+    runtime.activeProviderSessions = this.#states.size;
+  }
+
+  release(context) {
+    const { state } = context.conversation;
+    try { cleanupManagedSessionArtifacts(state.sessionId); } catch (error) {
+      process.stderr.write(`CodeBuddy terminal session cleanup failed: ${redactSecrets(error.message)}\n`);
+    }
+    this.#states.delete(state.threadId);
+    runtime.activeProviderSessions = this.#states.size;
+  }
+
+  get size() {
+    return this.#states.size;
+  }
+}
+
+const providerConversations = new ProviderConversationRegistry();
+
 function roleInstructionsFrom(value) {
   if (typeof value !== "string") return "";
   const matches = [...value.matchAll(
@@ -357,7 +679,7 @@ function validateManagedToolSurface(toolInfo, inputModalities) {
   }
 }
 
-function promptFrom(body) {
+function promptFrom(body, registry = providerConversations) {
   assertObject(body, "request body");
   if (body.stream !== true) throw new BridgeError("The CodeBuddy bridge requires stream=true");
   const route = resolveRoute(requireString(body.model, "model"));
@@ -367,21 +689,30 @@ function promptFrom(body) {
   }
   const input = typeof body.input === "string" ? [{ type: "message", role: "user", content: body.input }] : body.input;
   if (!Array.isArray(input)) throw new BridgeError("input must be a string or array");
-  let taskState;
+  let incomingTaskState;
   try {
-    taskState = taskStateFromInput(input, MAX_ACTIVE_TASK_CHARS);
+    incomingTaskState = taskStateFromInput(input, MAX_ACTIVE_TASK_CHARS);
   } catch (error) {
     if (error instanceof TaskStateError) throw new BridgeError(error.message);
     throw error;
   }
+  const threadId = requireString(body.client_metadata?.thread_id, "client_metadata.thread_id");
+  const conversation = registry.prepare(threadId, input, incomingTaskState);
+  const taskState = conversation.taskState;
   const toolInfo = codexToolsFrom(body, route.inputModalities);
   validateManagedToolSurface(toolInfo, route.inputModalities);
   const sections = [
-    "[Native delegation contract]\nWork as the delegated CodeBuddy sub-agent in the current workspace. Complete only the bounded task and return concise evidence to the parent. The MCP server named codex exposes the client-executed tools compatible with this managed model route. CodeBuddy serves those schemas lazily: use ToolSearch with the exact mcp__codex__ tool name before invoking it through DeferExecuteTool. When its proxy reports DEFERRED_TO_CODEX_CLIENT, immediately end the turn without retrying, fabricating a result, or calling another tool; the parent will execute it and resume you with the real result.",
+    conversation.providerSessionStarted
+      ? "[Native delegation continuation]\nContinue the same delegated task in this retained CodeBuddy conversation. The full active task remains authoritative in the provider session; do not ask the parent to resend it. New Codex client results and control messages follow below. Use ToolSearch with the exact mcp__codex__ tool name before DeferExecuteTool. When its proxy reports DEFERRED_TO_CODEX_CLIENT, end this turn immediately; the parent will execute that call and resume this same conversation with the real result."
+      : "[Native delegation contract]\nWork as the delegated CodeBuddy sub-agent in the current workspace. Complete only the bounded task and return concise evidence to the parent. The MCP server named codex exposes the client-executed tools compatible with this managed model route. CodeBuddy serves those schemas lazily: use ToolSearch with the exact mcp__codex__ tool name before invoking it through DeferExecuteTool. When its proxy reports DEFERRED_TO_CODEX_CLIENT, immediately end the turn without retrying, fabricating a result, or calling another tool; the parent will execute it and resume you with the real result.",
   ];
   const roleInstructions = roleInstructionsFrom(body.instructions);
-  if (roleInstructions) sections.push(`[Role instructions]\n${roleInstructions}`);
-  const activeTaskSection = activeTaskPromptSection(taskState);
+  if (roleInstructions && !conversation.providerSessionStarted) {
+    sections.push(`[Role instructions]\n${roleInstructions}`);
+  }
+  const activeTaskSection = conversation.activeTaskIncludedThisTurn
+    ? activeTaskPromptSection(taskState)
+    : "";
   if (activeTaskSection) sections.push(activeTaskSection);
   const progressSection = progressPromptSection(taskState);
   if (progressSection) sections.push(progressSection);
@@ -404,7 +735,7 @@ function promptFrom(body) {
   const pushHistory = (text, images = []) => {
     if (text || images.length > 0) history.push({ text, images });
   };
-  for (let index = 0; index < input.length; index += 1) {
+  for (const index of conversation.inputIndexes) {
     const item = assertObject(input[index], `input[${index}]`);
     const label = `input[${index}]`;
     if (item.type === "message") {
@@ -479,9 +810,21 @@ function promptFrom(body) {
   }
   sections.push(...retained);
   const prompt = sections.join("\n\n");
+  if (
+    conversation.providerSessionStarted
+    && !conversation.activeTaskIncludedThisTurn
+    && conversation.inputIndexes.length === 0
+  ) {
+    throw new BridgeError(
+      `CodeBuddy resumed task ${taskState.activeTask.id} without a new client result or control message`,
+    );
+  }
   let taskDiagnostics;
   try {
-    taskDiagnostics = taskDeliveryDiagnostics(taskState, prompt);
+    taskDiagnostics = taskDeliveryDiagnostics(taskState, prompt, {
+      activeTaskIncludedThisTurn: conversation.activeTaskIncludedThisTurn,
+      retainedInProviderSession: conversation.retainedInProviderSession,
+    });
   } catch (error) {
     if (error instanceof TaskStateError) throw new BridgeError(error.message);
     throw error;
@@ -501,6 +844,10 @@ function promptFrom(body) {
     toolInfo,
     taskState,
     taskDiagnostics,
+    conversation,
+    threadId,
+    providerSessionId: conversation.providerSessionId,
+    providerSessionStarted: conversation.providerSessionStarted,
   };
 }
 
@@ -539,6 +886,13 @@ function validateInit(context, initEvent) {
   if (!initEvent) throw new BridgeError("CodeBuddy completed without an init event", 502);
   if (initEvent.model !== context.model) throw new BridgeError(`CodeBuddy initialized unexpected model ${JSON.stringify(initEvent.model)}`, 502);
   if (initEvent.apiKeySource !== REQUIRED_AUTH_SOURCE) throw new BridgeError(`CodeBuddy used unexpected auth source ${JSON.stringify(initEvent.apiKeySource)}`, 502);
+  const initializedSessionId = initEvent.session_id ?? initEvent.sessionId;
+  if (initializedSessionId !== context.providerSessionId) {
+    throw new BridgeError(
+      `CodeBuddy initialized unexpected session ${JSON.stringify(initializedSessionId)}`,
+      502,
+    );
+  }
 }
 
 function validateResult(context, initEvent, resultEvent) {
@@ -575,12 +929,15 @@ function providerToolCallKey(call) {
 function codeBuddyArguments(context, mcpConfig) {
   const tools = ["ToolSearch", "DeferExecuteTool"];
   if (context.toolInfo.hosted.has("web_search")) tools.push("WebSearch");
+  const sessionArguments = context.providerSessionStarted
+    ? ["--resume", context.providerSessionId]
+    : ["--session-id", context.providerSessionId];
   return [
     CODEBUDDY_SCRIPT,
     "--print", "--input-format", "stream-json", "--output-format", "stream-json", "--include-partial-messages",
     "--dangerously-skip-permissions", "--tools", tools.join(","),
     "--model", context.model, "--effort", REQUIRED_EFFORT,
-    "--mcp-config", mcpConfig, "--strict-mcp-config", "--no-session-persistence",
+    "--mcp-config", mcpConfig, "--strict-mcp-config", ...sessionArguments,
   ];
 }
 
@@ -684,6 +1041,7 @@ function runCodeBuddy(context, onSpawn, onProviderEvent = () => {}) {
     });
     child.once("error", (error) => finish(new BridgeError(`CodeBuddy failed to start: ${error.message}`, 502)));
     child.once("close", (code, signal) => {
+      cleanupCodeBuddyProcessArtifacts(child.pid);
       parseLine(stdoutBuffer);
       if (code !== 0) {
         const detail = stderr.trim() ? `: ${redactSecrets(stderr.trim())}` : "";
@@ -808,6 +1166,8 @@ function managedModelsResponse() {
 
 async function handleResponses(request, response) {
   const context = promptFrom(await readJsonRequest(request));
+  providerConversations.begin(context);
+  runtime.activeRequests += 1;
   runtime.requests += 1;
   runtime.lastWorkingDirectory = context.workingDirectory;
   runtime.lastCodexToolCount = context.toolInfo.definitions.length;
@@ -822,6 +1182,8 @@ async function handleResponses(request, response) {
   runtime.lastTaskPartTypes = context.taskDiagnostics.taskPartTypes;
   runtime.lastTaskPartLengths = context.taskDiagnostics.taskPartLengths;
   runtime.lastCompleteTaskDelivered = context.taskDiagnostics.completeTaskDelivered;
+  runtime.lastActiveTaskIncludedThisTurn = context.taskDiagnostics.activeTaskIncludedThisTurn;
+  runtime.lastActiveTaskRetainedInProviderSession = context.taskDiagnostics.retainedInProviderSession;
   runtime.lastToolCallsSinceTask = context.taskState.progress.toolCallsSinceTask;
   runtime.lastSuccessfulMutationCount = context.taskState.progress.successfulMutationCount;
   runtime.lastChangedPaths = context.taskState.progress.changedPaths;
@@ -834,8 +1196,15 @@ async function handleResponses(request, response) {
   runtime.lastProviderActivityAt = null;
   runtime.lastProviderProgressEvents = 0;
   runtime.lastStreamedTextChars = 0;
+  runtime.lastProviderSessionHash = sha256(context.providerSessionId);
+  runtime.lastProviderSessionResumed = context.providerSessionStarted;
+  runtime.lastInputItemCount = context.conversation.inputItemCount;
+  runtime.lastDeltaItemCount = context.conversation.deltaItemCount;
+  runtime.lastPromptChars = context.prompt.length;
+  runtime.lastDeltaPromptChars = context.providerSessionStarted ? context.prompt.length : 0;
   let child = null;
   let clientGone = false;
+  let conversationReleased = false;
   const abort = () => { clientGone = true; if (child && !child.killed) child.kill(); };
   request.once("aborted", abort);
   response.once("close", () => { if (!response.writableEnded) abort(); });
@@ -844,12 +1213,8 @@ async function handleResponses(request, response) {
   });
   const responseId = `resp_${randomUUID()}`;
   writeSse(response, "response.created", { response: { id: responseId, object: "response", model: context.model, status: "in_progress" } });
-  const deferredMarker = "DEFERRED_TO_CODEX_CLIENT";
   let streamedMessageId = null;
   let streamedText = "";
-  let pendingText = "";
-  let rawVisibleText = "";
-  let deferredTextObserved = false;
   let lastProgressAt = 0;
   const emitText = (text) => {
     if (!text || clientGone) return;
@@ -875,25 +1240,6 @@ async function handleResponses(request, response) {
       delta: text,
     });
   };
-  const acceptVisibleText = (text) => {
-    if (!text || deferredTextObserved) return;
-    rawVisibleText += text;
-    pendingText += text;
-    const markerIndex = pendingText.indexOf(deferredMarker);
-    if (markerIndex >= 0) {
-      emitText(pendingText.slice(0, markerIndex));
-      pendingText = "";
-      deferredTextObserved = true;
-      return;
-    }
-    const safeLength = Math.max(0, pendingText.length - deferredMarker.length + 1);
-    emitText(pendingText.slice(0, safeLength));
-    pendingText = pendingText.slice(safeLength);
-  };
-  const flushVisibleText = () => {
-    if (!deferredTextObserved) emitText(pendingText);
-    pendingText = "";
-  };
   const onProviderEvent = (event) => {
     if (event?.type !== "stream_event" || !event.event) return;
     const providerEvent = event.event;
@@ -902,7 +1248,6 @@ async function handleResponses(request, response) {
       const visibleText = providerVisibleTextDelta(event);
       if (visibleText !== null) {
         activity = "writing";
-        acceptVisibleText(visibleText);
       } else if (providerEvent.delta?.type === "thinking_delta") {
         activity = "reasoning";
       } else if (providerEvent.delta?.type === "input_json_delta") {
@@ -928,10 +1273,8 @@ async function handleResponses(request, response) {
   try {
     const result = await runCodeBuddy(context, (spawned) => { child = spawned; }, onProviderEvent);
     if (clientGone) return;
-    flushVisibleText();
-    if (!deferredTextObserved && rawVisibleText && result.finalText && rawVisibleText !== result.finalText) {
-      throw new BridgeError("CodeBuddy streamed visible text that did not match its final assistant output", 502);
-    }
+    providerConversations.commit(context);
+    if (result.calls.length === 0 && result.finalText) emitText(result.finalText);
     runtime.completed += 1;
     runtime.lastModel = result.initEvent.model;
     runtime.lastAuthSource = result.initEvent.apiKeySource;
@@ -941,7 +1284,7 @@ async function handleResponses(request, response) {
     runtime.lastDurationApiMs = result.resultEvent.duration_api_ms ?? null;
     runtime.lastMaxTurnInputTokens = result.maxTurnInputTokens;
     runtime.maxObservedTurnInputTokens = Math.max(runtime.maxObservedTurnInputTokens, result.maxTurnInputTokens);
-    const providerFinalText = result.finalText || (result.calls.length > 0 ? streamedText : "");
+    const providerFinalText = result.finalText;
     let noMutationReason;
     try {
       noMutationReason = validateNoMutationCompletion(
@@ -1011,6 +1354,8 @@ async function handleResponses(request, response) {
           active_task_part_types: context.taskDiagnostics.taskPartTypes,
           active_task_part_lengths: context.taskDiagnostics.taskPartLengths,
           complete_active_task_delivered: context.taskDiagnostics.completeTaskDelivered,
+          active_task_included_this_turn: context.taskDiagnostics.activeTaskIncludedThisTurn,
+          active_task_retained_in_provider_session: context.taskDiagnostics.retainedInProviderSession,
           tool_calls_since_active_task: context.taskState.progress.toolCallsSinceTask,
           successful_apply_patch_mutations: context.taskState.progress.successfulMutationCount,
           changed_paths: context.taskState.progress.changedPaths,
@@ -1019,18 +1364,33 @@ async function handleResponses(request, response) {
           no_mutation_reason_category: noMutationReason?.category ?? null,
           no_mutation_reason_detail_hash: noMutationReason?.detailHash ?? null,
           no_mutation_reason_detail_length: noMutationReason?.detailLength ?? null,
+          provider_session_resumed: context.providerSessionStarted,
+          provider_session_hash: sha256(context.providerSessionId),
+          normalized_input_items: context.conversation.inputItemCount,
+          forwarded_delta_items: context.conversation.deltaItemCount,
+          normalized_prompt_chars: context.prompt.length,
         },
       },
     });
     response.end();
+    if (result.calls.length === 0 && !context.taskState.checkpointRequested) {
+      providerConversations.release(context);
+      conversationReleased = true;
+    }
   } catch (error) {
     if (clientGone) return;
+    providerConversations.resetProvider(context);
     runtime.failed += 1;
     writeSse(response, "response.failed", {
       response: { id: responseId, object: "response", status: "failed", error: { type: "bridge_error", message: redactSecrets(error.message) } },
     });
     response.end();
   } finally {
+    if (clientGone && !conversationReleased) {
+      providerConversations.release(context);
+      conversationReleased = true;
+    }
+    runtime.activeRequests = Math.max(0, runtime.activeRequests - 1);
     request.removeListener("aborted", abort);
   }
 }
@@ -1070,15 +1430,20 @@ function selfTest() {
     { type: "function", name: "view_image", description: "Inspect an image", parameters: { type: "object", properties: {} } },
     { type: "namespace", name: "mcp__rzmcp", tools: [{ type: "function", name: "search_project_index", parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } }] },
   ];
-  const normalizeSelfTestRequest = (input) => promptFrom({
+  const selfTestRegistry = new ProviderConversationRegistry();
+  let selfTestThread = 0;
+  const normalizeSelfTestRequest = (input, options = {}) => promptFrom({
     model: MODEL_ALIAS,
     stream: true,
     reasoning: { effort: "max" },
-    client_metadata: { cwd: process.cwd() },
+    client_metadata: {
+      cwd: process.cwd(),
+      thread_id: options.threadId ?? `self-test-thread-${selfTestThread += 1}`,
+    },
     instructions: "<external_cli_route_instructions>bounded role</external_cli_route_instructions>",
     tools: selfTestTools,
     input,
-  });
+  }, options.registry ?? selfTestRegistry);
   const readOnlyTask = normalizeSelfTestRequest([{
     type: "agent_message",
     id: "self-test-read-only",
@@ -1108,6 +1473,16 @@ function selfTest() {
     );
   }
   const context = normalizeSelfTestRequest([
+      {
+        type: "agent_message",
+        id: "self-test-context-task",
+        author: "/root",
+        recipient: "/root/test",
+        content: [{
+          type: "input_text",
+          text: "Message Type: NEW_TASK\nTask name: /root/test\nPayload:\nInspect one file.",
+        }],
+      },
       { type: "compaction", encrypted_content: "opaque" },
       { type: "agent_message", author: "/root", recipient: "/root/test", content: [{ type: "input_text", text: "inspect one file" }] },
       { type: "tool_search_call", call_id: "search-1", arguments: { query: "project index" } },
@@ -1161,6 +1536,86 @@ function selfTest() {
     || plaintextTask.prompt.split(plaintextPayload).length - 1 !== 1
   ) {
     throw new Error("self-test failed: plaintext V2 task delivery regressed");
+  }
+  const resumeRegistry = new ProviderConversationRegistry();
+  const resumeThread = "self-test-resume-thread";
+  const resumeFirst = normalizeSelfTestRequest(
+    [plaintextTaskItem],
+    { registry: resumeRegistry, threadId: resumeThread },
+  );
+  const firstSessionArgs = codeBuddyArguments(resumeFirst, "mcp-config.json");
+  if (
+    !firstSessionArgs.includes("--session-id")
+    || firstSessionArgs.includes("--resume")
+    || firstSessionArgs.includes("--no-session-persistence")
+  ) {
+    throw new Error("self-test failed: first provider turn must create a persistent managed session");
+  }
+  resumeRegistry.commit(resumeFirst);
+  const firstToolResultText = "Exit code: 0\nOutput:\ncontinuation proof";
+  const resumed = normalizeSelfTestRequest([
+    plaintextTaskItem,
+    { type: "function_call", name: "exec_command", call_id: "resume-read", arguments: "{}" },
+    { type: "function_call_output", call_id: "resume-read", output: firstToolResultText },
+  ], { registry: resumeRegistry, threadId: resumeThread });
+  const resumedSessionArgs = codeBuddyArguments(resumed, "mcp-config.json");
+  if (
+    !resumed.providerSessionStarted
+    || !resumedSessionArgs.includes("--resume")
+    || resumedSessionArgs.includes("--session-id")
+    || resumed.providerSessionId !== resumeFirst.providerSessionId
+    || resumed.prompt.includes(plaintextTaskText)
+    || !resumed.prompt.includes(firstToolResultText)
+    || resumed.taskDiagnostics.completeTaskOccurrences !== 0
+    || !resumed.taskDiagnostics.retainedInProviderSession
+    || resumed.conversation.deltaItemCount !== 1
+  ) {
+    throw new Error("self-test failed: resumed provider turn did not preserve session with delta-only input");
+  }
+  resumeRegistry.commit(resumed);
+  const postCompactionResult = "Exit code: 0\nOutput:\npost-compaction proof";
+  const postCompaction = normalizeSelfTestRequest([
+    { type: "compaction", encrypted_content: "provider-opaque" },
+    { type: "function_call", name: "exec_command", call_id: "post-compact-read", arguments: "{}" },
+    { type: "function_call_output", call_id: "post-compact-read", output: postCompactionResult },
+  ], { registry: resumeRegistry, threadId: resumeThread });
+  if (
+    postCompaction.taskState.activeTask.hash !== plaintextTask.taskState.activeTask.hash
+    || !postCompaction.taskDiagnostics.completeTaskDelivered
+    || !postCompaction.taskDiagnostics.retainedInProviderSession
+    || postCompaction.prompt.includes(plaintextTaskText)
+    || !postCompaction.prompt.includes(postCompactionResult)
+    || postCompaction.taskState.progress.toolCallsSinceTask !== 2
+  ) {
+    throw new Error("self-test failed: compaction removed retained task or cumulative progress");
+  }
+  resumeRegistry.commit(postCompaction);
+  const replacementResumePayload = "replace the active retained task";
+  const replacementResumeText = `${taskHeader}${replacementResumePayload}`;
+  const replacementResume = normalizeSelfTestRequest([{
+    id: "amsg-resume-replacement",
+    type: "agent_message",
+    author: "/root",
+    recipient: "/root/test",
+    content: [{ type: "input_text", text: replacementResumeText }],
+  }], { registry: resumeRegistry, threadId: resumeThread });
+  if (
+    replacementResume.providerSessionId !== resumeFirst.providerSessionId
+    || replacementResume.prompt.split(replacementResumeText).length - 1 !== 1
+    || replacementResume.prompt.includes(plaintextTaskText)
+    || replacementResume.taskState.progress.toolCallsSinceTask !== 0
+    || !replacementResume.taskDiagnostics.activeTaskIncludedThisTurn
+  ) {
+    throw new Error("self-test failed: followup task did not replace retained provider task atomically");
+  }
+  try {
+    normalizeSelfTestRequest(
+      [{ type: "message", role: "user", content: "orphan continuation" }],
+      { registry: new ProviderConversationRegistry(), threadId: "self-test-orphan" },
+    );
+    throw new Error("self-test failed: orphan continuation must fail loudly");
+  } catch (error) {
+    if (!String(error.message).includes("without an active NEW_TASK")) throw error;
   }
   const inheritedHistory = "h".repeat(MAX_PROMPT_CHARS + 10_000);
   const longFork = normalizeSelfTestRequest([
@@ -1294,6 +1749,38 @@ function selfTest() {
   ) {
     throw new Error("self-test failed: resumed mutation progress is not cumulative and authoritative");
   }
+  const mutationRegistry = new ProviderConversationRegistry();
+  const mutationThread = "self-test-mutation-resume";
+  const mutationFirstTurn = normalizeSelfTestRequest(
+    [mutationTaskItem],
+    { registry: mutationRegistry, threadId: mutationThread },
+  );
+  mutationRegistry.commit(mutationFirstTurn);
+  const mutationAfterFirstPatch = normalizeSelfTestRequest(firstPatchHistory, {
+    registry: mutationRegistry,
+    threadId: mutationThread,
+  });
+  if (mutationAfterFirstPatch.taskState.progress.successfulMutationCount !== 1) {
+    throw new Error("self-test failed: retained provider session lost its first patch");
+  }
+  mutationRegistry.commit(mutationAfterFirstPatch);
+  const mutationAfterCompaction = normalizeSelfTestRequest([
+    { type: "context_compaction", encrypted_content: "opaque" },
+    { type: "custom_tool_call", name: "apply_patch", call_id: "patch-two", input: "patch two" },
+    {
+      type: "custom_tool_call_output",
+      call_id: "patch-two",
+      output: "Exit code: 0\nOutput:\nSuccess. Updated the following files:\nM C:/fixture/proof.txt\n",
+    },
+  ], { registry: mutationRegistry, threadId: mutationThread });
+  if (
+    mutationAfterCompaction.taskState.progress.successfulMutationCount !== 2
+    || mutationAfterCompaction.taskState.progress.changedPaths.join(",") !== "C:/fixture/proof.txt"
+    || mutationAfterCompaction.prompt.includes(mutationTaskText)
+    || !mutationAfterCompaction.taskDiagnostics.retainedInProviderSession
+  ) {
+    throw new Error("self-test failed: compaction lost cumulative apply_patch evidence");
+  }
   const sanitizedDiagnostics = JSON.stringify(encryptedTask.taskDiagnostics);
   if (
     sanitizedDiagnostics.includes(encryptedPayload)
@@ -1413,7 +1900,11 @@ function selfTest() {
   if (!duplicatePatch || !patch || providerToolCallKey(duplicatePatch) !== providerToolCallKey(patch)) {
     throw new Error("self-test failed: duplicate Codex tool calls must share a semantic key");
   }
-  validateResult(context, { model: context.model, apiKeySource: REQUIRED_AUTH_SOURCE }, {
+  validateResult(context, {
+    model: context.model,
+    apiKeySource: REQUIRED_AUTH_SOURCE,
+    session_id: context.providerSessionId,
+  }, {
     subtype: "success", is_error: false, total_cost_usd: 0, modelUsage: { [context.model]: {} },
   });
   process.stdout.write("codebuddy-subagent-bridge self-test: ok\n");
@@ -1421,6 +1912,7 @@ function selfTest() {
 
 function start() {
   const port = configuredPort();
+  cleanupOrphanedManagedSessions();
   const server = createServer(async (request, response) => {
     try {
       if (request.method === "GET" && request.url === "/health") {
@@ -1430,7 +1922,8 @@ function start() {
           inputModalities: resolveRoute(MODEL_ALIAS).inputModalities,
           authSourceRequired: REQUIRED_AUTH_SOURCE, fallbackModel: null,
           explicitCostRequiredUsd: 0, codexManagedLazyTools: true,
-          promptTransport: "stream-json-stdin", incrementalVisibleOutput: true,
+          promptTransport: "stream-json-resume-delta", transientProviderSessions: true,
+          incrementalVisibleOutput: false,
           providerProgressHeartbeatMaxHz: 1, runtime,
         });
         return;

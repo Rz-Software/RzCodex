@@ -128,13 +128,13 @@ function outputText(value) {
   }).join("");
 }
 
-function applyPatchSucceeded(output) {
+export function applyPatchSucceeded(output) {
   const exitCodeKnown = /(?:^|\n)Exit code:\s*0\s*(?:\n|$)/.test(output);
   return /(?:^|\n)Success\. Updated the following files:\s*(?:\n|$)/.test(output)
     && (exitCodeKnown || !/(?:^|\n)Exit code:/m.test(output));
 }
 
-function changedPathsFromApplyPatch(output) {
+export function changedPathsFromApplyPatch(output) {
   const paths = [];
   for (const line of output.split(/\r?\n/)) {
     const match = /^\s*[AMD]\s+(.+?)\s*$/.exec(line);
@@ -240,7 +240,11 @@ function occurrences(haystack, needle) {
   return count;
 }
 
-export function taskDeliveryDiagnostics(taskState, normalizedPrompt) {
+export function taskDeliveryDiagnostics(
+  taskState,
+  normalizedPrompt,
+  { activeTaskIncludedThisTurn = true, retainedInProviderSession = false } = {},
+) {
   const task = taskState.activeTask;
   if (!task) {
     return {
@@ -253,12 +257,20 @@ export function taskDeliveryDiagnostics(taskState, normalizedPrompt) {
       taskPartLengths: [],
       completeTaskOccurrences: 0,
       completeTaskDelivered: false,
+      activeTaskIncludedThisTurn: false,
+      retainedInProviderSession: false,
     };
   }
   const completeTaskOccurrences = occurrences(normalizedPrompt, task.text);
-  if (completeTaskOccurrences !== 1) {
+  const expectedOccurrences = activeTaskIncludedThisTurn ? 1 : 0;
+  if (completeTaskOccurrences !== expectedOccurrences) {
     throw new TaskStateError(
-      `active task ${task.id} normalized occurrence count is ${completeTaskOccurrences}; expected exactly 1`,
+      `active task ${task.id} normalized occurrence count is ${completeTaskOccurrences}; expected exactly ${expectedOccurrences}`,
+    );
+  }
+  if (!activeTaskIncludedThisTurn && !retainedInProviderSession) {
+    throw new TaskStateError(
+      `active task ${task.id} was neither included this turn nor retained in the provider session`,
     );
   }
   return {
@@ -270,7 +282,9 @@ export function taskDeliveryDiagnostics(taskState, normalizedPrompt) {
     taskPartTypes: task.partTypes,
     taskPartLengths: task.partLengths,
     completeTaskOccurrences,
-    completeTaskDelivered: true,
+    completeTaskDelivered: activeTaskIncludedThisTurn || retainedInProviderSession,
+    activeTaskIncludedThisTurn,
+    retainedInProviderSession,
   };
 }
 
