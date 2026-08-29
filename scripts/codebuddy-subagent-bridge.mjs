@@ -7,6 +7,18 @@ import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+  TaskStateError,
+  activeTaskPromptSection,
+  authoritativeProgressReport,
+  checkpointPromptSection,
+  mutationContractPromptSection,
+  normalizeAgentMessageContent,
+  progressPromptSection,
+  taskDeliveryDiagnostics,
+  taskStateFromInput,
+  validateNoMutationCompletion,
+} from "./codebuddy-subagent-task-state.mjs";
 
 const PROVIDER_ID = "codebuddy";
 const MODEL_ALIAS = "@preset/codex-subagents";
@@ -15,6 +27,7 @@ const REQUIRED_EFFORT = "max";
 const DEFAULT_PORT = 54547;
 const MAX_REQUEST_BYTES = 32 * 1024 * 1024;
 const MAX_PROMPT_CHARS = 120_000;
+const MAX_ACTIVE_TASK_CHARS = 40_000;
 const STDERR_LIMIT = 16 * 1024;
 const REQUEST_TIMEOUT_MS = 30 * 60 * 1000;
 const TEXT_TOOL_NAME = "tool_search";
@@ -57,6 +70,22 @@ const runtime = {
   maxObservedCodexToolCount: 0,
   maxObservedCodexToolSchemaBytes: 0,
   lastWorkingDirectory: null,
+  lastTaskId: null,
+  lastTaskName: null,
+  lastTaskHash: null,
+  lastTaskIntent: null,
+  lastTaskDeliveryMode: null,
+  lastTaskPartTypes: [],
+  lastTaskPartLengths: [],
+  lastCompleteTaskDelivered: false,
+  lastToolCallsSinceTask: 0,
+  lastSuccessfulMutationCount: 0,
+  lastChangedPaths: [],
+  lastCompletedTool: null,
+  lastCheckpointRequested: false,
+  lastNoMutationReasonCategory: null,
+  lastNoMutationReasonDetailHash: null,
+  lastNoMutationReasonDetailLength: null,
 };
 
 function assertObject(value, label) {
@@ -213,7 +242,7 @@ function toolLookupKey(namespace, name) {
   return `${namespace ?? ""}\u0000${name}`;
 }
 
-function codexToolsFrom(body) {
+function codexToolsFrom(body, inputModalities) {
   if (body.tools !== undefined && !Array.isArray(body.tools)) throw new BridgeError("tools must be an array");
   const definitions = [];
   const byWire = new Map();
@@ -221,6 +250,11 @@ function codexToolsFrom(body) {
   const hosted = new Set();
   const add = (namespace, tool, label, toolSearch = false) => {
     const originalName = toolSearch ? TEXT_TOOL_NAME : requireString(tool.name, `${label}.name`);
+    if (
+      namespace === null
+      && originalName === "view_image"
+      && !inputModalities.includes("image")
+    ) return;
     const wireName = toolSearch ? WIRE_TEXT_TOOL_NAME : safeWireName(namespace, originalName);
     const existing = byWire.get(wireName);
     if (existing) {
@@ -308,10 +342,12 @@ function validateManagedToolSurface(toolInfo, inputModalities) {
       500,
     );
   }
-  const hasViewImage = toolInfo.byOriginal.has(toolLookupKey(null, "view_image"));
-  if (hasViewImage !== inputModalities.includes("image")) {
+  if (
+    inputModalities.includes("image")
+    && !toolInfo.byOriginal.has(toolLookupKey(null, "view_image"))
+  ) {
     throw new BridgeError(
-      `RzCodex image capability disagrees with the managed route: ${inputModalities.join(", ")}`,
+      "RzCodex managed preset omitted required native capability: view_image",
       500,
     );
   }
@@ -327,13 +363,28 @@ function promptFrom(body) {
   }
   const input = typeof body.input === "string" ? [{ type: "message", role: "user", content: body.input }] : body.input;
   if (!Array.isArray(input)) throw new BridgeError("input must be a string or array");
-  const toolInfo = codexToolsFrom(body);
+  let taskState;
+  try {
+    taskState = taskStateFromInput(input, MAX_ACTIVE_TASK_CHARS);
+  } catch (error) {
+    if (error instanceof TaskStateError) throw new BridgeError(error.message);
+    throw error;
+  }
+  const toolInfo = codexToolsFrom(body, route.inputModalities);
   validateManagedToolSurface(toolInfo, route.inputModalities);
   const sections = [
-    "[Native delegation contract]\nWork as the delegated CodeBuddy sub-agent in the current workspace. Complete only the bounded task and return concise evidence to the parent. The MCP server named codex exposes exactly the client-executed tools Codex made available for this turn. CodeBuddy serves those schemas lazily: use ToolSearch with the exact mcp__codex__ tool name before invoking it through DeferExecuteTool. When its proxy reports DEFERRED_TO_CODEX_CLIENT, immediately end the turn without retrying, fabricating a result, or calling another tool; the parent will execute it and resume you with the real result.",
+    "[Native delegation contract]\nWork as the delegated CodeBuddy sub-agent in the current workspace. Complete only the bounded task and return concise evidence to the parent. The MCP server named codex exposes the client-executed tools compatible with this managed model route. CodeBuddy serves those schemas lazily: use ToolSearch with the exact mcp__codex__ tool name before invoking it through DeferExecuteTool. When its proxy reports DEFERRED_TO_CODEX_CLIENT, immediately end the turn without retrying, fabricating a result, or calling another tool; the parent will execute it and resume you with the real result.",
   ];
   const roleInstructions = roleInstructionsFrom(body.instructions);
   if (roleInstructions) sections.push(`[Role instructions]\n${roleInstructions}`);
+  const activeTaskSection = activeTaskPromptSection(taskState);
+  if (activeTaskSection) sections.push(activeTaskSection);
+  const progressSection = progressPromptSection(taskState);
+  if (progressSection) sections.push(progressSection);
+  const mutationContractSection = mutationContractPromptSection(taskState);
+  if (mutationContractSection) sections.push(mutationContractSection);
+  const checkpointSection = checkpointPromptSection(taskState);
+  if (checkpointSection) sections.push(checkpointSection);
   if (toolInfo.definitions.length > 0) {
     const providerNames = toolInfo.definitions.map((tool) => `mcp__codex__${tool.name}`);
     sections.push(
@@ -345,6 +396,7 @@ function promptFrom(body) {
     sections.push("[Provider-native tools mapped this turn]\nweb_search -> CodeBuddy WebSearch");
   }
   const history = [];
+  const agentMessages = new Map(taskState.messages.map((message) => [message.index, message]));
   const pushHistory = (text, images = []) => {
     if (text || images.length > 0) history.push({ text, images });
   };
@@ -360,10 +412,15 @@ function promptFrom(body) {
         pushHistory(`[${role}]\n${text || "[Image input]"}`, images);
       }
     } else if (item.type === "agent_message") {
-      const author = typeof item.author === "string" ? item.author : "Codex";
-      const recipient = typeof item.recipient === "string" ? item.recipient : "CodeBuddy worker";
-      const text = contentText(item.content, `${label}.content`);
-      if (text) pushHistory(`[Delegated task ${author} -> ${recipient}]\n${text}`);
+      const message = agentMessages.get(index) ?? {
+        ...normalizeAgentMessageContent(item.content, `${label}.content`),
+        author: typeof item.author === "string" ? item.author : "Codex",
+        recipient: typeof item.recipient === "string" ? item.recipient : "CodeBuddy worker",
+        newTask: false,
+        checkpoint: false,
+      };
+      if (message.newTask && !message.checkpoint) continue;
+      pushHistory(`[Inter-agent message ${message.author} -> ${message.recipient}]\n${message.text}`);
     } else if (item.type === "reasoning") {
       const summary = Array.isArray(item.summary)
         ? item.summary.filter((part) => part?.type === "summary_text" && typeof part.text === "string")
@@ -417,6 +474,14 @@ function promptFrom(body) {
     retainedChars += section.text.length;
   }
   sections.push(...retained);
+  const prompt = sections.join("\n\n");
+  let taskDiagnostics;
+  try {
+    taskDiagnostics = taskDeliveryDiagnostics(taskState, prompt);
+  } catch (error) {
+    if (error instanceof TaskStateError) throw new BridgeError(error.message);
+    throw error;
+  }
   const workingDirectory = workingDirectoryFrom(body);
   if (!isAbsolute(workingDirectory) || !existsSync(workingDirectory)) {
     throw new BridgeError(`CodeBuddy working directory does not exist: ${JSON.stringify(workingDirectory)}`);
@@ -424,7 +489,15 @@ function promptFrom(body) {
   if (images.length > 0 && !route.inputModalities.includes("image")) {
     throw new BridgeError("The managed CodeBuddy route does not support image input", 500);
   }
-  return { model: route.model, prompt: sections.join("\n\n"), images, workingDirectory, toolInfo };
+  return {
+    model: route.model,
+    prompt,
+    images,
+    workingDirectory,
+    toolInfo,
+    taskState,
+    taskDiagnostics,
+  };
 }
 
 function requestArtifacts(context) {
@@ -714,6 +787,22 @@ async function handleResponses(request, response) {
   runtime.lastCodexToolSchemaBytes = Buffer.byteLength(jsonString(context.toolInfo.definitions));
   runtime.maxObservedCodexToolCount = Math.max(runtime.maxObservedCodexToolCount, runtime.lastCodexToolCount);
   runtime.maxObservedCodexToolSchemaBytes = Math.max(runtime.maxObservedCodexToolSchemaBytes, runtime.lastCodexToolSchemaBytes);
+  runtime.lastTaskId = context.taskDiagnostics.taskId;
+  runtime.lastTaskName = context.taskDiagnostics.taskName;
+  runtime.lastTaskHash = context.taskDiagnostics.taskHash;
+  runtime.lastTaskIntent = context.taskDiagnostics.taskIntent;
+  runtime.lastTaskDeliveryMode = context.taskDiagnostics.taskDeliveryMode;
+  runtime.lastTaskPartTypes = context.taskDiagnostics.taskPartTypes;
+  runtime.lastTaskPartLengths = context.taskDiagnostics.taskPartLengths;
+  runtime.lastCompleteTaskDelivered = context.taskDiagnostics.completeTaskDelivered;
+  runtime.lastToolCallsSinceTask = context.taskState.progress.toolCallsSinceTask;
+  runtime.lastSuccessfulMutationCount = context.taskState.progress.successfulMutationCount;
+  runtime.lastChangedPaths = context.taskState.progress.changedPaths;
+  runtime.lastCompletedTool = context.taskState.progress.lastCompletedTool;
+  runtime.lastCheckpointRequested = context.taskState.checkpointRequested;
+  runtime.lastNoMutationReasonCategory = null;
+  runtime.lastNoMutationReasonDetailHash = null;
+  runtime.lastNoMutationReasonDetailLength = null;
   let child = null;
   let clientGone = false;
   const abort = () => { clientGone = true; if (child && !child.killed) child.kill(); };
@@ -736,16 +825,36 @@ async function handleResponses(request, response) {
     runtime.lastDurationApiMs = result.resultEvent.duration_api_ms ?? null;
     runtime.lastMaxTurnInputTokens = result.maxTurnInputTokens;
     runtime.maxObservedTurnInputTokens = Math.max(runtime.maxObservedTurnInputTokens, result.maxTurnInputTokens);
+    let noMutationReason;
+    try {
+      noMutationReason = validateNoMutationCompletion(
+        context.taskState,
+        result.finalText,
+        result.calls,
+      );
+    } catch (error) {
+      if (error instanceof TaskStateError) throw new BridgeError(error.message, 502);
+      throw error;
+    }
+    if (noMutationReason) {
+      runtime.lastNoMutationReasonCategory = noMutationReason.category;
+      runtime.lastNoMutationReasonDetailHash = noMutationReason.detailHash;
+      runtime.lastNoMutationReasonDetailLength = noMutationReason.detailLength;
+    }
+    const progressReport = authoritativeProgressReport(context.taskState, noMutationReason);
+    const finalText = result.finalText && progressReport
+      ? `${result.finalText}\n\n${progressReport}`
+      : result.finalText;
     const output = [];
     let outputIndex = 0;
-    if (result.finalText) {
+    if (finalText) {
       const itemId = `msg_${randomUUID()}`;
       writeSse(response, "response.output_item.added", { output_index: outputIndex, item: responseMessageItem(itemId, "") });
       writeSse(response, "response.content_part.added", { item_id: itemId, output_index: outputIndex, content_index: 0, part: { type: "output_text", text: "", annotations: [] } });
-      writeSse(response, "response.output_text.delta", { item_id: itemId, output_index: outputIndex, content_index: 0, delta: result.finalText });
-      writeSse(response, "response.output_text.done", { item_id: itemId, output_index: outputIndex, content_index: 0, text: result.finalText });
-      writeSse(response, "response.content_part.done", { item_id: itemId, output_index: outputIndex, content_index: 0, part: { type: "output_text", text: result.finalText, annotations: [] } });
-      const item = responseMessageItem(itemId, result.finalText, "completed");
+      writeSse(response, "response.output_text.delta", { item_id: itemId, output_index: outputIndex, content_index: 0, delta: finalText });
+      writeSse(response, "response.output_text.done", { item_id: itemId, output_index: outputIndex, content_index: 0, text: finalText });
+      writeSse(response, "response.content_part.done", { item_id: itemId, output_index: outputIndex, content_index: 0, part: { type: "output_text", text: finalText, annotations: [] } });
+      const item = responseMessageItem(itemId, finalText, "completed");
       writeSse(response, "response.output_item.done", { output_index: outputIndex, item });
       output.push(item);
       outputIndex += 1;
@@ -767,6 +876,22 @@ async function handleResponses(request, response) {
           codex_client_tool_count: context.toolInfo.definitions.length,
           codex_client_tool_schema_bytes: Buffer.byteLength(jsonString(context.toolInfo.definitions)),
           codebuddy_max_turn_input_tokens: result.maxTurnInputTokens,
+          active_task_id: context.taskDiagnostics.taskId,
+          active_task_name: context.taskDiagnostics.taskName,
+          active_task_hash: context.taskDiagnostics.taskHash,
+          active_task_intent: context.taskDiagnostics.taskIntent,
+          active_task_delivery_mode: context.taskDiagnostics.taskDeliveryMode,
+          active_task_part_types: context.taskDiagnostics.taskPartTypes,
+          active_task_part_lengths: context.taskDiagnostics.taskPartLengths,
+          complete_active_task_delivered: context.taskDiagnostics.completeTaskDelivered,
+          tool_calls_since_active_task: context.taskState.progress.toolCallsSinceTask,
+          successful_apply_patch_mutations: context.taskState.progress.successfulMutationCount,
+          changed_paths: context.taskState.progress.changedPaths,
+          last_completed_tool: context.taskState.progress.lastCompletedTool,
+          checkpoint_requested: context.taskState.checkpointRequested,
+          no_mutation_reason_category: noMutationReason?.category ?? null,
+          no_mutation_reason_detail_hash: noMutationReason?.detailHash ?? null,
+          no_mutation_reason_detail_length: noMutationReason?.detailLength ?? null,
         },
       },
     });
@@ -795,21 +920,25 @@ function selfTest() {
   ) {
     throw new Error("self-test failed: managed model catalog disagrees with the route");
   }
-  const context = promptFrom({
+  const selfTestTools = [
+    { type: "web_search" },
+    { type: "tool_search", execution: "client", description: "Find tools", parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } },
+    { type: "custom", name: "apply_patch", description: "Apply a patch" },
+    { type: "function", name: "exec_command", description: "Run a command", parameters: { type: "object", properties: {} } },
+    { type: "function", name: "write_stdin", description: "Continue a command", parameters: { type: "object", properties: {} } },
+    { type: "function", name: "view_image", description: "Inspect an image", parameters: { type: "object", properties: {} } },
+    { type: "namespace", name: "mcp__rzmcp", tools: [{ type: "function", name: "search_project_index", parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } }] },
+  ];
+  const normalizeSelfTestRequest = (input) => promptFrom({
     model: MODEL_ALIAS,
     stream: true,
     reasoning: { effort: "max" },
     client_metadata: { cwd: process.cwd() },
     instructions: "<external_cli_route_instructions>bounded role</external_cli_route_instructions>",
-    tools: [
-      { type: "web_search" },
-      { type: "tool_search", execution: "client", description: "Find tools", parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } },
-      { type: "custom", name: "apply_patch", description: "Apply a patch" },
-      { type: "function", name: "exec_command", description: "Run a command", parameters: { type: "object", properties: {} } },
-      { type: "function", name: "write_stdin", description: "Continue a command", parameters: { type: "object", properties: {} } },
-      { type: "namespace", name: "mcp__rzmcp", tools: [{ type: "function", name: "search_project_index", parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } }] },
-    ],
-    input: [
+    tools: selfTestTools,
+    input,
+  });
+  const context = normalizeSelfTestRequest([
       { type: "compaction", encrypted_content: "opaque" },
       { type: "agent_message", author: "/root", recipient: "/root/test", content: [{ type: "input_text", text: "inspect one file" }] },
       { type: "tool_search_call", call_id: "search-1", arguments: { query: "project index" } },
@@ -822,14 +951,207 @@ function selfTest() {
           tools: [{ type: "function", name: "scan_project_index", parameters: { type: "object", properties: {} } }],
         }],
       },
-    ],
-  });
+    ]);
   if (context.model !== route.model || !context.prompt.includes("inspect one file") || context.prompt.includes("opaque")) {
     throw new Error("self-test failed: request normalization");
+  }
+  const taskHeader = "Message Type: NEW_TASK\nTask name: /root/test\nSender: /root\nPayload:\n";
+  const encryptedPayload = "implement encrypted delivery fixture";
+  const encryptedTask = normalizeSelfTestRequest([{
+    id: "amsg-encrypted",
+    type: "agent_message",
+    author: "/root",
+    recipient: "/root/test",
+    content: [
+      { type: "input_text", text: taskHeader },
+      { type: "encrypted_content", encrypted_content: encryptedPayload },
+    ],
+  }]);
+  if (
+    encryptedTask.taskDiagnostics.taskId !== "amsg-encrypted"
+    || encryptedTask.taskDiagnostics.taskDeliveryMode !== "encrypted_v2"
+    || encryptedTask.taskDiagnostics.completeTaskOccurrences !== 1
+    || encryptedTask.taskDiagnostics.taskPartTypes.join(",") !== "input_text,encrypted_content"
+    || encryptedTask.prompt.split(encryptedPayload).length - 1 !== 1
+  ) {
+    throw new Error("self-test failed: encrypted V2 task must be delivered completely exactly once");
+  }
+  const plaintextPayload = "inspect plaintext delivery fixture";
+  const plaintextTaskText = `${taskHeader}${plaintextPayload}`;
+  const plaintextTaskItem = {
+    id: "amsg-plaintext",
+    type: "agent_message",
+    author: "/root",
+    recipient: "/root/test",
+    content: [{ type: "input_text", text: plaintextTaskText }],
+  };
+  const plaintextTask = normalizeSelfTestRequest([plaintextTaskItem]);
+  if (
+    plaintextTask.taskDiagnostics.taskId !== "amsg-plaintext"
+    || plaintextTask.taskDiagnostics.taskDeliveryMode !== "plaintext_v2"
+    || plaintextTask.prompt.split(plaintextPayload).length - 1 !== 1
+  ) {
+    throw new Error("self-test failed: plaintext V2 task delivery regressed");
+  }
+  const inheritedHistory = "h".repeat(MAX_PROMPT_CHARS + 10_000);
+  const longFork = normalizeSelfTestRequest([
+    plaintextTaskItem,
+    { type: "message", role: "user", content: inheritedHistory },
+  ]);
+  if (
+    !longFork.taskDiagnostics.completeTaskDelivered
+    || longFork.prompt.split(plaintextTaskText).length - 1 !== 1
+  ) {
+    throw new Error("self-test failed: long inherited history removed the active task");
+  }
+  const afterLargeToolOutput = normalizeSelfTestRequest([
+    plaintextTaskItem,
+    { type: "function_call", name: "exec_command", call_id: "large-read", arguments: "{}" },
+    { type: "function_call_output", call_id: "large-read", output: "r".repeat(MAX_PROMPT_CHARS + 10_000) },
+  ]);
+  if (
+    !afterLargeToolOutput.taskDiagnostics.completeTaskDelivered
+    || afterLargeToolOutput.prompt.split(plaintextTaskText).length - 1 !== 1
+  ) {
+    throw new Error("self-test failed: large tool output removed the resumed active task");
+  }
+  const replacementPayload = "fix replacement task fixture";
+  const replacementTaskText = `${taskHeader}${replacementPayload}`;
+  const replacement = normalizeSelfTestRequest([
+    plaintextTaskItem,
+    { type: "function_call", name: "exec_command", call_id: "old-read", arguments: "{}" },
+    { type: "function_call_output", call_id: "old-read", output: inheritedHistory },
+    {
+      id: "amsg-replacement",
+      type: "agent_message",
+      author: "/root",
+      recipient: "/root/test",
+      content: [{ type: "input_text", text: replacementTaskText }],
+    },
+  ]);
+  if (
+    replacement.taskDiagnostics.taskId !== "amsg-replacement"
+    || replacement.prompt.split(replacementTaskText).length - 1 !== 1
+    || replacement.prompt.includes(plaintextTaskText)
+  ) {
+    throw new Error("self-test failed: follow-up task did not atomically replace the active task");
+  }
+  try {
+    normalizeSelfTestRequest([{
+      type: "agent_message",
+      author: "/root",
+      recipient: "/root/test",
+      content: [
+        { type: "input_text", text: taskHeader },
+        { type: "unsupported_task_content", value: "lost" },
+      ],
+    }]);
+    throw new Error("self-test failed: unsupported inter-agent task content must fail loudly");
+  } catch (error) {
+    if (!String(error.message).includes("unsupported inter-agent content type")) throw error;
+  }
+  try {
+    normalizeSelfTestRequest([{
+      type: "agent_message",
+      author: "/root",
+      recipient: "/root/test",
+      content: [],
+    }]);
+    throw new Error("self-test failed: missing inter-agent task content must fail loudly");
+  } catch (error) {
+    if (!String(error.message).includes("must be a non-empty string or content array")) throw error;
+  }
+  const mutationTaskText = `${taskHeader}Implement the two-step apply_patch fixture.`;
+  const mutationTaskItem = {
+    id: "amsg-mutation",
+    type: "agent_message",
+    author: "/root",
+    recipient: "/root/test",
+    content: [{ type: "input_text", text: mutationTaskText }],
+  };
+  const checkpointMessage = {
+    type: "agent_message",
+    author: "/root",
+    recipient: "/root/test",
+    content: [{
+      type: "input_text",
+      text: "Message Type: MESSAGE\nTask name: /root/test\nSender: /root\nPayload:\nReturn a checkpoint/report immediately with current progress.",
+    }],
+  };
+  const firstPatchHistory = [
+    mutationTaskItem,
+    { type: "function_call", name: "exec_command", call_id: "inspect", arguments: "{}" },
+    { type: "function_call_output", call_id: "inspect", output: "Exit code: 0\nOutput:\nbefore" },
+    { type: "custom_tool_call", name: "apply_patch", call_id: "patch-one", input: "patch one" },
+    {
+      type: "custom_tool_call_output",
+      call_id: "patch-one",
+      output: "Exit code: 0\nWall time: 0 seconds\nOutput:\nSuccess. Updated the following files:\nA C:/fixture/proof.txt\n",
+    },
+    checkpointMessage,
+  ];
+  const firstPatch = normalizeSelfTestRequest(firstPatchHistory);
+  if (
+    firstPatch.taskState.progress.successfulMutationCount !== 1
+    || firstPatch.taskState.progress.changedPaths.join(",") !== "C:/fixture/proof.txt"
+    || !firstPatch.taskState.checkpointRequested
+    || !firstPatch.prompt.includes("Do not start another tool call")
+    || !authoritativeProgressReport(firstPatch.taskState, null).includes("Successful apply_patch mutations: 1")
+  ) {
+    throw new Error("self-test failed: checkpoint lost authoritative first-patch progress");
+  }
+  const resumedMutation = normalizeSelfTestRequest([
+    ...firstPatchHistory,
+    {
+      type: "agent_message",
+      author: "/root",
+      recipient: "/root/test",
+      content: [{ type: "input_text", text: "Message Type: MESSAGE\nTask name: /root/test\nSender: /root\nPayload:\nProceed with the second patch." }],
+    },
+    { type: "custom_tool_call", name: "apply_patch", call_id: "patch-two", input: "patch two" },
+    {
+      type: "custom_tool_call_output",
+      call_id: "patch-two",
+      output: "Exit code: 0\nOutput:\nSuccess. Updated the following files:\nM C:/fixture/proof.txt\n",
+    },
+    { type: "function_call", name: "exec_command", call_id: "verify", arguments: "{}" },
+    { type: "function_call_output", call_id: "verify", output: "Exit code: 0\nOutput:\nafter" },
+  ]);
+  if (
+    resumedMutation.taskState.progress.successfulMutationCount !== 2
+    || resumedMutation.taskState.progress.changedPaths.join(",") !== "C:/fixture/proof.txt"
+    || resumedMutation.taskState.progress.lastCompletedTool !== "exec_command"
+    || resumedMutation.taskState.checkpointRequested
+  ) {
+    throw new Error("self-test failed: resumed mutation progress is not cumulative and authoritative");
+  }
+  const sanitizedDiagnostics = JSON.stringify(encryptedTask.taskDiagnostics);
+  if (
+    sanitizedDiagnostics.includes(encryptedPayload)
+    || !sanitizedDiagnostics.includes(encryptedTask.taskDiagnostics.taskHash)
+    || !sanitizedDiagnostics.includes("encrypted_content")
+  ) {
+    throw new Error("self-test failed: task diagnostics are missing hashes/types or persisted raw content");
+  }
+  const zeroMutation = normalizeSelfTestRequest([mutationTaskItem]);
+  try {
+    validateNoMutationCompletion(zeroMutation.taskState, "I stopped without editing.", []);
+    throw new Error("self-test failed: zero-mutation completion requires a structured reason");
+  } catch (error) {
+    if (!String(error.message).includes("no structured no_mutation_reason")) throw error;
+  }
+  const recordedReason = validateNoMutationCompletion(
+    zeroMutation.taskState,
+    "Blocked.\nNO_MUTATION_REASON: {\"category\":\"missing_input\",\"detail\":\"parent must choose the target\",\"resolvable_tool\":null}",
+    [],
+  );
+  if (!recordedReason || recordedReason.category !== "missing_input" || "detail" in recordedReason) {
+    throw new Error("self-test failed: no-mutation diagnostics must be structured and sanitized");
   }
   if (
     context.toolInfo.definitions.length !== 6 ||
     !context.toolInfo.byWire.has("apply_patch") ||
+    context.toolInfo.byWire.has("view_image") ||
     !context.toolInfo.byWire.has("mcp__rzmcp__search_project_index") ||
     !context.toolInfo.byWire.has("mcp__rzmcp__scan_project_index")
   ) {

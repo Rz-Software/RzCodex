@@ -37,6 +37,7 @@ use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::ShellEnvironmentPolicy;
 use codex_protocol::items::TurnItem;
 use codex_protocol::mcp::ClientMcpExtensions;
+use codex_protocol::models::AgentMessageInputContent;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::BaseInstructionsProvenance;
 use codex_protocol::models::ContentItem;
@@ -1002,19 +1003,36 @@ async fn multi_agent_v2_spawn_returns_path_and_send_message_accepts_relative_pat
         child_snapshot.session_source.get_agent_path().as_deref(),
         Some("/root/test_process")
     );
-    assert!(manager.captured_ops().iter().any(|(id, op)| {
-        *id == child_thread_id
-            && matches!(
-                op,
-                Op::InterAgentCommunication { communication, .. }
-                    if communication.author == AgentPath::root()
-                        && communication.recipient.as_str() == "/root/test_process"
-                        && communication.other_recipients.is_empty()
-                        && communication.content.is_empty()
-                        && communication.encrypted_content.as_deref() == Some("encrypted-spawn-message")
-                        && communication.trigger_turn
-            )
-    }));
+    let spawn_communication = manager
+        .captured_ops()
+        .into_iter()
+        .find_map(|(id, op)| match op {
+            Op::InterAgentCommunication { communication, .. }
+                if id == child_thread_id && communication.trigger_turn =>
+            {
+                Some(communication)
+            }
+            _ => None,
+        })
+        .expect("spawn task communication should be recorded");
+    assert_eq!(
+        spawn_communication.to_model_input_item(),
+        ResponseItem::AgentMessage {
+            id: None,
+            author: "/root".to_string(),
+            recipient: "/root/test_process".to_string(),
+            content: vec![
+                AgentMessageInputContent::InputText {
+                    text: "Message Type: NEW_TASK\nTask name: /root/test_process\nSender: /root\nPayload:\n"
+                        .to_string(),
+                },
+                AgentMessageInputContent::EncryptedContent {
+                    encrypted_content: "encrypted-spawn-message".to_string(),
+                },
+            ],
+            internal_chat_message_metadata_passthrough: None,
+        }
+    );
 
     SendMessageHandlerV2
         .handle(invocation(
