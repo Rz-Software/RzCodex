@@ -486,9 +486,10 @@ function writeSse(response, type, payload) {
   response.write(`event: ${type}\ndata: ${json({ type, ...payload })}\n\n`);
 }
 
-function writeSseHeartbeat(response) {
-  if (response.destroyed || response.writableEnded) return;
-  response.write(": rzcodex-keepalive\n\n");
+function writeSseHeartbeat(response, responseId) {
+  writeSse(response, "response.in_progress", {
+    response: { id: responseId, object: "response", model: MODEL_ALIAS, status: "in_progress" },
+  });
 }
 
 async function readJsonRequest(request) {
@@ -524,7 +525,7 @@ async function handleResponses(request, response) {
   response.writeHead(200, { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache", connection: "keep-alive" });
   const responseId = `resp_${randomUUID()}`;
   writeSse(response, "response.created", { response: { id: responseId, object: "response", model: MODEL_ALIAS, status: "in_progress" } });
-  const heartbeat = setInterval(() => writeSseHeartbeat(response), SSE_HEARTBEAT_MS);
+  const heartbeat = setInterval(() => writeSseHeartbeat(response, responseId), SSE_HEARTBEAT_MS);
   heartbeat.unref();
   try {
     const result = await execute(context, selected, (spawned) => { child = spawned; });
@@ -637,8 +638,9 @@ function selfTest() {
   if (!(staleIndex >= 0 && staleIndex < taskIndex && taskIndex < checkpointIndex)) throw new Error("active task precedence failed");
   if (prompt.indexOf(task, taskIndex + task.length) !== -1) throw new Error("active task duplication failed");
   const heartbeatWrites = [];
-  writeSseHeartbeat({ destroyed: false, writableEnded: false, write: (value) => heartbeatWrites.push(value) });
-  if (heartbeatWrites.join("") !== ": rzcodex-keepalive\n\n") throw new Error("SSE heartbeat failed");
+  writeSseHeartbeat({ destroyed: false, writableEnded: false, write: (value) => heartbeatWrites.push(value) }, "resp-self-test");
+  const heartbeat = heartbeatWrites.join("");
+  if (!heartbeat.includes("event: response.in_progress") || !heartbeat.includes('"id":"resp-self-test"')) throw new Error("SSE heartbeat failed");
   process.stdout.write("devin-subagent-bridge self-test: ok\n");
 }
 
