@@ -2564,6 +2564,9 @@ impl App {
             AppEvent::OpenAgentPicker => {
                 self.open_agent_picker(app_server).await;
             }
+            AppEvent::SetSubagentRoute { route_id } => {
+                self.chat_widget.activate_subagent_route(&route_id);
+            }
             AppEvent::AgentPickerThreadsLoaded {
                 primary_thread_id,
                 request_id,

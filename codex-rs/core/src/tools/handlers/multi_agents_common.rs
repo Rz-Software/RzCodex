@@ -8,6 +8,7 @@ use crate::session::turn_context::TurnContext;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
+use codex_config::resolve_active_subagent_route;
 use codex_models_manager::manager::RefreshStrategy;
 use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
@@ -387,6 +388,74 @@ pub(crate) async fn apply_spawn_agent_role(
         &model_info.supported_reasoning_levels,
         &reasoning_effort,
     )
+}
+
+/// Applies the centrally selected child-only route after all role/default layers.
+///
+/// The route state file is deliberately opt-in. When it is absent, stock Codex spawn behavior is
+/// unchanged. Once enabled, per-spawn model overrides are rejected so every new native child uses
+/// the same auditable route. Resumed children bypass this path and retain their stored runtime.
+pub(crate) async fn apply_managed_subagent_route(
+    session: &Session,
+    config: &mut Config,
+    requested_model: Option<&str>,
+    requested_reasoning_effort: Option<ReasoningEffort>,
+) -> Result<(), FunctionCallError> {
+    let resolved = resolve_active_subagent_route(config.codex_home.as_ref()).map_err(|err| {
+        FunctionCallError::RespondToModel(format!(
+            "managed subagent route configuration is invalid: {err:#}"
+        ))
+    })?;
+    let Some(resolved) = resolved else {
+        return Ok(());
+    };
+    if requested_model.is_some() || requested_reasoning_effort.is_some() {
+        return Err(FunctionCallError::RespondToModel(format!(
+            "Subagent route `{}` is centrally managed; omit per-spawn model and reasoning_effort overrides or switch routes with `codex subagents use <route>`.",
+            resolved.id
+        )));
+    }
+
+    let provider = config
+        .model_providers
+        .get(&resolved.route.model_provider)
+        .cloned()
+        .ok_or_else(|| {
+            FunctionCallError::RespondToModel(format!(
+                "Subagent route `{}` references missing model provider `{}`.",
+                resolved.id, resolved.route.model_provider
+            ))
+        })?;
+    config
+        .model_provider_id
+        .clone_from(&resolved.route.model_provider);
+    config.model_provider = provider;
+    config.model = Some(resolved.route.model.clone());
+    config.model_reasoning_effort = Some(resolved.route.reasoning_effort.clone());
+    config
+        .model_input_modalities
+        .clone_from(&resolved.route.input_modalities);
+
+    let model_info = session
+        .services
+        .models_manager
+        .get_model_info(&resolved.route.model, &config.to_models_manager_config())
+        .await;
+    if !model_info.used_fallback_model_metadata {
+        validate_spawn_agent_reasoning_effort(
+            &resolved.route.model,
+            &model_info.supported_reasoning_levels,
+            &resolved.route.reasoning_effort,
+        )?;
+    }
+    tracing::info!(
+        route_id = %resolved.id,
+        model_provider = %resolved.route.model_provider,
+        model = %resolved.route.model,
+        reasoning_effort = %resolved.route.reasoning_effort,
+        "applied managed subagent route"
+    );
+    Ok(())
 }
 
 fn find_spawn_agent_model_name(

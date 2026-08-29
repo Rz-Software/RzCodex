@@ -141,6 +141,13 @@ async fn handle_spawn_agent(
                 .clone_from(&turn.developer_instructions);
         }
     }
+    apply_managed_subagent_route(
+        &session,
+        &mut config,
+        args.model.as_deref(),
+        args.reasoning_effort.clone(),
+    )
+    .await?;
     apply_spawn_agent_service_tier(&session, &mut config).await?;
     apply_spawn_agent_runtime_overrides(&mut config, turn.as_ref())?;
 

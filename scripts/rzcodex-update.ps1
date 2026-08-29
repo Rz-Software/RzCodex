@@ -279,6 +279,10 @@ try {
     Invoke-NativeCommand -FilePath "just" -ArgumentList @("fmt-check") -WorkingDirectory $CodexRustRoot
     if ($RunTests) {
         Invoke-NativeCommand -FilePath "just" -ArgumentList @("test", "-p", "codex-core", "agent::role::tests") -WorkingDirectory $CodexRustRoot
+        Invoke-NativeCommand -FilePath "just" -ArgumentList @("test", "-p", "codex-config", "subagent_routes") -WorkingDirectory $CodexRustRoot
+        Invoke-NativeCommand -FilePath "just" -ArgumentList @("test", "-p", "codex-core", "managed_subagent_route_overrides_role_model_provider_and_reasoning") -WorkingDirectory $CodexRustRoot
+        Invoke-NativeCommand -FilePath "just" -ArgumentList @("test", "-p", "codex-cli", "subagents_cmd::tests::parses_route_selection") -WorkingDirectory $CodexRustRoot
+        Invoke-NativeCommand -FilePath "just" -ArgumentList @("test", "-p", "codex-tui", "route_picker_description_snapshot") -WorkingDirectory $CodexRustRoot
         Invoke-NativeCommand -FilePath "just" -ArgumentList @("test", "-p", "codex-core", "collaboration_calls_without_encrypted_arguments_use_plaintext_messages") -WorkingDirectory $CodexRustRoot
         Invoke-NativeCommand -FilePath "just" -ArgumentList @("test", "-p", "codex-models-manager", "managed_preset_uses_lazy_tool_discovery_with_direct_tools") -WorkingDirectory $CodexRustRoot
         Invoke-NativeCommand -FilePath "just" -ArgumentList @("test", "-p", "codex-tui", "chatwidget::tests::exec_flow::exec_history_extends_previous_when_consecutive") -WorkingDirectory $CodexRustRoot

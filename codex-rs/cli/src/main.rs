@@ -59,6 +59,7 @@ mod remote_control_cmd;
 #[cfg(target_os = "windows")]
 mod sandbox_setup;
 mod state_db_recovery;
+mod subagents_cmd;
 #[cfg(not(windows))]
 mod wsl_paths;
 
@@ -67,6 +68,7 @@ use crate::plugin_cmd::PluginCli;
 use crate::plugin_cmd::PluginSubcommand;
 use crate::queue_cmd::QueueCommand;
 use crate::remote_control_cmd::RemoteControlCommand;
+use crate::subagents_cmd::SubagentsCommand;
 use doctor::DoctorCommand;
 use state_db_recovery as local_state_db;
 
@@ -132,6 +134,9 @@ struct MultitoolCli {
 enum Subcommand {
     /// Browse all agent sessions on the shared local app-server daemon.
     Agents(AgentsCommand),
+
+    /// Inspect or switch the centrally managed native-subagent route.
+    Subagents(SubagentsCommand),
 
     /// Run Codex non-interactively.
     #[clap(visible_alias = "e")]
@@ -1177,6 +1182,14 @@ async fn cli_main(
                 root_config_overrides.clone(),
             );
             codex_exec::run_main(exec_cli, arg0_paths.clone()).await?;
+        }
+        Some(Subcommand::Subagents(command)) => {
+            reject_remote_mode_for_subcommand(
+                root_remote.as_deref(),
+                root_remote_auth_token_env.as_deref(),
+                "subagents",
+            )?;
+            subagents_cmd::run(command, &root_config_overrides).await?;
         }
         Some(Subcommand::McpServer(McpServerCommand { strict_config })) => {
             eprintln!(
@@ -2430,6 +2443,7 @@ fn unsupported_subcommand_name_for_strict_config(
         Some(Subcommand::RemoteControl(remote_control)) => Some(remote_control.subcommand_name()),
         Some(Subcommand::Mcp(_)) => Some("mcp"),
         Some(Subcommand::Plugin(_)) => Some("plugin"),
+        Some(Subcommand::Subagents(_)) => Some("subagents"),
         Some(Subcommand::MigrateRollouts(_)) => Some("migrate-rollouts"),
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         Some(Subcommand::App(_)) => Some("app"),

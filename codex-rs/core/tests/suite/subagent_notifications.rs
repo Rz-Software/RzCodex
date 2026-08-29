@@ -3059,6 +3059,81 @@ async fn spawn_agent_role_overrides_requested_model_and_reasoning_settings() -> 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn managed_subagent_route_overrides_role_model_provider_and_reasoning() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let child_snapshot = spawn_child_and_capture_snapshot(
+        &server,
+        json!({
+            "message": CHILD_PROMPT,
+            "agent_type": "custom",
+        }),
+        |builder| {
+            builder.with_config(|config| {
+                let role_path = config.codex_home.join("managed-route-role.toml");
+                std::fs::write(
+                    &role_path,
+                    format!(
+                        "model = \"{ROLE_MODEL}\"\nmodel_reasoning_effort = \"{ROLE_REASONING_EFFORT}\"\n",
+                    ),
+                )
+                .expect("write role config");
+                config.agent_roles.insert(
+                    "custom".to_string(),
+                    AgentRoleConfig {
+                        description: Some("Custom role".to_string()),
+                        config_file: Some(role_path.to_path_buf()),
+                        nickname_candidates: None,
+                    },
+                );
+                config.model_providers.insert(
+                    "route-provider".to_string(),
+                    config.model_provider.clone(),
+                );
+                std::fs::write(
+                    config.codex_home.join("subagent-models.json"),
+                    serde_json::to_vec_pretty(&json!({
+                        "routes": {
+                            "managed": {
+                                "label": "Managed test route",
+                                "modelProvider": "route-provider",
+                                "model": REQUESTED_MODEL,
+                                "reasoningEffort": "low",
+                                "inputModalities": ["text"]
+                            }
+                        }
+                    }))
+                    .expect("serialize route catalog"),
+                )
+                .expect("write route catalog");
+                std::fs::write(
+                    config.codex_home.join("subagent-route.json"),
+                    br#"{"version":1,"activeRoute":"managed"}"#,
+                )
+                .expect("write active route");
+            })
+        },
+    )
+    .await?;
+
+    assert_eq!(
+        (
+            child_snapshot.model_provider_id,
+            child_snapshot.model,
+            child_snapshot.reasoning_effort,
+        ),
+        (
+            "route-provider".to_string(),
+            REQUESTED_MODEL.to_string(),
+            Some(REQUESTED_REASONING_EFFORT),
+        )
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn spawn_agent_preserves_configured_defaults_through_unrelated_role() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
