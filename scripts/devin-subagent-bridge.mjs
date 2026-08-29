@@ -63,8 +63,8 @@ function requireString(value, label) {
   return value;
 }
 
-function sanitizedEnvironment() {
-  const env = { ...process.env, NO_COLOR: "1" };
+function sanitizedEnvironment(source = process.env) {
+  const env = { ...source, NO_COLOR: "1" };
   for (const key of [
     "DEVIN_API_KEY", "DEVIN_ORG_ID", "COGNITION_API_KEY", "OPENAI_API_KEY",
     "OPENAI_ORG_ID", "OPENAI_PROJECT_ID", "CODEX_API_KEY", "OPENROUTER_API_KEY",
@@ -768,6 +768,17 @@ function jsonResponse(response, status, value) {
 async function selfTest() {
   if (chooseRoute().key !== "primary") throw new Error("unified primary route failed");
   if (!LEGACY_REQUEST_EFFORTS.has("max") || LEGACY_REQUEST_EFFORTS.has("xhigh")) throw new Error("legacy effort compatibility failed");
+  const isolatedEnvironment = sanitizedEnvironment({
+    OPENAI_API_KEY: "must-not-survive",
+    OPENAI_ORG_ID: "must-not-survive",
+    OPENAI_PROJECT_ID: "must-not-survive",
+    CODEX_API_KEY: "must-not-survive",
+    RETAINED_TEST_VALUE: "retained",
+  });
+  if (["OPENAI_API_KEY", "OPENAI_ORG_ID", "OPENAI_PROJECT_ID", "CODEX_API_KEY"].some((key) => key in isolatedEnvironment)) {
+    throw new Error("OpenAI credential isolation failed");
+  }
+  if (isolatedEnvironment.RETAINED_TEST_VALUE !== "retained") throw new Error("environment isolation removed unrelated values");
   if (!QUOTA_FAILURE.test("Daily usage quota reached")) throw new Error("quota detection failed");
   if (!RESOURCE_EXHAUSTED.test('{"cognition.ai/errorKind":"resource_exhausted","cognition.ai/retryable":true}')) throw new Error("resource exhaustion detection failed");
   const wrappedQuotaFailure = {
