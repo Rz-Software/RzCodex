@@ -2019,5 +2019,22 @@ fn extract_first_bold(s: &str) -> Option<String> {
     None
 }
 
+/// Extract the last complete line (ending with `\n`) from `s`, trimmed.
+///
+/// Used as a fallback when [`extract_first_bold`] finds no `**bold**` header, so that
+/// plain-text reasoning deltas (e.g. native subagent bridge progress like
+/// "Devin native tool 3: grep.") still produce a visible live status header.
+/// Returns `None` if no complete line exists or it is empty after trimming.
+fn extract_last_complete_line(s: &str) -> Option<String> {
+    let end = s.rfind('\n')?;
+    let line = s[..end].rsplit('\n').next().unwrap_or(&s[..end]);
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests;

@@ -4677,6 +4677,66 @@ async fn reasoning_delta_redraws_only_when_header_becomes_visible() {
 }
 
 #[tokio::test]
+async fn reasoning_delta_plain_text_line_shows_live_status() {
+    // Native subagent bridges emit plain-text progress as reasoning deltas
+    // (e.g. "Devin native tool 1: exec.\n"). Without a **bold** header the
+    // /subagents window must still show real-time activity, not stay blank
+    // until TurnCompleted.
+    let (frame_requester, mut draw_rx) = FrameRequester::test_channel();
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual_with_auth(
+        /*model_override*/ None,
+        /*has_chatgpt_account*/ false,
+        /*has_codex_backend_auth*/ false,
+        frame_requester,
+    )
+    .await;
+    chat.on_task_started();
+    assert!(chat.bottom_pane.status_indicator_visible());
+    while draw_rx.try_recv().is_ok() {}
+
+    // Partial line with no newline: no status update yet.
+    chat.on_agent_reasoning_delta("Devin native worker started".to_string());
+    assert!(matches!(
+        draw_rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+    assert_eq!(chat.reasoning_header, None);
+
+    // Complete first line: status header should update.
+    chat.on_agent_reasoning_delta(" with GLM 5.2 High.\n".to_string());
+    assert!(draw_rx.try_recv().is_ok());
+    let status = chat
+        .bottom_pane
+        .status_widget()
+        .expect("status indicator should be visible");
+    assert_eq!(
+        status.header(),
+        "Devin native worker started with GLM 5.2 High."
+    );
+
+    // Second tool progress line: status header should update to the new line.
+    chat.on_agent_reasoning_delta("Devin native tool 1: exec.\n".to_string());
+    assert!(draw_rx.try_recv().is_ok());
+    let status = chat
+        .bottom_pane
+        .status_widget()
+        .expect("status indicator should remain visible");
+    assert_eq!(status.header(), "Devin native tool 1: exec.");
+
+    // Third tool progress line: status header should update again.
+    chat.on_agent_reasoning_delta("Devin native tool 2: grep.\n".to_string());
+    assert!(draw_rx.try_recv().is_ok());
+    let status = chat
+        .bottom_pane
+        .status_widget()
+        .expect("status indicator should remain visible");
+    assert_eq!(status.header(), "Devin native tool 2: grep.");
+
+    // reasoning_header must NOT be set for plain-text fallback (it's for bold headers only).
+    assert_eq!(chat.reasoning_header, None);
+}
+
+#[tokio::test]
 async fn reasoning_delta_does_not_double_schedule_visible_status_redraw() {
     let (frame_requester, mut draw_rx) = FrameRequester::test_channel();
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual_with_auth(

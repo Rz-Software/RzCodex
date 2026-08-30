@@ -247,9 +247,18 @@ impl ChatWidget {
         if self.reasoning_header.is_none() {
             self.reasoning_header = extract_first_bold(&self.reasoning_buffer);
         }
-        let Some(header) = self.reasoning_header.as_deref() else {
-            // Fallback while we don't yet have a bold header: leave existing header as-is.
-            return;
+        // Use the bold header if available. Otherwise, for plain-text reasoning
+        // (e.g. native subagent bridge progress like "Devin native tool 3: grep."),
+        // fall back to the last complete newline-delimited line so the /subagents
+        // window shows real-time activity instead of remaining blank until TurnCompleted.
+        let header = if let Some(bold) = self.reasoning_header.as_deref() {
+            bold.to_string()
+        } else {
+            let Some(line) = extract_last_complete_line(&self.reasoning_buffer) else {
+                // No bold header and no complete line yet: leave existing header as-is.
+                return;
+            };
+            line
         };
 
         let status = &self.status_state.current_status;
@@ -266,7 +275,6 @@ impl ChatWidget {
         }
 
         // Update the shimmer header to the extracted reasoning chunk header.
-        let header = header.to_string();
         self.status_state.terminal_title_status_kind = TerminalTitleStatusKind::Thinking;
         if !self.set_status_header(header) {
             self.request_redraw();
