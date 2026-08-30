@@ -80,11 +80,22 @@ impl ChatWidget {
             }
             ServerNotification::PlanDelta(notification) => self.on_plan_delta(notification.delta),
             ServerNotification::ReasoningSummaryTextDelta(notification) => {
-                self.on_agent_reasoning_delta(notification.delta);
+                // handle_server_notification is only reached for live events (replay_kind=None)
+                // or ThreadSnapshot replay of buffered active-turn deltas. Completed-item
+                // replay goes through replay_thread_item -> handle_thread_item instead.
+                // So reasoning deltas here are always LiveOrBuffered, even during ThreadSnapshot
+                // replay, so parent-owned threads stream visible progress on selection.
+                self.on_agent_reasoning_delta(
+                    notification.delta,
+                    ReasoningDeltaOrigin::LiveOrBuffered,
+                );
             }
             ServerNotification::ReasoningTextDelta(notification) => {
                 if self.config.show_raw_agent_reasoning {
-                    self.on_agent_reasoning_delta(notification.delta);
+                    self.on_agent_reasoning_delta(
+                        notification.delta,
+                        ReasoningDeltaOrigin::LiveOrBuffered,
+                    );
                 }
             }
             ServerNotification::ReasoningSummaryPartAdded(_) => self.on_reasoning_section_break(),

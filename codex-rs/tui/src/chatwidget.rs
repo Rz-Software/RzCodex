@@ -828,6 +828,21 @@ pub(crate) enum ReplayKind {
     ThreadSnapshot,
 }
 
+/// Origin of a reasoning-summary text delta, distinguishing live/buffered
+/// delivery from completed-item replay so parent-owned subagent threads can
+/// stream visible progress in both cases without duplicating grouped replay.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReasoningDeltaOrigin {
+    /// Delta arrived live or was buffered and replayed via `handle_server_notification`
+    /// (including `ThreadSnapshot` replay of buffered active-turn deltas). Parent-owned
+    /// threads commit each complete line to visible history before item/turn completion.
+    LiveOrBuffered,
+    /// Delta is part of a completed `ThreadItem::Reasoning` being replayed as a grouped
+    /// block via `replay_thread_item`. Progress lines must not be committed individually;
+    /// `on_agent_reasoning_final` emits a single grouped summary cell.
+    CompletedItemReplay,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SessionConfiguredDisplay {
     Normal,

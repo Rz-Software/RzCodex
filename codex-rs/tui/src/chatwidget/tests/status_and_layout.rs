@@ -4652,24 +4652,33 @@ async fn reasoning_delta_redraws_only_when_header_becomes_visible() {
     let (frame_requester, mut draw_rx) = FrameRequester::test_channel();
     chat.frame_requester = frame_requester;
 
-    chat.on_agent_reasoning_delta("still looking".to_string());
+    chat.on_agent_reasoning_delta(
+        "still looking".to_string(),
+        ReasoningDeltaOrigin::LiveOrBuffered,
+    );
     assert!(matches!(
         draw_rx.try_recv(),
         Err(tokio::sync::mpsc::error::TryRecvError::Empty)
     ));
     assert_eq!(chat.reasoning_header, None);
 
-    chat.on_agent_reasoning_delta(" **Checking".to_string());
+    chat.on_agent_reasoning_delta(
+        " **Checking".to_string(),
+        ReasoningDeltaOrigin::LiveOrBuffered,
+    );
     assert!(matches!(
         draw_rx.try_recv(),
         Err(tokio::sync::mpsc::error::TryRecvError::Empty)
     ));
 
-    chat.on_agent_reasoning_delta(" files**".to_string());
+    chat.on_agent_reasoning_delta(" files**".to_string(), ReasoningDeltaOrigin::LiveOrBuffered);
     assert!(draw_rx.try_recv().is_ok());
     assert_eq!(chat.reasoning_header.as_deref(), Some("Checking files"));
 
-    chat.on_agent_reasoning_delta(" and preparing a response".to_string());
+    chat.on_agent_reasoning_delta(
+        " and preparing a response".to_string(),
+        ReasoningDeltaOrigin::LiveOrBuffered,
+    );
     assert!(matches!(
         draw_rx.try_recv(),
         Err(tokio::sync::mpsc::error::TryRecvError::Empty)
@@ -4695,7 +4704,10 @@ async fn reasoning_delta_plain_text_line_shows_live_status() {
     while draw_rx.try_recv().is_ok() {}
 
     // Partial line with no newline: no status update yet.
-    chat.on_agent_reasoning_delta("Devin native worker started".to_string());
+    chat.on_agent_reasoning_delta(
+        "Devin native worker started".to_string(),
+        ReasoningDeltaOrigin::LiveOrBuffered,
+    );
     assert!(matches!(
         draw_rx.try_recv(),
         Err(tokio::sync::mpsc::error::TryRecvError::Empty)
@@ -4703,7 +4715,10 @@ async fn reasoning_delta_plain_text_line_shows_live_status() {
     assert_eq!(chat.reasoning_header, None);
 
     // Complete first line: status header should update.
-    chat.on_agent_reasoning_delta(" with GLM 5.2 High.\n".to_string());
+    chat.on_agent_reasoning_delta(
+        " with GLM 5.2 High.\n".to_string(),
+        ReasoningDeltaOrigin::LiveOrBuffered,
+    );
     assert!(draw_rx.try_recv().is_ok());
     let status = chat
         .bottom_pane
@@ -4715,7 +4730,10 @@ async fn reasoning_delta_plain_text_line_shows_live_status() {
     );
 
     // Second tool progress line: status header should update to the new line.
-    chat.on_agent_reasoning_delta("Devin native tool 1: exec.\n".to_string());
+    chat.on_agent_reasoning_delta(
+        "Devin native tool 1: exec.\n".to_string(),
+        ReasoningDeltaOrigin::LiveOrBuffered,
+    );
     assert!(draw_rx.try_recv().is_ok());
     let status = chat
         .bottom_pane
@@ -4724,7 +4742,10 @@ async fn reasoning_delta_plain_text_line_shows_live_status() {
     assert_eq!(status.header(), "Devin native tool 1: exec.");
 
     // Third tool progress line: status header should update again.
-    chat.on_agent_reasoning_delta("Devin native tool 2: grep.\n".to_string());
+    chat.on_agent_reasoning_delta(
+        "Devin native tool 2: grep.\n".to_string(),
+        ReasoningDeltaOrigin::LiveOrBuffered,
+    );
     assert!(draw_rx.try_recv().is_ok());
     let status = chat
         .bottom_pane
@@ -4734,6 +4755,40 @@ async fn reasoning_delta_plain_text_line_shows_live_status() {
 
     // reasoning_header must NOT be set for plain-text fallback (it's for bold headers only).
     assert_eq!(chat.reasoning_header, None);
+}
+
+#[tokio::test]
+async fn non_parent_owned_reasoning_does_not_commit_live_progress() {
+    // A normal (non-parent-owned) thread must preserve existing behavior: reasoning deltas update
+    // only the status header, never committing progress lines into visible history before completion.
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.on_task_started();
+    while rx.try_recv().is_ok() {}
+
+    chat.on_agent_reasoning_delta(
+        "Devin native tool 1: exec.\n".to_string(),
+        ReasoningDeltaOrigin::LiveOrBuffered,
+    );
+    chat.on_agent_reasoning_delta(
+        "Devin native tool 2: grep.\n".to_string(),
+        ReasoningDeltaOrigin::LiveOrBuffered,
+    );
+
+    let mut committed = 0;
+    while let Ok(ev) = rx.try_recv() {
+        if matches!(ev, AppEvent::InsertHistoryCell(_)) {
+            committed += 1;
+        }
+    }
+    assert_eq!(
+        committed, 0,
+        "non-parent-owned reasoning must not commit live progress cells"
+    );
+    // Buffer retains the full text (not drained) for the final summary block.
+    assert!(
+        chat.reasoning_buffer.contains("Devin native tool 1"),
+        "buffer not drained for non-parent-owned"
+    );
 }
 
 #[tokio::test]
@@ -4750,7 +4805,10 @@ async fn reasoning_delta_does_not_double_schedule_visible_status_redraw() {
     assert!(chat.bottom_pane.status_indicator_visible());
     while draw_rx.try_recv().is_ok() {}
 
-    chat.on_agent_reasoning_delta("**Checking files**".to_string());
+    chat.on_agent_reasoning_delta(
+        "**Checking files**".to_string(),
+        ReasoningDeltaOrigin::LiveOrBuffered,
+    );
 
     assert_eq!(chat.reasoning_header.as_deref(), Some("Checking files"));
     assert!(draw_rx.try_recv().is_ok());
@@ -4764,7 +4822,10 @@ async fn reasoning_delta_does_not_double_schedule_visible_status_redraw() {
 async fn reasoning_delta_restores_recreated_status_indicator_header() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.on_task_started();
-    chat.on_agent_reasoning_delta("**Checking files**".to_string());
+    chat.on_agent_reasoning_delta(
+        "**Checking files**".to_string(),
+        ReasoningDeltaOrigin::LiveOrBuffered,
+    );
 
     chat.on_agent_message_delta("Preamble line\n".to_string());
     chat.on_commit_tick();
@@ -4778,7 +4839,10 @@ async fn reasoning_delta_restores_recreated_status_indicator_header() {
         .expect("status indicator should be recreated");
     assert_eq!(status.header(), "Working");
 
-    chat.on_agent_reasoning_delta(" and preparing a response".to_string());
+    chat.on_agent_reasoning_delta(
+        " and preparing a response".to_string(),
+        ReasoningDeltaOrigin::LiveOrBuffered,
+    );
 
     let status = chat
         .bottom_pane

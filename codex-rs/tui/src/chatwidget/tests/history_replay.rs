@@ -1157,6 +1157,181 @@ async fn replayed_reasoning_item_preserves_summary_parts_and_hides_raw_reasoning
 }
 
 #[tokio::test]
+async fn replayed_parent_owned_reasoning_remains_grouped_not_line_by_line() {
+    // Replay of a parent-owned subagent thread must feed reasoning parts as a single grouped
+    // summary block, not commit each newline-delimited line separately (completed-item replay
+    // uses ReasoningDeltaOrigin::CompletedItemReplay which skips the line-by-line commit).
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.config.show_raw_agent_reasoning = false;
+    chat.set_parent_owned_thread();
+    chat.handle_thread_session(crate::session_state::ThreadSessionState {
+        thread_id: ThreadId::new(),
+        forked_from_id: None,
+        fork_parent_title: None,
+        thread_name: None,
+        model: "test-model".to_string(),
+        model_provider_id: "test-provider".to_string(),
+        service_tier: None,
+        approval_policy: AskForApproval::Never,
+        approvals_reviewer: ApprovalsReviewer::User,
+        permission_profile: PermissionProfile::read_only(),
+        active_permission_profile: None,
+        cwd: test_project_path().abs(),
+        runtime_workspace_roots: Vec::new(),
+        instruction_source_paths: Vec::new(),
+        reasoning_effort: None,
+        collaboration_mode: None,
+        personality: None,
+        message_history: None,
+        network_proxy: None,
+        rollout_path: None,
+    });
+    let _ = drain_insert_history(&mut rx);
+
+    chat.replay_thread_item(
+        AppServerThreadItem::Reasoning {
+            id: "reasoning-1".to_string(),
+            summary: vec!["Devin native tool 1: exec.\nDevin native tool 2: grep.".to_string()],
+            content: Vec::new(),
+        },
+        "turn-1".to_string(),
+        ReplayKind::ThreadSnapshot,
+    );
+
+    // Replay must produce at most one grouped reasoning cell, not one per line.
+    let mut cells = 0;
+    while let Ok(ev) = rx.try_recv() {
+        if matches!(ev, AppEvent::InsertHistoryCell(_)) {
+            cells += 1;
+        }
+    }
+    assert!(
+        cells <= 1,
+        "replayed parent-owned reasoning must remain grouped (<=1 cell), got {cells}"
+    );
+}
+
+#[tokio::test]
+async fn parent_owned_buffered_delta_replay_streams_visible_before_completion() {
+    // Selecting a running parent-owned child replays its buffered active-turn
+    // ReasoningSummaryTextDelta events via handle_server_notification with
+    // ReplayKind::ThreadSnapshot. These are buffered *live* deltas, not completed
+    // items, so they must be treated as LiveOrBuffered and committed to visible
+    // history immediately — not hidden behind a from_replay gate.
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.set_parent_owned_thread();
+    chat.handle_thread_session(crate::session_state::ThreadSessionState {
+        thread_id: ThreadId::new(),
+        forked_from_id: None,
+        fork_parent_title: None,
+        thread_name: None,
+        model: "test-model".to_string(),
+        model_provider_id: "test-provider".to_string(),
+        service_tier: None,
+        approval_policy: AskForApproval::Never,
+        approvals_reviewer: ApprovalsReviewer::User,
+        permission_profile: PermissionProfile::read_only(),
+        active_permission_profile: None,
+        cwd: test_project_path().abs(),
+        runtime_workspace_roots: Vec::new(),
+        instruction_source_paths: Vec::new(),
+        reasoning_effort: None,
+        collaboration_mode: None,
+        personality: None,
+        message_history: None,
+        network_proxy: None,
+        rollout_path: None,
+    });
+    let _ = drain_insert_history(&mut rx);
+
+    // Simulate selecting a running child: replay TurnStarted + buffered reasoning
+    // deltas via handle_server_notification with ThreadSnapshot replay kind.
+    chat.handle_server_notification(
+        ServerNotification::TurnStarted(TurnStartedNotification {
+            thread_id: "thread-1".to_string(),
+            turn: app_server_turn("turn-1", AppServerTurnStatus::InProgress, None, None),
+        }),
+        Some(ReplayKind::ThreadSnapshot),
+    );
+    let _ = drain_insert_history(&mut rx);
+
+    // Buffered complete progress line replayed during snapshot selection.
+    chat.handle_server_notification(
+        ServerNotification::ReasoningSummaryTextDelta(ReasoningSummaryTextDeltaNotification {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            item_id: "reasoning-1".to_string(),
+            delta: "Devin native tool 1: exec.\n".to_string(),
+            summary_index: 0,
+        }),
+        Some(ReplayKind::ThreadSnapshot),
+    );
+
+    // The buffered progress line must be visible immediately, before turn completion.
+    let mut seen = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        if let AppEvent::InsertHistoryCell(cell) = ev {
+            seen.push(lines_to_single_string(&cell.display_lines(/*width*/ 80)));
+        }
+    }
+    assert_eq!(
+        seen.len(),
+        1,
+        "buffered live delta replay must commit one visible cell immediately, got {seen:?}"
+    );
+    assert!(
+        seen[0].contains("Devin native tool 1: exec."),
+        "first buffered line must be visible, got {:?}",
+        seen[0]
+    );
+
+    // A subsequent live delta (after selection, replay_kind=None) must also commit
+    // without duplicating the already-shown line.
+    chat.handle_server_notification(
+        ServerNotification::ReasoningSummaryTextDelta(ReasoningSummaryTextDeltaNotification {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            item_id: "reasoning-1".to_string(),
+            delta: "Devin native tool 2: grep.\n".to_string(),
+            summary_index: 0,
+        }),
+        /*replay_kind*/ None,
+    );
+    while let Ok(ev) = rx.try_recv() {
+        if let AppEvent::InsertHistoryCell(cell) = ev {
+            seen.push(lines_to_single_string(&cell.display_lines(/*width*/ 80)));
+        }
+    }
+    assert_eq!(
+        seen.len(),
+        2,
+        "live delta after replay must commit exactly one more cell, got {seen:?}"
+    );
+    assert!(
+        seen[1].contains("Devin native tool 2: grep."),
+        "second live line must be visible, got {:?}",
+        seen[1]
+    );
+    insta::assert_snapshot!(seen.concat(), @r"
+• Devin native tool 1: exec.
+• Devin native tool 2: grep.
+");
+
+    // Finalizing the reasoning block must not duplicate the drained lines.
+    chat.on_agent_reasoning_final();
+    let mut final_cells = 0;
+    while let Ok(ev) = rx.try_recv() {
+        if matches!(ev, AppEvent::InsertHistoryCell(_)) {
+            final_cells += 1;
+        }
+    }
+    assert_eq!(
+        final_cells, 0,
+        "on_agent_reasoning_final must not duplicate drained live progress, got {final_cells}"
+    );
+}
+
+#[tokio::test]
 async fn replayed_reasoning_item_shows_raw_reasoning_when_enabled() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.config.show_raw_agent_reasoning = true;

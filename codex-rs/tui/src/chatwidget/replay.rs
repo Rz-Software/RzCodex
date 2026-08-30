@@ -141,7 +141,10 @@ impl ChatWidget {
                         if index > 0 {
                             self.on_reasoning_section_break();
                         }
-                        self.on_agent_reasoning_delta(delta);
+                        self.on_agent_reasoning_delta(
+                            delta,
+                            ReasoningDeltaOrigin::CompletedItemReplay,
+                        );
                     }
                 }
                 self.on_agent_reasoning_final();

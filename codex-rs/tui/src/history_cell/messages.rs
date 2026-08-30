@@ -644,6 +644,22 @@ pub(crate) fn new_reasoning_summary_block(
     ))
 }
 
+/// Create a visible live reasoning progress cell for a single completed plain-text line emitted
+/// by a parent-owned subagent bridge (e.g. "Devin native tool 3: grep.").
+///
+/// Unlike [`new_reasoning_summary_block`], this is always visible (`transcript_only = false`) so
+/// the `/subagents` window streams real-time activity before the reasoning item completes. The
+/// caller drains committed lines from the reasoning buffer so the final summary block cannot
+/// duplicate already-shown content.
+pub(crate) fn new_live_reasoning_progress_line(text: String, cwd: &Path) -> Box<dyn HistoryCell> {
+    Box::new(ReasoningSummaryCell::new(
+        String::new(),
+        text,
+        cwd,
+        /*transcript_only*/ false,
+    ))
+}
+
 /// Split structured reasoning-summary parts into the status header and renderable content.
 pub(crate) fn split_reasoning_summary_parts(reasoning_parts: &[String]) -> (String, String) {
     let mut leading_empty_part_header = None;

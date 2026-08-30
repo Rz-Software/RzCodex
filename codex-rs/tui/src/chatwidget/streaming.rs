@@ -229,10 +229,12 @@ impl ChatWidget {
         }
     }
 
-    pub(super) fn on_agent_reasoning_delta(&mut self, delta: String) {
-        // For reasoning deltas, do not stream to history. Accumulate the
-        // current reasoning block and extract the first bold element
-        // (between **/**) as the chunk header. Show this header as status.
+    pub(super) fn on_agent_reasoning_delta(&mut self, delta: String, origin: ReasoningDeltaOrigin) {
+        // Accumulate the current reasoning block and extract the first bold element
+        // (between **/**) as the chunk header, shown as the bottom shimmer status. For
+        // parent-owned subagent threads (blocks_direct_input), complete newline-delimited
+        // progress lines are also committed to visible history before item/turn completion
+        // so the `/subagents` window streams real activity (see commit_live_reasoning_progress_lines).
         self.reasoning_buffer.push_str(&delta);
 
         if self.safety_buffering_is_waiting() {
@@ -261,6 +263,13 @@ impl ChatWidget {
             line
         };
 
+        // Parent-owned subagent threads expose complete progress lines in the selected
+        // `/subagents` view. This applies to both live delivery and replay of the active turn's
+        // buffered notifications. Completed reasoning-item replay remains grouped.
+        if self.blocks_direct_input && origin == ReasoningDeltaOrigin::LiveOrBuffered {
+            self.commit_live_reasoning_progress_lines();
+        }
+
         let status = &self.status_state.current_status;
         if self.status_state.terminal_title_status_kind == TerminalTitleStatusKind::Thinking
             && status.header == header
@@ -279,6 +288,30 @@ impl ChatWidget {
         if !self.set_status_header(header) {
             self.request_redraw();
         }
+    }
+
+    /// Commit each complete newline-delimited line accumulated in `reasoning_buffer` as a visible
+    /// history cell, then drain the committed text so only the partial tail remains.
+    ///
+    /// This is the live presentation path for parent-owned subagent threads: the bridge emits
+    /// plain-text progress (e.g. "Devin native tool 3: grep.") as `reasoning_summary_text.delta`
+    /// on a single long-lived reasoning item. Without this, `on_agent_reasoning_delta` only
+    /// updates the bottom shimmer header and the selected child transcript stays blank until the
+    /// final assistant item arrives.
+    fn commit_live_reasoning_progress_lines(&mut self) {
+        while let Some(nl_idx) = self.reasoning_buffer.find('\n') {
+            // Own the trimmed line before draining so the borrow ends before the
+            // mutable `drain` below (otherwise the borrow checker rejects this).
+            let line = self.reasoning_buffer[..nl_idx].trim().to_string();
+            // Remove the consumed line including its trailing newline.
+            self.reasoning_buffer.drain(0..nl_idx + 1);
+            if line.is_empty() {
+                continue;
+            }
+            let cell = history_cell::new_live_reasoning_progress_line(line, &self.config.cwd);
+            self.add_boxed_history(cell);
+        }
+        self.request_redraw();
     }
 
     pub(super) fn on_agent_reasoning_final(&mut self) {
