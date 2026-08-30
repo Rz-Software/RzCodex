@@ -215,18 +215,19 @@ function parseQuotaSnapshot(stdout, fetchedAt = Date.now()) {
       throw new BridgeError(`Antigravity quota query omitted ${label} bucket ${json(id)}`, 502);
     }
     const remainingFraction = Number(bucket.remaining_fraction);
-    const resetAt = Date.parse(bucket.reset_time);
+    const resetTime = typeof bucket.reset_time === "string" ? bucket.reset_time.trim() : "";
+    const resetAt = resetTime ? Date.parse(resetTime) : null;
     if (!Number.isFinite(remainingFraction) || remainingFraction < 0 || remainingFraction > 1) {
       throw new BridgeError(`Antigravity ${label} quota has invalid remaining fraction ${json(bucket.remaining_fraction)}`, 502);
     }
-    if (!Number.isFinite(resetAt)) {
+    if (resetAt !== null && !Number.isFinite(resetAt)) {
       throw new BridgeError(`Antigravity ${label} quota has invalid reset time ${json(bucket.reset_time)}`, 502);
     }
     return {
       id,
       group: bucket.group,
       remainingFraction,
-      resetAt: new Date(resetAt).toISOString(),
+      resetAt: resetAt === null ? null : new Date(resetAt).toISOString(),
     };
   };
   const readPool = (ids, label) => {
@@ -235,10 +236,15 @@ function parseQuotaSnapshot(stdout, fetchedAt = Date.now()) {
       .filter(Boolean);
     const remainingFraction = Math.min(...poolBuckets.map((bucket) => bucket.remainingFraction));
     const limitingBuckets = poolBuckets.filter((bucket) => bucket.remainingFraction === remainingFraction);
+    const limitingResetTimes = limitingBuckets
+      .map((bucket) => Date.parse(bucket.resetAt))
+      .filter(Number.isFinite);
     return {
       group: poolBuckets[0].group,
       remainingFraction,
-      resetAt: new Date(Math.max(...limitingBuckets.map((bucket) => Date.parse(bucket.resetAt)))).toISOString(),
+      resetAt: limitingResetTimes.length > 0
+        ? new Date(Math.max(...limitingResetTimes)).toISOString()
+        : null,
       buckets: poolBuckets,
     };
   };
@@ -303,7 +309,7 @@ class AntigravityQuotaRouter {
 
   exhausted(snapshot) {
     return new BridgeError(
-      `Both Antigravity usage pools are depleted; Claude/GPT resets ${snapshot.primary.resetAt}, Gemini resets ${snapshot.fallback.resetAt}`,
+      `Both Antigravity usage pools are depleted; Claude/GPT resets ${snapshot.primary.resetAt || "at an unknown time"}, Gemini resets ${snapshot.fallback.resetAt || "at an unknown time"}`,
       429,
     );
   }
@@ -424,15 +430,16 @@ function historyEntries(input, taskState) {
   return entries;
 }
 
-function boundedEntries(entries, budget, activeTaskText) {
+function boundedEntries(entries, budget, activeTaskText, entrySeparatorChars = 0) {
   const retained = [];
   let remaining = Math.max(0, budget);
-  for (let index = entries.length - 1; index >= 0 && remaining > 0; index -= 1) {
+  for (let index = entries.length - 1; index >= 0 && remaining > entrySeparatorChars; index -= 1) {
     let text = entries[index].text;
     if (activeTaskText) text = text.split(activeTaskText).join("[duplicate active task omitted]");
-    if (text.length > remaining) text = text.slice(-remaining);
+    const textBudget = remaining - entrySeparatorChars;
+    if (text.length > textBudget) text = text.slice(-textBudget);
     retained.unshift({ ...entries[index], text });
-    remaining -= text.length;
+    remaining -= text.length + entrySeparatorChars;
   }
   return retained;
 }
@@ -482,11 +489,15 @@ function fullPrompt(context) {
   const sections = [delegationContract(context.requestId, context.workingDirectory)];
   if (context.roleInstructions) sections.push(`[Role instructions]\n${context.roleInstructions}`);
   const activeTask = activeTaskPromptSection(context.taskState);
-  const mandatoryChars = sections.reduce((sum, section) => sum + section.length, 0) + activeTask.length;
+  const mandatorySectionCount = sections.length + (activeTask ? 1 : 0);
+  const mandatoryChars = sections.reduce((sum, section) => sum + section.length, 0)
+    + activeTask.length
+    + Math.max(0, mandatorySectionCount - 1) * 2;
   const retained = boundedEntries(
     context.entries,
     MAX_PROMPT_CHARS - mandatoryChars,
     context.taskState.activeTask?.text,
+    2,
   );
   if (activeTask) {
     const activeIndex = context.taskState.activeTask.index;
@@ -1309,7 +1320,7 @@ async function selfTest() {
           ] },
           { name: "Claude and GPT models", buckets: [
             { id: PRIMARY_QUOTA_BUCKET_IDS[0], remaining_fraction: 1, reset_time: "2026-09-06T01:56:48Z" },
-            { id: PRIMARY_QUOTA_BUCKET_IDS[1], remaining_fraction: 0.5, reset_time: "2026-08-30T17:00:00Z" },
+            { id: PRIMARY_QUOTA_BUCKET_IDS[1], remaining_fraction: 0.5 },
           ] },
         ],
       },
@@ -1319,6 +1330,9 @@ async function selfTest() {
   fixtureRouter.snapshot = () => quotaFixture;
   if (quotaFixture.primary.remainingFraction !== 0.5 || quotaFixture.fallback.remainingFraction !== 0.25) {
     throw new Error("Antigravity effective quota did not honor the tightest active window");
+  }
+  if (quotaFixture.primary.buckets[1].resetAt !== null || quotaFixture.primary.resetAt !== null) {
+    throw new Error("Antigravity missing reset timestamps were not preserved as unknown");
   }
   if (fixtureRouter.select().id !== route.primaryModel) throw new Error("Claude/GPT pool was not preferred");
   if (fixtureRouter.select(route.quotaFallbackModel).id !== route.quotaFallbackModel) {
@@ -1337,6 +1351,27 @@ async function selfTest() {
   if (weeklyOnlyQuota.primary.buckets.length !== 1 || weeklyOnlyQuota.fallback.buckets.length !== 1) {
     throw new Error("weekly-only Antigravity plans were not accepted");
   }
+  const liveMissingResetQuota = parseQuotaSnapshot(json({
+    status: "SUCCESS",
+    command: {
+      name: "usage",
+      data: { groups: [
+        { name: "Gemini Models", buckets: [
+          { id: FALLBACK_QUOTA_BUCKET_IDS[0], remaining_fraction: 0.77, reset_time: "2026-09-06T02:55:38Z" },
+          { id: FALLBACK_QUOTA_BUCKET_IDS[1], remaining_fraction: 0.93, reset_time: "2026-08-30T19:58:39Z" },
+        ] },
+        { name: "Claude and GPT models", buckets: [
+          { id: PRIMARY_QUOTA_BUCKET_IDS[0], remaining_fraction: 0, reset_time: "2026-09-06T02:56:54Z" },
+          { id: PRIMARY_QUOTA_BUCKET_IDS[1], remaining_fraction: 0.02 },
+        ] },
+      ] },
+    },
+  }));
+  fixtureRouter.snapshot = () => liveMissingResetQuota;
+  if (fixtureRouter.select().id !== route.quotaFallbackModel) {
+    throw new Error("missing non-limiting Claude reset time skipped the available Gemini pool");
+  }
+  fixtureRouter.snapshot = () => quotaFixture;
   quotaFixture.primary.remainingFraction = 0;
   if (fixtureRouter.select().id !== route.quotaFallbackModel) throw new Error("Gemini quota fallback was not selected");
   quotaFixture.fallback.remainingFraction = 0;
@@ -1462,7 +1497,11 @@ async function selfTest() {
     client_metadata: { cwd: process.cwd(), thread_id: "thread-agy-fixture" },
     tools: Array.from({ length: 100 }, (_, index) => ({ name: `ignored_${index}`, description: "x".repeat(1_000) })),
     input: [
-      { type: "message", role: "user", content: "x".repeat(120_000) },
+      ...Array.from({ length: 12 }, (_, index) => ({
+        type: "message",
+        role: index % 2 === 0 ? "user" : "assistant",
+        content: `saturated-history-${index}\n${"x".repeat(9_000)}`,
+      })),
       {
         type: "agent_message", id: "agy-task", author: "Codex", recipient: "/root/agy_fixture",
         content: [{ type: "input_text", text: taskHeader }, { type: "encrypted_content", encrypted_content: taskPayload }],
@@ -1472,7 +1511,11 @@ async function selfTest() {
   const context = requestContext(fixture);
   const first = fullPrompt(context);
   const firstDiagnostics = taskDeliveryDiagnostics(context.taskState, first);
-  if (first.length > MAX_PROMPT_CHARS || firstDiagnostics.completeTaskOccurrences !== 1) {
+  if (
+    first.length > MAX_PROMPT_CHARS
+    || first.length < MAX_PROMPT_CHARS - 100
+    || firstDiagnostics.completeTaskOccurrences !== 1
+  ) {
     throw new Error("bounded encrypted task delivery failed");
   }
   if (context.toolSchemaBytes < 100_000) throw new Error("tool-schema fixture is too small");
