@@ -114,6 +114,28 @@ function Get-InstalledBuildMetadata {
     }
 }
 
+function Test-BinaryInputsChanged {
+    param(
+        [Parameter(Mandatory)]
+        [object]$InstalledMetadata
+    )
+
+    $installedCommit = $InstalledMetadata.commit
+    & git -C $RepoRoot rev-parse --verify --quiet "${installedCommit}^{commit}" *> $null
+    if ($LASTEXITCODE -ne 0) {
+        return $true
+    }
+
+    & git -C $RepoRoot diff --quiet "$installedCommit..HEAD" -- codex-rs
+    if ($LASTEXITCODE -eq 0) {
+        return $false
+    }
+    if ($LASTEXITCODE -eq 1) {
+        return $true
+    }
+    throw "Could not compare current Rust binary inputs with installed commit $installedCommit."
+}
+
 function Test-MergeInProgress {
     Push-Location -LiteralPath $RepoRoot
     try {
@@ -338,14 +360,21 @@ try {
         throw "Could not resolve the current RzCodex commit."
     }
     $installedMetadata = Get-InstalledBuildMetadata
+    $binaryInputsChanged = $null -eq $installedMetadata -or
+        $installedMetadata.baseVersion -ne $baseVersion -or
+        (Test-BinaryInputsChanged -InstalledMetadata $installedMetadata)
     $buildRequired = $ForceBuild -or
         $updateAvailable -or
-        $null -eq $installedMetadata -or
-        $installedMetadata.commit -ne $currentCommit -or
-        $installedMetadata.baseVersion -ne $baseVersion
+        $binaryInputsChanged
 
     if (-not $buildRequired) {
-        Write-UpdateStatus -Result "current" -Message "RzCodex $baseVersion already contains upstream/main." -Commit $currentCommit
+        $message = if ($installedMetadata.commit -eq $currentCommit) {
+            "RzCodex $baseVersion already contains upstream/main."
+        }
+        else {
+            "RzCodex $baseVersion already contains upstream/main; Rust binary inputs are unchanged since installed commit $($installedMetadata.commit)."
+        }
+        Write-UpdateStatus -Result "current" -Message $message -Commit $currentCommit
         exit 0
     }
 
