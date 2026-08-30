@@ -2,7 +2,7 @@
 
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { homedir } from "node:os";
 import { isAbsolute, join, normalize } from "node:path";
@@ -30,21 +30,61 @@ const INIT_TIMEOUT_MS = 30 * 1000;
 const SESSION_IDLE_MS = 30 * 60 * 1000;
 const SSE_HEARTBEAT_MS = 15 * 1000;
 const MAX_SESSIONS = 8;
+const MAX_CONCURRENT_TURNS = 1;
 const QUOTA_CACHE_MS = 30 * 1000;
-const PRIMARY_QUOTA_BUCKET_ID = "3p-weekly";
-const FALLBACK_QUOTA_BUCKET_ID = "gemini-weekly";
-const MODEL_QUOTA_FAILURE = /exhausted your quota on this model|quota[^\r\n]{0,100}(?:exhaust|exceed|deplet)|LLM_CALL_QUOTA_EXCEEDED/i;
+const PRIMARY_QUOTA_BUCKET_IDS = ["3p-weekly", "3p-5h"];
+const FALLBACK_QUOTA_BUCKET_IDS = ["gemini-weekly", "gemini-5h"];
+const MODEL_QUOTA_FAILURE = /RESOURCE_EXHAUSTED|LLM_CALL_QUOTA_EXCEEDED|individual quota reached|exhausted your (?:capacity|quota)(?: on this model)?|quota[^\r\n]{0,100}(?:exhaust|exceed|deplet|reach)/i;
+const PROVIDER_FAILURE_SIGNAL = /RESOURCE_EXHAUSTED|LLM_CALL_QUOTA_EXCEEDED|individual quota reached|exhausted your (?:capacity|quota)|agent executor error|calling model:/i;
 const CENTRAL_CONFIG = join(homedir(), ".codex", "subagent-models.json");
 const AGY_EXE = join(process.env.LOCALAPPDATA || join(homedir(), "AppData", "Local"), "agy", "bin", "agy.exe");
 const MCP_CONFIG = join(homedir(), ".gemini", "config", "mcp_config.json");
 const LAZY_MCP_SERVER = "rzcodex-lazy";
+const AGENT_ID = "rzcodex-native";
+const AGENT_DEFINITION_PATH = join(homedir(), ".gemini", "config", "agents", AGENT_ID, "agent.md");
+const AGENT_DEFINITION = `---
+name: ${AGENT_ID}
+description: Restricted primary agent used by RzCodex native workers.
+tools:
+  - view_file
+  - list_dir
+  - find_by_name
+  - grep_search
+  - run_command
+  - write_to_file
+  - replace_file_content
+  - search_web
+  - read_url_content
+mainAgent: true
+subagent: false
+forceDisableFundamentalComponents: true
+commandExecutionPolicy: eager
+inheritCustomizations: false
+---
+
+# RzCodex native worker
+
+You are already a bounded native sub-agent owned by a separate Codex main agent. Work directly on the assigned task. Never delegate, invoke another agent, define an agent, start a background task, or wait on hidden work. Keep each reasoning/tool cycle focused, return promptly when the task is complete, and return a concise concrete blocker or question when the main agent must decide something.
+`;
 const MUTATION_TOOLS = new Set(["multi_replace_file_content", "replace_file_content", "sed_file", "write_to_file"]);
+const FORBIDDEN_AGENT_TOOLS = new Set([
+  "browser_subagent",
+  "define_subagent",
+  "invoke_subagent",
+  "manage_inbox",
+  "manage_subagents",
+  "manage_task",
+  "schedule",
+  "send_message",
+]);
+const REQUIRED_AGENT_TOOLS = new Set(["call_mcp_tool", "grep_search", "replace_file_content", "run_command", "view_file", "write_to_file"]);
 
 class BridgeError extends Error {
-  constructor(message, status = 400) {
+  constructor(message, status = 400, code = null) {
     super(message);
     this.name = "BridgeError";
     this.status = status;
+    this.code = code;
   }
 }
 
@@ -81,6 +121,49 @@ function sanitizedEnvironment(source = process.env) {
     "VERTEX_AI_API_KEY",
   ]) delete env[key];
   return env;
+}
+
+function ensureAgentDefinition() {
+  mkdirSync(join(homedir(), ".gemini", "config", "agents", AGENT_ID), { recursive: true });
+  const current = existsSync(AGENT_DEFINITION_PATH)
+    ? readFileSync(AGENT_DEFINITION_PATH, "utf8")
+    : null;
+  if (current !== AGENT_DEFINITION) writeFileSync(AGENT_DEFINITION_PATH, AGENT_DEFINITION, "utf8");
+  return sha256(AGENT_DEFINITION);
+}
+
+function providerFailureDetail(result, stderr) {
+  const details = [];
+  const add = (value) => {
+    if (typeof value !== "string") return;
+    const normalized = value.replace(/\s+/g, " ").trim();
+    if (normalized && !details.includes(normalized)) details.push(normalized.slice(0, 600));
+  };
+  add(result?.error);
+  add(result?.error?.message);
+  add(result?.message);
+  if (typeof result?.response === "string" && PROVIDER_FAILURE_SIGNAL.test(result.response)) {
+    add(result.response);
+  }
+  const diagnosticLines = String(stderr || "").split(/\r?\n/)
+    .filter((line) => PROVIDER_FAILURE_SIGNAL.test(line));
+  for (const line of diagnosticLines.slice(-3)) {
+    add(line.replace(/^.*?(?:run\.go|errorreport\.go):\d+\]\s*/, ""));
+  }
+  return details.join(" | ").slice(0, 1_500);
+}
+
+function attachTurnProgress(error, turn) {
+  error.toolCalls = turn.toolStepKeys.size;
+  error.toolNames = [...turn.toolNames];
+  error.mutationToolCalls = turn.mutationToolStepKeys.size;
+  error.rzMcpTools = [...turn.rzMcpTools];
+  error.subagentActivity = turn.subagentActivity;
+  error.forbiddenToolName = turn.forbiddenToolName;
+  if (error.toolCalls > 0 || error.rzMcpTools.length > 0 || error.subagentActivity) {
+    error.routeCommitted = true;
+  }
+  return error;
 }
 
 function centralRoute() {
@@ -125,9 +208,12 @@ function parseQuotaSnapshot(stdout, fetchedAt = Date.now()) {
   }
   const buckets = (payload.command?.data?.groups || []).flatMap((group) =>
     (group.buckets || []).map((bucket) => ({ ...bucket, group: group.name })));
-  const readBucket = (id, label) => {
+  const readBucket = (id, label, required = true) => {
     const bucket = buckets.find((entry) => entry.id === id);
-    if (!bucket) throw new BridgeError(`Antigravity quota query omitted ${label} bucket ${json(id)}`, 502);
+    if (!bucket) {
+      if (!required) return null;
+      throw new BridgeError(`Antigravity quota query omitted ${label} bucket ${json(id)}`, 502);
+    }
     const remainingFraction = Number(bucket.remaining_fraction);
     const resetAt = Date.parse(bucket.reset_time);
     if (!Number.isFinite(remainingFraction) || remainingFraction < 0 || remainingFraction > 1) {
@@ -143,10 +229,23 @@ function parseQuotaSnapshot(stdout, fetchedAt = Date.now()) {
       resetAt: new Date(resetAt).toISOString(),
     };
   };
+  const readPool = (ids, label) => {
+    const poolBuckets = ids
+      .map((id, index) => readBucket(id, label, index === 0))
+      .filter(Boolean);
+    const remainingFraction = Math.min(...poolBuckets.map((bucket) => bucket.remainingFraction));
+    const limitingBuckets = poolBuckets.filter((bucket) => bucket.remainingFraction === remainingFraction);
+    return {
+      group: poolBuckets[0].group,
+      remainingFraction,
+      resetAt: new Date(Math.max(...limitingBuckets.map((bucket) => Date.parse(bucket.resetAt)))).toISOString(),
+      buckets: poolBuckets,
+    };
+  };
   return {
     fetchedAt: new Date(fetchedAt).toISOString(),
-    primary: readBucket(PRIMARY_QUOTA_BUCKET_ID, "Claude/GPT"),
-    fallback: readBucket(FALLBACK_QUOTA_BUCKET_ID, "Gemini"),
+    primary: readPool(PRIMARY_QUOTA_BUCKET_IDS, "Claude/GPT"),
+    fallback: readPool(FALLBACK_QUOTA_BUCKET_IDS, "Gemini"),
   };
 }
 
@@ -190,10 +289,16 @@ class AntigravityQuotaRouter {
     throw this.exhausted(snapshot);
   }
 
-  markPrimaryDepleted() {
+  markDepleted(model) {
     const snapshot = this.snapshot();
-    snapshot.primary.remainingFraction = 0;
-    snapshot.primary.forcedDepleted = true;
+    const bucket = model === route.primaryModel
+      ? snapshot.primary
+      : model === route.quotaFallbackModel
+        ? snapshot.fallback
+        : null;
+    if (!bucket) throw new BridgeError(`Cannot mark unknown Antigravity model ${json(model)} depleted`, 500);
+    bucket.remainingFraction = 0;
+    bucket.forcedDepleted = true;
   }
 
   exhausted(snapshot) {
@@ -422,6 +527,7 @@ function subtractUsage(current, previous) {
 function sessionArguments(selectedModel) {
   return [
     "--input-format", "stream-json", "--output-format", "stream-json",
+    "--agent", AGENT_ID,
     "--model", selectedModel.id,
     ...(selectedModel.effort ? ["--effort", selectedModel.effort] : []),
     "--dangerously-skip-permissions", "--disable-slash-commands",
@@ -512,14 +618,26 @@ class AntigravitySession {
         this.fail(new BridgeError(`Antigravity initialized unexpected model ${json(init.model)}`, 502));
         return;
       }
+      if (init.agent !== AGENT_ID) {
+        this.fail(new BridgeError(`Antigravity initialized unexpected agent ${json(init.agent)}`, 502));
+        return;
+      }
       if (init.permission_mode !== "always-proceed") {
         this.fail(new BridgeError(`Antigravity initialized unexpected permission mode ${json(init.permission_mode)}`, 502));
+        return;
+      }
+      const initializedTools = new Set(Array.isArray(init.tools) ? init.tools : []);
+      const reportedForbiddenTools = [...FORBIDDEN_AGENT_TOOLS].filter((name) => initializedTools.has(name));
+      const missingTools = [...REQUIRED_AGENT_TOOLS].filter((name) => !initializedTools.has(name));
+      if (missingTools.length > 0) {
+        this.fail(new BridgeError(`Antigravity omitted required worker tools: ${missingTools.join(", ")}`, 502));
         return;
       }
       this.init = { ...init, conversationId: event.conversation_id };
       this.initSettled = true;
       runtime.lastAuthVerifiedAt = new Date().toISOString();
       runtime.lastInitializedToolCount = Array.isArray(init.tools) ? init.tools.length : null;
+      runtime.lastInitializedForbiddenTools = reportedForbiddenTools;
       runtime.lastConversationId = event.conversation_id || null;
       this.resolveInit(this.init);
       return;
@@ -532,16 +650,37 @@ class AntigravitySession {
         this.turn.generatedTokens += Number(step.usage?.output_tokens || 0);
         this.turn.generationSeconds += Number(step.duration_seconds || 0);
       }
-      if (step.step_type === "tool" && step.state === "ACTIVE") {
+      if (step.step_type === "tool") {
         const name = step.tool_name || step.tool_info?.name;
+        const stepIndex = Number.isInteger(step.step_index) ? step.step_index : `unknown-${this.turn.unknownToolSteps++}`;
+        const stepKey = `${step.conversation_id || this.init?.conversationId || "unknown"}:${stepIndex}`;
+        const firstObservation = !this.turn.toolStepKeys.has(stepKey);
+        this.turn.toolStepKeys.add(stepKey);
         if (typeof name === "string") this.turn.toolNames.add(name);
-        if (MUTATION_TOOLS.has(name)) this.turn.mutationToolCalls += 1;
+        if (firstObservation && MUTATION_TOOLS.has(name)) this.turn.mutationToolStepKeys.add(stepKey);
+        if (firstObservation && FORBIDDEN_AGENT_TOOLS.has(name)) {
+          this.turn.forbiddenToolName = name;
+          const error = attachTurnProgress(
+            new BridgeError(`Antigravity attempted forbidden orchestration tool ${json(name)}`, 502, "provider_state_changed"),
+            this.turn,
+          );
+          this.fail(error);
+          return;
+        }
         if (name === "call_mcp_tool") {
           const parameters = step.tool_info?.parameters || {};
           const server = parameters.ServerName || parameters.server_name || parameters.server || parameters.mcp_server;
           const tool = parameters.ToolName || parameters.tool_name || parameters.name;
           if (server === LAZY_MCP_SERVER && typeof tool === "string") this.turn.rzMcpTools.add(tool);
         }
+      }
+      if (step.subagent_info) {
+        this.turn.subagentActivity = true;
+        const error = attachTurnProgress(
+          new BridgeError("Antigravity attempted forbidden nested-agent activity", 502, "provider_state_changed"),
+          this.turn,
+        );
+        this.fail(error);
       }
       return;
     }
@@ -568,8 +707,12 @@ class AntigravitySession {
         generatedTokens: 0,
         generationSeconds: 0,
         toolNames: new Set(),
+        toolStepKeys: new Set(),
+        mutationToolStepKeys: new Set(),
         rzMcpTools: new Set(),
-        mutationToolCalls: 0,
+        subagentActivity: false,
+        forbiddenToolName: null,
+        unknownToolSteps: 0,
       };
       this.child.stdin.write(`${json({ event: "user", message: { content: prompt } })}\n`, (error) => {
         if (error) this.fail(new BridgeError(`Cannot deliver the task to Antigravity: ${error.message}`, 502));
@@ -582,16 +725,18 @@ class AntigravitySession {
     this.turn = null;
     turn.cleanup();
     if (!result || result.status !== "SUCCESS") {
-      const quotaFailure = MODEL_QUOTA_FAILURE.test(json(result || {}));
-      const error = new BridgeError(
+      const detail = providerFailureDetail(result, this.stderr);
+      const quotaFailure = MODEL_QUOTA_FAILURE.test(`${json(result || {})}\n${detail}`);
+      const error = attachTurnProgress(new BridgeError(
         quotaFailure
-          ? `Antigravity model quota is depleted for ${this.model}`
-          : `Antigravity turn failed with status ${json(result?.status)}`,
+          ? `Antigravity model quota is depleted for ${this.model}${detail ? `: ${detail}` : ""}`
+          : `Antigravity turn failed with status ${json(result?.status)}${detail ? `: ${detail}` : ""}`,
         quotaFailure ? 429 : 502,
-      );
+      ), turn);
       error.modelQuotaFailure = quotaFailure;
-      error.safeToRetry = turn.toolNames.size === 0
-        && turn.rzMcpTools.size === 0;
+      error.safeToRetry = error.toolCalls === 0
+        && error.rzMcpTools.length === 0
+        && !error.subagentActivity;
       error.routeCommitted = !error.safeToRetry;
       turn.reject(error);
       this.close();
@@ -611,9 +756,10 @@ class AntigravitySession {
       usage,
       peakContextTokens: turn.peakContextTokens,
       outputTokensPerSecond: turn.generationSeconds > 0 ? turn.generatedTokens / turn.generationSeconds : null,
+      toolCalls: turn.toolStepKeys.size,
       toolNames: [...turn.toolNames],
       rzMcpTools: [...turn.rzMcpTools],
-      mutationToolCalls: turn.mutationToolCalls,
+      mutationToolCalls: turn.mutationToolStepKeys.size,
       durationSeconds: Number(result.duration_seconds || 0),
       conversationId: result.conversation_id || this.init?.conversationId || null,
     });
@@ -628,10 +774,7 @@ class AntigravitySession {
       const turn = this.turn;
       this.turn = null;
       turn.cleanup();
-      if (turn.toolNames.size > 0 || turn.rzMcpTools.size > 0) {
-        error.routeCommitted = true;
-      }
-      turn.reject(error);
+      turn.reject(attachTurnProgress(error, turn));
     }
     this.close();
   }
@@ -644,7 +787,7 @@ class AntigravitySession {
       const turn = this.turn;
       this.turn = null;
       turn.cleanup();
-      turn.reject(error);
+      turn.reject(attachTurnProgress(error, turn));
     }
     if (this.child && !this.child.killed) this.child.kill();
     this.onClose(this);
@@ -746,6 +889,7 @@ function readRequestBody(request) {
 
 const route = centralRoute();
 if (!existsSync(AGY_EXE)) throw new BridgeError(`Antigravity CLI is missing at ${AGY_EXE}`, 500);
+const agentDefinitionHash = ensureAgentDefinition();
 const models = {
   primary: { id: route.primaryModel, label: verifyModelAvailable(route.primaryModel), effort: null },
   fallback: {
@@ -758,6 +902,7 @@ const mcpConfig = verifyLazyMcpConfig();
 const quotaRouter = new AntigravityQuotaRouter();
 quotaRouter.snapshot(true);
 const sessions = new Map();
+let activeTurnAdmissions = 0;
 const runtime = {
   incomingRequests: 0,
   completed: 0,
@@ -767,11 +912,13 @@ const runtime = {
   sessionsCreated: 0,
   sessionsReused: 0,
   quotaPoolSwitches: 0,
+  capacityDeferrals: 0,
   lastActualModel: null,
   lastActualModelLabel: null,
   lastAuthVerifiedAt: null,
   lastConversationId: null,
   lastInitializedToolCount: null,
+  lastInitializedForbiddenTools: [],
   lastInputTokens: null,
   lastCachedInputTokens: null,
   lastOutputTokens: null,
@@ -870,7 +1017,18 @@ async function handleResponses(request, response) {
   });
   const heartbeat = setInterval(() => writeHeartbeat(response, responseId), SSE_HEARTBEAT_MS);
   let selectedSession;
+  let admitted = false;
   try {
+    if (activeTurnAdmissions >= MAX_CONCURRENT_TURNS) {
+      runtime.capacityDeferrals += 1;
+      throw new BridgeError(
+        "Antigravity quota protection admits only one native worker turn at a time",
+        429,
+        "provider_busy",
+      );
+    }
+    activeTurnAdmissions += 1;
+    admitted = true;
     let { session, reused } = await sessionFor(context);
     selectedSession = session;
     let prompt = reused ? resumePrompt(context, session) : fullPrompt(context);
@@ -886,15 +1044,17 @@ async function handleResponses(request, response) {
       }
     };
     let diagnostics = diagnosticsFor(prompt, reused);
+    runtime.lastCompleteTaskDelivered = diagnostics.completeTaskDelivered;
     let result;
     try {
       result = await session.run(prompt, controller.signal);
     } catch (error) {
+      const modelQuotaFailure = error?.modelQuotaFailure === true;
+      if (modelQuotaFailure) quotaRouter.markDepleted(session.model);
       const safeClaudeQuotaFailure = session.model === route.primaryModel
-        && error?.modelQuotaFailure === true
+        && modelQuotaFailure
         && error?.safeToRetry === true;
       if (!safeClaudeQuotaFailure) throw error;
-      quotaRouter.markPrimaryDepleted();
       runtime.quotaPoolSwitches += 1;
       ({ session, reused } = await sessionFor(context));
       selectedSession = session;
@@ -913,7 +1073,7 @@ async function handleResponses(request, response) {
     runtime.lastPeakTurnContextTokens = result.peakContextTokens;
     runtime.lastOutputTokensPerSecond = result.outputTokensPerSecond;
     runtime.lastDurationSeconds = result.durationSeconds;
-    runtime.lastNativeToolCalls = result.toolNames.length;
+    runtime.lastNativeToolCalls = result.toolCalls;
     runtime.lastNativeToolNames = result.toolNames;
     runtime.lastMutationToolCalls = result.mutationToolCalls;
     runtime.lastRzMcpTools = result.rzMcpTools;
@@ -932,7 +1092,7 @@ async function handleResponses(request, response) {
       provider_session_reused: reused,
       peak_turn_context_tokens: result.peakContextTokens,
       output_tokens_per_second: result.outputTokensPerSecond,
-      native_tool_calls: result.toolNames.length,
+      native_tool_calls: result.toolCalls,
       native_tool_names: result.toolNames,
       mutation_tool_calls: result.mutationToolCalls,
       rzmcp_tools_called: result.rzMcpTools,
@@ -951,6 +1111,12 @@ async function handleResponses(request, response) {
   } catch (error) {
     runtime.failed += 1;
     runtime.lastError = String(error?.message || error).slice(0, 2_000);
+    runtime.lastActualModel = selectedSession?.model || null;
+    runtime.lastActualModelLabel = selectedSession?.modelLabel || null;
+    runtime.lastNativeToolCalls = Number(error?.toolCalls || 0);
+    runtime.lastNativeToolNames = Array.isArray(error?.toolNames) ? error.toolNames : [];
+    runtime.lastMutationToolCalls = Number(error?.mutationToolCalls || 0);
+    runtime.lastRzMcpTools = Array.isArray(error?.rzMcpTools) ? error.rzMcpTools : [];
     writeSse(response, "response.failed", {
       response: {
         id: responseId,
@@ -958,7 +1124,7 @@ async function handleResponses(request, response) {
         model: MODEL_ALIAS,
         status: "failed",
         error: {
-          code: error?.routeCommitted === true ? "provider_state_changed" : "external_provider_error",
+          code: error?.code || (error?.routeCommitted === true ? "provider_state_changed" : "external_provider_error"),
           message: runtime.lastError,
         },
       },
@@ -966,6 +1132,7 @@ async function handleResponses(request, response) {
     response.end();
     if (selectedSession?.closed === false && !context.sessionKey) selectedSession.close();
   } finally {
+    if (admitted) activeTurnAdmissions = Math.max(0, activeTurnAdmissions - 1);
     clearInterval(heartbeat);
   }
 }
@@ -1018,18 +1185,28 @@ function health() {
     modelAlias: MODEL_ALIAS,
     configuredModel: route.primaryModel,
     configuredModelLabel: models.primary.label,
+    agent: {
+      id: AGENT_ID,
+      definitionPath: AGENT_DEFINITION_PATH,
+      definitionHash: agentDefinitionHash,
+      declarativeToolAllowlist: AGENT_DEFINITION.match(/^  - .+$/gm)?.map((line) => line.slice(4)) || [],
+      forceDisableFundamentalComponents: true,
+      forbiddenToolPolicy: "terminate_committed_turn",
+      forbiddenTools: [...FORBIDDEN_AGENT_TOOLS],
+      initReportsProviderBaseToolSurface: true,
+    },
     routing: {
       primary: {
         model: models.primary.id,
         label: models.primary.label,
         effort: "model-default-thinking",
-        quotaBucket: PRIMARY_QUOTA_BUCKET_ID,
+        quotaBuckets: PRIMARY_QUOTA_BUCKET_IDS,
       },
       quotaFallback: {
         model: models.fallback.id,
         label: models.fallback.label,
         effort: models.fallback.effort,
-        quotaBucket: FALLBACK_QUOTA_BUCKET_ID,
+        quotaBuckets: FALLBACK_QUOTA_BUCKET_IDS,
       },
       policy: "claude_gpt_pool_then_gemini_pool",
     },
@@ -1043,7 +1220,13 @@ function health() {
     },
     lazyRzMcp: { server: LAZY_MCP_SERVER, proxyTools: 2, ...mcpConfig },
     codexToolSchemasForwarded: 0,
-    sessionPolicy: { persistentStreamJson: true, idleMilliseconds: SESSION_IDLE_MS, maximumSessions: MAX_SESSIONS },
+    sessionPolicy: {
+      persistentStreamJson: true,
+      idleMilliseconds: SESSION_IDLE_MS,
+      maximumSessions: MAX_SESSIONS,
+      maximumConcurrentTurns: MAX_CONCURRENT_TURNS,
+      activeTurnAdmissions,
+    },
     activeSessions: sessions.size,
     activeTurns: [...sessions.values()].filter((session) => session.busy).length,
     runtime,
@@ -1053,6 +1236,9 @@ function health() {
 async function selfTest() {
   const primaryArgs = sessionArguments(models.primary);
   const fallbackArgs = sessionArguments(models.fallback);
+  if (primaryArgs[primaryArgs.indexOf("--agent") + 1] !== AGENT_ID) {
+    throw new Error("restricted Antigravity agent was not selected");
+  }
   if (primaryArgs.includes("--effort")) throw new Error("Opus Thinking received an unsupported effort flag");
   if (fallbackArgs[fallbackArgs.indexOf("--effort") + 1] !== REQUIRED_EFFORT) {
     throw new Error("Gemini Flash High did not receive high effort");
@@ -1063,17 +1249,39 @@ async function selfTest() {
       name: "usage",
       data: {
         groups: [
-          { name: "Gemini Models", buckets: [{ id: FALLBACK_QUOTA_BUCKET_ID, remaining_fraction: 0.75, reset_time: "2026-09-04T00:13:07Z" }] },
-          { name: "Claude and GPT models", buckets: [{ id: PRIMARY_QUOTA_BUCKET_ID, remaining_fraction: 1, reset_time: "2026-09-06T01:56:48Z" }] },
+          { name: "Gemini Models", buckets: [
+            { id: FALLBACK_QUOTA_BUCKET_IDS[0], remaining_fraction: 0.75, reset_time: "2026-09-04T00:13:07Z" },
+            { id: FALLBACK_QUOTA_BUCKET_IDS[1], remaining_fraction: 0.25, reset_time: "2026-08-30T17:00:00Z" },
+          ] },
+          { name: "Claude and GPT models", buckets: [
+            { id: PRIMARY_QUOTA_BUCKET_IDS[0], remaining_fraction: 1, reset_time: "2026-09-06T01:56:48Z" },
+            { id: PRIMARY_QUOTA_BUCKET_IDS[1], remaining_fraction: 0.5, reset_time: "2026-08-30T17:00:00Z" },
+          ] },
         ],
       },
     },
   }), Date.parse("2026-08-30T12:00:00Z"));
   const fixtureRouter = new AntigravityQuotaRouter(() => Date.parse("2026-08-30T12:00:01Z"));
   fixtureRouter.snapshot = () => quotaFixture;
+  if (quotaFixture.primary.remainingFraction !== 0.5 || quotaFixture.fallback.remainingFraction !== 0.25) {
+    throw new Error("Antigravity effective quota did not honor the tightest active window");
+  }
   if (fixtureRouter.select().id !== route.primaryModel) throw new Error("Claude/GPT pool was not preferred");
   if (fixtureRouter.select(route.quotaFallbackModel).id !== route.quotaFallbackModel) {
     throw new Error("Gemini task route was not sticky");
+  }
+  const weeklyOnlyQuota = parseQuotaSnapshot(json({
+    status: "SUCCESS",
+    command: {
+      name: "usage",
+      data: { groups: [
+        { name: "Gemini Models", buckets: [{ id: FALLBACK_QUOTA_BUCKET_IDS[0], remaining_fraction: 0.75, reset_time: "2026-09-04T00:13:07Z" }] },
+        { name: "Claude and GPT models", buckets: [{ id: PRIMARY_QUOTA_BUCKET_IDS[0], remaining_fraction: 1, reset_time: "2026-09-06T01:56:48Z" }] },
+      ] },
+    },
+  }));
+  if (weeklyOnlyQuota.primary.buckets.length !== 1 || weeklyOnlyQuota.fallback.buckets.length !== 1) {
+    throw new Error("weekly-only Antigravity plans were not accepted");
   }
   quotaFixture.primary.remainingFraction = 0;
   if (fixtureRouter.select().id !== route.quotaFallbackModel) throw new Error("Gemini quota fallback was not selected");
@@ -1084,18 +1292,37 @@ async function selfTest() {
   } catch (error) {
     if (!(error instanceof BridgeError) || error.status !== 429) throw error;
   }
-  const quotaFailureFor = (toolNames, generatedTokens = 0) => {
+  const quotaFailureFor = (toolNames, generatedTokens = 0, message = "Individual quota reached. Resets in 1h.") => {
     const session = new AntigravitySession("quota-fixture", process.cwd(), "task", models.primary, () => {});
     session.close = () => {};
+    session.init = { conversationId: "quota-fixture" };
     let rejected;
     session.turn = {
       cleanup: () => {},
       reject: (error) => { rejected = error; },
       generatedTokens,
-      toolNames: new Set(toolNames),
+      toolNames: new Set(),
+      toolStepKeys: new Set(),
+      mutationToolStepKeys: new Set(),
       rzMcpTools: new Set(),
+      subagentActivity: false,
+      forbiddenToolName: null,
+      unknownToolSteps: 0,
     };
-    session.finishTurn({ status: "ERROR", response: "You have exhausted your quota on this model." });
+    for (const [stepIndex, toolName] of toolNames.entries()) {
+      session.consumeEvent({
+        event: "step_update",
+        step_update: {
+          conversation_id: "quota-fixture",
+          step_index: stepIndex,
+          state: "DONE",
+          step_type: "tool",
+          tool_name: toolName,
+          tool_info: { name: toolName, parameters: {} },
+        },
+      });
+    }
+    session.finishTurn({ status: "ERROR", error: message });
     return rejected;
   };
   const safeQuotaFailure = quotaFailureFor([], 100);
@@ -1105,6 +1332,67 @@ async function selfTest() {
   }
   if (!committedQuotaFailure?.modelQuotaFailure || committedQuotaFailure.safeToRetry || !committedQuotaFailure.routeCommitted) {
     throw new Error("committed model-quota failure classification failed");
+  }
+  if (committedQuotaFailure.toolCalls !== 1 || committedQuotaFailure.mutationToolCalls !== 1) {
+    throw new Error("DONE-only tool commitment accounting failed");
+  }
+  const capacityQuotaFailure = quotaFailureFor([], 0, "You have exhausted your capacity on this model.");
+  if (!capacityQuotaFailure?.modelQuotaFailure) throw new Error("capacity quota classification failed");
+  const initSession = new AntigravitySession("init-fixture", process.cwd(), "task", models.primary, () => {});
+  let initResolved = false;
+  let initRejected = false;
+  initSession.resolveInit = () => { initResolved = true; };
+  initSession.rejectInit = () => { initRejected = true; };
+  initSession.consumeEvent({
+    event: "init",
+    conversation_id: "init-fixture",
+    init: {
+      model: models.primary.id,
+      agent: AGENT_ID,
+      permission_mode: "always-proceed",
+      tools: [...REQUIRED_AGENT_TOOLS, ...FORBIDDEN_AGENT_TOOLS],
+    },
+  });
+  if (!initResolved || initRejected || runtime.lastInitializedForbiddenTools.length !== FORBIDDEN_AGENT_TOOLS.size) {
+    throw new Error("provider base-tool init surface was mistaken for the effective agent allowlist");
+  }
+  const forbiddenSession = new AntigravitySession("forbidden-fixture", process.cwd(), "task", models.primary, () => {});
+  forbiddenSession.close = () => {};
+  forbiddenSession.init = { conversationId: "forbidden-fixture" };
+  forbiddenSession.initSettled = true;
+  let forbiddenFailure;
+  forbiddenSession.turn = {
+    cleanup: () => {},
+    reject: (error) => { forbiddenFailure = error; },
+    generatedTokens: 0,
+    toolNames: new Set(),
+    toolStepKeys: new Set(),
+    mutationToolStepKeys: new Set(),
+    rzMcpTools: new Set(),
+    subagentActivity: false,
+    forbiddenToolName: null,
+    unknownToolSteps: 0,
+  };
+  forbiddenSession.consumeEvent({
+    event: "step_update",
+    step_update: {
+      conversation_id: "forbidden-fixture",
+      step_index: 0,
+      state: "DONE",
+      step_type: "tool",
+      tool_name: "manage_task",
+      tool_info: { name: "manage_task", parameters: {} },
+    },
+  });
+  if (!forbiddenFailure?.routeCommitted || forbiddenFailure.code !== "provider_state_changed" || forbiddenFailure.forbiddenToolName !== "manage_task") {
+    throw new Error("forbidden Antigravity orchestration tool did not fail closed");
+  }
+  if (/^model\s*:/m.test(AGENT_DEFINITION)) throw new Error("agent definition pinned a model");
+  for (const name of FORBIDDEN_AGENT_TOOLS) {
+    if (AGENT_DEFINITION.includes(`  - ${name}\n`)) throw new Error(`agent definition exposed ${name}`);
+  }
+  if (!AGENT_DEFINITION.includes("subagent: false\n") || !AGENT_DEFINITION.includes("forceDisableFundamentalComponents: true\n")) {
+    throw new Error("agent definition did not disable provider-side nesting");
   }
   const taskHeader = "Message Type: NEW_TASK\nTask name: /root/agy_fixture\nPayload:\n";
   const taskPayload = "Implement the bounded fixture now.";

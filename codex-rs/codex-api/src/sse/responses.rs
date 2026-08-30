@@ -439,6 +439,12 @@ pub fn process_responses_event(
                                 serde_json::from_value::<MisalignmentErrorDetails>(details).ok()
                             }),
                         };
+                    } else if error.code.as_deref() == Some("provider_state_changed") {
+                        let message = error.message.unwrap_or_else(|| {
+                            "External provider stopped after executing tools; the turn was not replayed."
+                                .to_string()
+                        });
+                        response_error = ApiError::InvalidRequest { message };
                     } else if matches!(error.code.as_deref(), Some("invalid_prompt" | "bio_policy"))
                     {
                         let message = error
@@ -1137,6 +1143,28 @@ mod tests {
                 }
                 _ => panic!("unexpected events for {code}: {events:?}"),
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_state_changed_error_is_not_retryable() {
+        let event = json!({
+            "type": "response.failed",
+            "response": {
+                "error": {
+                    "code": "provider_state_changed",
+                    "message": "Provider quota ended after a file edit."
+                }
+            },
+        });
+        let sse = format!("event: response.failed\ndata: {event}\n\n");
+        let events = collect_events(&[sse.as_bytes()]).await;
+
+        match events.as_slice() {
+            [Err(ApiError::InvalidRequest { message })] => {
+                assert_eq!(message, "Provider quota ended after a file edit.");
+            }
+            other => panic!("unexpected provider-state event: {other:?}"),
         }
     }
 

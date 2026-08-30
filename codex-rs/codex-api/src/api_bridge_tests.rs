@@ -52,6 +52,18 @@ fn map_api_error_preserves_retry_delay() {
 }
 
 #[test]
+fn map_api_error_does_not_retry_changed_provider_state() {
+    let err = map_api_error(ApiError::InvalidRequest {
+        message: "Provider stopped after executing tools.".to_string(),
+    });
+
+    assert_eq!(
+        (err.is_retryable(), err.to_string()),
+        (false, "Provider stopped after executing tools.".to_string(),)
+    );
+}
+
+#[test]
 fn map_api_error_maps_server_overloaded_from_503_body() {
     let body = serde_json::json!({
         "error": {

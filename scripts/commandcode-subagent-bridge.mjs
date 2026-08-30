@@ -6,6 +6,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { basename, isAbsolute, join } from "node:path";
 import { existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { normalizeAgentMessageContent } from "./codebuddy-subagent-task-state.mjs";
 
 const COMMAND_CODE_PACKAGE_NAME = "command-code";
 const MINIMUM_COMMAND_CODE_VERSION = "1.33.0";
@@ -120,6 +121,7 @@ const cursorRuntime = {
   failed: 0,
   lastInitializedModel: null,
   lastInputTokens: null,
+  lastNativeToolNames: [],
   lastWorkingDirectory: null,
 };
 
@@ -1180,6 +1182,19 @@ function cursorContentText(value, label) {
   }).join("");
 }
 
+function preserveCursorCommit(error, nativeToolNames) {
+  const names = [...new Set(nativeToolNames.filter((name) => typeof name === "string" && name))];
+  if (names.length > 0) {
+    error.routeCommitted = true;
+    error.nativeToolNames = names;
+  }
+  return error;
+}
+
+function cursorResponseErrorCode(error) {
+  return error?.routeCommitted === true ? "provider_state_changed" : "external_provider_error";
+}
+
 function cursorPromptFrom(body) {
   assertObject(body, "request body");
   if (body.stream !== true) throw new BridgeError("The Cursor bridge only supports stream=true Responses requests");
@@ -1212,7 +1227,8 @@ function cursorPromptFrom(body) {
     if (item.type === "agent_message") {
       const author = typeof item.author === "string" ? item.author : "Codex";
       const recipient = typeof item.recipient === "string" ? item.recipient : "Cursor worker";
-      sections.push(`[Delegated task ${author} -> ${recipient}]\n${cursorContentText(item.content, `${label}.content`)}`);
+      const normalized = normalizeAgentMessageContent(item.content, `${label}.content`);
+      sections.push(`[Delegated task ${author} -> ${recipient}]\n${normalized.text}`);
       continue;
     }
     if (item.type === "reasoning") {
@@ -1236,6 +1252,7 @@ function cursorPromptFrom(body) {
       sections.push(`[Prior tool result ${requireString(item.call_id, `${label}.call_id`)}]\n${textOutput(item.output, `${label}.output`)}`);
       continue;
     }
+    if (PROVIDER_OPAQUE_INPUT_TYPES.has(item.type)) continue;
     throw new BridgeError(`${label} has unsupported Cursor input type ${JSON.stringify(item.type)}`);
   }
   const prompt = sections.filter(Boolean).join("\n\n");
@@ -1312,12 +1329,13 @@ function runCursorAgent(context, onSpawn) {
     let finalText = "";
     let resultEvent = null;
     let initializedModel = "";
+    const nativeToolNames = [];
     const finish = (error, value) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       transportedPrompt.cleanup();
-      error ? reject(error) : resolve(value);
+      error ? reject(preserveCursorCommit(error, nativeToolNames)) : resolve(value);
     };
     const parseLine = (line) => {
       if (!line.trim()) return;
@@ -1330,6 +1348,11 @@ function runCursorAgent(context, onSpawn) {
         initializedModel = event.model;
       }
       if (event.type === "assistant" && Array.isArray(event.message?.content)) {
+        for (const part of event.message.content) {
+          if (part?.type === "tool_use" && typeof part.name === "string" && part.name) {
+            nativeToolNames.push(part.name);
+          }
+        }
         const text = event.message.content
           .filter((part) => part?.type === "text" && typeof part.text === "string")
           .map((part) => part.text)
@@ -1372,7 +1395,12 @@ function runCursorAgent(context, onSpawn) {
         finish(new BridgeError("Cursor Agent completed without assistant output", 502));
         return;
       }
-      finish(undefined, { text, usage: resultEvent.usage ?? {}, initializedModel });
+      finish(undefined, {
+        text,
+        usage: resultEvent.usage ?? {},
+        initializedModel,
+        nativeToolNames: [...new Set(nativeToolNames)],
+      });
     });
   });
 }
@@ -1418,6 +1446,7 @@ async function handleCursorResponses(request, response) {
     cursorRuntime.completed += 1;
     cursorRuntime.lastInitializedModel = result.initializedModel || null;
     cursorRuntime.lastInputTokens = Number.isInteger(result.usage?.inputTokens) ? result.usage.inputTokens : null;
+    cursorRuntime.lastNativeToolNames = result.nativeToolNames;
     const itemId = `msg_${randomUUID()}`;
     const item = responseMessageItem(itemId, "");
     writeSse(response, "response.output_item.added", { output_index: 0, item });
@@ -1456,7 +1485,11 @@ async function handleCursorResponses(request, response) {
         id: responseId,
         object: "response",
         status: "failed",
-        error: { type: "bridge_error", message: redactSecrets(error.message) },
+        error: {
+          code: cursorResponseErrorCode(error),
+          type: "bridge_error",
+          message: redactSecrets(error.message),
+        },
       },
     });
     response.end();
@@ -2670,6 +2703,41 @@ async function handleOpenCodeResponses(request, response) {
 
 function selfTest() {
   readCommandCodeInstallation();
+  const cursorTaskPayload = "<agent_message type=\"new_task\">\nactive-cursor-task\n</agent_message>";
+  const cursorTask = cursorPromptFrom({
+    model: "cursor/test-model",
+    input: [
+      { type: "compaction", encrypted_content: "provider-opaque" },
+      {
+        type: "agent_message",
+        author: "/root",
+        recipient: "/root/worker",
+        content: [
+          { type: "input_text", text: "[inter-agent header]\n" },
+          { type: "encrypted_content", encrypted_content: cursorTaskPayload },
+        ],
+      },
+    ],
+    stream: true,
+    client_metadata: { cwd: process.cwd() },
+  });
+  if (
+    cursorTask.prompt.split(cursorTaskPayload).length !== 2
+    || cursorTask.prompt.includes("provider-opaque")
+  ) {
+    throw new Error("self-test failed: Cursor encrypted task and compaction portability");
+  }
+  const cursorCommittedError = preserveCursorCommit(
+    new BridgeError("fixture", 502),
+    ["read_file", "apply_patch", "apply_patch"],
+  );
+  if (
+    cursorResponseErrorCode(cursorCommittedError) !== "provider_state_changed"
+    || cursorCommittedError.nativeToolNames.join(",") !== "read_file,apply_patch"
+    || cursorResponseErrorCode(new BridgeError("transient", 502)) !== "external_provider_error"
+  ) {
+    throw new Error("self-test failed: Cursor native-tool commitment classification");
+  }
   if (translateToolDefinition({ type: "web_search" }, 0).length !== 0) {
     throw new Error("self-test failed: hosted web search must not be forwarded to CommandCode");
   }

@@ -721,6 +721,18 @@ function sanitizedProviderFailure(error) {
     .slice(0, 2_000);
 }
 
+function preserveProviderCommit(error, session) {
+  const toolCalls = Array.isArray(session?.toolCalls)
+    ? session.toolCalls.filter((call) => call?.name)
+    : [];
+  if (toolCalls.length > 0) {
+    error.routeCommitted = true;
+    error.toolCalls = toolCalls.length;
+    error.toolNames = [...new Set(toolCalls.map((call) => call.name))];
+  }
+  return error;
+}
+
 async function runCliWithResourceRetries(context, selectedModel, onSpawn, signal, deadline) {
   let attempt = 0;
   while (true) {
@@ -730,6 +742,14 @@ async function runCliWithResourceRetries(context, selectedModel, onSpawn, signal
     const cliResult = await runCli(context, selectedModel, onSpawn, remainingMs);
     const session = await waitForSession(context.requestId);
     if (!isRetryableResourceFailure(cliResult)) return { cliResult, session };
+    if (session?.toolCalls?.some((call) => call?.name)) {
+      const error = preserveProviderCommit(
+        new BridgeError("Devin became resource exhausted after executing native tools; the turn was not replayed", 502),
+        session,
+      );
+      removeSession(session.id);
+      throw error;
+    }
     if (session) removeSession(session.id);
     attempt += 1;
     const backoffMs = resourceBackoffMs(attempt);
@@ -796,12 +816,16 @@ function fallbackResult(completion, reason) {
 
 function finalizeDevinResult(selected, routeResult, fallbackState) {
   const { cliResult, session } = routeResult;
-  if (cliResult.code !== 0 || !cliResult.stdout) {
-    if (session) removeSession(session.id);
-    throw new BridgeError(`Devin failed: ${cliResult.stderr || cliResult.stdout || `exit ${cliResult.code}`}`, 502);
+  if (!session) {
+    if (cliResult.code !== 0 || !cliResult.stdout) {
+      throw new BridgeError(`Devin failed: ${cliResult.stderr || cliResult.stdout || `exit ${cliResult.code}`}`, 502);
+    }
+    throw new BridgeError("Devin completed without a traceable ephemeral session", 502);
   }
-  if (!session) throw new BridgeError("Devin completed without a traceable ephemeral session", 502);
   try {
+    if (cliResult.code !== 0 || !cliResult.stdout) {
+      throw new BridgeError(`Devin failed: ${cliResult.stderr || cliResult.stdout || `exit ${cliResult.code}`}`, 502);
+    }
     if (session.model !== selected.model.model_uid) {
       throw new BridgeError(`Devin used unexpected model ${json(session.model)}`, 502);
     }
@@ -834,6 +858,8 @@ function finalizeDevinResult(selected, routeResult, fallbackState) {
       inputTokens, cachedTokens, outputTokens, peakTurnContextTokens, outputTokensPerSecond,
       toolCalls, nativeToolNames: toolCalls.map((call) => call.name), rzMcpTools,
     };
+  } catch (error) {
+    throw preserveProviderCommit(error, session);
   } finally {
     removeSession(session.id);
   }
@@ -948,6 +974,14 @@ async function execute(context, requestBody, initialRoute, onSpawn, signal, fall
     });
   }
 
+  if (routeResult.session?.toolCalls?.some((call) => call?.name)) {
+    const error = preserveProviderCommit(
+      new BridgeError("Devin quota ended after executing native tools; provider fallback was not started", 502),
+      routeResult.session,
+    );
+    removeSession(routeResult.session.id);
+    throw error;
+  }
   if (routeResult.session) removeSession(routeResult.session.id);
   if (calendarQuotaState.record(routeResult.cliResult)) runtime.calendarQuotaActivations += 1;
   runtime.lastQuotaPinCreated = quotaTaskPins.pin(
@@ -1031,6 +1065,10 @@ function emitOutputItems(response, result, streamedMessageIds = new Set()) {
 function writeSse(response, type, payload) {
   if (response.destroyed || response.writableEnded) return;
   response.write(`event: ${type}\ndata: ${json({ type, ...payload })}\n\n`);
+}
+
+function providerResponseErrorCode(error) {
+  return error?.routeCommitted === true ? "provider_state_changed" : "external_provider_error";
 }
 
 function writeSseHeartbeat(response, responseId, modelAlias = MODEL_ALIAS) {
@@ -1189,7 +1227,7 @@ async function handleResponses(request, response) {
     response.end();
   } catch (error) {
     runtime.failed += 1;
-    writeSse(response, "response.failed", { response: { id: responseId, object: "response", model: context.modelAlias, status: "failed", error: { code: "external_provider_error", message: error.message } } });
+    writeSse(response, "response.failed", { response: { id: responseId, object: "response", model: context.modelAlias, status: "failed", error: { code: providerResponseErrorCode(error), message: error.message } } });
     response.end();
   } finally {
     clearInterval(heartbeat);
@@ -1509,6 +1547,22 @@ async function selfTest() {
   }
   if (!sanitizedProviderFailure(new Error("authorization: Bearer secret-value")).includes("[REDACTED]")) {
     throw new Error("provider failure redaction failed");
+  }
+  if (
+    providerResponseErrorCode({ routeCommitted: true }) !== "provider_state_changed"
+    || providerResponseErrorCode(new Error("transient")) !== "external_provider_error"
+  ) {
+    throw new Error("committed fallback failure classification failed");
+  }
+  const committedError = preserveProviderCommit(new Error("fixture"), {
+    toolCalls: [{ name: "apply_patch" }, { name: "apply_patch" }, { name: "view_file" }],
+  });
+  if (
+    committedError.routeCommitted !== true
+    || committedError.toolCalls !== 3
+    || committedError.toolNames.join(",") !== "apply_patch,view_file"
+  ) {
+    throw new Error("Devin native-tool commitment classification failed");
   }
   let concurrentFreeCalls = 0;
   let peakConcurrentFreeCalls = 0;
