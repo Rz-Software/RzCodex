@@ -30,7 +30,7 @@ const INIT_TIMEOUT_MS = 30 * 1000;
 const SESSION_IDLE_MS = 30 * 60 * 1000;
 const SSE_HEARTBEAT_MS = 15 * 1000;
 const MAX_SESSIONS = 8;
-const MAX_CONCURRENT_TURNS = 1;
+const MAX_PROGRESS_EVENTS = 256;
 const QUOTA_CACHE_MS = 30 * 1000;
 const PRIMARY_QUOTA_BUCKET_IDS = ["3p-weekly", "3p-5h"];
 const FALLBACK_QUOTA_BUCKET_IDS = ["gemini-weekly", "gemini-5h"];
@@ -657,6 +657,13 @@ class AntigravitySession {
         const firstObservation = !this.turn.toolStepKeys.has(stepKey);
         this.turn.toolStepKeys.add(stepKey);
         if (typeof name === "string") this.turn.toolNames.add(name);
+        if (firstObservation) {
+          this.turn.onProgress?.({
+            kind: "tool",
+            index: this.turn.toolStepKeys.size,
+            name: typeof name === "string" ? name : "unknown_tool",
+          });
+        }
         if (firstObservation && MUTATION_TOOLS.has(name)) this.turn.mutationToolStepKeys.add(stepKey);
         if (firstObservation && FORBIDDEN_AGENT_TOOLS.has(name)) {
           this.turn.forbiddenToolName = name;
@@ -687,7 +694,7 @@ class AntigravitySession {
     if (event?.event === "result" && this.turn) this.finishTurn(event.result);
   }
 
-  run(prompt, signal) {
+  run(prompt, signal, onProgress = () => {}) {
     if (!this.init) throw new BridgeError("Antigravity session is not initialized", 500);
     if (this.turn) throw new BridgeError("Antigravity session already has an active turn", 409);
     if (signal?.aborted) throw new BridgeError("Client disconnected before Antigravity started", 499);
@@ -713,6 +720,7 @@ class AntigravitySession {
         subagentActivity: false,
         forbiddenToolName: null,
         unknownToolSteps: 0,
+        onProgress,
       };
       this.child.stdin.write(`${json({ event: "user", message: { content: prompt } })}\n`, (error) => {
         if (error) this.fail(new BridgeError(`Cannot deliver the task to Antigravity: ${error.message}`, 502));
@@ -805,6 +813,56 @@ function writeHeartbeat(response, responseId) {
   });
 }
 
+function progressToolName(value) {
+  return String(value || "unknown_tool")
+    .replace(/[^A-Za-z0-9_.:-]+/g, "_")
+    .slice(0, 80) || "unknown_tool";
+}
+
+function createProgressEmitter(response) {
+  const itemId = `progress_${randomUUID()}`;
+  let added = false;
+  let completed = null;
+  let text = "";
+  let events = 0;
+  const emit = (delta) => {
+    if (completed || events >= MAX_PROGRESS_EVENTS || typeof delta !== "string" || !delta) return;
+    if (!added) {
+      added = true;
+      writeSse(response, "response.output_item.added", {
+        output_index: 0,
+        item: { type: "reasoning", id: itemId, status: "in_progress", summary: [] },
+      });
+    }
+    events += 1;
+    text += delta;
+    writeSse(response, "response.reasoning_summary_text.delta", {
+      item_id: itemId,
+      output_index: 0,
+      summary_index: 0,
+      delta,
+    });
+  };
+  const finish = () => {
+    if (completed || !added) return completed;
+    completed = {
+      type: "reasoning",
+      id: itemId,
+      status: "completed",
+      summary: text ? [{ type: "summary_text", text }] : [],
+    };
+    writeSse(response, "response.reasoning_summary_text.done", {
+      item_id: itemId,
+      output_index: 0,
+      summary_index: 0,
+      text,
+    });
+    writeSse(response, "response.output_item.done", { output_index: 0, item: completed });
+    return completed;
+  };
+  return { emit, finish, get added() { return added; } };
+}
+
 function usageFrom(result) {
   return {
     input_tokens: result.usage.input_tokens,
@@ -815,37 +873,38 @@ function usageFrom(result) {
   };
 }
 
-function emitCompleted(response, responseId, result, metadata) {
+function emitCompleted(response, responseId, result, metadata, prefixOutput = []) {
   const messageId = `msg_${randomUUID()}`;
+  const outputIndex = prefixOutput.length;
   const item = {
     type: "message", id: messageId, status: "completed", role: "assistant",
     content: [{ type: "output_text", text: result.text, annotations: [] }],
   };
   writeSse(response, "response.output_item.added", {
-    output_index: 0,
+    output_index: outputIndex,
     item: { ...item, status: "in_progress", content: [] },
   });
   writeSse(response, "response.content_part.added", {
-    item_id: messageId, output_index: 0, content_index: 0,
+    item_id: messageId, output_index: outputIndex, content_index: 0,
     part: { type: "output_text", text: "", annotations: [] },
   });
   writeSse(response, "response.output_text.delta", {
-    item_id: messageId, output_index: 0, content_index: 0, delta: result.text,
+    item_id: messageId, output_index: outputIndex, content_index: 0, delta: result.text,
   });
   writeSse(response, "response.output_text.done", {
-    item_id: messageId, output_index: 0, content_index: 0, text: result.text,
+    item_id: messageId, output_index: outputIndex, content_index: 0, text: result.text,
   });
   writeSse(response, "response.content_part.done", {
-    item_id: messageId, output_index: 0, content_index: 0, part: item.content[0],
+    item_id: messageId, output_index: outputIndex, content_index: 0, part: item.content[0],
   });
-  writeSse(response, "response.output_item.done", { output_index: 0, item });
+  writeSse(response, "response.output_item.done", { output_index: outputIndex, item });
   const completed = {
     id: responseId,
     object: "response",
     created_at: Math.floor(Date.now() / 1000),
     status: "completed",
     model: MODEL_ALIAS,
-    output: [item],
+    output: [...prefixOutput, item],
     usage: usageFrom(result),
     error: null,
     incomplete_details: null,
@@ -902,7 +961,6 @@ const mcpConfig = verifyLazyMcpConfig();
 const quotaRouter = new AntigravityQuotaRouter();
 quotaRouter.snapshot(true);
 const sessions = new Map();
-let activeTurnAdmissions = 0;
 const runtime = {
   incomingRequests: 0,
   completed: 0,
@@ -912,7 +970,6 @@ const runtime = {
   sessionsCreated: 0,
   sessionsReused: 0,
   quotaPoolSwitches: 0,
-  capacityDeferrals: 0,
   lastActualModel: null,
   lastActualModelLabel: null,
   lastAuthVerifiedAt: null,
@@ -1011,26 +1068,17 @@ async function handleResponses(request, response) {
     response: { id: responseId, object: "response", model: MODEL_ALIAS, status: "in_progress" },
   });
   writeHeartbeat(response, responseId);
+  const progress = createProgressEmitter(response);
   const controller = new AbortController();
   response.once("close", () => {
     if (!response.writableEnded) controller.abort();
   });
   const heartbeat = setInterval(() => writeHeartbeat(response, responseId), SSE_HEARTBEAT_MS);
   let selectedSession;
-  let admitted = false;
   try {
-    if (activeTurnAdmissions >= MAX_CONCURRENT_TURNS) {
-      runtime.capacityDeferrals += 1;
-      throw new BridgeError(
-        "Antigravity quota protection admits only one native worker turn at a time",
-        429,
-        "provider_busy",
-      );
-    }
-    activeTurnAdmissions += 1;
-    admitted = true;
     let { session, reused } = await sessionFor(context);
     selectedSession = session;
+    progress.emit(`Antigravity native worker started with ${session.modelLabel}.\n`);
     let prompt = reused ? resumePrompt(context, session) : fullPrompt(context);
     const diagnosticsFor = (currentPrompt, currentReused) => {
       try {
@@ -1047,7 +1095,9 @@ async function handleResponses(request, response) {
     runtime.lastCompleteTaskDelivered = diagnostics.completeTaskDelivered;
     let result;
     try {
-      result = await session.run(prompt, controller.signal);
+      result = await session.run(prompt, controller.signal, ({ index, name }) => {
+        progress.emit(`Antigravity native tool ${index}: ${progressToolName(name)}.\n`);
+      });
     } catch (error) {
       const modelQuotaFailure = error?.modelQuotaFailure === true;
       if (modelQuotaFailure) quotaRouter.markDepleted(session.model);
@@ -1058,9 +1108,12 @@ async function handleResponses(request, response) {
       runtime.quotaPoolSwitches += 1;
       ({ session, reused } = await sessionFor(context));
       selectedSession = session;
+      progress.emit(`Antigravity quota route switched to ${session.modelLabel}.\n`);
       prompt = fullPrompt(context);
       diagnostics = diagnosticsFor(prompt, false);
-      result = await session.run(prompt, controller.signal);
+      result = await session.run(prompt, controller.signal, ({ index, name }) => {
+        progress.emit(`Antigravity native tool ${index}: ${progressToolName(name)}.\n`);
+      });
     }
     for (const key of context.messageKeys) session.seenMessageKeys.add(key);
     runtime.completed += 1;
@@ -1081,6 +1134,7 @@ async function handleResponses(request, response) {
     runtime.lastCompleteTaskDelivered = diagnostics.completeTaskDelivered;
     runtime.lastProviderSessionReused = reused;
     runtime.lastError = null;
+    const progressItem = progress.finish();
     emitCompleted(response, responseId, result, {
       provider: PROVIDER_ID,
       actual_provider: PROVIDER_ID,
@@ -1105,11 +1159,12 @@ async function handleResponses(request, response) {
       active_task_included_this_turn: diagnostics.activeTaskIncludedThisTurn,
       active_task_retained_in_provider_session: diagnostics.retainedInProviderSession,
       complete_active_task_delivered: diagnostics.completeTaskDelivered,
-    });
+    }, progressItem ? [progressItem] : []);
     response.end();
     if (!context.sessionKey) session.close();
   } catch (error) {
     runtime.failed += 1;
+    progress.finish();
     runtime.lastError = String(error?.message || error).slice(0, 2_000);
     runtime.lastActualModel = selectedSession?.model || null;
     runtime.lastActualModelLabel = selectedSession?.modelLabel || null;
@@ -1132,7 +1187,6 @@ async function handleResponses(request, response) {
     response.end();
     if (selectedSession?.closed === false && !context.sessionKey) selectedSession.close();
   } finally {
-    if (admitted) activeTurnAdmissions = Math.max(0, activeTurnAdmissions - 1);
     clearInterval(heartbeat);
   }
 }
@@ -1224,8 +1278,7 @@ function health() {
       persistentStreamJson: true,
       idleMilliseconds: SESSION_IDLE_MS,
       maximumSessions: MAX_SESSIONS,
-      maximumConcurrentTurns: MAX_CONCURRENT_TURNS,
-      activeTurnAdmissions,
+      maximumConcurrentTurns: MAX_SESSIONS,
     },
     activeSessions: sessions.size,
     activeTurns: [...sessions.values()].filter((session) => session.busy).length,
@@ -1438,13 +1491,28 @@ async function selfTest() {
   }
   if (isolated.RETAINED_TEST_VALUE !== "retained") throw new Error("environment isolation removed unrelated values");
   const writes = [];
-  emitCompleted({ destroyed: false, writableEnded: false, write: (value) => writes.push(value) }, "resp-test", {
+  const testResponse = { destroyed: false, writableEnded: false, write: (value) => writes.push(value) };
+  const testProgress = createProgressEmitter(testResponse);
+  testProgress.emit("Antigravity native worker started.\n");
+  testProgress.emit(`Antigravity native tool 1: ${progressToolName("view file with unsafe spacing")}.\n`);
+  const testProgressItem = testProgress.finish();
+  emitCompleted(testResponse, "resp-test", {
     text: "done",
     usage: { input_tokens: 10, cache_read_tokens: 2, output_tokens: 3, thinking_tokens: 1, total_tokens: 13 },
-  }, {});
+  }, {}, [testProgressItem]);
   const sse = writes.join("");
-  if (!sse.includes("response.output_text.delta") || !sse.includes("response.completed")) {
+  if (
+    !sse.includes("response.reasoning_summary_text.delta")
+    || !sse.includes("Antigravity native tool 1: view_file_with_unsafe_spacing")
+    || !sse.includes('"output_index":1')
+    || !sse.includes('"output":[{"type":"reasoning"')
+    || !sse.includes("response.output_text.delta")
+    || !sse.includes("response.completed")
+  ) {
     throw new Error("Responses SSE lifecycle failed");
+  }
+  if (MAX_SESSIONS < 3) {
+    throw new Error("Antigravity concurrent turn capacity was unexpectedly restricted");
   }
   process.stdout.write("antigravity-subagent-bridge self-test: ok\n");
 }

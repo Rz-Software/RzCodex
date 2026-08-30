@@ -35,6 +35,8 @@ const MAX_ACTIVE_TASK_CHARS = 40_000;
 const OUTPUT_LIMIT = 2 * 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 30 * 60 * 1000;
 const SSE_HEARTBEAT_MS = 15 * 1000;
+const NATIVE_PROGRESS_POLL_MS = 1 * 1000;
+const MAX_PROGRESS_EVENTS = 256;
 const FREE_ROUTE_CONCURRENCY = 2;
 const RESOURCE_BACKOFF_BASE_MS = 5 * 1000;
 const RESOURCE_BACKOFF_MAX_MS = 2 * 60 * 1000;
@@ -658,7 +660,7 @@ function removeSession(sessionId) {
   if (result.status !== 0) throw new BridgeError(`Failed to remove ephemeral Devin session ${sessionId}`, 502);
 }
 
-function runCli(context, selectedModel, onSpawn, timeoutMs = REQUEST_TIMEOUT_MS) {
+function runCli(context, selectedModel, onSpawn, onProgress, timeoutMs = REQUEST_TIMEOUT_MS) {
   const promptPath = join(REQUEST_DIRECTORY, `${context.requestId}.txt`);
   writeFileSync(promptPath, context.prompt, { encoding: "utf8", flag: "wx" });
   const args = [
@@ -675,10 +677,28 @@ function runCli(context, selectedModel, onSpawn, timeoutMs = REQUEST_TIMEOUT_MS)
     let stdout = "";
     let stderr = "";
     let settled = false;
+    const seenToolCalls = new Set();
+    const reportProgress = () => {
+      let session;
+      try {
+        session = inspectSession(context.requestId);
+      } catch {
+        return;
+      }
+      for (const [index, call] of (session?.toolCalls || []).entries()) {
+        if (!call?.name) continue;
+        const key = typeof call.id === "string" && call.id ? call.id : `${call.name}:${index}`;
+        if (seenToolCalls.has(key)) continue;
+        seenToolCalls.add(key);
+        onProgress?.({ kind: "tool", index: seenToolCalls.size, name: call.name });
+      }
+    };
     const finish = (error, value) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      clearInterval(progressTimer);
+      reportProgress();
       try { unlinkSync(promptPath); } catch (cleanupError) {
         if (cleanupError?.code !== "ENOENT" && !error) error = cleanupError;
       }
@@ -688,6 +708,8 @@ function runCli(context, selectedModel, onSpawn, timeoutMs = REQUEST_TIMEOUT_MS)
       child.kill();
       finish(new BridgeError(`Devin exceeded ${timeoutMs}ms`, 504));
     }, timeoutMs);
+    const progressTimer = setInterval(reportProgress, NATIVE_PROGRESS_POLL_MS);
+    progressTimer.unref();
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (chunk) => { stdout = `${stdout}${chunk}`.slice(-OUTPUT_LIMIT); });
     child.stderr.setEncoding("utf8");
@@ -733,13 +755,13 @@ function preserveProviderCommit(error, session) {
   return error;
 }
 
-async function runCliWithResourceRetries(context, selectedModel, onSpawn, signal, deadline) {
+async function runCliWithResourceRetries(context, selectedModel, onSpawn, onProgress, signal, deadline) {
   let attempt = 0;
   while (true) {
     throwIfAborted(signal);
     const remainingMs = deadline - Date.now();
     if (remainingMs <= 0) throw new BridgeError("Devin resource retry deadline exceeded", 504);
-    const cliResult = await runCli(context, selectedModel, onSpawn, remainingMs);
+    const cliResult = await runCli(context, selectedModel, onSpawn, onProgress, remainingMs);
     const session = await waitForSession(context.requestId);
     if (!isRetryableResourceFailure(cliResult)) return { cliResult, session };
     if (session?.toolCalls?.some((call) => call?.name)) {
@@ -776,7 +798,8 @@ function fallbackResult(completion, reason) {
   const cachedTokens = Number(usage.input_tokens_details?.cached_tokens || 0);
   const outputTokens = Number(usage.output_tokens || 0);
   const providerMetadata = completion.metadata || {};
-  const toolCalls = completion.output
+  const providerOutput = completion.output.filter((item) => item?.type !== "reasoning");
+  const toolCalls = providerOutput
     .filter((item) => ["function_call", "custom_tool_call", "tool_search_call"].includes(item?.type))
     .map((item) => ({
       id: item.call_id || item.id,
@@ -787,7 +810,7 @@ function fallbackResult(completion, reason) {
     ? providerMetadata.native_tool_names.filter((name) => typeof name === "string")
     : toolCalls.map((call) => call.name);
   return {
-    output: completion.output,
+    output: providerOutput,
     providerMetadata,
     selected: {
       ...fallbackSelection(reason),
@@ -870,6 +893,7 @@ async function executeProviderFallback(
   requestBody,
   initialRoute,
   onSpawn,
+  onProgress,
   signal,
   fallbackRelay,
 ) {
@@ -906,11 +930,13 @@ async function executeProviderFallback(
         model: models.terminal,
         reason: "antigravity_unavailable_after_devin_quota",
       };
+      onProgress?.(`Antigravity became unavailable; switched to Devin ${selected.model.label}.\n`);
       routeResult = await withRouteCapacity(selected, signal, () =>
         runCliWithResourceRetries(
           context,
           selected.model,
           onSpawn,
+          ({ index, name }) => onProgress?.(`Devin native tool ${index}: ${progressToolName(name)}.\n`),
           signal,
           Date.now() + REQUEST_TIMEOUT_MS,
         ));
@@ -934,23 +960,27 @@ async function executeProviderFallback(
   return fallback.value;
 }
 
-async function execute(context, requestBody, initialRoute, onSpawn, signal, fallbackRelay) {
+async function execute(context, requestBody, initialRoute, onSpawn, onProgress, signal, fallbackRelay) {
   if (initialRoute.key === "fallback") {
+    onProgress?.("Native route selected Antigravity because the Devin quota is currently unavailable.\n");
     return executeProviderFallback(
       context,
       requestBody,
       initialRoute,
       onSpawn,
+      onProgress,
       signal,
       fallbackRelay,
     );
   }
 
+  onProgress?.(`Devin native worker started with ${initialRoute.model.label}.\n`);
   const routeResult = await withRouteCapacity(initialRoute, signal, () =>
     runCliWithResourceRetries(
       context,
       initialRoute.model,
       onSpawn,
+      ({ index, name }) => onProgress?.(`Devin native tool ${index}: ${progressToolName(name)}.\n`),
       signal,
       Date.now() + REQUEST_TIMEOUT_MS,
     ));
@@ -988,11 +1018,13 @@ async function execute(context, requestBody, initialRoute, onSpawn, signal, fall
     context.threadId,
     context.taskDiagnostics.taskHash,
   );
+  onProgress?.("Devin quota reached before native work; switched to Antigravity.\n");
   return executeProviderFallback(
     context,
     requestBody,
     fallbackSelection("devin_quota_antigravity_available"),
     onSpawn,
+    onProgress,
     signal,
     fallbackRelay,
   );
@@ -1012,9 +1044,10 @@ function responseMessageItem(id, text, status = "in_progress") {
   return { type: "message", id, status, role: "assistant", content: [{ type: "output_text", text, annotations: [] }] };
 }
 
-function emitOutputItems(response, result, streamedMessageIds = new Set()) {
+function emitOutputItems(response, result, streamedMessageIds = new Set(), prefixOutput = []) {
   const output = result.output || [responseMessageItem(`msg_${randomUUID()}`, result.text, "completed")];
-  output.forEach((item, outputIndex) => {
+  output.forEach((item, itemIndex) => {
+    const outputIndex = prefixOutput.length + itemIndex;
     if (item.type !== "message") {
       writeSse(response, "response.output_item.done", { output_index: outputIndex, item });
       return;
@@ -1059,7 +1092,7 @@ function emitOutputItems(response, result, streamedMessageIds = new Set()) {
       item: { ...item, id: itemId, status: "completed" },
     });
   });
-  return output;
+  return [...prefixOutput, ...output];
 }
 
 function writeSse(response, type, payload) {
@@ -1077,14 +1110,83 @@ function writeSseHeartbeat(response, responseId, modelAlias = MODEL_ALIAS) {
   });
 }
 
-function createFallbackStreamRelay(response, responseId, modelAlias = MODEL_ALIAS) {
+function progressToolName(value) {
+  return String(value || "unknown_tool")
+    .replace(/[^A-Za-z0-9_.:-]+/g, "_")
+    .slice(0, 80) || "unknown_tool";
+}
+
+function createProgressEmitter(response) {
+  const itemId = `progress_${randomUUID()}`;
+  let added = false;
+  let completed = null;
+  let text = "";
+  let events = 0;
+  const emit = (delta) => {
+    if (completed || events >= MAX_PROGRESS_EVENTS || typeof delta !== "string" || !delta) return;
+    if (!added) {
+      added = true;
+      writeSse(response, "response.output_item.added", {
+        output_index: 0,
+        item: { type: "reasoning", id: itemId, status: "in_progress", summary: [] },
+      });
+    }
+    events += 1;
+    text += delta;
+    writeSse(response, "response.reasoning_summary_text.delta", {
+      item_id: itemId,
+      output_index: 0,
+      summary_index: 0,
+      delta,
+    });
+  };
+  const finish = () => {
+    if (completed || !added) return completed;
+    completed = {
+      type: "reasoning",
+      id: itemId,
+      status: "completed",
+      summary: text ? [{ type: "summary_text", text }] : [],
+    };
+    writeSse(response, "response.reasoning_summary_text.done", {
+      item_id: itemId,
+      output_index: 0,
+      summary_index: 0,
+      text,
+    });
+    writeSse(response, "response.output_item.done", { output_index: 0, item: completed });
+    return completed;
+  };
+  return { emit, finish, get added() { return added; } };
+}
+
+function createFallbackStreamRelay(response, responseId, modelAlias = MODEL_ALIAS, progress = null) {
   const pendingMessages = new Map();
   const streamedMessageIds = new Set();
+  const providerProgressIds = new Set();
   let committed = false;
   const accept = async (event) => {
     const payload = event.payload || {};
     if (event.type === "response.in_progress") {
       writeSseHeartbeat(response, responseId, modelAlias);
+      return;
+    }
+    if (
+      event.type === "response.output_item.added"
+      && payload.item?.type === "reasoning"
+      && typeof payload.item.id === "string"
+      && payload.item.id.startsWith("progress_")
+    ) {
+      providerProgressIds.add(payload.item.id);
+      return;
+    }
+    if (
+      event.type === "response.reasoning_summary_text.delta"
+      && providerProgressIds.has(payload.item_id)
+      && typeof payload.delta === "string"
+      && payload.delta
+    ) {
+      progress?.emit(payload.delta);
       return;
     }
     if (event.type === "response.output_item.added" && payload.item?.type === "message") {
@@ -1100,13 +1202,7 @@ function createFallbackStreamRelay(response, responseId, modelAlias = MODEL_ALIA
     if (event.type !== "response.output_text.delta" || typeof payload.delta !== "string" || !payload.delta) return;
     const pending = pendingMessages.get(payload.item_id);
     if (!pending?.part) throw new BridgeError("Fallback provider streamed text before its message lifecycle", 502);
-    if (!streamedMessageIds.has(payload.item_id)) {
-      writeSse(response, "response.output_item.added", pending.added);
-      writeSse(response, "response.content_part.added", pending.part);
-      streamedMessageIds.add(payload.item_id);
-      committed = true;
-    }
-    writeSse(response, "response.output_text.delta", payload);
+    committed = true;
   };
   return {
     accept,
@@ -1158,7 +1254,8 @@ async function handleResponses(request, response) {
   response.writeHead(200, { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache", connection: "keep-alive" });
   const responseId = `resp_${randomUUID()}`;
   writeSse(response, "response.created", { response: { id: responseId, object: "response", model: context.modelAlias, status: "in_progress" } });
-  const fallbackRelay = createFallbackStreamRelay(response, responseId, context.modelAlias);
+  const progress = createProgressEmitter(response);
+  const fallbackRelay = createFallbackStreamRelay(response, responseId, context.modelAlias, progress);
   const heartbeat = setInterval(() => writeSseHeartbeat(response, responseId, context.modelAlias), SSE_HEARTBEAT_MS);
   heartbeat.unref();
   try {
@@ -1167,6 +1264,7 @@ async function handleResponses(request, response) {
       requestBody,
       selected,
       (spawned) => { child = spawned; },
+      progress.emit,
       abortController.signal,
       fallbackRelay,
     );
@@ -1202,7 +1300,13 @@ async function handleResponses(request, response) {
     runtime.lastNativeToolCalls = result.nativeToolNames.length;
     runtime.lastNativeToolNames = [...new Set(result.nativeToolNames)];
     runtime.lastRzMcpTools = [...new Set(result.rzMcpTools)];
-    const output = emitOutputItems(response, result, fallbackRelay.streamedMessageIds);
+    const progressItem = progress.finish();
+    const output = emitOutputItems(
+      response,
+      result,
+      fallbackRelay.streamedMessageIds,
+      progressItem ? [progressItem] : [],
+    );
     writeSse(response, "response.completed", { response: {
       id: responseId, object: "response", created_at: Math.floor(Date.now() / 1000), status: "completed",
       model: context.modelAlias, output, usage: usageFrom(result), error: null, incomplete_details: null,
@@ -1227,6 +1331,7 @@ async function handleResponses(request, response) {
     response.end();
   } catch (error) {
     runtime.failed += 1;
+    progress.finish();
     writeSse(response, "response.failed", { response: { id: responseId, object: "response", model: context.modelAlias, status: "failed", error: { code: providerResponseErrorCode(error), message: error.message } } });
     response.end();
   } finally {
@@ -1474,33 +1579,63 @@ async function selfTest() {
     writableEnded: false,
     write: (value) => relayWrites.push(value),
   };
-  const relay = createFallbackStreamRelay(relayResponse, "resp-relay");
+  const relayProgress = createProgressEmitter(relayResponse);
+  const relay = createFallbackStreamRelay(relayResponse, "resp-relay", MODEL_ALIAS, relayProgress);
   await relay.accept({
     type: "response.output_item.added",
-    payload: { output_index: 0, item: responseMessageItem("msg-relay", "") },
+    payload: {
+      output_index: 0,
+      item: { type: "reasoning", id: "progress_provider", status: "in_progress", summary: [] },
+    },
+  });
+  await relay.accept({
+    type: "response.reasoning_summary_text.delta",
+    payload: { item_id: "progress_provider", output_index: 0, summary_index: 0, delta: "safe native progress\n" },
+  });
+  await relay.accept({
+    type: "response.output_item.added",
+    payload: { output_index: 1, item: { type: "reasoning", id: "rs-hidden", status: "in_progress", summary: [] } },
+  });
+  await relay.accept({
+    type: "response.reasoning_summary_text.delta",
+    payload: { item_id: "rs-hidden", output_index: 1, summary_index: 0, delta: "hidden provider reasoning" },
+  });
+  if (
+    !relayProgress.added
+    || relay.committed
+    || !relayWrites.join("").includes("safe native progress")
+    || relayWrites.join("").includes("hidden provider reasoning")
+  ) {
+    throw new Error("fallback progress relay boundary failed");
+  }
+  await relay.accept({
+    type: "response.output_item.added",
+    payload: { output_index: 1, item: responseMessageItem("msg-relay", "") },
   });
   await relay.accept({
     type: "response.content_part.added",
     payload: {
       item_id: "msg-relay",
-      output_index: 0,
+      output_index: 1,
       content_index: 0,
       part: { type: "output_text", text: "", annotations: [] },
     },
   });
-  if (relayWrites.length !== 0 || relay.committed) throw new Error("fallback relay committed before visible output");
+  if (relay.committed) throw new Error("fallback relay committed before visible output");
   await relay.accept({
     type: "response.output_text.delta",
-    payload: { item_id: "msg-relay", output_index: 0, content_index: 0, delta: "streamed" },
+    payload: { item_id: "msg-relay", output_index: 1, content_index: 0, delta: "streamed" },
   });
-  if (!relay.committed || !relay.streamedMessageIds.has("msg-relay")) throw new Error("fallback relay did not commit visible output");
+  if (!relay.committed || relay.streamedMessageIds.size !== 0) throw new Error("fallback relay did not retain provider output for ordered completion");
   const streamedFixture = {
     output: [responseMessageItem("msg-relay", "streamed", "completed")],
   };
-  emitOutputItems(relayResponse, streamedFixture, relay.streamedMessageIds);
+  const relayProgressItem = relayProgress.finish();
+  emitOutputItems(relayResponse, streamedFixture, relay.streamedMessageIds, [relayProgressItem]);
   const relayOutput = relayWrites.join("");
   if (
-    relayOutput.split("event: response.output_item.added").length - 1 !== 1
+    relayOutput.split("event: response.output_item.added").length - 1 !== 2
+    || !relayOutput.includes('"output_index":1')
     || !relayOutput.includes("event: response.output_text.done")
     || !relayOutput.includes("event: response.output_item.done")
   ) {
@@ -1508,7 +1643,15 @@ async function selfTest() {
   }
   const fallbackFixture = fallbackResult({
     status: "completed",
-    output: [responseMessageItem("msg-fallback", "done", "completed")],
+    output: [
+      {
+        type: "reasoning",
+        id: "progress-fallback",
+        status: "completed",
+        summary: [{ type: "summary_text", text: "provider progress" }],
+      },
+      responseMessageItem("msg-fallback", "done", "completed"),
+    ],
     usage: { input_tokens: 100, input_tokens_details: { cached_tokens: 10 }, output_tokens: 20 },
     metadata: {
       actual_provider: route.quotaFallbackProvider,
@@ -1526,6 +1669,8 @@ async function selfTest() {
   if (
     fallbackFixture.selected.key !== "fallback"
     || fallbackFixture.selected.provider !== "antigravity"
+    || fallbackFixture.output.length !== 1
+    || fallbackFixture.output[0]?.id !== "msg-fallback"
     || fallbackFixture.nativeToolNames[0] !== "exec_command"
     || fallbackFixture.rzMcpTools[0] !== "find_blueprint_nodes"
     || fallbackFixture.peakTurnContextTokens !== 110
