@@ -266,6 +266,10 @@ impl CodexThread {
         self.io.shutdown_and_wait().await
     }
 
+    pub(crate) async fn close_submission_channel_and_wait(&self) {
+        self.io.close_submission_channel_and_wait().await;
+    }
+
     /// Wait until the underlying session loop has terminated.
     pub async fn wait_until_terminated(&self) {
         self.io.session_loop_termination.clone().await;

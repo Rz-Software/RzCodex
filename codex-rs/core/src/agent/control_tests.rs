@@ -250,6 +250,51 @@ impl AgentControlHarness {
     }
 }
 
+#[tokio::test]
+async fn internal_died_error_keeps_reloadable_v2_agent_registered() {
+    let harness = AgentControlHarness::new().await;
+    let state = harness
+        .control
+        .upgrade()
+        .expect("thread manager should be live");
+    let thread_id = ThreadId::new();
+    let path = AgentPath::try_from("/root/reloadable_worker").expect("valid agent path");
+    let mut reservation = harness
+        .control
+        .state
+        .reserve_spawn_slot(/*max_threads*/ None)
+        .expect("reserve registry slot");
+    reservation
+        .reserve_agent_path(&path)
+        .expect("reserve agent path");
+    reservation.commit(AgentMetadata {
+        agent_id: Some(thread_id),
+        agent_path: Some(path),
+        ..Default::default()
+    });
+    harness.control.state.mark_reloadable_v2(thread_id);
+
+    let result = harness
+        .control
+        .handle_thread_request_result(thread_id, &state, Err(CodexErr::InternalAgentDied))
+        .await;
+
+    assert!(matches!(
+        result
+            .expect_err("request should still report the dead runtime")
+            .details(),
+        CodexErrorDetails::InternalAgentDied
+    ));
+    assert!(
+        harness
+            .control
+            .state
+            .agent_metadata_for_thread(thread_id)
+            .is_some(),
+        "a reloadable V2 identity must survive a dead evicted runtime"
+    );
+}
+
 async fn persisted_originator(thread: &CodexThread) -> String {
     thread.ensure_rollout_materialized().await;
     thread

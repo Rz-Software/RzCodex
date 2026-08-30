@@ -3,9 +3,11 @@ use codex_protocol::ThreadId;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::error::Result;
+use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::TurnEnvironmentSelection;
+use codex_protocol::turn_input::TurnStartOptions;
 use rand::prelude::IndexedRandom;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -37,14 +39,18 @@ struct ActiveAgents {
 
 struct RegisteredAgent {
     path: String,
+    reloadable_v2: bool,
     evicted_environments: Option<Vec<TurnEnvironmentSelection>>,
+    evicted_mailbox: Option<Vec<(InterAgentCommunication, TurnStartOptions)>>,
 }
 
 impl RegisteredAgent {
     fn new(path: String) -> Self {
         Self {
             path,
+            reloadable_v2: false,
             evicted_environments: None,
+            evicted_mailbox: None,
         }
     }
 }
@@ -212,6 +218,61 @@ impl AgentRegistry {
         if let Some(agent) = active_agents.thread_paths.get_mut(&thread_id) {
             agent.evicted_environments = None;
         }
+    }
+
+    pub(crate) fn save_evicted_mailbox(
+        &self,
+        thread_id: ThreadId,
+        mailbox: Vec<(InterAgentCommunication, TurnStartOptions)>,
+    ) {
+        if mailbox.is_empty() {
+            return;
+        }
+        let mut active_agents = self
+            .active_agents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(agent) = active_agents.thread_paths.get_mut(&thread_id) {
+            match &mut agent.evicted_mailbox {
+                Some(existing) => existing.extend(mailbox),
+                None => agent.evicted_mailbox = Some(mailbox),
+            }
+        }
+    }
+
+    pub(crate) fn mark_reloadable_v2(&self, thread_id: ThreadId) {
+        let mut active_agents = self
+            .active_agents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(agent) = active_agents.thread_paths.get_mut(&thread_id) {
+            agent.reloadable_v2 = true;
+        }
+    }
+
+    pub(crate) fn is_reloadable_v2(&self, thread_id: ThreadId) -> bool {
+        self.active_agents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .thread_paths
+            .get(&thread_id)
+            .is_some_and(|agent| agent.reloadable_v2)
+    }
+
+    /// Atomically take (read and clear) the evicted mailbox for a thread.
+    /// Ensures exactly one caller restores the mail across concurrent reload attempts.
+    pub(crate) fn take_evicted_mailbox(
+        &self,
+        thread_id: ThreadId,
+    ) -> Option<Vec<(InterAgentCommunication, TurnStartOptions)>> {
+        let mut active_agents = self
+            .active_agents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        active_agents
+            .thread_paths
+            .get_mut(&thread_id)
+            .and_then(|agent| agent.evicted_mailbox.take())
     }
 
     pub(crate) fn live_agents(&self) -> Vec<AgentMetadata> {

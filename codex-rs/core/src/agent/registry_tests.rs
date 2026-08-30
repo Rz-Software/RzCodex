@@ -94,6 +94,9 @@ fn commit_holds_slot_until_release() {
             .and_then(|metadata| metadata.agent_id),
         Some(thread_id)
     );
+    assert!(!registry.is_reloadable_v2(thread_id));
+    registry.mark_reloadable_v2(thread_id);
+    assert!(registry.is_reloadable_v2(thread_id));
 
     let err = match registry.reserve_spawn_slot(Some(1)) {
         Ok(_) => panic!("limit should be enforced"),
@@ -106,6 +109,7 @@ fn commit_holds_slot_until_release() {
 
     registry.release_spawned_thread(thread_id);
     assert!(registry.agent_metadata_for_thread(thread_id).is_none());
+    assert!(!registry.is_reloadable_v2(thread_id));
     let reservation = registry
         .reserve_spawn_slot(Some(1))
         .expect("slot released after thread removal");

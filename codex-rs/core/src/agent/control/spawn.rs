@@ -325,6 +325,7 @@ impl AgentControl {
             None
         };
         let owner_thread_id = parent.as_ref().map(|(parent, _)| parent.session.thread_id);
+        let _thread_transition = self.lock_v2_thread_transition(thread_id).await;
         if owner_thread_id.is_none() && state.get_thread(thread_id).await.is_ok() {
             self.touch_loaded_v2_residency(&state, thread_id).await;
             return Ok(());
@@ -562,6 +563,14 @@ impl AgentControl {
                     self.validate_loaded_v2_child(&reloaded_thread.thread, parent_thread_id)?;
                 }
                 self.state.clear_evicted_environments(thread_id);
+                if let Some(mailbox) = self.state.take_evicted_mailbox(thread_id) {
+                    reloaded_thread
+                        .thread
+                        .session
+                        .input_queue
+                        .restore_mailbox_communications(mailbox)
+                        .await;
+                }
                 residency_slot.commit(reloaded_thread.thread_id);
                 state.notify_thread_created(reloaded_thread.thread_id);
                 Ok(())
@@ -572,6 +581,13 @@ impl AgentControl {
                         self.validate_loaded_v2_child(&thread, parent_thread_id)?;
                     }
                     self.state.clear_evicted_environments(thread_id);
+                    if let Some(mailbox) = self.state.take_evicted_mailbox(thread_id) {
+                        thread
+                            .session
+                            .input_queue
+                            .restore_mailbox_communications(mailbox)
+                            .await;
+                    }
                     drop(residency_slot);
                     self.touch_loaded_v2_residency(&state, thread_id).await;
                     return Ok(());
@@ -695,6 +711,9 @@ impl AgentControl {
         };
         agent_metadata.agent_id = Some(new_thread.thread_id);
         reservation.commit(agent_metadata.clone());
+        if spawn_uses_v2_residency {
+            self.state.mark_reloadable_v2(new_thread.thread_id);
+        }
         if let Some(residency_slot) = residency_slot {
             residency_slot.commit(new_thread.thread_id);
         }

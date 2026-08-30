@@ -139,6 +139,43 @@ impl InputQueue {
         !self.mailbox_pending_mails.lock().await.is_empty()
     }
 
+    /// Drain all pending mailbox communications, returning the communications and their
+    /// start options in delivery order. Used during V2 residency eviction to preserve
+    /// queued inter-agent mail across eviction/reload so terminal residents with passive
+    /// mail can be evicted without losing the mail.
+    pub(crate) async fn drain_pending_mailbox_communications(
+        &self,
+    ) -> Vec<(InterAgentCommunication, TurnStartOptions)> {
+        self.mailbox_pending_mails
+            .lock()
+            .await
+            .drain(..)
+            .map(|mail| (mail.communication, mail.start_options))
+            .collect()
+    }
+
+    /// Restore previously drained mailbox communications, preserving delivery order.
+    /// Used during V2 residency reload to re-enqueue mail that was saved before eviction.
+    pub(crate) async fn restore_mailbox_communications(
+        &self,
+        mails: Vec<(InterAgentCommunication, TurnStartOptions)>,
+    ) {
+        if mails.is_empty() {
+            return;
+        }
+        {
+            let mut pending = self.mailbox_pending_mails.lock().await;
+            for (communication, start_options) in mails {
+                pending.push_back(PendingMailboxCommunication {
+                    communication,
+                    start_options,
+                    _diagnostics_guard: PENDING_MAILBOX_MESSAGES.track(),
+                });
+            }
+        }
+        self.activity_tx.send_replace(InputQueueActivity::Mailbox);
+    }
+
     pub(crate) async fn has_trigger_turn_mailbox_items(&self) -> bool {
         self.mailbox_pending_mails
             .lock()

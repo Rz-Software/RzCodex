@@ -9,10 +9,12 @@ use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::SessionSource;
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
-use tracing::warn;
+use tokio::sync::Notify;
 
 #[derive(Default)]
 pub(super) struct V2Residency {
@@ -23,11 +25,30 @@ pub(super) struct V2Residency {
 struct V2ResidencyState {
     residents: VecDeque<ThreadId>,
     pending_slots: usize,
+    evicting: HashSet<ThreadId>,
+    transitions: HashMap<ThreadId, Arc<Notify>>,
 }
 
 pub(super) struct V2ResidencySlot {
     residency: Arc<V2Residency>,
     active: bool,
+}
+
+pub(super) struct V2ThreadTransition {
+    residency: Arc<V2Residency>,
+    thread_id: ThreadId,
+    token: Arc<Notify>,
+}
+
+struct V2EvictionAttempt {
+    residency: Arc<V2Residency>,
+    thread_id: ThreadId,
+    transition: Option<V2ThreadTransition>,
+}
+
+enum V2TransitionStart {
+    Acquired(V2ThreadTransition),
+    Wait(std::pin::Pin<Box<tokio::sync::futures::OwnedNotified>>),
 }
 
 impl V2ResidencySlot {
@@ -45,6 +66,38 @@ impl Drop for V2ResidencySlot {
     }
 }
 
+impl Drop for V2ThreadTransition {
+    fn drop(&mut self) {
+        self.residency
+            .finish_transition(self.thread_id, &self.token);
+    }
+}
+
+impl V2EvictionAttempt {
+    fn thread_id(&self) -> ThreadId {
+        self.thread_id
+    }
+
+    fn into_pending_slot(mut self) -> V2ResidencySlot {
+        self.residency
+            .finish_eviction_with_pending_slot(self.thread_id);
+        drop(self.transition.take());
+        V2ResidencySlot {
+            residency: Arc::clone(&self.residency),
+            active: true,
+        }
+    }
+}
+
+impl Drop for V2EvictionAttempt {
+    fn drop(&mut self) {
+        if let Some(transition) = self.transition.take() {
+            transition.residency.cancel_eviction(transition.thread_id);
+            drop(transition);
+        }
+    }
+}
+
 impl AgentControl {
     pub(super) async fn reserve_v2_residency_slot(
         &self,
@@ -58,6 +111,18 @@ impl AgentControl {
         Arc::clone(&self.v2_residency)
             .reserve_slot(state, capacity, protected_thread_id)
             .await
+    }
+
+    pub(super) async fn lock_v2_thread_transition(
+        &self,
+        thread_id: ThreadId,
+    ) -> V2ThreadTransition {
+        loop {
+            match Arc::clone(&self.v2_residency).begin_transition(thread_id) {
+                V2TransitionStart::Acquired(transition) => return transition,
+                V2TransitionStart::Wait(wait) => wait.await,
+            }
+        }
     }
 
     pub(super) async fn touch_loaded_v2_residency(
@@ -84,22 +149,21 @@ impl V2Residency {
         capacity: usize,
         protected_thread_id: Option<ThreadId>,
     ) -> CodexResult<V2ResidencySlot> {
-        loop {
-            if self.try_reserve_pending_slot(capacity) {
-                return Ok(V2ResidencySlot {
-                    residency: self,
-                    active: true,
-                });
-            }
-            if !self
-                .try_unload_one_resident(manager, protected_thread_id)
-                .await
-            {
-                return Err(CodexErr::new(CodexErrorDetails::AgentLimitReached {
-                    max_threads: capacity,
-                }));
-            }
+        if self.try_reserve_pending_slot(capacity) {
+            return Ok(V2ResidencySlot {
+                residency: self,
+                active: true,
+            });
         }
+        if let Some(slot) = self
+            .try_unload_one_resident(manager, protected_thread_id)
+            .await
+        {
+            return Ok(slot);
+        }
+        Err(CodexErr::new(CodexErrorDetails::AgentLimitReached {
+            max_threads: capacity,
+        }))
     }
 
     fn try_reserve_pending_slot(&self, capacity: usize) -> bool {
@@ -107,7 +171,13 @@ impl V2Residency {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.residents.len().saturating_add(state.pending_slots) >= capacity {
+        if state
+            .residents
+            .len()
+            .saturating_add(state.pending_slots)
+            .saturating_add(state.evicting.len())
+            >= capacity
+        {
             return false;
         }
         state.pending_slots += 1;
@@ -115,35 +185,42 @@ impl V2Residency {
     }
 
     async fn try_unload_one_resident(
-        &self,
+        self: &Arc<Self>,
         manager: &Arc<ThreadManagerState>,
         protected_thread_id: Option<ThreadId>,
-    ) -> bool {
+    ) -> Option<V2ResidencySlot> {
         let candidates_to_scan = self.resident_count();
         for _ in 0..candidates_to_scan {
-            let Some(candidate_thread_id) = self.pop_lru_candidate(protected_thread_id) else {
-                return false;
-            };
+            let eviction = self.begin_lru_eviction(protected_thread_id)?;
+            let candidate_thread_id = eviction.thread_id();
             let Some(candidate_thread) = manager
                 .get_thread(candidate_thread_id)
                 .await
                 .ok()
                 .filter(|thread| is_resident_candidate(thread))
             else {
-                continue;
+                return Some(eviction.into_pending_slot());
             };
             if !wait_until_unloadable(candidate_thread.as_ref()).await {
-                self.touch(candidate_thread_id);
+                drop(eviction);
                 continue;
             }
             candidate_thread.ensure_rollout_materialized().await;
-            if let Err(err) = candidate_thread.shutdown_and_wait().await {
-                warn!(
-                    "failed to shut down v2 resident thread before unloading {candidate_thread_id}: {err}"
-                );
-                self.touch(candidate_thread_id);
+            let Some(candidate_thread) = manager
+                .remove_thread_if_matches(&candidate_thread_id, &candidate_thread)
+                .await
+            else {
+                drop(eviction);
                 continue;
-            }
+            };
+            candidate_thread.close_submission_channel_and_wait().await;
+            // Closing the submission channel makes a racing message atomic with eviction: it
+            // was either accepted and processed before teardown, or rejected by its sender.
+            let mailbox = candidate_thread
+                .session
+                .input_queue
+                .drain_pending_mailbox_communications()
+                .await;
             let environments = candidate_thread.environment_selections().await;
             candidate_thread
                 .session
@@ -151,10 +228,17 @@ impl V2Residency {
                 .agent_control
                 .state
                 .save_evicted_environments(candidate_thread_id, environments);
-            let _ = manager.remove_thread(&candidate_thread_id).await;
-            return true;
+            if !mailbox.is_empty() {
+                candidate_thread
+                    .session
+                    .services
+                    .agent_control
+                    .state
+                    .save_evicted_mailbox(candidate_thread_id, mailbox);
+            }
+            return Some(eviction.into_pending_slot());
         }
-        false
+        None
     }
 
     fn resident_count(&self) -> usize {
@@ -165,7 +249,10 @@ impl V2Residency {
             .len()
     }
 
-    fn pop_lru_candidate(&self, protected_thread_id: Option<ThreadId>) -> Option<ThreadId> {
+    fn begin_lru_eviction(
+        self: &Arc<Self>,
+        protected_thread_id: Option<ThreadId>,
+    ) -> Option<V2EvictionAttempt> {
         let mut state = self
             .state
             .lock()
@@ -173,13 +260,86 @@ impl V2Residency {
         let candidates_to_scan = state.residents.len();
         for _ in 0..candidates_to_scan {
             let candidate_thread_id = state.residents.pop_front()?;
-            if Some(candidate_thread_id) == protected_thread_id {
+            if Some(candidate_thread_id) == protected_thread_id
+                || state.transitions.contains_key(&candidate_thread_id)
+            {
                 state.residents.push_back(candidate_thread_id);
                 continue;
             }
-            return Some(candidate_thread_id);
+            let token = Arc::new(Notify::new());
+            state
+                .transitions
+                .insert(candidate_thread_id, Arc::clone(&token));
+            state.evicting.insert(candidate_thread_id);
+            return Some(V2EvictionAttempt {
+                residency: Arc::clone(self),
+                thread_id: candidate_thread_id,
+                transition: Some(V2ThreadTransition {
+                    residency: Arc::clone(self),
+                    thread_id: candidate_thread_id,
+                    token,
+                }),
+            });
         }
         None
+    }
+
+    fn begin_transition(self: Arc<Self>, thread_id: ThreadId) -> V2TransitionStart {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(existing) = state.transitions.get(&thread_id) {
+            let mut wait = Box::pin(Arc::clone(existing).notified_owned());
+            wait.as_mut().enable();
+            return V2TransitionStart::Wait(wait);
+        }
+        let token = Arc::new(Notify::new());
+        state.transitions.insert(thread_id, Arc::clone(&token));
+        V2TransitionStart::Acquired(V2ThreadTransition {
+            residency: Arc::clone(&self),
+            thread_id,
+            token,
+        })
+    }
+
+    fn finish_transition(&self, thread_id: ThreadId, token: &Arc<Notify>) {
+        let removed = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state
+                .transitions
+                .get(&thread_id)
+                .is_some_and(|current| Arc::ptr_eq(current, token))
+            {
+                state.transitions.remove(&thread_id)
+            } else {
+                None
+            }
+        };
+        if let Some(notify) = removed {
+            notify.notify_waiters();
+        }
+    }
+
+    fn cancel_eviction(&self, thread_id: ThreadId) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.evicting.remove(&thread_id);
+        touch_resident(&mut state.residents, thread_id);
+    }
+
+    fn finish_eviction_with_pending_slot(&self, thread_id: ThreadId) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.evicting.remove(&thread_id);
+        state.pending_slots = state.pending_slots.saturating_add(1);
     }
 
     fn touch(&self, thread_id: ThreadId) {
@@ -232,10 +392,16 @@ pub(super) fn is_v2_resident_session_source(session_source: &SessionSource) -> b
 
 async fn wait_until_unloadable(thread: &CodexThread) -> bool {
     loop {
+        // Passive mail does not make a terminal resident active and is preserved by the caller.
+        // Trigger-turn mail does: it must run instead of being converted into evicted mailbox state.
         if !matches!(
             thread.agent_status().await,
             AgentStatus::Completed(_) | AgentStatus::Errored(_) | AgentStatus::Interrupted
-        ) || thread.session.input_queue.has_pending_mailbox_items().await
+        ) || thread
+            .session
+            .input_queue
+            .has_trigger_turn_mailbox_items()
+            .await
         {
             return false;
         }

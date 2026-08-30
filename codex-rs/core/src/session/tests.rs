@@ -64,6 +64,7 @@ use codex_protocol::ThreadId;
 use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::TrustLevel;
+use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::exec_output::ExecToolCallOutput;
 use codex_protocol::models::AgentMessageInputContent;
 use codex_protocol::models::FileSystemPermissions;
@@ -8418,6 +8419,40 @@ async fn shutdown_and_wait_waits_when_shutdown_is_already_in_progress() {
         .await
         .expect("shutdown waiter join")
         .expect("shutdown waiter");
+}
+
+#[tokio::test]
+async fn close_submission_channel_drains_accepted_work_and_rejects_late_submissions() {
+    let (tx_sub, rx_sub) = async_channel::bounded::<Submission>(4);
+    let (_tx_event, rx_event) = async_channel::unbounded();
+    let drained = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let drained_for_loop = Arc::clone(&drained);
+    let session_loop_handle = tokio::spawn(async move {
+        while let Ok(submission) = rx_sub.recv().await {
+            drained_for_loop.lock().await.push(submission.op);
+        }
+    });
+    let io = SessionIo {
+        tx_sub,
+        rx_event,
+        agent_status: watch::channel(AgentStatus::PendingInit).1,
+        session_loop_termination: session_loop_termination_from_handle(session_loop_handle),
+    };
+
+    io.submit(Op::Interrupt)
+        .await
+        .expect("submission accepted before close");
+    io.close_submission_channel_and_wait().await;
+
+    assert!(matches!(drained.lock().await.as_slice(), [Op::Interrupt]));
+    let late_error = io
+        .submit(Op::Interrupt)
+        .await
+        .expect_err("submission after close must fail loudly");
+    assert!(matches!(
+        late_error.details(),
+        CodexErrorDetails::InternalAgentDied
+    ));
 }
 
 #[tokio::test]

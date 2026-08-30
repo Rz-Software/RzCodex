@@ -921,6 +921,15 @@ impl SessionIo {
         Ok(())
     }
 
+    /// Atomically stop accepting submissions, drain the already accepted queue, and wait for
+    /// normal session teardown. This is used when unloading a terminal resident so an
+    /// inter-agent message racing with eviction is either accepted and preserved or rejected;
+    /// it can never be accepted behind a shutdown operation and silently dropped.
+    pub(crate) async fn close_submission_channel_and_wait(&self) {
+        self.tx_sub.close();
+        self.session_loop_termination.clone().await;
+    }
+
     pub(crate) async fn next_event(&self) -> CodexResult<Event> {
         let event = self
             .rx_event
