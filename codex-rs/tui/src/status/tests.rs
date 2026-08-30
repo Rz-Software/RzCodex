@@ -178,6 +178,7 @@ fn render_lines(lines: &[Line<'static>]) -> Vec<String> {
                 .iter()
                 .map(|span| span.content.as_ref())
                 .collect::<String>()
+                .replace(crate::version::CODEX_CLI_VERSION, "<VERSION>")
         })
         .collect()
 }
@@ -231,6 +232,7 @@ fn buffer_to_text(buffer: &Buffer, width: u16) -> String {
                 .collect::<String>()
                 .trim_end()
                 .to_string()
+                .replace(crate::version::CODEX_CLI_VERSION, "<VERSION>")
         })
         .collect::<Vec<_>>();
     sanitize_directory(lines).join("\n")

@@ -215,6 +215,11 @@ macro_rules! assert_chatwidget_snapshot {
     }};
 }
 
+#[test]
+fn prompt_placeholder_uses_rzcodex_brand() {
+    assert_eq!(PLACEHOLDER, "Ask RzCodex to do anything");
+}
+
 fn next_goal_draft(
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
     expected_thread_id: ThreadId,

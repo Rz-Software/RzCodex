@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use chrono::SecondsFormat;
+use codex_build_info::CLI_VERSION;
 use codex_protocol::RolloutId;
 use codex_protocol::SessionId;
 use codex_protocol::ThreadId;
@@ -881,7 +882,7 @@ impl RolloutRecorder {
                     timestamp,
                     cwd: cwd.clone(),
                     originator,
-                    cli_version: env!("CARGO_PKG_VERSION").to_string(),
+                    cli_version: CLI_VERSION.to_string(),
                     agent_nickname: source.get_nickname(),
                     agent_role: source.get_agent_role(),
                     agent_path: source.get_agent_path().map(Into::into),

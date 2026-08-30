@@ -6,6 +6,7 @@ use semver::Version;
 use tempfile::tempdir;
 
 use crate::BuildInfo;
+use crate::CLI_VERSION;
 
 const BUILD_COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
 
@@ -38,7 +39,7 @@ fn packaged_runtime_uses_manifest_version() {
     );
 }
 
-/// Unpackaged builds expose their stamped commit and structured source version.
+/// Unpackaged builds retain the version embedded by their build channel.
 #[test]
 fn unpackaged_runtime_uses_build_commit() {
     let context = InstallContext::from_exe(
@@ -50,7 +51,7 @@ fn unpackaged_runtime_uses_build_commit() {
     assert_eq!(
         BuildInfo::resolve(&context, BUILD_COMMIT),
         BuildInfo {
-            version: Version::new(0, 0, 0),
+            version: Version::parse(CLI_VERSION).expect("embedded CLI version"),
             build_commit: BUILD_COMMIT.to_string(),
         },
     );
@@ -76,7 +77,7 @@ fn legacy_package_without_version_uses_build_commit() {
     assert_eq!(
         BuildInfo::resolve(&context, BUILD_COMMIT),
         BuildInfo {
-            version: Version::new(0, 0, 0),
+            version: Version::parse(CLI_VERSION).expect("embedded CLI version"),
             build_commit: BUILD_COMMIT.to_string(),
         },
     );
@@ -105,7 +106,7 @@ fn invalid_package_version_uses_build_commit() {
     assert_eq!(
         BuildInfo::resolve(&context, BUILD_COMMIT),
         BuildInfo {
-            version: Version::new(0, 0, 0),
+            version: Version::parse(CLI_VERSION).expect("embedded CLI version"),
             build_commit: BUILD_COMMIT.to_string(),
         },
     );

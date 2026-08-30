@@ -1,5 +1,6 @@
 use std::future::Future;
 
+use codex_build_info::CLI_VERSION;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
 
@@ -26,7 +27,7 @@ pub(crate) fn init(
     let otel = match config {
         Some(config) => codex_core::otel_init::build_provider(
             config,
-            env!("CARGO_PKG_VERSION"),
+            CLI_VERSION,
             Some(OTEL_SERVICE_NAME),
             DEFAULT_ANALYTICS_ENABLED,
         )

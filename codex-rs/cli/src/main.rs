@@ -98,20 +98,21 @@ use codex_protocol::protocol::AskForApproval;
 use codex_protocol::user_input::UserInput;
 use codex_terminal_detection::TerminalName;
 
-/// Codex CLI
+/// RzCodex CLI
 ///
 /// If no subcommand is specified, options will be forwarded to the interactive CLI.
 #[derive(Debug, Parser)]
 #[clap(
     author,
-    version,
+    name = codex_build_info::PRODUCT_NAME,
+    version = codex_build_info::CLI_VERSION,
     // If a sub‑command is given, ignore requirements of the default args.
     subcommand_negates_reqs = true,
     // The executable is sometimes invoked via a platform‑specific name like
     // `codex-x86_64-unknown-linux-musl`, but the help output should always use
-    // the generic `codex` command name that users run.
-    bin_name = "codex",
-    override_usage = "codex [OPTIONS] [PROMPT]\n       codex [OPTIONS] <COMMAND> [ARGS]"
+    // the stable RzCodex alias rather than the internal codex.exe filename.
+    bin_name = "RzCodex",
+    override_usage = "RzCodex [OPTIONS] [PROMPT]\n       RzCodex [OPTIONS] <COMMAND> [ARGS]"
 )]
 struct MultitoolCli {
     #[clap(flatten)]
@@ -3499,15 +3500,15 @@ mod tests {
     fn plugin_marketplace_help_uses_plugin_namespace() {
         let help = help_from_args(&["codex", "plugin", "marketplace", "--help"]);
         assert!(
-            help.contains("Usage: codex plugin marketplace [OPTIONS] <COMMAND>"),
+            help.contains("Usage: RzCodex plugin marketplace [OPTIONS] <COMMAND>"),
             "{help}"
         );
 
         for (subcommand, usage) in [
-            ("add", "Usage: codex plugin marketplace add"),
-            ("list", "Usage: codex plugin marketplace list"),
-            ("upgrade", "Usage: codex plugin marketplace upgrade"),
-            ("remove", "Usage: codex plugin marketplace remove"),
+            ("add", "Usage: RzCodex plugin marketplace add"),
+            ("list", "Usage: RzCodex plugin marketplace list"),
+            ("upgrade", "Usage: RzCodex plugin marketplace upgrade"),
+            ("remove", "Usage: RzCodex plugin marketplace remove"),
         ] {
             let help = help_from_args(&["codex", "plugin", "marketplace", subcommand, "--help"]);
             assert!(help.contains(usage), "{help}");

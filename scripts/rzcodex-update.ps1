@@ -1,7 +1,8 @@
 [CmdletBinding()]
 param(
     [switch]$ForceBuild,
-    [switch]$RunTests
+    [switch]$RunTests,
+    [string]$InvocationId = ""
 )
 
 Set-StrictMode -Version Latest
@@ -11,6 +12,7 @@ $RepoRoot = Split-Path -Parent $PSScriptRoot
 $CodexRustRoot = Join-Path $RepoRoot "codex-rs"
 $InstallRoot = Join-Path $env:USERPROFILE ".codex\forked-bin"
 $PointerPath = Join-Path $InstallRoot "current.txt"
+$BuildMetadataFilename = "rzcodex-build.json"
 $StateRoot = Join-Path $env:LOCALAPPDATA "RzCodex"
 $LogRoot = Join-Path $StateRoot "Logs"
 $StatusPath = Join-Path $StateRoot "last-update.json"
@@ -57,8 +59,59 @@ function Write-UpdateStatus {
         result = $Result
         message = $Message
         commit = $Commit
+        invocationId = $InvocationId
     }
     $status | ConvertTo-Json | Set-Content -LiteralPath $StatusPath -Encoding utf8
+}
+
+function Resolve-UpstreamBaseVersion {
+    $tagNames = @(& git -C $RepoRoot tag --list "rust-v*")
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not enumerate upstream Codex release tags."
+    }
+
+    $stableReleases = foreach ($tagName in $tagNames) {
+        if ($tagName -match '^rust-v(?<Version>\d+\.\d+\.\d+)$') {
+            $parsedVersion = $null
+            if (-not [System.Version]::TryParse($Matches.Version, [ref]$parsedVersion)) {
+                continue
+            }
+            [pscustomobject]@{
+                Tag = $tagName
+                Version = $parsedVersion
+            }
+        }
+    }
+    $latestRelease = $stableReleases | Sort-Object Version -Descending | Select-Object -First 1
+    if (-not $latestRelease) {
+        throw "No stable upstream Codex release tag is available."
+    }
+    return $latestRelease.Version.ToString(3)
+}
+
+function Get-InstalledBuildMetadata {
+    if (-not (Test-Path -LiteralPath $PointerPath -PathType Leaf)) {
+        return $null
+    }
+
+    try {
+        $installedBinary = [System.IO.File]::ReadAllText($PointerPath).Trim()
+        if (-not (Test-Path -LiteralPath $installedBinary -PathType Leaf)) {
+            return $null
+        }
+        $metadataPath = Join-Path (Split-Path -Parent $installedBinary) $BuildMetadataFilename
+        if (-not (Test-Path -LiteralPath $metadataPath -PathType Leaf)) {
+            return $null
+        }
+        $metadata = Get-Content -LiteralPath $metadataPath -Raw | ConvertFrom-Json
+        if ($metadata.commit -isnot [string] -or $metadata.baseVersion -isnot [string]) {
+            return $null
+        }
+        return $metadata
+    }
+    catch {
+        return $null
+    }
 }
 
 function Test-MergeInProgress {
@@ -158,7 +211,10 @@ function Initialize-RustyV8Artifacts {
 function Install-CodexBinary {
     param(
         [Parameter(Mandatory)]
-        [string]$Commit
+        [string]$Commit,
+
+        [Parameter(Mandatory)]
+        [string]$BaseVersion
     )
 
     $releaseRoot = Join-Path $CodexRustRoot "target\release"
@@ -187,10 +243,23 @@ function Install-CodexBinary {
         Move-Item -LiteralPath $temporaryBinary -Destination $installedBinary -Force
     }
 
-    & $destinationBinary --version
-    if ($LASTEXITCODE -ne 0) {
-        throw "The newly built Codex binary failed its version smoke test."
+    $reportedVersion = (& $destinationBinary --version | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0 -or $reportedVersion -ne "RzCodex $BaseVersion") {
+        throw "The newly built RzCodex binary reported '$reportedVersion'; expected 'RzCodex $BaseVersion'."
     }
+
+    $buildMetadata = [ordered]@{
+        product = "RzCodex"
+        baseVersion = $BaseVersion
+        commit = $Commit
+    }
+    $metadataPath = Join-Path $versionRoot $BuildMetadataFilename
+    $temporaryMetadataPath = "$metadataPath.$PID.tmp"
+    [System.IO.File]::WriteAllText(
+        $temporaryMetadataPath,
+        (($buildMetadata | ConvertTo-Json) + [Environment]::NewLine)
+    )
+    Move-Item -LiteralPath $temporaryMetadataPath -Destination $metadataPath -Force
 
     $temporaryPointer = "$PointerPath.$PID.tmp"
     [System.IO.File]::WriteAllText($temporaryPointer, $destinationBinary)
@@ -263,11 +332,20 @@ try {
         throw "Could not compare rz-main with upstream/main."
     }
     $updateAvailable = $ancestorExitCode -eq 1
-    $buildRequired = $ForceBuild -or $updateAvailable -or -not (Test-Path -LiteralPath $PointerPath -PathType Leaf)
+    $baseVersion = Resolve-UpstreamBaseVersion
+    $currentCommit = (& git -C $RepoRoot rev-parse --short=12 HEAD).Trim()
+    if ($LASTEXITCODE -ne 0 -or -not $currentCommit) {
+        throw "Could not resolve the current RzCodex commit."
+    }
+    $installedMetadata = Get-InstalledBuildMetadata
+    $buildRequired = $ForceBuild -or
+        $updateAvailable -or
+        $null -eq $installedMetadata -or
+        $installedMetadata.commit -ne $currentCommit -or
+        $installedMetadata.baseVersion -ne $baseVersion
 
     if (-not $buildRequired) {
-        $currentCommit = (& git -C $RepoRoot rev-parse --short=12 HEAD).Trim()
-        Write-UpdateStatus -Result "current" -Message "RzCodex already contains upstream/main." -Commit $currentCommit
+        Write-UpdateStatus -Result "current" -Message "RzCodex $baseVersion already contains upstream/main." -Commit $currentCommit
         exit 0
     }
 
@@ -276,6 +354,8 @@ try {
         Invoke-NativeCommand -FilePath "git" -ArgumentList @("merge", "--no-commit", "--no-ff", "upstream/main") -WorkingDirectory $RepoRoot
     }
 
+    $env:RZCODEX_BASE_VERSION = $baseVersion
+    $env:RZCODEX_REPO_ROOT = $RepoRoot
     Invoke-NativeCommand -FilePath "just" -ArgumentList @("fmt-check") -WorkingDirectory $CodexRustRoot
     if ($RunTests) {
         Invoke-NativeCommand -FilePath "just" -ArgumentList @("test", "-p", "codex-core", "agent::role::tests") -WorkingDirectory $CodexRustRoot
@@ -311,8 +391,8 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw "Could not resolve the installed RzCodex commit."
     }
-    Install-CodexBinary -Commit $installedCommit
-    Write-UpdateStatus -Result "updated" -Message "RzCodex built, pushed, and installed successfully." -Commit $installedCommit
+    Install-CodexBinary -Commit $installedCommit -BaseVersion $baseVersion
+    Write-UpdateStatus -Result "updated" -Message "RzCodex $baseVersion built, pushed, and installed successfully." -Commit $installedCommit
 }
 catch {
     if ($mergeStarted -or (Test-MergeInProgress)) {

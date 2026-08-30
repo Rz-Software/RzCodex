@@ -12,6 +12,7 @@ use std::path::PathBuf;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::time::Duration;
 
+use codex_build_info::CLI_VERSION;
 use codex_core::config::Config;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use codex_http_client::ClientRouteClass;
@@ -115,7 +116,7 @@ pub(super) fn updates_check(config: &Config) -> DoctorCheck {
     match fetch_latest_version(&install_context) {
         Ok(latest_version) => {
             details.push(format!("latest version: {latest_version}"));
-            if is_newer(&latest_version, env!("CARGO_PKG_VERSION")) == Some(true) {
+            if is_newer(&latest_version, CLI_VERSION) == Some(true) {
                 details.push("latest version status: newer version is available".to_string());
             } else {
                 details.push("latest version status: current version is not older".to_string());

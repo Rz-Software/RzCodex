@@ -50,6 +50,7 @@ pub enum SlashCommand {
     Diff,
     Mention,
     Status,
+    Update,
     Cd,
     #[strum(to_string = "pwd", serialize = "cwd")]
     Pwd,
@@ -111,6 +112,7 @@ impl SlashCommand {
             SlashCommand::Import => "import setup, this project, and recent chats from Claude Code",
             SlashCommand::Hooks => "view and manage lifecycle hooks",
             SlashCommand::Status => "show current session configuration and token usage",
+            SlashCommand::Update => "update and install the latest RzCodex build",
             SlashCommand::Cd => "change the current working directory",
             SlashCommand::Pwd => "show the current working directory",
             SlashCommand::Usage => "view account usage or use a usage limit reset",
@@ -227,6 +229,7 @@ impl SlashCommand {
             | SlashCommand::Plan
             | SlashCommand::Cd
             | SlashCommand::Clear
+            | SlashCommand::Update
             | SlashCommand::Logout
             | SlashCommand::MemoryDrop
             | SlashCommand::MemoryUpdate => false,
@@ -329,5 +332,11 @@ mod tests {
             SlashCommand::from_str("approve"),
             Ok(SlashCommand::AutoReview)
         );
+    }
+
+    #[test]
+    fn update_command_is_available_when_idle() {
+        assert_eq!(SlashCommand::from_str("update"), Ok(SlashCommand::Update));
+        assert!(!SlashCommand::Update.available_during_task());
     }
 }

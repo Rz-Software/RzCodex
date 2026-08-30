@@ -32,6 +32,7 @@ use codex_api::ApiError;
 use codex_api::ResponsesWebsocketClient;
 use codex_api::is_azure_responses_provider;
 use codex_arg0::Arg0DispatchPaths;
+use codex_build_info::CLI_VERSION;
 use codex_config::types::McpServerConfig;
 use codex_config::types::McpServerTransportConfig;
 use codex_core::config::Config;
@@ -565,7 +566,7 @@ async fn build_report(
         schema_version: 1,
         generated_at: generated_at(),
         overall_status,
-        codex_version: env!("CARGO_PKG_VERSION").to_string(),
+        codex_version: CLI_VERSION.to_string(),
         checks,
     }
 }

@@ -36,7 +36,9 @@ pub(super) fn truncated_path_variants(path: &str) -> Vec<String> {
 }
 
 pub(super) fn normalize_snapshot_paths(text: impl Into<String>) -> String {
-    let mut text = text.into();
+    let mut text = text
+        .into()
+        .replace("Ask RzCodex to do anything", "Ask Codex to do anything");
 
     for unix_path in ["/tmp/project", "/tmp/hooks.json"] {
         let platform_path = test_path_display(unix_path);

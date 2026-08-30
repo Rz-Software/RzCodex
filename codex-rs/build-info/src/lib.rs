@@ -10,6 +10,24 @@ use serde::Serialize;
 
 static BUILD_INFO: OnceLock<BuildInfo> = OnceLock::new();
 
+/// Product name shown by the customized CLI and TUI.
+pub const PRODUCT_NAME: &str = "RzCodex";
+
+/// Upstream Codex release containing the synchronized source tree.
+///
+/// Managed RzCodex builds stamp this through the updater. Ordinary upstream-style
+/// source builds retain Cargo's `0.0.0` package version.
+pub const CLI_VERSION: &str = match option_env!("RZCODEX_BASE_VERSION") {
+    Some(version) => version,
+    None => env!("CARGO_PKG_VERSION"),
+};
+
+/// Whether this executable was produced by the managed RzCodex updater.
+pub const IS_MANAGED_RZCODEX_BUILD: bool = option_env!("RZCODEX_BASE_VERSION").is_some();
+
+/// Source checkout used by the managed updater that produced this executable.
+pub const RZCODEX_REPOSITORY_ROOT: Option<&str> = option_env!("RZCODEX_REPO_ROOT");
+
 /// Initialize build information from the commit stamped into the calling executable.
 ///
 /// The environment lookup intentionally expands at the macro call site so Git
@@ -74,12 +92,12 @@ impl BuildInfo {
 
     /// Format the version for a user-facing Codex header.
     pub fn display_version(&self) -> String {
-        if self.build_commit == "dev" {
-            "dev".to_string()
-        } else if self.is_source_build() {
-            format!("v{}", self.build_commit)
-        } else {
+        if !self.is_source_build() {
             format!("v{}", self.version)
+        } else if self.build_commit == "dev" {
+            "dev".to_string()
+        } else {
+            format!("v{}", self.build_commit)
         }
     }
 
@@ -102,7 +120,7 @@ impl BuildInfo {
         }
 
         Self {
-            version: Version::new(0, 0, 0),
+            version: Version::parse(CLI_VERSION).unwrap_or_else(|_| Version::new(0, 0, 0)),
             build_commit: build_commit.to_owned(),
         }
     }

@@ -7,6 +7,7 @@ use std::time::Instant;
 
 use anyhow::Context;
 use clap::Parser;
+use codex_build_info::CLI_VERSION;
 use codex_core::config::ConfigBuilder;
 use codex_protocol::ThreadId;
 use codex_thread_store::LocalThreadStore;
@@ -58,7 +59,7 @@ pub(crate) async fn run(
         .await?;
     let otel = codex_core::otel_init::build_provider(
         &config,
-        env!("CARGO_PKG_VERSION"),
+        CLI_VERSION,
         /*service_name_override*/ None,
         /*default_analytics_enabled*/ true,
     )

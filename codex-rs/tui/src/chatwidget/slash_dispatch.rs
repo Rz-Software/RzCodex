@@ -14,6 +14,14 @@ use crate::bottom_pane::slash_commands::SlashCommandItem;
 use crate::bottom_pane::slash_commands::find_slash_command;
 use crate::goal_display::GOAL_USAGE;
 use crate::goal_files::GoalDraft;
+#[cfg(windows)]
+use serde::Deserialize;
+#[cfg(windows)]
+use std::path::Path;
+#[cfg(windows)]
+use std::process::Stdio;
+#[cfg(windows)]
+use tokio::process::Command;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SlashCommandDispatchSource {
@@ -37,6 +45,89 @@ const SIDE_SLASH_COMMAND_UNAVAILABLE_HINT: &str =
 const GOAL_USAGE_HINT: &str = "Example: /goal improve benchmark coverage";
 const RAW_USAGE: &str = "Usage: /raw [on|off]";
 const USAGE_CHATGPT_LOGIN_REQUIRED: &str = "Sign in with ChatGPT to use /usage.";
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+#[cfg(windows)]
+#[derive(Deserialize)]
+struct RzCodexUpdateStatus {
+    result: String,
+    message: String,
+    #[serde(rename = "invocationId")]
+    invocation_id: String,
+}
+
+#[cfg(windows)]
+fn rzcodex_update_result_cell(
+    outcome: Result<RzCodexUpdateStatus, String>,
+) -> history_cell::PlainHistoryCell {
+    match outcome {
+        Ok(status) if status.result == "failed" => {
+            history_cell::new_error_event(format!("RzCodex update failed: {}", status.message))
+        }
+        Ok(status) => {
+            let hint = (status.result == "updated")
+                .then(|| "Restart RzCodex when convenient to use the new build.".to_string());
+            history_cell::new_info_event(status.message, hint)
+        }
+        Err(err) => history_cell::new_error_event(format!("RzCodex update failed: {err}")),
+    }
+}
+
+#[cfg(windows)]
+async fn run_rzcodex_update(repo_root: &Path) -> Result<RzCodexUpdateStatus, String> {
+    let update_script = repo_root.join("scripts").join("rzcodex-update.ps1");
+    if !update_script.is_file() {
+        return Err(format!(
+            "managed updater not found at {}",
+            update_script.display()
+        ));
+    }
+
+    let invocation_id = uuid::Uuid::new_v4().to_string();
+    let process_status = Command::new("pwsh.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+        ])
+        .arg(&update_script)
+        .args(["-InvocationId", &invocation_id])
+        .current_dir(repo_root)
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .map_err(|err| format!("could not start the managed updater: {err}"))?;
+
+    let local_app_data = std::env::var_os("LOCALAPPDATA")
+        .ok_or_else(|| "LOCALAPPDATA is unavailable".to_string())?;
+    let status_path = Path::new(&local_app_data)
+        .join("RzCodex")
+        .join("last-update.json");
+    let status_json = tokio::fs::read_to_string(&status_path)
+        .await
+        .map_err(|err| format!("could not read {}: {err}", status_path.display()))?;
+    let update_status: RzCodexUpdateStatus = serde_json::from_str(&status_json)
+        .map_err(|err| format!("invalid updater status at {}: {err}", status_path.display()))?;
+    if update_status.invocation_id != invocation_id {
+        return Err(format!(
+            "updater status at {} belongs to a different invocation",
+            status_path.display()
+        ));
+    }
+
+    if process_status.success() {
+        Ok(update_status)
+    } else {
+        Err(update_status.message)
+    }
+}
 
 impl ChatWidget {
     /// Dispatch a bare slash command and record its staged local-history entry.
@@ -476,6 +567,37 @@ impl ChatWidget {
                         /*refreshing_rate_limits*/ false, /*request_id*/ None,
                     );
                 }
+            }
+            SlashCommand::Update => {
+                #[cfg(windows)]
+                {
+                    let Some(repo_root) = codex_build_info::RZCODEX_REPOSITORY_ROOT else {
+                        self.add_error_message(
+                            "This build does not contain managed RzCodex updater metadata."
+                                .to_string(),
+                        );
+                        return;
+                    };
+
+                    self.add_info_message(
+                        format!(
+                            "Checking for RzCodex updates from v{}.",
+                            codex_build_info::CLI_VERSION
+                        ),
+                        Some("The updater runs hidden in the background.".to_string()),
+                    );
+                    let tx = self.app_event_tx.clone();
+                    let repo_root = std::path::PathBuf::from(repo_root);
+                    tokio::spawn(async move {
+                        let cell = rzcodex_update_result_cell(run_rzcodex_update(&repo_root).await);
+                        tx.send(AppEvent::InsertHistoryCell(Box::new(cell)));
+                    });
+                }
+                #[cfg(not(windows))]
+                self.add_error_message(
+                    "The managed RzCodex updater is currently available only on Windows."
+                        .to_string(),
+                );
             }
             SlashCommand::Cd => {
                 self.dispatch_command_with_args(SlashCommand::Cd, "~".to_string(), Vec::new());
@@ -1191,6 +1313,7 @@ impl ChatWidget {
             | SlashCommand::Skills
             | SlashCommand::Import
             | SlashCommand::Hooks
+            | SlashCommand::Update
             | SlashCommand::Title
             | SlashCommand::Statusline
             | SlashCommand::Theme
@@ -1246,5 +1369,44 @@ impl ChatWidget {
         ));
         self.bottom_pane.drain_pending_submission_state();
         false
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    fn render_cell(cell: &history_cell::PlainHistoryCell) -> String {
+        cell.display_lines(/*width*/ 120)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn rzcodex_update_result_snapshot() {
+        let updated = rzcodex_update_result_cell(Ok(RzCodexUpdateStatus {
+            result: "updated".to_string(),
+            message: "RzCodex 0.151.0 built, pushed, and installed successfully.".to_string(),
+            invocation_id: "test-invocation".to_string(),
+        }));
+        let failed = rzcodex_update_result_cell(Err("working tree is dirty".to_string()));
+
+        insta::assert_snapshot!(
+            format!("updated:\n{}\n\nfailed:\n{}", render_cell(&updated), render_cell(&failed)),
+            @r"
+        updated:
+        • RzCodex 0.151.0 built, pushed, and installed successfully. Restart RzCodex when convenient to use the new build.
+
+        failed:
+        ■ RzCodex update failed: working tree is dirty
+        "
+        );
     }
 }
