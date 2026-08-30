@@ -72,11 +72,11 @@ pub(crate) struct SpawnRequestSummary {
     pub(crate) reasoning_effort: ReasoningEffortConfig,
 }
 
-pub(crate) fn agent_picker_status_dot_spans(is_closed: bool) -> Vec<Span<'static>> {
-    let dot = if is_closed {
-        "•".into()
-    } else {
+pub(crate) fn agent_picker_activity_dot_spans(is_active: bool) -> Vec<Span<'static>> {
+    let dot = if is_active {
         "•".green()
+    } else {
+        "•".dim()
     };
     vec![dot, " ".into()]
 }

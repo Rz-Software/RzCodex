@@ -374,6 +374,15 @@ impl AgentNavigationState {
         )
     }
 
+    pub(crate) fn tabbed_picker_subtitle() -> String {
+        let previous: Span<'static> = previous_agent_shortcut().into();
+        let next: Span<'static> = next_agent_shortcut().into();
+        format!(
+            "Active agents are separate from saved transcript history. Left/Right changes tabs; {} previous, {} next.",
+            previous.content, next.content
+        )
+    }
+
     #[cfg(test)]
     /// Returns only the ordered thread ids for focused tests of traversal invariants.
     ///

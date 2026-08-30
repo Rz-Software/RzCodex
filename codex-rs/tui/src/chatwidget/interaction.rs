@@ -244,6 +244,10 @@ impl ChatWidget {
         self.bottom_pane.selected_index_for_present_view(view_id)
     }
 
+    pub(crate) fn active_tab_id_for_active_view(&self, view_id: &'static str) -> Option<&str> {
+        self.bottom_pane.active_tab_id_for_active_view(view_id)
+    }
+
     pub(crate) fn replace_selection_view_if_present(
         &mut self,
         view_id: &'static str,

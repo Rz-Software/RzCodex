@@ -132,7 +132,7 @@ impl V2Residency {
             else {
                 continue;
             };
-            if !is_unloadable(candidate_thread.as_ref()).await {
+            if !wait_until_unloadable(candidate_thread.as_ref()).await {
                 self.touch(candidate_thread_id);
                 continue;
             }
@@ -230,12 +230,38 @@ pub(super) fn is_v2_resident_session_source(session_source: &SessionSource) -> b
     matches!(session_source, SessionSource::SubAgent(_))
 }
 
-async fn is_unloadable(thread: &CodexThread) -> bool {
-    matches!(
-        thread.agent_status().await,
-        AgentStatus::Completed(_) | AgentStatus::Errored(_) | AgentStatus::Interrupted
-    ) && thread.session.active_turn.lock().await.is_none()
-        && !thread.session.input_queue.has_pending_mailbox_items().await
+async fn wait_until_unloadable(thread: &CodexThread) -> bool {
+    loop {
+        if !matches!(
+            thread.agent_status().await,
+            AgentStatus::Completed(_) | AgentStatus::Errored(_) | AgentStatus::Interrupted
+        ) || thread.session.input_queue.has_pending_mailbox_items().await
+        {
+            return false;
+        }
+
+        let mut wait_for_clear = {
+            let active_turn = thread.session.active_turn.lock().await;
+            let Some(active_turn) = active_turn.as_ref() else {
+                return true;
+            };
+            if active_turn.task.is_some() {
+                // A resumed turn won the race after the terminal snapshot. It is genuinely live
+                // and must not be evicted or make this spawn wait for an unbounded work turn.
+                return false;
+            }
+            let mut wait_for_clear = Box::pin(Arc::clone(&active_turn.cleared).notified_owned());
+            // notify_waiters does not retain a permit. Register before releasing active_turn so
+            // its Drop notification cannot land between constructing and polling this future.
+            wait_for_clear.as_mut().enable();
+            wait_for_clear
+        };
+
+        // TurnComplete is deliberately emitted before ActiveTurn is removed so parent delivery
+        // and persistence retain their ordering. A concurrent spawn must wait for that teardown
+        // boundary instead of reporting a stale agent-limit failure.
+        wait_for_clear.as_mut().await;
+    }
 }
 
 #[cfg(test)]

@@ -1850,6 +1850,57 @@ async fn open_agent_picker_keeps_missing_threads_for_replay() -> Result<()> {
 }
 
 #[tokio::test]
+async fn agent_picker_separates_active_agents_from_transcript_history() {
+    let mut app = Box::pin(make_test_app()).await;
+    let main_thread_id = ThreadId::new();
+    let running_thread_id = ThreadId::new();
+    let history_thread_id = ThreadId::new();
+    app.primary_thread_id = Some(main_thread_id);
+    app.active_thread_id = Some(main_thread_id);
+    app.agent_navigation.upsert(
+        main_thread_id,
+        /*agent_nickname*/ None,
+        /*agent_role*/ None,
+        /*is_closed*/ false,
+    );
+    app.agent_navigation.upsert(
+        running_thread_id,
+        Some("Runner".to_string()),
+        Some("worker".to_string()),
+        /*is_closed*/ false,
+    );
+    app.agent_navigation.mark_running(running_thread_id);
+    app.agent_navigation.upsert(
+        history_thread_id,
+        Some("Finished".to_string()),
+        Some("explorer".to_string()),
+        /*is_closed*/ true,
+    );
+
+    let params = app.agent_picker_selection_view_params(/*selected*/ None);
+    assert!(params.items.is_empty());
+    assert_eq!(params.tabs.len(), 2);
+    assert_eq!(params.tabs[0].id, "active");
+    assert_eq!(params.tabs[0].label, "Active (2)");
+    assert_eq!(
+        params.tabs[0]
+            .items
+            .iter()
+            .map(|item| item.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Main [default]", "Runner [worker]"]
+    );
+    assert_eq!(params.tabs[1].id, "history");
+    assert_eq!(params.tabs[1].label, "History (1)");
+    assert_eq!(params.tabs[1].items[0].name, "Finished [explorer]");
+    assert_eq!(params.initial_tab_id.as_deref(), Some("active"));
+
+    app.active_thread_id = Some(history_thread_id);
+    let params = app.agent_picker_selection_view_params(/*selected*/ None);
+    assert_eq!(params.initial_tab_id.as_deref(), Some("history"));
+}
+
+#[tokio::test]
 async fn open_agent_picker_preserves_cached_metadata_for_replay_threads() -> Result<()> {
     let mut app = Box::pin(make_test_app()).await;
     let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(

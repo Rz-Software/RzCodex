@@ -18,6 +18,8 @@ use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
 use pretty_assertions::assert_eq;
 use std::sync::Arc;
+use tokio::time::Duration;
+use tokio::time::timeout;
 
 #[tokio::test]
 async fn residency_slot_reservation_unloads_oldest_idle_v2_agent() {
@@ -133,6 +135,63 @@ async fn interrupted_v2_agent_is_lost_after_residency_eviction() {
     }
 }
 
+#[tokio::test]
+async fn residency_reservation_waits_for_terminal_turn_teardown() {
+    let mut config = test_config().await;
+    let _ = config.features.enable(Feature::MultiAgentV2);
+    // The configured session limit includes the root; two permits one resident child.
+    config.multi_agent_v2.max_concurrent_threads_per_session = 2;
+    let temp_home = tempfile::tempdir().expect("create temp home");
+    config.codex_home = temp_home.path().to_path_buf().try_into().unwrap();
+    config.cwd = temp_home.path().to_path_buf().try_into().unwrap();
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    );
+    let root = manager
+        .start_thread(StartThreadOptions::new(config.clone()))
+        .await
+        .expect("start root thread");
+    let control = manager.agent_control();
+    let state = control.upgrade().expect("thread manager should be live");
+
+    let first_slot = control
+        .reserve_v2_residency_slot(&state, &config, /*protected_thread_id*/ None)
+        .await
+        .expect("first resident slot");
+    let first =
+        spawn_v2_subagent(&control, &state, config.clone(), root.thread_id, "worker-1").await;
+    first_slot.commit(first.thread_id);
+    mark_thread_completed_without_clearing(first.thread.as_ref()).await;
+
+    let reserve = tokio::spawn({
+        let control = control.clone();
+        let state = Arc::clone(&state);
+        let config = config.clone();
+        async move {
+            control
+                .reserve_v2_residency_slot(&state, &config, /*protected_thread_id*/ None)
+                .await
+        }
+    });
+    tokio::task::yield_now().await;
+    assert!(
+        !reserve.is_finished(),
+        "reservation should synchronize with terminal teardown instead of failing"
+    );
+
+    clear_active_turn(first.thread.as_ref()).await;
+    let second_slot = timeout(Duration::from_secs(5), reserve)
+        .await
+        .expect("reservation should finish after terminal teardown")
+        .expect("reservation task should not panic")
+        .expect("terminal resident should be evicted");
+    drop(second_slot);
+    assert!(manager.get_thread(first.thread_id).await.is_err());
+}
+
 async fn spawn_v2_subagent(
     control: &AgentControl,
     state: &Arc<ThreadManagerState>,
@@ -159,6 +218,11 @@ async fn spawn_v2_subagent(
 }
 
 async fn mark_thread_completed(thread: &CodexThread) {
+    mark_thread_completed_without_clearing(thread).await;
+    clear_active_turn(thread).await;
+}
+
+async fn mark_thread_completed_without_clearing(thread: &CodexThread) {
     let turn = thread.session.new_default_turn().await;
     thread
         .session
@@ -175,7 +239,6 @@ async fn mark_thread_completed(thread: &CodexThread) {
             }),
         )
         .await;
-    clear_active_turn(thread).await;
 }
 
 async fn mark_thread_interrupted(thread: &CodexThread) {

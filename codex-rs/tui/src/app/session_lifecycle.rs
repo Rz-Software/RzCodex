@@ -170,54 +170,119 @@ impl App {
         &self,
         selected: Option<usize>,
     ) -> SelectionViewParams {
-        let mut initial_selected_idx = selected;
-        let items: Vec<SelectionItem> = self
-            .agent_navigation
-            .ordered_threads()
-            .into_iter()
-            .enumerate()
-            .map(|(idx, (thread_id, entry))| {
-                if initial_selected_idx.is_none() && self.active_thread_id == Some(thread_id) {
-                    initial_selected_idx = Some(idx);
-                }
-                let id = thread_id;
-                let is_primary = self.primary_thread_id == Some(thread_id);
-                let name = entry
-                    .agent_path
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|agent_path| !is_primary && !agent_path.is_empty())
-                    .map(ToOwned::to_owned)
-                    .unwrap_or_else(|| {
-                        format_agent_picker_item_name(
-                            entry.agent_nickname.as_deref(),
-                            entry.agent_role.as_deref(),
-                            is_primary,
-                        )
-                    });
-                let uuid = thread_id.to_string();
-                SelectionItem {
-                    name: name.clone(),
-                    name_prefix_spans: agent_picker_status_dot_spans(entry.is_closed),
-                    description: Some(uuid.clone()),
-                    is_current: self.active_thread_id == Some(thread_id),
-                    actions: vec![Box::new(move |tx| {
-                        tx.send(AppEvent::SelectAgentThread(id));
-                    })],
-                    dismiss_on_select: true,
-                    search_value: Some(format!("{name} {uuid}")),
-                    ..Default::default()
-                }
-            })
-            .collect();
+        const ACTIVE_TAB_ID: &str = "active";
+        const HISTORY_TAB_ID: &str = "history";
+
+        let mut active_threads = Vec::new();
+        let mut history_threads = Vec::new();
+        for (thread_id, entry) in self.agent_navigation.ordered_threads() {
+            if self.primary_thread_id == Some(thread_id) || entry.is_running {
+                active_threads.push((thread_id, entry));
+            } else {
+                history_threads.push((thread_id, entry));
+            }
+        }
+
+        let active_items = active_threads
+            .iter()
+            .map(|(thread_id, entry)| self.agent_picker_selection_item(*thread_id, entry, true))
+            .collect::<Vec<_>>();
+        let history_items = history_threads
+            .iter()
+            .map(|(thread_id, entry)| self.agent_picker_selection_item(*thread_id, entry, false))
+            .collect::<Vec<_>>();
+        let has_history = !history_items.is_empty();
+
+        let (items, tabs, initial_tab_id, subtitle) = if has_history {
+            let active_tab_selected = self
+                .chat_widget
+                .active_tab_id_for_active_view(AGENT_PICKER_VIEW_ID)
+                .map(ToOwned::to_owned)
+                .filter(|tab_id| matches!(tab_id.as_str(), ACTIVE_TAB_ID | HISTORY_TAB_ID))
+                .or_else(|| {
+                    history_threads
+                        .iter()
+                        .any(|(thread_id, _)| self.active_thread_id == Some(*thread_id))
+                        .then(|| HISTORY_TAB_ID.to_string())
+                })
+                .or_else(|| active_items.is_empty().then(|| HISTORY_TAB_ID.to_string()))
+                .unwrap_or_else(|| ACTIVE_TAB_ID.to_string());
+            let active_count = active_items.len();
+            let history_count = history_items.len();
+            (
+                Vec::new(),
+                vec![
+                    SelectionTab {
+                        id: ACTIVE_TAB_ID.to_string(),
+                        label: format!("Active ({active_count})"),
+                        header: Box::new(()),
+                        items: active_items,
+                    },
+                    SelectionTab {
+                        id: HISTORY_TAB_ID.to_string(),
+                        label: format!("History ({history_count})"),
+                        header: Box::new(()),
+                        items: history_items,
+                    },
+                ],
+                Some(active_tab_selected),
+                AgentNavigationState::tabbed_picker_subtitle(),
+            )
+        } else {
+            (
+                active_items,
+                Vec::new(),
+                None,
+                AgentNavigationState::picker_subtitle(),
+            )
+        };
 
         SelectionViewParams {
             view_id: Some(AGENT_PICKER_VIEW_ID),
             title: Some("Subagents".to_string()),
-            subtitle: Some(AgentNavigationState::picker_subtitle()),
+            subtitle: Some(subtitle),
             footer_hint: Some(standard_popup_hint_line()),
             items,
-            initial_selected_idx,
+            tabs,
+            initial_tab_id,
+            initial_selected_idx: selected,
+            is_searchable: has_history,
+            ..Default::default()
+        }
+    }
+
+    fn agent_picker_selection_item(
+        &self,
+        thread_id: ThreadId,
+        entry: &AgentPickerThreadEntry,
+        is_active: bool,
+    ) -> SelectionItem {
+        let id = thread_id;
+        let is_primary = self.primary_thread_id == Some(thread_id);
+        let name = entry
+            .agent_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|agent_path| !is_primary && !agent_path.is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| {
+                format_agent_picker_item_name(
+                    entry.agent_nickname.as_deref(),
+                    entry.agent_role.as_deref(),
+                    is_primary,
+                )
+            });
+        let uuid = thread_id.to_string();
+        SelectionItem {
+            name: name.clone(),
+            name_prefix_spans: agent_picker_activity_dot_spans(is_active),
+            description: Some(uuid.clone()),
+            is_current: self.active_thread_id == Some(thread_id),
+            actions: vec![Box::new(move |tx| {
+                tx.send(AppEvent::SelectAgentThread(id));
+            })],
+            dismiss_on_select: true,
+            search_value: Some(format!("{name} {uuid}")),
             ..Default::default()
         }
     }

@@ -51,6 +51,7 @@ tools:
   - find_by_name
   - grep_search
   - run_command
+  - manage_task
   - write_to_file
   - replace_file_content
   - search_web
@@ -64,7 +65,7 @@ inheritCustomizations: false
 
 # RzCodex native worker
 
-You are already a bounded native sub-agent owned by a separate Codex main agent. Work directly on the assigned task. Never delegate, invoke another agent, define an agent, start a background task, or wait on hidden work. Keep each reasoning/tool cycle focused, return promptly when the task is complete, and return a concise concrete blocker or question when the main agent must decide something.
+You are already a bounded native sub-agent owned by a separate Codex main agent. Work directly on the assigned task. Never delegate, invoke another agent, define an agent, or create background work. Use run_command for read-only inspection only; never edit, create, move, delete, build, test, or invoke a side-effecting script through it. A long run_command may be moved to the background by the client runtime; manage only that command with manage_task and do not poll it repeatedly. Use the dedicated file tools for file mutations. Keep each reasoning/tool cycle focused, return promptly when the task is complete, and return a concise concrete blocker or question when the main agent must decide something.
 `;
 const MUTATION_TOOLS = new Set(["multi_replace_file_content", "replace_file_content", "sed_file", "write_to_file"]);
 const FORBIDDEN_AGENT_TOOLS = new Set([
@@ -73,11 +74,10 @@ const FORBIDDEN_AGENT_TOOLS = new Set([
   "invoke_subagent",
   "manage_inbox",
   "manage_subagents",
-  "manage_task",
   "schedule",
   "send_message",
 ]);
-const REQUIRED_AGENT_TOOLS = new Set(["call_mcp_tool", "grep_search", "replace_file_content", "run_command", "view_file", "write_to_file"]);
+const REQUIRED_AGENT_TOOLS = new Set(["call_mcp_tool", "grep_search", "manage_task", "replace_file_content", "run_command", "view_file", "write_to_file"]);
 
 class BridgeError extends Error {
   constructor(message, status = 400, code = null) {
@@ -742,9 +742,10 @@ class AntigravitySession {
         quotaFailure ? 429 : 502,
       ), turn);
       error.modelQuotaFailure = quotaFailure;
-      error.safeToRetry = error.toolCalls === 0
+      error.safeToRetry = error.mutationToolCalls === 0
         && error.rzMcpTools.length === 0
-        && !error.subagentActivity;
+        && !error.subagentActivity
+        && !error.forbiddenToolName;
       error.routeCommitted = !error.safeToRetry;
       turn.reject(error);
       this.close();
@@ -1379,9 +1380,13 @@ async function selfTest() {
     return rejected;
   };
   const safeQuotaFailure = quotaFailureFor([], 100);
+  const readOnlyQuotaFailure = quotaFailureFor(["view_file", "grep_search", "run_command", "manage_task"]);
   const committedQuotaFailure = quotaFailureFor(["write_to_file"]);
   if (!safeQuotaFailure?.modelQuotaFailure || !safeQuotaFailure.safeToRetry || safeQuotaFailure.routeCommitted) {
     throw new Error("safe model-quota retry classification failed");
+  }
+  if (!readOnlyQuotaFailure?.modelQuotaFailure || !readOnlyQuotaFailure.safeToRetry || readOnlyQuotaFailure.routeCommitted) {
+    throw new Error("read-only model-quota retry classification failed");
   }
   if (!committedQuotaFailure?.modelQuotaFailure || committedQuotaFailure.safeToRetry || !committedQuotaFailure.routeCommitted) {
     throw new Error("committed model-quota failure classification failed");
@@ -1433,11 +1438,11 @@ async function selfTest() {
       step_index: 0,
       state: "DONE",
       step_type: "tool",
-      tool_name: "manage_task",
-      tool_info: { name: "manage_task", parameters: {} },
+      tool_name: "invoke_subagent",
+      tool_info: { name: "invoke_subagent", parameters: {} },
     },
   });
-  if (!forbiddenFailure?.routeCommitted || forbiddenFailure.code !== "provider_state_changed" || forbiddenFailure.forbiddenToolName !== "manage_task") {
+  if (!forbiddenFailure?.routeCommitted || forbiddenFailure.code !== "provider_state_changed" || forbiddenFailure.forbiddenToolName !== "invoke_subagent") {
     throw new Error("forbidden Antigravity orchestration tool did not fail closed");
   }
   if (/^model\s*:/m.test(AGENT_DEFINITION)) throw new Error("agent definition pinned a model");

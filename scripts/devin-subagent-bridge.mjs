@@ -40,6 +40,7 @@ const MAX_PROGRESS_EVENTS = 256;
 const FREE_ROUTE_CONCURRENCY = 2;
 const RESOURCE_BACKOFF_BASE_MS = 5 * 1000;
 const RESOURCE_BACKOFF_MAX_MS = 2 * 60 * 1000;
+const QUOTA_RECOVERY_PROBE_MS = 30 * 60 * 1000;
 const FALLBACK_BRIDGE_ENDPOINT = "http://127.0.0.1:54549/v1/responses";
 const FALLBACK_REQUIRED_AUTH_SOURCE = "Antigravity cached OAuth session";
 const FALLBACK_REQUIRED_EFFORT = "high";
@@ -55,7 +56,7 @@ const DEVIN_EXE = join(process.env.LOCALAPPDATA || join(homedir(), "AppData", "L
 const DEVIN_DB = join(process.env.APPDATA || join(homedir(), "AppData", "Roaming"), "devin", "cli", "sessions.db");
 const QUOTA_FAILURE = /(?:daily|weekly|included|usage)[\s\S]{0,100}quota[\s\S]{0,100}(?:exhaust|exceed|reach|limit)|quota[\s\S]{0,100}(?:exhaust|exceed|reach|limit)/i;
 const RESOURCE_EXHAUSTED = /cognition\.ai\/errorKind[\s\S]{0,100}resource_exhausted|resource_exhausted[\s\S]{0,100}cognition\.ai\/retryable[\s\S]{0,20}true/i;
-const QUOTA_STATE_VERSION = 1;
+const QUOTA_STATE_VERSION = 2;
 
 class BridgeError extends Error {
   constructor(message, status = 400) {
@@ -112,7 +113,7 @@ class CalendarQuotaState {
     try {
       const parsed = JSON.parse(readFileSync(this.statePath, "utf8"));
       if (
-        parsed.version !== QUOTA_STATE_VERSION
+        ![1, QUOTA_STATE_VERSION].includes(parsed.version)
         || !["daily", "weekly", "calendar"].includes(parsed.kind)
         || !Number.isFinite(parsed.confirmedAt)
         || !Number.isFinite(parsed.retryAt)
@@ -120,8 +121,20 @@ class CalendarQuotaState {
       ) {
         throw new Error("invalid schema");
       }
-      this.state = { kind: parsed.kind, confirmedAt: parsed.confirmedAt, retryAt: parsed.retryAt };
+      const nextProbeAt = Number.isFinite(parsed.nextProbeAt)
+        ? parsed.nextProbeAt
+        : Math.min(parsed.retryAt, parsed.confirmedAt + QUOTA_RECOVERY_PROBE_MS);
+      if (nextProbeAt <= parsed.confirmedAt || nextProbeAt > parsed.retryAt) {
+        throw new Error("invalid recovery probe boundary");
+      }
+      this.state = {
+        kind: parsed.kind,
+        confirmedAt: parsed.confirmedAt,
+        retryAt: parsed.retryAt,
+        nextProbeAt,
+      };
       this.isActive();
+      if (this.state && parsed.version !== QUOTA_STATE_VERSION) this.persist();
     } catch (error) {
       throw new BridgeError(`Cannot read persisted Devin quota state: ${error.message}`, 500);
     }
@@ -137,9 +150,21 @@ class CalendarQuotaState {
   record(cliResult, nowMs = this.now()) {
     const kind = quotaKindFromFailure(cliResult);
     if (!kind) return false;
-    const candidate = { kind, confirmedAt: nowMs, retryAt: nextCalendarQuotaProbeAt(kind, nowMs) };
-    if (this.state?.retryAt >= candidate.retryAt && this.state.retryAt > nowMs) return false;
-    this.state = candidate;
+    const candidateRetryAt = nextCalendarQuotaProbeAt(kind, nowMs);
+    const retryAt = Math.max(this.state?.retryAt || 0, candidateRetryAt);
+    this.state = {
+      kind: this.state?.retryAt > candidateRetryAt ? this.state.kind : kind,
+      confirmedAt: nowMs,
+      retryAt,
+      nextProbeAt: Math.min(retryAt, nowMs + QUOTA_RECOVERY_PROBE_MS),
+    };
+    this.persist();
+    return true;
+  }
+
+  claimRecoveryProbe(nowMs = this.now()) {
+    if (!this.isActive(nowMs) || this.state.nextProbeAt > nowMs) return false;
+    this.state.nextProbeAt = Math.min(this.state.retryAt, nowMs + QUOTA_RECOVERY_PROBE_MS);
     this.persist();
     return true;
   }
@@ -175,8 +200,14 @@ class CalendarQuotaState {
   snapshot(nowMs = this.now()) {
     const active = this.isActive(nowMs);
     return active
-      ? { active, kind: this.state.kind, confirmedAt: this.state.confirmedAt, retryAt: this.state.retryAt }
-      : { active, kind: null, confirmedAt: null, retryAt: null };
+      ? {
+        active,
+        kind: this.state.kind,
+        confirmedAt: this.state.confirmedAt,
+        retryAt: this.state.retryAt,
+        nextProbeAt: this.state.nextProbeAt,
+      }
+      : { active, kind: null, confirmedAt: null, retryAt: null, nextProbeAt: null };
   }
 }
 
@@ -306,7 +337,7 @@ const runtime = {
   fallbackAttempts: 0, fallbackCompleted: 0, fallbackFailed: 0, terminalFallbacks: 0,
   fallbackStreamCommits: 0, lastFallbackStreamCommitted: false,
   lastFallbackStreamedMessageCount: 0,
-  quotaProbeSkips: 0, quotaPinsReleased: 0,
+  quotaProbeSkips: 0, quotaRecoveryProbes: 0, quotaPinsReleased: 0,
   calendarQuotaSkips: 0, calendarQuotaActivations: 0, calendarQuotaClears: 0,
   lastQuotaProbeSkipped: false, lastQuotaSkipScope: null, lastQuotaPinCreated: false,
   lastFallbackError: null, lastFallbackAuthSource: null,
@@ -585,6 +616,17 @@ function chooseRoute(context, quotaState = calendarQuotaState, taskPins = quotaT
     return fallbackSelection("active_task_confirmed_devin_quota_failure");
   }
   if (quotaState.isActive()) {
+    if (quotaState.claimRecoveryProbe()) {
+      runtime.quotaRecoveryProbes += 1;
+      runtime.lastQuotaProbeSkipped = false;
+      runtime.lastQuotaSkipScope = "calendar_recovery_probe";
+      return {
+        key: "primary",
+        provider: "devin",
+        model: models.primary,
+        reason: "calendar_quota_recovery_probe",
+      };
+    }
     runtime.lastQuotaProbeSkipped = true;
     runtime.lastQuotaSkipScope = "calendar_quota";
     runtime.quotaProbeSkips += 1;
@@ -1408,7 +1450,7 @@ function health(requestedRoute = "auto") {
         cost: models.terminal.cost_summary || models.terminal.cost_tier,
       },
       orderedPolicy: "devin_primary_then_antigravity_on_quota_then_devin_free_on_antigravity_failure",
-      quotaDetection: "explicit_daily_or_weekly_quota_failure_persisted_until_its_next_local_calendar_refresh",
+      quotaDetection: "explicit_daily_or_weekly_quota_failure_with_single_bounded_recovery_probe_every_30_minutes",
     },
     apiKeysStripped: true, isolatedConfigImports: ["agents_standard"], lazyRzMcpProxyTools: 2,
     rawPromptFilesRetained: false, ephemeralSessionsRemoved: true,
@@ -1441,6 +1483,18 @@ async function selfTest() {
   ) {
     throw new Error("daily calendar quota routing failed");
   }
+  let recoveryProbeNow = fixedQuotaNow;
+  const recoveryProbeState = new CalendarQuotaState(null, () => recoveryProbeNow);
+  recoveryProbeState.record(dailyQuotaFailure);
+  recoveryProbeNow += QUOTA_RECOVERY_PROBE_MS;
+  const recoveryProbeRoute = chooseRoute(selfTestRouteContext, recoveryProbeState, selfTestTaskPins);
+  if (
+    recoveryProbeRoute.key !== "primary"
+    || recoveryProbeRoute.reason !== "calendar_quota_recovery_probe"
+    || chooseRoute(selfTestRouteContext, recoveryProbeState, selfTestTaskPins).key !== "fallback"
+  ) {
+    throw new Error("bounded calendar quota recovery probe routing failed");
+  }
   const dailyRetryAt = selfTestQuotaState.snapshot().retryAt;
   if (!selfTestQuotaState.record(weeklyQuotaFailure) || selfTestQuotaState.snapshot().retryAt <= dailyRetryAt) {
     throw new Error("weekly quota did not extend the calendar route pin");
@@ -1455,7 +1509,12 @@ async function selfTest() {
     persistentQuota.record(dailyQuotaFailure);
     persistentQuota.record(weeklyQuotaFailure);
     const reloadedQuota = new CalendarQuotaState(quotaFixturePath, () => fixedQuotaNow);
-    if (reloadedQuota.snapshot().kind !== "weekly") throw new Error("persisted quota state did not reload");
+    if (
+      reloadedQuota.snapshot().kind !== "weekly"
+      || !Number.isFinite(reloadedQuota.snapshot().nextProbeAt)
+    ) {
+      throw new Error("persisted quota state did not reload");
+    }
   } finally {
     try { unlinkSync(quotaFixturePath); } catch (error) { if (error?.code !== "ENOENT") throw error; }
     try { unlinkSync(`${quotaFixturePath}.${process.pid}.tmp`); } catch (error) { if (error?.code !== "ENOENT") throw error; }

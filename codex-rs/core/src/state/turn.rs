@@ -33,6 +33,10 @@ use codex_protocol::protocol::TokenUsage;
 pub(crate) struct ActiveTurn {
     pub(crate) task: Option<RunningTask>,
     pub(crate) turn_state: Arc<Mutex<TurnState>>,
+    /// Wakes lifecycle consumers once this turn is no longer installed as the session's active
+    /// turn. This closes the small window where a terminal status is already observable while
+    /// terminal-event forwarding and final persistence are still finishing.
+    pub(crate) cleared: Arc<Notify>,
 }
 
 /// Whether mailbox deliveries should still be folded into the current turn.
@@ -61,7 +65,14 @@ impl Default for ActiveTurn {
         Self {
             task: None,
             turn_state: Arc::new(Mutex::new(TurnState::default())),
+            cleared: Arc::new(Notify::new()),
         }
+    }
+}
+
+impl Drop for ActiveTurn {
+    fn drop(&mut self) {
+        self.cleared.notify_waiters();
     }
 }
 
