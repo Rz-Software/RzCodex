@@ -44,7 +44,7 @@ function requireObject(value, label) {
   return value;
 }
 
-export function codeBuddyForwardBody(body, modelAlias, effort) {
+export function fallbackForwardBody(body, modelAlias, effort) {
   requireObject(body, "request body");
   return {
     ...body,
@@ -55,7 +55,7 @@ export function codeBuddyForwardBody(body, modelAlias, effort) {
 }
 
 async function readBoundedResponse(response, maxResponseBytes) {
-  if (!response.body) throw new ProviderRouteError("CodeBuddy bridge returned an empty HTTP body");
+  if (!response.body) throw new ProviderRouteError("Fallback bridge returned an empty HTTP body");
   const chunks = [];
   let totalBytes = 0;
   for await (const chunk of response.body) {
@@ -63,7 +63,7 @@ async function readBoundedResponse(response, maxResponseBytes) {
     totalBytes += bytes.length;
     if (totalBytes > maxResponseBytes) {
       await response.body.cancel().catch(() => {});
-      throw new ProviderRouteError(`CodeBuddy bridge response exceeded ${maxResponseBytes} bytes`);
+      throw new ProviderRouteError(`Fallback bridge response exceeded ${maxResponseBytes} bytes`);
     }
     chunks.push(bytes);
   }
@@ -87,11 +87,11 @@ function parseResponsesSseBlock(block) {
   try {
     payload = JSON.parse(dataLines.join("\n"));
   } catch (error) {
-    throw new ProviderRouteError(`CodeBuddy bridge returned malformed SSE JSON: ${error.message}`);
+    throw new ProviderRouteError(`Fallback bridge returned malformed SSE JSON: ${error.message}`);
   }
   const payloadType = typeof payload?.type === "string" ? payload.type : null;
   if (eventName && payloadType && eventName !== payloadType) {
-    throw new ProviderRouteError(`CodeBuddy bridge SSE event mismatch: event=${eventName} payload=${payloadType}`);
+    throw new ProviderRouteError(`Fallback bridge SSE event mismatch: event=${eventName} payload=${payloadType}`);
   }
   return { type: eventName || payloadType, payload };
 }
@@ -133,20 +133,28 @@ export function parseResponsesSse(raw) {
   return [...decoder.push(Buffer.from(String(raw))), ...decoder.finish()];
 }
 
+function providerFailure(error) {
+  const failure = new ProviderRouteError(
+    `Fallback bridge failed: ${error?.message || error?.type || "unknown provider failure"}`,
+  );
+  if (error?.code === "provider_state_changed") failure.routeCommitted = true;
+  return failure;
+}
+
 export function completedResponseFromSse(raw) {
   let completed = null;
   for (const event of parseResponsesSse(raw)) {
     if (event.type === "response.failed") {
       const error = event.payload?.response?.error;
-      throw new ProviderRouteError(`CodeBuddy bridge failed: ${error?.message || error?.type || "unknown provider failure"}`);
+      throw providerFailure(error);
     }
     if (event.type === "response.completed") {
-      if (completed) throw new ProviderRouteError("CodeBuddy bridge returned more than one completed response");
+      if (completed) throw new ProviderRouteError("Fallback bridge returned more than one completed response");
       completed = event.payload?.response;
     }
   }
-  if (!completed) throw new ProviderRouteError("CodeBuddy bridge ended without a completed response");
-  return requireObject(completed, "CodeBuddy completed response");
+  if (!completed) throw new ProviderRouteError("Fallback bridge ended without a completed response");
+  return requireObject(completed, "fallback completed response");
 }
 
 export async function runResponsesBridge({
@@ -167,31 +175,29 @@ export async function runResponsesBridge({
     });
   } catch (error) {
     if (signal?.aborted || error?.name === "AbortError") throw error;
-    throw new ProviderRouteError(`CodeBuddy bridge request failed: ${error.message}`, 502, { cause: error });
+    throw new ProviderRouteError(`Fallback bridge request failed: ${error.message}`, 502, { cause: error });
   }
   if (!response.ok) {
     const raw = await readBoundedResponse(response, maxResponseBytes);
     const detail = raw.trim().slice(0, 2_000);
-    throw new ProviderRouteError(`CodeBuddy bridge returned HTTP ${response.status}${detail ? `: ${detail}` : ""}`);
+    throw new ProviderRouteError(`Fallback bridge returned HTTP ${response.status}${detail ? `: ${detail}` : ""}`);
   }
   const contentType = response.headers.get("content-type") || "";
   if (!contentType.toLowerCase().includes("text/event-stream")) {
-    throw new ProviderRouteError(`CodeBuddy bridge returned unexpected content type ${JSON.stringify(contentType)}`);
+    throw new ProviderRouteError(`Fallback bridge returned unexpected content type ${JSON.stringify(contentType)}`);
   }
-  if (!response.body) throw new ProviderRouteError("CodeBuddy bridge returned an empty HTTP body");
+  if (!response.body) throw new ProviderRouteError("Fallback bridge returned an empty HTTP body");
   const decoder = new ResponsesSseDecoder();
   let completed = null;
   let totalBytes = 0;
   const accept = async (event) => {
     if (event.type === "response.failed") {
       const error = event.payload?.response?.error;
-      throw new ProviderRouteError(
-        `CodeBuddy bridge failed: ${error?.message || error?.type || "unknown provider failure"}`,
-      );
+      throw providerFailure(error);
     }
     if (event.type === "response.completed") {
-      if (completed) throw new ProviderRouteError("CodeBuddy bridge returned more than one completed response");
-      completed = requireObject(event.payload?.response, "CodeBuddy completed response");
+      if (completed) throw new ProviderRouteError("Fallback bridge returned more than one completed response");
+      completed = requireObject(event.payload?.response, "fallback completed response");
     }
     await onEvent(event);
   };
@@ -201,7 +207,7 @@ export async function runResponsesBridge({
       totalBytes += bytes.length;
       if (totalBytes > maxResponseBytes) {
         await response.body.cancel().catch(() => {});
-        throw new ProviderRouteError(`CodeBuddy bridge response exceeded ${maxResponseBytes} bytes`);
+        throw new ProviderRouteError(`Fallback bridge response exceeded ${maxResponseBytes} bytes`);
       }
       for (const event of decoder.push(bytes)) await accept(event);
     }
@@ -209,54 +215,58 @@ export async function runResponsesBridge({
   } catch (error) {
     if (signal?.aborted || error?.name === "AbortError") throw error;
     if (error instanceof ProviderRouteError) throw error;
-    throw new ProviderRouteError(`CodeBuddy bridge stream failed: ${error.message}`, 502, { cause: error });
+    throw new ProviderRouteError(`Fallback bridge stream failed: ${error.message}`, 502, { cause: error });
   }
-  if (!completed) throw new ProviderRouteError("CodeBuddy bridge ended without a completed response");
+  if (!completed) throw new ProviderRouteError("Fallback bridge ended without a completed response");
   return completed;
 }
 
-export function validateCodeBuddyCompletion(completion, expected) {
-  requireObject(completion, "CodeBuddy completed response");
+export function validateOAuthFallbackCompletion(completion, expected) {
+  requireObject(completion, "fallback completed response");
   if (completion.status !== "completed") {
-    throw new ProviderRouteError(`CodeBuddy returned response status ${JSON.stringify(completion.status)}`);
+    throw new ProviderRouteError(`Fallback provider returned response status ${JSON.stringify(completion.status)}`);
   }
-  const metadata = requireObject(completion.metadata, "CodeBuddy response metadata");
-  if (metadata.codebuddy_initialized_model !== expected.model) {
+  const metadata = requireObject(completion.metadata, "fallback response metadata");
+  if (metadata.actual_provider !== expected.provider) {
     throw new ProviderRouteError(
-      `CodeBuddy initialized unexpected model ${JSON.stringify(metadata.codebuddy_initialized_model)}`,
+      `Fallback bridge used unexpected provider ${JSON.stringify(metadata.actual_provider)}`,
     );
   }
-  if (metadata.codebuddy_auth_source !== expected.authSource) {
+  const expectedModels = Array.isArray(expected.models) ? expected.models : [expected.model];
+  if (!expectedModels.includes(metadata.actual_model)) {
     throw new ProviderRouteError(
-      `CodeBuddy used unexpected auth source ${JSON.stringify(metadata.codebuddy_auth_source)}`,
+      `Fallback bridge initialized unexpected model ${JSON.stringify(metadata.actual_model)}`,
     );
   }
-  if (metadata.codebuddy_total_cost_usd !== 0) {
+  if (metadata.auth_source !== expected.authSource) {
     throw new ProviderRouteError(
-      `CodeBuddy reported non-zero or unknown explicit cost ${JSON.stringify(metadata.codebuddy_total_cost_usd)}`,
+      `Fallback bridge used unexpected auth source ${JSON.stringify(metadata.auth_source)}`,
     );
+  }
+  if (metadata.codex_tool_schema_bytes_forwarded !== 0 || metadata.lazy_rzmcp_proxy_tools !== 2) {
+    throw new ProviderRouteError("Fallback bridge did not preserve lazy RzMCP tool serving");
   }
   if (!Array.isArray(completion.output) || completion.output.length === 0) {
-    throw new ProviderRouteError("CodeBuddy completed without output items");
+    throw new ProviderRouteError("Fallback provider completed without output items");
   }
   return completion;
 }
 
-export async function runQuotaFallbackChain({
+export async function runProviderFallbackChain({
   signal,
-  runCodeBuddy,
+  runFallback,
   runTerminal,
-  onCodeBuddyFailure = () => {},
+  onFallbackFailure = () => {},
 }) {
   try {
-    return { stage: "codebuddy", value: await runCodeBuddy(), codeBuddyError: null };
+    return { stage: "fallback", value: await runFallback(), fallbackError: null };
   } catch (error) {
     if (signal?.aborted || error?.name === "AbortError" || error?.status === 499) throw error;
     if (error?.routeCommitted === true) {
-      onCodeBuddyFailure(error);
+      onFallbackFailure(error);
       throw error;
     }
-    onCodeBuddyFailure(error);
-    return { stage: "terminal", value: await runTerminal(error), codeBuddyError: error };
+    onFallbackFailure(error);
+    return { stage: "terminal", value: await runTerminal(error), fallbackError: error };
   }
 }

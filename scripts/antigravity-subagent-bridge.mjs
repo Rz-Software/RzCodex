@@ -30,6 +30,10 @@ const INIT_TIMEOUT_MS = 30 * 1000;
 const SESSION_IDLE_MS = 30 * 60 * 1000;
 const SSE_HEARTBEAT_MS = 15 * 1000;
 const MAX_SESSIONS = 8;
+const QUOTA_CACHE_MS = 30 * 1000;
+const PRIMARY_QUOTA_BUCKET_ID = "3p-weekly";
+const FALLBACK_QUOTA_BUCKET_ID = "gemini-weekly";
+const MODEL_QUOTA_FAILURE = /exhausted your quota on this model|quota[^\r\n]{0,100}(?:exhaust|exceed|deplet)|LLM_CALL_QUOTA_EXCEEDED/i;
 const CENTRAL_CONFIG = join(homedir(), ".codex", "subagent-models.json");
 const AGY_EXE = join(process.env.LOCALAPPDATA || join(homedir(), "AppData", "Local"), "agy", "bin", "agy.exe");
 const MCP_CONFIG = join(homedir(), ".gemini", "config", "mcp_config.json");
@@ -91,7 +95,8 @@ function centralRoute() {
     throw new BridgeError("Antigravity managed route must declare exactly the text modality", 500);
   }
   return {
-    model: requireString(route.model, "antigravity.model"),
+    primaryModel: requireString(route.primaryModel, "antigravity.primaryModel"),
+    quotaFallbackModel: requireString(route.quotaFallbackModel, "antigravity.quotaFallbackModel"),
     inputModalities: route.inputModalities,
   };
 }
@@ -106,6 +111,105 @@ function verifyModelAvailable(model) {
   const exact = result.stdout.split(/\r?\n/).find((line) => line.trim().split(/\s+/)[0] === model);
   if (!exact) throw new BridgeError(`Configured Antigravity model ${json(model)} is unavailable`, 500);
   return exact.trim().slice(model.length).trim() || model;
+}
+
+function parseQuotaSnapshot(stdout, fetchedAt = Date.now()) {
+  let payload;
+  try {
+    payload = JSON.parse(stdout);
+  } catch (error) {
+    throw new BridgeError(`Antigravity quota output is not valid JSON: ${error.message}`, 502);
+  }
+  if (payload.status !== "SUCCESS" || payload.command?.name !== "usage") {
+    throw new BridgeError(`Antigravity quota query returned an unexpected payload: ${json(payload.status)}`, 502);
+  }
+  const buckets = (payload.command?.data?.groups || []).flatMap((group) =>
+    (group.buckets || []).map((bucket) => ({ ...bucket, group: group.name })));
+  const readBucket = (id, label) => {
+    const bucket = buckets.find((entry) => entry.id === id);
+    if (!bucket) throw new BridgeError(`Antigravity quota query omitted ${label} bucket ${json(id)}`, 502);
+    const remainingFraction = Number(bucket.remaining_fraction);
+    const resetAt = Date.parse(bucket.reset_time);
+    if (!Number.isFinite(remainingFraction) || remainingFraction < 0 || remainingFraction > 1) {
+      throw new BridgeError(`Antigravity ${label} quota has invalid remaining fraction ${json(bucket.remaining_fraction)}`, 502);
+    }
+    if (!Number.isFinite(resetAt)) {
+      throw new BridgeError(`Antigravity ${label} quota has invalid reset time ${json(bucket.reset_time)}`, 502);
+    }
+    return {
+      id,
+      group: bucket.group,
+      remainingFraction,
+      resetAt: new Date(resetAt).toISOString(),
+    };
+  };
+  return {
+    fetchedAt: new Date(fetchedAt).toISOString(),
+    primary: readBucket(PRIMARY_QUOTA_BUCKET_ID, "Claude/GPT"),
+    fallback: readBucket(FALLBACK_QUOTA_BUCKET_ID, "Gemini"),
+  };
+}
+
+class AntigravityQuotaRouter {
+  constructor(now = () => Date.now()) {
+    this.now = now;
+    this.cached = null;
+    this.refreshes = 0;
+    this.lastError = null;
+  }
+
+  snapshot(force = false) {
+    const now = this.now();
+    const fetchedAt = this.cached ? Date.parse(this.cached.fetchedAt) : 0;
+    if (!force && this.cached && now - fetchedAt < QUOTA_CACHE_MS) return this.cached;
+    const result = spawnSync(AGY_EXE, ["-p", "/quota", "--output-format", "json"], {
+      env: sanitizedEnvironment(),
+      windowsHide: true,
+      encoding: "utf8",
+      maxBuffer: 4 * 1024 * 1024,
+      timeout: 15_000,
+    });
+    if (result.status !== 0) {
+      this.lastError = String(result.stderr || result.stdout || `exit ${result.status}`).slice(0, 2_000);
+      throw new BridgeError(`Cannot query Antigravity quota: ${this.lastError}`, 502);
+    }
+    this.cached = parseQuotaSnapshot(result.stdout, now);
+    this.refreshes += 1;
+    this.lastError = null;
+    return this.cached;
+  }
+
+  select(existingModel = null) {
+    const snapshot = this.snapshot();
+    if (existingModel === route.quotaFallbackModel) {
+      if (snapshot.fallback.remainingFraction > 0) return models.fallback;
+      throw this.exhausted(snapshot);
+    }
+    if (snapshot.primary.remainingFraction > 0) return models.primary;
+    if (snapshot.fallback.remainingFraction > 0) return models.fallback;
+    throw this.exhausted(snapshot);
+  }
+
+  markPrimaryDepleted() {
+    const snapshot = this.snapshot();
+    snapshot.primary.remainingFraction = 0;
+    snapshot.primary.forcedDepleted = true;
+  }
+
+  exhausted(snapshot) {
+    return new BridgeError(
+      `Both Antigravity usage pools are depleted; Claude/GPT resets ${snapshot.primary.resetAt}, Gemini resets ${snapshot.fallback.resetAt}`,
+      429,
+    );
+  }
+
+  health() {
+    return {
+      refreshes: this.refreshes,
+      lastError: this.lastError,
+      snapshot: this.cached,
+    };
+  }
 }
 
 function verifyLazyMcpConfig() {
@@ -315,11 +419,24 @@ function subtractUsage(current, previous) {
   return result;
 }
 
+function sessionArguments(selectedModel) {
+  return [
+    "--input-format", "stream-json", "--output-format", "stream-json",
+    "--model", selectedModel.id,
+    ...(selectedModel.effort ? ["--effort", selectedModel.effort] : []),
+    "--dangerously-skip-permissions", "--disable-slash-commands",
+    "--print-timeout", "30m",
+  ];
+}
+
 class AntigravitySession {
-  constructor(key, workingDirectory, activeTaskHash, onClose) {
+  constructor(key, workingDirectory, activeTaskHash, selectedModel, onClose) {
     this.key = key;
     this.workingDirectory = workingDirectory;
     this.activeTaskHash = activeTaskHash;
+    this.model = selectedModel.id;
+    this.modelLabel = selectedModel.label;
+    this.modelEffort = selectedModel.effort;
     this.onClose = onClose;
     this.seenMessageKeys = new Set();
     this.child = null;
@@ -340,12 +457,7 @@ class AntigravitySession {
 
   async start() {
     if (this.child) return this.initPromise;
-    const args = [
-      "--input-format", "stream-json", "--output-format", "stream-json",
-      "--model", route.model, "--effort", REQUIRED_EFFORT,
-      "--dangerously-skip-permissions", "--disable-slash-commands",
-      "--print-timeout", "30m",
-    ];
+    const args = sessionArguments({ id: this.model, effort: this.modelEffort });
     this.child = spawn(AGY_EXE, args, {
       cwd: this.workingDirectory,
       env: sanitizedEnvironment(),
@@ -396,7 +508,7 @@ class AntigravitySession {
   consumeEvent(event) {
     if (event?.event === "init") {
       const init = assertObject(event.init, "Antigravity init");
-      if (init.model !== route.model) {
+      if (init.model !== this.model) {
         this.fail(new BridgeError(`Antigravity initialized unexpected model ${json(init.model)}`, 502));
         return;
       }
@@ -470,7 +582,18 @@ class AntigravitySession {
     this.turn = null;
     turn.cleanup();
     if (!result || result.status !== "SUCCESS") {
-      turn.reject(new BridgeError(`Antigravity turn failed with status ${json(result?.status)}`, 502));
+      const quotaFailure = MODEL_QUOTA_FAILURE.test(json(result || {}));
+      const error = new BridgeError(
+        quotaFailure
+          ? `Antigravity model quota is depleted for ${this.model}`
+          : `Antigravity turn failed with status ${json(result?.status)}`,
+        quotaFailure ? 429 : 502,
+      );
+      error.modelQuotaFailure = quotaFailure;
+      error.safeToRetry = turn.toolNames.size === 0
+        && turn.rzMcpTools.size === 0;
+      error.routeCommitted = !error.safeToRetry;
+      turn.reject(error);
       this.close();
       return;
     }
@@ -505,6 +628,9 @@ class AntigravitySession {
       const turn = this.turn;
       this.turn = null;
       turn.cleanup();
+      if (turn.toolNames.size > 0 || turn.rzMcpTools.size > 0) {
+        error.routeCommitted = true;
+      }
       turn.reject(error);
     }
     this.close();
@@ -620,8 +746,17 @@ function readRequestBody(request) {
 
 const route = centralRoute();
 if (!existsSync(AGY_EXE)) throw new BridgeError(`Antigravity CLI is missing at ${AGY_EXE}`, 500);
-const modelLabel = verifyModelAvailable(route.model);
+const models = {
+  primary: { id: route.primaryModel, label: verifyModelAvailable(route.primaryModel), effort: null },
+  fallback: {
+    id: route.quotaFallbackModel,
+    label: verifyModelAvailable(route.quotaFallbackModel),
+    effort: REQUIRED_EFFORT,
+  },
+};
 const mcpConfig = verifyLazyMcpConfig();
+const quotaRouter = new AntigravityQuotaRouter();
+quotaRouter.snapshot(true);
 const sessions = new Map();
 const runtime = {
   incomingRequests: 0,
@@ -631,7 +766,9 @@ const runtime = {
   supersededTurns: 0,
   sessionsCreated: 0,
   sessionsReused: 0,
+  quotaPoolSwitches: 0,
   lastActualModel: null,
+  lastActualModelLabel: null,
   lastAuthVerifiedAt: null,
   lastConversationId: null,
   lastInitializedToolCount: null,
@@ -670,12 +807,12 @@ function evictIdleSession() {
 async function sessionFor(context) {
   let session = context.sessionKey ? sessions.get(context.sessionKey) : null;
   const taskHash = context.taskState.activeTask?.hash || null;
-  const incompatible = session && (
+  const taskIncompatible = session && (
     session.closed
     || session.workingDirectory !== context.workingDirectory
     || session.activeTaskHash !== taskHash
   );
-  if (incompatible) {
+  if (taskIncompatible) {
     session.close();
     session = null;
   }
@@ -684,13 +821,25 @@ async function sessionFor(context) {
     session.close(new BridgeError("Antigravity turn superseded by a newer turn for the same worker", 409));
     session = null;
   }
+  const selectedModel = quotaRouter.select(session?.model || null);
+  if (session && session.model !== selectedModel.id) {
+    session.close();
+    session = null;
+    runtime.quotaPoolSwitches += 1;
+  }
   if (session) {
     runtime.sessionsReused += 1;
     return { session, reused: true };
   }
   if (sessions.size >= MAX_SESSIONS) evictIdleSession();
   const key = context.sessionKey || `ephemeral:${context.requestId}`;
-  session = new AntigravitySession(key, context.workingDirectory, taskHash, removeSession);
+  session = new AntigravitySession(
+    key,
+    context.workingDirectory,
+    taskHash,
+    selectedModel,
+    removeSession,
+  );
   sessions.set(key, session);
   runtime.sessionsCreated += 1;
   await session.start();
@@ -722,23 +871,41 @@ async function handleResponses(request, response) {
   const heartbeat = setInterval(() => writeHeartbeat(response, responseId), SSE_HEARTBEAT_MS);
   let selectedSession;
   try {
-    const { session, reused } = await sessionFor(context);
+    let { session, reused } = await sessionFor(context);
     selectedSession = session;
-    const prompt = reused ? resumePrompt(context, session) : fullPrompt(context);
-    let diagnostics;
+    let prompt = reused ? resumePrompt(context, session) : fullPrompt(context);
+    const diagnosticsFor = (currentPrompt, currentReused) => {
+      try {
+        return taskDeliveryDiagnostics(context.taskState, currentPrompt, {
+          activeTaskIncludedThisTurn: !currentReused,
+          retainedInProviderSession: currentReused,
+        });
+      } catch (error) {
+        if (error instanceof TaskStateError) throw new BridgeError(error.message, 500);
+        throw error;
+      }
+    };
+    let diagnostics = diagnosticsFor(prompt, reused);
+    let result;
     try {
-      diagnostics = taskDeliveryDiagnostics(context.taskState, prompt, {
-        activeTaskIncludedThisTurn: !reused,
-        retainedInProviderSession: reused,
-      });
+      result = await session.run(prompt, controller.signal);
     } catch (error) {
-      if (error instanceof TaskStateError) throw new BridgeError(error.message, 500);
-      throw error;
+      const safeClaudeQuotaFailure = session.model === route.primaryModel
+        && error?.modelQuotaFailure === true
+        && error?.safeToRetry === true;
+      if (!safeClaudeQuotaFailure) throw error;
+      quotaRouter.markPrimaryDepleted();
+      runtime.quotaPoolSwitches += 1;
+      ({ session, reused } = await sessionFor(context));
+      selectedSession = session;
+      prompt = fullPrompt(context);
+      diagnostics = diagnosticsFor(prompt, false);
+      result = await session.run(prompt, controller.signal);
     }
-    const result = await session.run(prompt, controller.signal);
     for (const key of context.messageKeys) session.seenMessageKeys.add(key);
     runtime.completed += 1;
-    runtime.lastActualModel = route.model;
+    runtime.lastActualModel = session.model;
+    runtime.lastActualModelLabel = session.modelLabel;
     runtime.lastInputTokens = result.usage.input_tokens;
     runtime.lastCachedInputTokens = result.usage.cache_read_tokens;
     runtime.lastOutputTokens = result.usage.output_tokens;
@@ -757,9 +924,9 @@ async function handleResponses(request, response) {
     emitCompleted(response, responseId, result, {
       provider: PROVIDER_ID,
       actual_provider: PROVIDER_ID,
-      actual_model: route.model,
-      actual_model_label: modelLabel,
-      reasoning_effort: REQUIRED_EFFORT,
+      actual_model: session.model,
+      actual_model_label: session.modelLabel,
+      reasoning_effort: session.modelEffort || "model-default-thinking",
       auth_source: "Antigravity cached OAuth session",
       conversation_id: result.conversationId,
       provider_session_reused: reused,
@@ -790,7 +957,10 @@ async function handleResponses(request, response) {
         object: "response",
         model: MODEL_ALIAS,
         status: "failed",
-        error: { code: "external_provider_error", message: runtime.lastError },
+        error: {
+          code: error?.routeCommitted === true ? "provider_state_changed" : "external_provider_error",
+          message: runtime.lastError,
+        },
       },
     });
     response.end();
@@ -846,8 +1016,24 @@ function health() {
     provider: PROVIDER_ID,
     port,
     modelAlias: MODEL_ALIAS,
-    configuredModel: route.model,
-    configuredModelLabel: modelLabel,
+    configuredModel: route.primaryModel,
+    configuredModelLabel: models.primary.label,
+    routing: {
+      primary: {
+        model: models.primary.id,
+        label: models.primary.label,
+        effort: "model-default-thinking",
+        quotaBucket: PRIMARY_QUOTA_BUCKET_ID,
+      },
+      quotaFallback: {
+        model: models.fallback.id,
+        label: models.fallback.label,
+        effort: models.fallback.effort,
+        quotaBucket: FALLBACK_QUOTA_BUCKET_ID,
+      },
+      policy: "claude_gpt_pool_then_gemini_pool",
+    },
+    quota: quotaRouter.health(),
     effort: REQUIRED_EFFORT,
     inputModalities: route.inputModalities,
     auth: {
@@ -865,6 +1051,61 @@ function health() {
 }
 
 async function selfTest() {
+  const primaryArgs = sessionArguments(models.primary);
+  const fallbackArgs = sessionArguments(models.fallback);
+  if (primaryArgs.includes("--effort")) throw new Error("Opus Thinking received an unsupported effort flag");
+  if (fallbackArgs[fallbackArgs.indexOf("--effort") + 1] !== REQUIRED_EFFORT) {
+    throw new Error("Gemini Flash High did not receive high effort");
+  }
+  const quotaFixture = parseQuotaSnapshot(json({
+    status: "SUCCESS",
+    command: {
+      name: "usage",
+      data: {
+        groups: [
+          { name: "Gemini Models", buckets: [{ id: FALLBACK_QUOTA_BUCKET_ID, remaining_fraction: 0.75, reset_time: "2026-09-04T00:13:07Z" }] },
+          { name: "Claude and GPT models", buckets: [{ id: PRIMARY_QUOTA_BUCKET_ID, remaining_fraction: 1, reset_time: "2026-09-06T01:56:48Z" }] },
+        ],
+      },
+    },
+  }), Date.parse("2026-08-30T12:00:00Z"));
+  const fixtureRouter = new AntigravityQuotaRouter(() => Date.parse("2026-08-30T12:00:01Z"));
+  fixtureRouter.snapshot = () => quotaFixture;
+  if (fixtureRouter.select().id !== route.primaryModel) throw new Error("Claude/GPT pool was not preferred");
+  if (fixtureRouter.select(route.quotaFallbackModel).id !== route.quotaFallbackModel) {
+    throw new Error("Gemini task route was not sticky");
+  }
+  quotaFixture.primary.remainingFraction = 0;
+  if (fixtureRouter.select().id !== route.quotaFallbackModel) throw new Error("Gemini quota fallback was not selected");
+  quotaFixture.fallback.remainingFraction = 0;
+  try {
+    fixtureRouter.select();
+    throw new Error("depleted Antigravity pools did not fail");
+  } catch (error) {
+    if (!(error instanceof BridgeError) || error.status !== 429) throw error;
+  }
+  const quotaFailureFor = (toolNames, generatedTokens = 0) => {
+    const session = new AntigravitySession("quota-fixture", process.cwd(), "task", models.primary, () => {});
+    session.close = () => {};
+    let rejected;
+    session.turn = {
+      cleanup: () => {},
+      reject: (error) => { rejected = error; },
+      generatedTokens,
+      toolNames: new Set(toolNames),
+      rzMcpTools: new Set(),
+    };
+    session.finishTurn({ status: "ERROR", response: "You have exhausted your quota on this model." });
+    return rejected;
+  };
+  const safeQuotaFailure = quotaFailureFor([], 100);
+  const committedQuotaFailure = quotaFailureFor(["write_to_file"]);
+  if (!safeQuotaFailure?.modelQuotaFailure || !safeQuotaFailure.safeToRetry || safeQuotaFailure.routeCommitted) {
+    throw new Error("safe model-quota retry classification failed");
+  }
+  if (!committedQuotaFailure?.modelQuotaFailure || committedQuotaFailure.safeToRetry || !committedQuotaFailure.routeCommitted) {
+    throw new Error("committed model-quota failure classification failed");
+  }
   const taskHeader = "Message Type: NEW_TASK\nTask name: /root/agy_fixture\nPayload:\n";
   const taskPayload = "Implement the bounded fixture now.";
   const task = `${taskHeader}${taskPayload}`;

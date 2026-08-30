@@ -17,14 +17,15 @@ import {
 } from "./codebuddy-subagent-task-state.mjs";
 import {
   ActiveTaskRoutePins,
-  codeBuddyForwardBody,
-  runQuotaFallbackChain,
+  fallbackForwardBody,
+  runProviderFallbackChain,
   runResponsesBridge,
-  validateCodeBuddyCompletion,
+  validateOAuthFallbackCompletion,
 } from "./native-subagent-provider-router.mjs";
 
 const PROVIDER_ID = "devin";
 const MODEL_ALIAS = "@preset/codex-subagents";
+const DEVIN_FREE_MODEL_ALIAS = "@preset/codex-subagents-devin-free";
 const REQUIRED_EFFORT = "high";
 const LEGACY_REQUEST_EFFORTS = new Set(["max"]);
 const DEFAULT_PORT = 54548;
@@ -37,10 +38,10 @@ const SSE_HEARTBEAT_MS = 15 * 1000;
 const FREE_ROUTE_CONCURRENCY = 2;
 const RESOURCE_BACKOFF_BASE_MS = 5 * 1000;
 const RESOURCE_BACKOFF_MAX_MS = 2 * 60 * 1000;
-const CODEBUDDY_BRIDGE_ENDPOINT = "http://127.0.0.1:54547/v1/responses";
-const CODEBUDDY_REQUIRED_AUTH_SOURCE = "www.codebuddy.ai";
-const CODEBUDDY_REQUIRED_EFFORT = "max";
-const CODEBUDDY_CONTEXT_WINDOW = 131_072;
+const FALLBACK_BRIDGE_ENDPOINT = "http://127.0.0.1:54549/v1/responses";
+const FALLBACK_REQUIRED_AUTH_SOURCE = "Antigravity cached OAuth session";
+const FALLBACK_REQUIRED_EFFORT = "high";
+const FALLBACK_CONTEXT_WINDOW = 131_072;
 const SCRIPT_DIRECTORY = dirname(fileURLToPath(import.meta.url));
 const CENTRAL_CONFIG = join(homedir(), ".codex", "subagent-models.json");
 const USER_DEVIN_CONFIG = join(process.env.APPDATA || join(homedir(), "AppData", "Roaming"), "devin", "config.json");
@@ -197,10 +198,10 @@ function centralRoute() {
   }
   const route = assertObject(parsed[PROVIDER_ID], `central route ${PROVIDER_ID}`);
   const quotaFallbackProvider = requireString(route.quotaFallbackProvider, "quotaFallbackProvider");
-  if (quotaFallbackProvider !== "codebuddy") {
-    throw new BridgeError(`Devin quota fallback provider must be codebuddy, got ${json(quotaFallbackProvider)}`, 500);
+  if (quotaFallbackProvider !== "antigravity") {
+    throw new BridgeError(`Devin quota fallback provider must be antigravity, got ${json(quotaFallbackProvider)}`, 500);
   }
-  const codeBuddyRoute = assertObject(parsed[quotaFallbackProvider], `central route ${quotaFallbackProvider}`);
+  const fallbackRoute = assertObject(parsed[quotaFallbackProvider], `central route ${quotaFallbackProvider}`);
   const inputModalities = route.inputModalities;
   if (!Array.isArray(inputModalities) || inputModalities.length !== 1 || inputModalities[0] !== "text") {
     throw new BridgeError("Devin managed route must declare exactly the text modality", 500);
@@ -208,7 +209,10 @@ function centralRoute() {
   return {
     primaryModel: requireString(route.primaryModel, "primaryModel"),
     quotaFallbackProvider,
-    codeBuddyModel: requireString(codeBuddyRoute.model, "codebuddy.model"),
+    fallbackModels: [
+      requireString(fallbackRoute.primaryModel, "antigravity.primaryModel"),
+      requireString(fallbackRoute.quotaFallbackModel, "antigravity.quotaFallbackModel"),
+    ],
     terminalFallbackModel: requireString(route.terminalFallbackModel, "terminalFallbackModel"),
     inputModalities,
   };
@@ -297,13 +301,13 @@ const runtime = {
   lastRejectedError: null, lastConfiguredRoute: null, lastActualModel: null,
   lastActualProvider: null, lastModelLabel: null, lastQuotaFallback: false,
   lastTerminalFallback: false, lastFallbackReason: null,
-  codeBuddyAttempts: 0, codeBuddyCompleted: 0, codeBuddyFailed: 0, terminalFallbacks: 0,
-  codeBuddyStreamCommits: 0, lastCodeBuddyStreamCommitted: false,
-  lastCodeBuddyStreamedMessageCount: 0,
+  fallbackAttempts: 0, fallbackCompleted: 0, fallbackFailed: 0, terminalFallbacks: 0,
+  fallbackStreamCommits: 0, lastFallbackStreamCommitted: false,
+  lastFallbackStreamedMessageCount: 0,
   quotaProbeSkips: 0, quotaPinsReleased: 0,
   calendarQuotaSkips: 0, calendarQuotaActivations: 0, calendarQuotaClears: 0,
   lastQuotaProbeSkipped: false, lastQuotaSkipScope: null, lastQuotaPinCreated: false,
-  lastCodeBuddyError: null, lastCodeBuddyAuthSource: null, lastCodeBuddyCostUsd: null,
+  lastFallbackError: null, lastFallbackAuthSource: null,
   lastCreditCost: null, lastAcuCost: null,
   lastInputTokens: null, lastCachedInputTokens: null, lastOutputTokens: null,
   lastPeakTurnContextTokens: null, lastOutputTokensPerSecond: null,
@@ -311,6 +315,7 @@ const runtime = {
   lastWorkingDirectory: null, lastTaskId: null, lastTaskName: null, lastTaskHash: null,
   lastTaskIntent: null, lastTaskDeliveryMode: null, lastTaskPartTypes: [],
   lastTaskPartLengths: [], lastCompleteTaskDelivered: false,
+  actualByConfiguredRoute: { auto: null, "devin-free": null },
 };
 
 const terminalCapacity = { active: 0, waiters: [] };
@@ -449,7 +454,13 @@ function roleInstructionsFrom(value) {
 function promptFrom(body) {
   assertObject(body, "request body");
   if (body.stream !== true) throw new BridgeError("The Devin bridge requires stream=true");
-  if (requireString(body.model, "model") !== MODEL_ALIAS) throw new BridgeError(`Unknown managed model alias ${json(body.model)}`);
+  const modelAlias = requireString(body.model, "model");
+  const requestedRoute = modelAlias === MODEL_ALIAS
+    ? "auto"
+    : modelAlias === DEVIN_FREE_MODEL_ALIAS
+      ? "devin-free"
+      : null;
+  if (!requestedRoute) throw new BridgeError(`Unknown managed model alias ${json(modelAlias)}`);
   const effort = body.reasoning?.effort;
   if (effort !== undefined && effort !== REQUIRED_EFFORT && !LEGACY_REQUEST_EFFORTS.has(effort)) {
     throw new BridgeError(`Devin subagents require centrally configured effort ${REQUIRED_EFFORT}`);
@@ -528,20 +539,40 @@ function promptFrom(body) {
     throw error;
   }
   const toolSchemaBytes = Buffer.byteLength(json(body.tools || []));
-  return { requestId, prompt, workingDirectory, threadId, taskState, taskDiagnostics, toolSchemaBytes };
+  return {
+    requestId,
+    prompt,
+    workingDirectory,
+    threadId,
+    taskState,
+    taskDiagnostics,
+    toolSchemaBytes,
+    modelAlias,
+    requestedRoute,
+  };
 }
 
-function codeBuddySelection(reason) {
+function fallbackSelection(reason) {
   return {
-    key: "codebuddy",
+    key: "fallback",
     provider: route.quotaFallbackProvider,
-    model: { model_uid: route.codeBuddyModel, label: route.codeBuddyModel },
+    model: { model_uid: MODEL_ALIAS, label: "Antigravity managed chain" },
     reason,
   };
 }
 
 function chooseRoute(context, quotaState = calendarQuotaState, taskPins = quotaTaskPins) {
   runtime.lastQuotaPinCreated = false;
+  if (context.requestedRoute === "devin-free") {
+    runtime.lastQuotaProbeSkipped = true;
+    runtime.lastQuotaSkipScope = "explicit_devin_free_route";
+    return {
+      key: "terminal",
+      provider: "devin",
+      model: models.terminal,
+      reason: "explicit_devin_free_route",
+    };
+  }
   runtime.lastQuotaProbeSkipped = taskPins.has(
     context.threadId,
     context.taskDiagnostics.taskHash,
@@ -549,14 +580,14 @@ function chooseRoute(context, quotaState = calendarQuotaState, taskPins = quotaT
   runtime.lastQuotaSkipScope = runtime.lastQuotaProbeSkipped ? "active_task" : null;
   if (runtime.lastQuotaProbeSkipped) {
     runtime.quotaProbeSkips += 1;
-    return codeBuddySelection("active_task_confirmed_devin_quota_failure");
+    return fallbackSelection("active_task_confirmed_devin_quota_failure");
   }
   if (quotaState.isActive()) {
     runtime.lastQuotaProbeSkipped = true;
     runtime.lastQuotaSkipScope = "calendar_quota";
     runtime.quotaProbeSkips += 1;
     runtime.calendarQuotaSkips += 1;
-    return codeBuddySelection("persisted_calendar_devin_quota_failure");
+    return fallbackSelection("persisted_calendar_devin_quota_failure");
   }
   return { key: "primary", provider: "devin", model: models.primary, reason: "all_tasks_primary" };
 }
@@ -719,7 +750,7 @@ async function runCliWithResourceRetries(context, selectedModel, onSpawn, signal
   }
 }
 
-function codeBuddyResult(completion, reason) {
+function fallbackResult(completion, reason) {
   const usage = completion.usage || {};
   const inputTokens = Number(usage.input_tokens || 0);
   const cachedTokens = Number(usage.input_tokens_details?.cached_tokens || 0);
@@ -732,23 +763,34 @@ function codeBuddyResult(completion, reason) {
       name: item.name || "tool_search",
       arguments: item.arguments || item.input || null,
     }));
+  const nativeToolNames = Array.isArray(providerMetadata.native_tool_names)
+    ? providerMetadata.native_tool_names.filter((name) => typeof name === "string")
+    : toolCalls.map((call) => call.name);
   return {
     output: completion.output,
     providerMetadata,
-    selected: codeBuddySelection(reason),
+    selected: {
+      ...fallbackSelection(reason),
+      model: {
+        model_uid: providerMetadata.actual_model,
+        label: providerMetadata.actual_model_label || providerMetadata.actual_model,
+      },
+    },
     quotaFallback: true,
     terminalFallback: false,
     fallbackReason: "confirmed_devin_quota_failure",
-    codeBuddyFailure: null,
+    fallbackFailure: null,
     creditCost: 0,
     acuCost: 0,
     inputTokens,
     cachedTokens,
     outputTokens,
-    peakTurnContextTokens: Number(providerMetadata.codebuddy_max_turn_input_tokens || 0),
-    outputTokensPerSecond: null,
-    toolCalls,
-    rzMcpTools: [],
+    peakTurnContextTokens: Number(providerMetadata.peak_turn_context_tokens || 0),
+    outputTokensPerSecond: Number(providerMetadata.output_tokens_per_second || 0) || null,
+    toolCalls, nativeToolNames,
+    rzMcpTools: Array.isArray(providerMetadata.rzmcp_tools_called)
+      ? providerMetadata.rzmcp_tools_called.filter((name) => typeof name === "string")
+      : [],
   };
 }
 
@@ -787,55 +829,56 @@ function finalizeDevinResult(selected, routeResult, fallbackState) {
       quotaFallback: fallbackState.quotaFallback,
       terminalFallback: fallbackState.terminalFallback,
       fallbackReason: fallbackState.fallbackReason,
-      codeBuddyFailure: fallbackState.codeBuddyFailure,
+      fallbackFailure: fallbackState.fallbackFailure,
       creditCost, acuCost,
       inputTokens, cachedTokens, outputTokens, peakTurnContextTokens, outputTokensPerSecond,
-      toolCalls, rzMcpTools,
+      toolCalls, nativeToolNames: toolCalls.map((call) => call.name), rzMcpTools,
     };
   } finally {
     removeSession(session.id);
   }
 }
 
-async function executeCodeBuddyFallback(
+async function executeProviderFallback(
   context,
   requestBody,
   initialRoute,
   onSpawn,
   signal,
-  codeBuddyRelay,
+  fallbackRelay,
 ) {
   let selected = initialRoute;
   let routeResult;
-  runtime.codeBuddyAttempts += 1;
-  const fallback = await runQuotaFallbackChain({
+  runtime.fallbackAttempts += 1;
+  const fallback = await runProviderFallbackChain({
     signal,
-    runCodeBuddy: async () => {
+    runFallback: async () => {
       try {
-        const forwardedBody = codeBuddyForwardBody(requestBody, MODEL_ALIAS, CODEBUDDY_REQUIRED_EFFORT);
+        const forwardedBody = fallbackForwardBody(requestBody, MODEL_ALIAS, FALLBACK_REQUIRED_EFFORT);
         const completion = await runResponsesBridge({
-          endpoint: CODEBUDDY_BRIDGE_ENDPOINT,
+          endpoint: FALLBACK_BRIDGE_ENDPOINT,
           body: forwardedBody,
           signal,
-          onEvent: codeBuddyRelay.accept,
+          onEvent: fallbackRelay.accept,
         });
-        validateCodeBuddyCompletion(completion, {
-          model: route.codeBuddyModel,
-          authSource: CODEBUDDY_REQUIRED_AUTH_SOURCE,
+        validateOAuthFallbackCompletion(completion, {
+          provider: route.quotaFallbackProvider,
+          models: route.fallbackModels,
+          authSource: FALLBACK_REQUIRED_AUTH_SOURCE,
         });
-        return codeBuddyResult(completion, selected.reason);
+        return fallbackResult(completion, selected.reason);
       } catch (error) {
-        if (codeBuddyRelay.committed) error.routeCommitted = true;
+        if (fallbackRelay.committed) error.routeCommitted = true;
         throw error;
       }
     },
-    runTerminal: async (codeBuddyError) => {
+    runTerminal: async (fallbackError) => {
       runtime.terminalFallbacks += 1;
       selected = {
         key: "terminal",
         provider: "devin",
         model: models.terminal,
-        reason: "codebuddy_unavailable_after_devin_quota",
+        reason: "antigravity_unavailable_after_devin_quota",
       };
       routeResult = await withRouteCapacity(selected, signal, () =>
         runCliWithResourceRetries(
@@ -848,32 +891,32 @@ async function executeCodeBuddyFallback(
       return finalizeDevinResult(selected, routeResult, {
         quotaFallback: true,
         terminalFallback: true,
-        fallbackReason: "codebuddy_unavailable_after_confirmed_devin_quota_failure",
-        codeBuddyFailure: sanitizedProviderFailure(codeBuddyError),
+        fallbackReason: "antigravity_unavailable_after_confirmed_devin_quota_failure",
+        fallbackFailure: sanitizedProviderFailure(fallbackError),
       });
     },
-    onCodeBuddyFailure: (error) => {
-      runtime.codeBuddyFailed += 1;
-      runtime.lastCodeBuddyError = sanitizedProviderFailure(error);
+    onFallbackFailure: (error) => {
+      runtime.fallbackFailed += 1;
+      runtime.lastFallbackError = sanitizedProviderFailure(error);
     },
   });
-  if (fallback.stage === "codebuddy") {
-    runtime.codeBuddyCompleted += 1;
-    runtime.lastCodeBuddyError = null;
+  if (fallback.stage === "fallback") {
+    runtime.fallbackCompleted += 1;
+    runtime.lastFallbackError = null;
     return fallback.value;
   }
   return fallback.value;
 }
 
-async function execute(context, requestBody, initialRoute, onSpawn, signal, codeBuddyRelay) {
-  if (initialRoute.key === "codebuddy") {
-    return executeCodeBuddyFallback(
+async function execute(context, requestBody, initialRoute, onSpawn, signal, fallbackRelay) {
+  if (initialRoute.key === "fallback") {
+    return executeProviderFallback(
       context,
       requestBody,
       initialRoute,
       onSpawn,
       signal,
-      codeBuddyRelay,
+      fallbackRelay,
     );
   }
 
@@ -885,6 +928,14 @@ async function execute(context, requestBody, initialRoute, onSpawn, signal, code
       signal,
       Date.now() + REQUEST_TIMEOUT_MS,
     ));
+  if (initialRoute.key === "terminal") {
+    return finalizeDevinResult(initialRoute, routeResult, {
+      quotaFallback: false,
+      terminalFallback: false,
+      fallbackReason: null,
+      fallbackFailure: null,
+    });
+  }
   if (!isQuotaFailure(routeResult.cliResult)) {
     if (!cliFailed(routeResult.cliResult) && calendarQuotaState.clear()) {
       runtime.calendarQuotaClears += 1;
@@ -893,7 +944,7 @@ async function execute(context, requestBody, initialRoute, onSpawn, signal, code
       quotaFallback: false,
       terminalFallback: false,
       fallbackReason: null,
-      codeBuddyFailure: null,
+      fallbackFailure: null,
     });
   }
 
@@ -903,13 +954,13 @@ async function execute(context, requestBody, initialRoute, onSpawn, signal, code
     context.threadId,
     context.taskDiagnostics.taskHash,
   );
-  return executeCodeBuddyFallback(
+  return executeProviderFallback(
     context,
     requestBody,
-    codeBuddySelection("devin_quota_codebuddy_available"),
+    fallbackSelection("devin_quota_antigravity_available"),
     onSpawn,
     signal,
-    codeBuddyRelay,
+    fallbackRelay,
   );
 }
 
@@ -982,24 +1033,24 @@ function writeSse(response, type, payload) {
   response.write(`event: ${type}\ndata: ${json({ type, ...payload })}\n\n`);
 }
 
-function writeSseHeartbeat(response, responseId) {
+function writeSseHeartbeat(response, responseId, modelAlias = MODEL_ALIAS) {
   writeSse(response, "response.in_progress", {
-    response: { id: responseId, object: "response", model: MODEL_ALIAS, status: "in_progress" },
+    response: { id: responseId, object: "response", model: modelAlias, status: "in_progress" },
   });
 }
 
-function createCodeBuddyStreamRelay(response, responseId) {
+function createFallbackStreamRelay(response, responseId, modelAlias = MODEL_ALIAS) {
   const pendingMessages = new Map();
   const streamedMessageIds = new Set();
   let committed = false;
   const accept = async (event) => {
     const payload = event.payload || {};
     if (event.type === "response.in_progress") {
-      writeSseHeartbeat(response, responseId);
+      writeSseHeartbeat(response, responseId, modelAlias);
       return;
     }
     if (event.type === "response.output_item.added" && payload.item?.type === "message") {
-      const itemId = requireString(payload.item.id, "CodeBuddy streamed message id");
+      const itemId = requireString(payload.item.id, "fallback streamed message id");
       pendingMessages.set(itemId, { added: payload, part: null });
       return;
     }
@@ -1010,7 +1061,7 @@ function createCodeBuddyStreamRelay(response, responseId) {
     }
     if (event.type !== "response.output_text.delta" || typeof payload.delta !== "string" || !payload.delta) return;
     const pending = pendingMessages.get(payload.item_id);
-    if (!pending?.part) throw new BridgeError("CodeBuddy streamed text before its message lifecycle", 502);
+    if (!pending?.part) throw new BridgeError("Fallback provider streamed text before its message lifecycle", 502);
     if (!streamedMessageIds.has(payload.item_id)) {
       writeSse(response, "response.output_item.added", pending.added);
       writeSse(response, "response.content_part.added", pending.part);
@@ -1054,8 +1105,8 @@ async function handleResponses(request, response) {
   runtime.lastCompleteTaskDelivered = context.taskDiagnostics.completeTaskDelivered;
   const selected = chooseRoute(context);
   runtime.lastConfiguredRoute = selected.key;
-  runtime.lastCodeBuddyStreamCommitted = false;
-  runtime.lastCodeBuddyStreamedMessageCount = 0;
+  runtime.lastFallbackStreamCommitted = false;
+  runtime.lastFallbackStreamedMessageCount = 0;
   let child = null;
   const abortController = new AbortController();
   const abort = () => {
@@ -1068,9 +1119,9 @@ async function handleResponses(request, response) {
   response.once("close", () => { if (!response.writableEnded) abort(); });
   response.writeHead(200, { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache", connection: "keep-alive" });
   const responseId = `resp_${randomUUID()}`;
-  writeSse(response, "response.created", { response: { id: responseId, object: "response", model: MODEL_ALIAS, status: "in_progress" } });
-  const codeBuddyRelay = createCodeBuddyStreamRelay(response, responseId);
-  const heartbeat = setInterval(() => writeSseHeartbeat(response, responseId), SSE_HEARTBEAT_MS);
+  writeSse(response, "response.created", { response: { id: responseId, object: "response", model: context.modelAlias, status: "in_progress" } });
+  const fallbackRelay = createFallbackStreamRelay(response, responseId, context.modelAlias);
+  const heartbeat = setInterval(() => writeSseHeartbeat(response, responseId, context.modelAlias), SSE_HEARTBEAT_MS);
   heartbeat.unref();
   try {
     const result = await execute(
@@ -1079,26 +1130,30 @@ async function handleResponses(request, response) {
       selected,
       (spawned) => { child = spawned; },
       abortController.signal,
-      codeBuddyRelay,
+      fallbackRelay,
     );
     if (quotaTaskPins.releaseAfterFinalResponse(
       context.threadId,
       context.taskDiagnostics.taskHash,
       result.toolCalls.length,
     )) runtime.quotaPinsReleased += 1;
-    runtime.lastCodeBuddyStreamCommitted = codeBuddyRelay.committed;
-    runtime.lastCodeBuddyStreamedMessageCount = codeBuddyRelay.streamedMessageIds.size;
-    if (codeBuddyRelay.committed) runtime.codeBuddyStreamCommits += 1;
+    runtime.lastFallbackStreamCommitted = fallbackRelay.committed;
+    runtime.lastFallbackStreamedMessageCount = fallbackRelay.streamedMessageIds.size;
+    if (fallbackRelay.committed) runtime.fallbackStreamCommits += 1;
     runtime.completed += 1;
     runtime.lastActualProvider = result.selected.provider;
     runtime.lastActualModel = result.selected.model.model_uid;
     runtime.lastModelLabel = result.selected.model.label;
+    runtime.actualByConfiguredRoute[context.requestedRoute] = {
+      provider: result.selected.provider,
+      model: result.selected.model.model_uid,
+      label: result.selected.model.label,
+    };
     runtime.lastQuotaFallback = result.quotaFallback;
     runtime.lastTerminalFallback = result.terminalFallback;
     runtime.lastFallbackReason = result.fallbackReason;
-    runtime.lastCodeBuddyError = result.codeBuddyFailure;
-    runtime.lastCodeBuddyAuthSource = result.providerMetadata.codebuddy_auth_source || null;
-    runtime.lastCodeBuddyCostUsd = result.providerMetadata.codebuddy_total_cost_usd ?? null;
+    runtime.lastFallbackError = result.fallbackFailure;
+    runtime.lastFallbackAuthSource = result.providerMetadata.auth_source || null;
     runtime.lastCreditCost = result.creditCost;
     runtime.lastAcuCost = result.acuCost;
     runtime.lastInputTokens = result.inputTokens;
@@ -1106,26 +1161,26 @@ async function handleResponses(request, response) {
     runtime.lastOutputTokens = result.outputTokens;
     runtime.lastPeakTurnContextTokens = result.peakTurnContextTokens;
     runtime.lastOutputTokensPerSecond = result.outputTokensPerSecond;
-    runtime.lastNativeToolCalls = result.toolCalls.length;
-    runtime.lastNativeToolNames = [...new Set(result.toolCalls.map((call) => call.name))];
+    runtime.lastNativeToolCalls = result.nativeToolNames.length;
+    runtime.lastNativeToolNames = [...new Set(result.nativeToolNames)];
     runtime.lastRzMcpTools = [...new Set(result.rzMcpTools)];
-    const output = emitOutputItems(response, result, codeBuddyRelay.streamedMessageIds);
+    const output = emitOutputItems(response, result, fallbackRelay.streamedMessageIds);
     writeSse(response, "response.completed", { response: {
       id: responseId, object: "response", created_at: Math.floor(Date.now() / 1000), status: "completed",
-      model: MODEL_ALIAS, output, usage: usageFrom(result), error: null, incomplete_details: null,
+      model: context.modelAlias, output, usage: usageFrom(result), error: null, incomplete_details: null,
       metadata: {
         ...result.providerMetadata,
         provider: PROVIDER_ID, route: result.selected.key, route_reason: result.selected.reason,
         actual_provider: result.selected.provider,
         actual_model: result.selected.model.model_uid, actual_model_label: result.selected.model.label,
         quota_fallback: result.quotaFallback, terminal_fallback: result.terminalFallback,
-        fallback_reason: result.fallbackReason, codebuddy_failure: result.codeBuddyFailure,
+        fallback_reason: result.fallbackReason, fallback_failure: result.fallbackFailure,
         total_credit_cost: result.creditCost, total_acu_cost: result.acuCost,
         peak_turn_context_tokens: result.peakTurnContextTokens, output_tokens_per_second: result.outputTokensPerSecond,
-        native_tool_calls: result.toolCalls.length, native_tool_names: runtime.lastNativeToolNames,
+        native_tool_calls: result.nativeToolNames.length, native_tool_names: runtime.lastNativeToolNames,
         rzmcp_tools_called: runtime.lastRzMcpTools,
-        codex_tool_schema_bytes_ignored: result.selected.provider === "devin" ? context.toolSchemaBytes : 0,
-        codex_tool_schema_bytes_forwarded: result.selected.provider === "codebuddy" ? context.toolSchemaBytes : 0,
+        codex_tool_schema_bytes_ignored: context.toolSchemaBytes,
+        codex_tool_schema_bytes_forwarded: 0,
         active_task_id: context.taskDiagnostics.taskId, active_task_hash: context.taskDiagnostics.taskHash,
         active_task_delivery_mode: context.taskDiagnostics.taskDeliveryMode,
         complete_active_task_delivered: context.taskDiagnostics.completeTaskDelivered,
@@ -1134,7 +1189,7 @@ async function handleResponses(request, response) {
     response.end();
   } catch (error) {
     runtime.failed += 1;
-    writeSse(response, "response.failed", { response: { id: responseId, object: "response", model: MODEL_ALIAS, status: "failed", error: { code: "external_provider_error", message: error.message } } });
+    writeSse(response, "response.failed", { response: { id: responseId, object: "response", model: context.modelAlias, status: "failed", error: { code: "external_provider_error", message: error.message } } });
     response.end();
   } finally {
     clearInterval(heartbeat);
@@ -1144,13 +1199,13 @@ async function handleResponses(request, response) {
 }
 
 function managedModelsResponse() {
-  const contextWindow = Math.min(
+  const managedContextWindow = Math.min(
     models.primary.max_context_tokens,
     models.terminal.max_context_tokens,
-    CODEBUDDY_CONTEXT_WINDOW,
+    FALLBACK_CONTEXT_WINDOW,
   );
-  return { models: [{
-    slug: MODEL_ALIAS, display_name: "Managed native subagent", description: "Centrally routed native subagent",
+  const modelDefinition = (slug, displayName, description, contextWindow) => ({
+    slug, display_name: displayName, description,
     base_instructions: "You are a bounded delegated coding sub-agent. Use local tools and return concise evidence.",
     default_reasoning_level: REQUIRED_EFFORT, supported_reasoning_levels: [{ effort: REQUIRED_EFFORT, description: "Maximum" }],
     shell_type: "unified_exec", visibility: "none", supported_in_api: true, priority: 0, availability_nux: null,
@@ -1162,22 +1217,46 @@ function managedModelsResponse() {
     experimental_supported_tools: [], input_modalities: route.inputModalities, supports_search_tool: true,
     use_responses_lite: false, node_repl_auto_review_required: false, node_repl_disabled: false,
     tool_mode: "direct", multi_agent_version: "v2",
-  }] };
+  });
+  return { models: [
+    modelDefinition(
+      MODEL_ALIAS,
+      "Managed native subagent",
+      "Centrally routed native subagent",
+      managedContextWindow,
+    ),
+    modelDefinition(
+      DEVIN_FREE_MODEL_ALIAS,
+      "Devin free native subagent",
+      `Direct ${models.terminal.label} native subagent`,
+      models.terminal.max_context_tokens,
+    ),
+  ] };
 }
 
-function health() {
+function health(requestedRoute = "auto") {
+  const defaultActual = requestedRoute === "devin-free"
+    ? { provider: "devin", model: models.terminal.model_uid, label: models.terminal.label }
+    : calendarQuotaState.isActive()
+      ? { provider: route.quotaFallbackProvider, model: route.fallbackModels[0], label: route.fallbackModels[0] }
+      : { provider: "devin", model: models.primary.model_uid, label: models.primary.label };
+  const routeActual = runtime.actualByConfiguredRoute[requestedRoute] || defaultActual;
   return {
-    ok: true, provider: PROVIDER_ID, port, modelAlias: MODEL_ALIAS, effort: REQUIRED_EFFORT,
+    ok: true, provider: PROVIDER_ID, port, modelAlias: MODEL_ALIAS,
+    modelAliases: { auto: MODEL_ALIAS, devinFree: DEVIN_FREE_MODEL_ALIAS }, effort: REQUIRED_EFFORT,
+    lastActualProvider: routeActual.provider,
+    lastActualModel: routeActual.model,
+    lastActualModelLabel: routeActual.label,
     auth, inputModalities: route.inputModalities,
     routing: {
       primary: { uid: models.primary.model_uid, label: models.primary.label, cost: models.primary.cost_summary || models.primary.cost_tier },
       quotaFallback: {
         provider: route.quotaFallbackProvider,
-        uid: route.codeBuddyModel,
-        effort: CODEBUDDY_REQUIRED_EFFORT,
-        authSource: CODEBUDDY_REQUIRED_AUTH_SOURCE,
+        uids: route.fallbackModels,
+        effort: FALLBACK_REQUIRED_EFFORT,
+        authSource: FALLBACK_REQUIRED_AUTH_SOURCE,
         explicitCostRequiredUsd: 0,
-        endpoint: CODEBUDDY_BRIDGE_ENDPOINT,
+        endpoint: FALLBACK_BRIDGE_ENDPOINT,
       },
       terminalFallback: {
         provider: "devin",
@@ -1185,7 +1264,7 @@ function health() {
         label: models.terminal.label,
         cost: models.terminal.cost_summary || models.terminal.cost_tier,
       },
-      orderedPolicy: "devin_primary_then_codebuddy_on_quota_then_devin_free_on_codebuddy_failure",
+      orderedPolicy: "devin_primary_then_antigravity_on_quota_then_devin_free_on_antigravity_failure",
       quotaDetection: "explicit_daily_or_weekly_quota_failure_persisted_until_its_next_local_calendar_refresh",
     },
     apiKeysStripped: true, isolatedConfigImports: ["agents_standard"], lazyRzMcpProxyTools: 2,
@@ -1214,7 +1293,7 @@ async function selfTest() {
   if (
     !selfTestQuotaState.record(dailyQuotaFailure)
     || selfTestQuotaState.snapshot().kind !== "daily"
-    || chooseRoute(selfTestRouteContext, selfTestQuotaState, selfTestTaskPins).key !== "codebuddy"
+    || chooseRoute(selfTestRouteContext, selfTestQuotaState, selfTestTaskPins).key !== "fallback"
     || runtime.lastQuotaSkipScope !== "calendar_quota"
   ) {
     throw new Error("daily calendar quota routing failed");
@@ -1238,7 +1317,11 @@ async function selfTest() {
     try { unlinkSync(quotaFixturePath); } catch (error) { if (error?.code !== "ENOENT") throw error; }
     try { unlinkSync(`${quotaFixturePath}.${process.pid}.tmp`); } catch (error) { if (error?.code !== "ENOENT") throw error; }
   }
-  if (route.quotaFallbackProvider !== "codebuddy" || !route.codeBuddyModel || !models.terminal.model_uid) {
+  if (
+    route.quotaFallbackProvider !== "antigravity"
+    || route.fallbackModels.length !== 2
+    || !models.terminal.model_uid
+  ) {
     throw new Error("ordered provider configuration failed");
   }
   if (!LEGACY_REQUEST_EFFORTS.has("max") || LEGACY_REQUEST_EFFORTS.has("xhigh")) throw new Error("legacy effort compatibility failed");
@@ -1280,6 +1363,26 @@ async function selfTest() {
     }],
   }).workingDirectory;
   if (environmentWorkspace !== process.cwd()) throw new Error("environment workspace detection failed");
+  const directFreeContext = promptFrom({
+    stream: true,
+    model: DEVIN_FREE_MODEL_ALIAS,
+    reasoning: { effort: REQUIRED_EFFORT },
+    input: [{ type: "message", role: "user", content: "Use the direct free route." }],
+  });
+  if (
+    directFreeContext.requestedRoute !== "devin-free"
+    || chooseRoute(directFreeContext, selfTestQuotaState, selfTestTaskPins).key !== "terminal"
+  ) {
+    throw new Error("direct Devin free route failed");
+  }
+  const advertisedModels = managedModelsResponse().models;
+  if (
+    advertisedModels.length !== 2
+    || !advertisedModels.some((model) => model.slug === MODEL_ALIAS)
+    || !advertisedModels.some((model) => model.slug === DEVIN_FREE_MODEL_ALIAS)
+  ) {
+    throw new Error("managed route aliases were not both advertised");
+  }
   const uniqueCalls = uniqueToolCalls([
     { tool_calls: '[{"id":"call-1","name":"read"},{"id":"call-2","name":"edit"}]' },
     { tool_calls: '[{"id":"call-1","name":"read"},{"id":"call-2","name":"edit"}]' },
@@ -1333,7 +1436,7 @@ async function selfTest() {
     writableEnded: false,
     write: (value) => relayWrites.push(value),
   };
-  const relay = createCodeBuddyStreamRelay(relayResponse, "resp-relay");
+  const relay = createFallbackStreamRelay(relayResponse, "resp-relay");
   await relay.accept({
     type: "response.output_item.added",
     payload: { output_index: 0, item: responseMessageItem("msg-relay", "") },
@@ -1347,12 +1450,12 @@ async function selfTest() {
       part: { type: "output_text", text: "", annotations: [] },
     },
   });
-  if (relayWrites.length !== 0 || relay.committed) throw new Error("CodeBuddy relay committed before visible output");
+  if (relayWrites.length !== 0 || relay.committed) throw new Error("fallback relay committed before visible output");
   await relay.accept({
     type: "response.output_text.delta",
     payload: { item_id: "msg-relay", output_index: 0, content_index: 0, delta: "streamed" },
   });
-  if (!relay.committed || !relay.streamedMessageIds.has("msg-relay")) throw new Error("CodeBuddy relay did not commit visible output");
+  if (!relay.committed || !relay.streamedMessageIds.has("msg-relay")) throw new Error("fallback relay did not commit visible output");
   const streamedFixture = {
     output: [responseMessageItem("msg-relay", "streamed", "completed")],
   };
@@ -1363,38 +1466,46 @@ async function selfTest() {
     || !relayOutput.includes("event: response.output_text.done")
     || !relayOutput.includes("event: response.output_item.done")
   ) {
-    throw new Error("CodeBuddy streamed output lifecycle replay failed");
+    throw new Error("fallback streamed output lifecycle replay failed");
   }
-  const codeBuddyFixture = codeBuddyResult({
+  const fallbackFixture = fallbackResult({
     status: "completed",
-    output: [{ type: "function_call", id: "fc-test", call_id: "call-test", name: "exec_command", arguments: "{}" }],
+    output: [responseMessageItem("msg-fallback", "done", "completed")],
     usage: { input_tokens: 100, input_tokens_details: { cached_tokens: 10 }, output_tokens: 20 },
     metadata: {
-      codebuddy_initialized_model: route.codeBuddyModel,
-      codebuddy_auth_source: CODEBUDDY_REQUIRED_AUTH_SOURCE,
-      codebuddy_total_cost_usd: 0,
-      codebuddy_max_turn_input_tokens: 110,
+      actual_provider: route.quotaFallbackProvider,
+      actual_model: route.fallbackModels[0],
+      actual_model_label: "Claude Opus 4.6 (Thinking)",
+      auth_source: FALLBACK_REQUIRED_AUTH_SOURCE,
+      peak_turn_context_tokens: 110,
+      output_tokens_per_second: 250,
+      native_tool_names: ["exec_command"],
+      rzmcp_tools_called: ["find_blueprint_nodes"],
+      codex_tool_schema_bytes_forwarded: 0,
+      lazy_rzmcp_proxy_tools: 2,
     },
   });
   if (
-    codeBuddyFixture.selected.key !== "codebuddy"
-    || codeBuddyFixture.selected.provider !== "codebuddy"
-    || codeBuddyFixture.toolCalls[0]?.name !== "exec_command"
-    || codeBuddyFixture.peakTurnContextTokens !== 110
+    fallbackFixture.selected.key !== "fallback"
+    || fallbackFixture.selected.provider !== "antigravity"
+    || fallbackFixture.nativeToolNames[0] !== "exec_command"
+    || fallbackFixture.rzMcpTools[0] !== "find_blueprint_nodes"
+    || fallbackFixture.peakTurnContextTokens !== 110
+    || fallbackFixture.outputTokensPerSecond !== 250
   ) {
-    throw new Error("CodeBuddy result normalization failed");
+    throw new Error("Antigravity result normalization failed");
   }
   const replayWrites = [];
   const replayOutput = emitOutputItems({
     destroyed: false,
     writableEnded: false,
     write: (value) => replayWrites.push(value),
-  }, codeBuddyFixture);
+  }, fallbackFixture);
   if (
-    replayOutput[0]?.call_id !== "call-test"
-    || !replayWrites.join("").includes('"type":"function_call"')
+    replayOutput[0]?.id !== "msg-fallback"
+    || !replayWrites.join("").includes('"type":"message"')
   ) {
-    throw new Error("CodeBuddy tool-call replay failed");
+    throw new Error("Antigravity completion replay failed");
   }
   if (!sanitizedProviderFailure(new Error("authorization: Bearer secret-value")).includes("[REDACTED]")) {
     throw new Error("provider failure redaction failed");
@@ -1430,7 +1541,13 @@ const server = createServer(async (request, response) => {
   runtime.incomingRequests += 1;
   try {
     const url = new URL(request.url || "/", `http://${request.headers.host || "127.0.0.1"}`);
-    if (request.method === "GET" && url.pathname === "/health") return jsonResponse(response, 200, health());
+    if (request.method === "GET" && url.pathname === "/health") {
+      const requestedRoute = url.searchParams.get("route") || "auto";
+      if (!["auto", "devin-free"].includes(requestedRoute)) {
+        return jsonResponse(response, 400, { error: { message: `Unknown health route ${json(requestedRoute)}` } });
+      }
+      return jsonResponse(response, 200, health(requestedRoute));
+    }
     if (request.method === "GET" && ["/models", "/v1/models"].includes(url.pathname)) return jsonResponse(response, 200, managedModelsResponse());
     if (request.method === "POST" && url.pathname === "/v1/responses") return await handleResponses(request, response);
     runtime.rejected += 1;

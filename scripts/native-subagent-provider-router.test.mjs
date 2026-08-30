@@ -3,16 +3,20 @@ import { createServer } from "node:http";
 import test from "node:test";
 import {
   ActiveTaskRoutePins,
-  codeBuddyForwardBody,
+  fallbackForwardBody,
   completedResponseFromSse,
   parseResponsesSse,
-  runQuotaFallbackChain,
+  runProviderFallbackChain,
   runResponsesBridge,
-  validateCodeBuddyCompletion,
+  validateOAuthFallbackCompletion,
 } from "./native-subagent-provider-router.mjs";
 
 const MODEL_ALIAS = "@preset/codex-subagents";
-const EXPECTED = { model: "hy4-preview", authSource: "www.codebuddy.ai" };
+const EXPECTED = {
+  provider: "antigravity",
+  models: ["claude-opus-4-6-thinking", "gemini-3.7-flash-high"],
+  authSource: "Antigravity cached OAuth session",
+};
 
 function sse(type, payload) {
   return `event: ${type}\ndata: ${JSON.stringify({ type, ...payload })}\n\n`;
@@ -33,9 +37,11 @@ function completion(overrides = {}) {
       total_tokens: 120,
     },
     metadata: {
-      codebuddy_initialized_model: EXPECTED.model,
-      codebuddy_auth_source: EXPECTED.authSource,
-      codebuddy_total_cost_usd: 0,
+      actual_provider: EXPECTED.provider,
+      actual_model: EXPECTED.models[0],
+      auth_source: EXPECTED.authSource,
+      codex_tool_schema_bytes_forwarded: 0,
+      lazy_rzmcp_proxy_tools: 2,
       complete_active_task_delivered: true,
     },
     ...overrides,
@@ -56,9 +62,9 @@ async function withServer(handler, callback) {
   }
 }
 
-test("CodeBuddy forwarding preserves the request and upgrades only provider effort", () => {
+test("fallback forwarding preserves the request and changes only provider effort", () => {
   const input = [{ type: "message", role: "user", content: "task" }];
-  const forwarded = codeBuddyForwardBody({
+  const forwarded = fallbackForwardBody({
     model: MODEL_ALIAS,
     stream: true,
     reasoning: { effort: "high", summary: "none" },
@@ -98,7 +104,7 @@ test("SSE parsing preserves completed tool-call output after heartbeats", () => 
   assert.deepEqual(completedResponseFromSse(raw), completed);
 });
 
-test("the loopback Responses client accepts chunked CodeBuddy completion", async () => {
+test("the loopback Responses client accepts a chunked fallback completion", async () => {
   const progress = sse("response.in_progress", { response: { status: "in_progress" } });
   const completed = sse("response.completed", { response: completion() });
   let serverEnded = false;
@@ -137,6 +143,17 @@ test("the loopback Responses client rejects provider, HTTP, content, and size fa
     await assert.rejects(runResponsesBridge({ endpoint, body: {} }), /model removed/);
   });
   await withServer((_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.end(sse("response.failed", {
+      response: { error: { code: "provider_state_changed", message: "turn failed after an edit" } },
+    }));
+  }, async (endpoint) => {
+    await assert.rejects(
+      runResponsesBridge({ endpoint, body: {} }),
+      (error) => error.routeCommitted === true && /after an edit/.test(error.message),
+    );
+  });
+  await withServer((_request, response) => {
     response.writeHead(503, { "content-type": "application/json" });
     response.end('{"error":"offline"}');
   }, async (endpoint) => {
@@ -156,42 +173,49 @@ test("the loopback Responses client rejects provider, HTTP, content, and size fa
   });
 });
 
-test("CodeBuddy completion validation rejects model, auth, cost, and empty-output fallback", () => {
-  assert.deepEqual(validateCodeBuddyCompletion(completion(), EXPECTED), completion());
-  assert.throws(() => validateCodeBuddyCompletion(completion({
-    metadata: { ...completion().metadata, codebuddy_initialized_model: "removed-model" },
+test("OAuth fallback validation rejects provider, model, auth, eager tools, and empty output", () => {
+  assert.deepEqual(validateOAuthFallbackCompletion(completion(), EXPECTED), completion());
+  const geminiCompletion = completion({
+    metadata: { ...completion().metadata, actual_model: EXPECTED.models[1] },
+  });
+  assert.deepEqual(validateOAuthFallbackCompletion(geminiCompletion, EXPECTED), geminiCompletion);
+  assert.throws(() => validateOAuthFallbackCompletion(completion({
+    metadata: { ...completion().metadata, actual_provider: "codebuddy" },
+  }), EXPECTED), /unexpected provider/);
+  assert.throws(() => validateOAuthFallbackCompletion(completion({
+    metadata: { ...completion().metadata, actual_model: "removed-model" },
   }), EXPECTED), /unexpected model/);
-  assert.throws(() => validateCodeBuddyCompletion(completion({
-    metadata: { ...completion().metadata, codebuddy_auth_source: "api-key" },
+  assert.throws(() => validateOAuthFallbackCompletion(completion({
+    metadata: { ...completion().metadata, auth_source: "api-key" },
   }), EXPECTED), /unexpected auth source/);
-  assert.throws(() => validateCodeBuddyCompletion(completion({
-    metadata: { ...completion().metadata, codebuddy_total_cost_usd: 0.01 },
-  }), EXPECTED), /non-zero or unknown explicit cost/);
-  assert.throws(() => validateCodeBuddyCompletion(completion({ output: [] }), EXPECTED), /without output items/);
+  assert.throws(() => validateOAuthFallbackCompletion(completion({
+    metadata: { ...completion().metadata, codex_tool_schema_bytes_forwarded: 1 },
+  }), EXPECTED), /lazy RzMCP/);
+  assert.throws(() => validateOAuthFallbackCompletion(completion({ output: [] }), EXPECTED), /without output items/);
 });
 
-test("quota fallback prefers CodeBuddy and does not touch the terminal Devin route", async () => {
+test("quota fallback prefers Antigravity and does not touch the terminal Devin route", async () => {
   let terminalCalls = 0;
-  const result = await runQuotaFallbackChain({
-    runCodeBuddy: async () => "hy4",
+  const result = await runProviderFallbackChain({
+    runFallback: async () => "gemini",
     runTerminal: async () => { terminalCalls += 1; return "glm"; },
   });
-  assert.deepEqual(result, { stage: "codebuddy", value: "hy4", codeBuddyError: null });
+  assert.deepEqual(result, { stage: "fallback", value: "gemini", fallbackError: null });
   assert.equal(terminalCalls, 0);
 });
 
-test("any CodeBuddy availability failure reaches terminal Devin exactly once", async () => {
+test("any Antigravity availability failure reaches terminal Devin exactly once", async () => {
   const failure = new Error("unreachable");
   const observed = [];
   let terminalCalls = 0;
-  const result = await runQuotaFallbackChain({
-    runCodeBuddy: async () => { throw failure; },
+  const result = await runProviderFallbackChain({
+    runFallback: async () => { throw failure; },
     runTerminal: async (error) => { terminalCalls += 1; assert.equal(error, failure); return "glm"; },
-    onCodeBuddyFailure: (error) => observed.push(error),
+    onFallbackFailure: (error) => observed.push(error),
   });
   assert.equal(result.stage, "terminal");
   assert.equal(result.value, "glm");
-  assert.equal(result.codeBuddyError, failure);
+  assert.equal(result.fallbackError, failure);
   assert.deepEqual(observed, [failure]);
   assert.equal(terminalCalls, 1);
 });
@@ -199,9 +223,9 @@ test("any CodeBuddy availability failure reaches terminal Devin exactly once", a
 test("client abort never starts terminal fallback", async () => {
   const controller = new AbortController();
   let terminalCalls = 0;
-  await assert.rejects(runQuotaFallbackChain({
+  await assert.rejects(runProviderFallbackChain({
     signal: controller.signal,
-    runCodeBuddy: async () => {
+    runFallback: async () => {
       controller.abort();
       throw new DOMException("aborted", "AbortError");
     },
@@ -210,14 +234,14 @@ test("client abort never starts terminal fallback", async () => {
   assert.equal(terminalCalls, 0);
 });
 
-test("a committed CodeBuddy stream fails explicitly instead of mixing in terminal output", async () => {
+test("a committed fallback stream fails explicitly instead of mixing in terminal output", async () => {
   const failure = Object.assign(new Error("stream failed after output"), { routeCommitted: true });
   const observed = [];
   let terminalCalls = 0;
-  await assert.rejects(runQuotaFallbackChain({
-    runCodeBuddy: async () => { throw failure; },
+  await assert.rejects(runProviderFallbackChain({
+    runFallback: async () => { throw failure; },
     runTerminal: async () => { terminalCalls += 1; },
-    onCodeBuddyFailure: (error) => observed.push(error),
+    onFallbackFailure: (error) => observed.push(error),
   }), /stream failed after output/);
   assert.equal(terminalCalls, 0);
   assert.deepEqual(observed, [failure]);
