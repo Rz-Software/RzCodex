@@ -36,6 +36,9 @@ const PRIMARY_QUOTA_BUCKET_IDS = ["3p-weekly", "3p-5h"];
 const FALLBACK_QUOTA_BUCKET_IDS = ["gemini-weekly", "gemini-5h"];
 const MODEL_QUOTA_FAILURE = /RESOURCE_EXHAUSTED|LLM_CALL_QUOTA_EXCEEDED|individual quota reached|exhausted your (?:capacity|quota)(?: on this model)?|quota[^\r\n]{0,100}(?:exhaust|exceed|deplet|reach)/i;
 const PROVIDER_FAILURE_SIGNAL = /RESOURCE_EXHAUSTED|LLM_CALL_QUOTA_EXCEEDED|individual quota reached|exhausted your (?:capacity|quota)|agent executor error|calling model:/i;
+const INTERRUPTED_STREAM_FAILURE = /the stream was interrupted\.\s*please continue the task you were working on\./i;
+const STREAM_CONTINUATION_BACKOFF_BASE_MS = 1_000;
+const STREAM_CONTINUATION_BACKOFF_MAX_MS = 30_000;
 const CENTRAL_CONFIG = join(homedir(), ".codex", "subagent-models.json");
 const AGY_EXE = join(process.env.LOCALAPPDATA || join(homedir(), "AppData", "Local"), "agy", "bin", "agy.exe");
 const MCP_CONFIG = join(homedir(), ".gemini", "config", "mcp_config.json");
@@ -160,6 +163,9 @@ function attachTurnProgress(error, turn) {
   error.rzMcpTools = [...turn.rzMcpTools];
   error.subagentActivity = turn.subagentActivity;
   error.forbiddenToolName = turn.forbiddenToolName;
+  error.peakContextTokens = Number(turn.peakContextTokens || 0);
+  error.generatedTokens = Number(turn.generatedTokens || 0);
+  error.generationSeconds = Number(turn.generationSeconds || 0);
   if (error.toolCalls > 0 || error.rzMcpTools.length > 0 || error.subagentActivity) {
     error.routeCommitted = true;
   }
@@ -535,6 +541,168 @@ function subtractUsage(current, previous) {
   return result;
 }
 
+function abortError() {
+  return new BridgeError("Client disconnected while Antigravity was active", 499);
+}
+
+function throwIfAborted(signal) {
+  if (signal?.aborted) throw abortError();
+}
+
+function delayWithAbort(milliseconds, signal) {
+  throwIfAborted(signal);
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(finish, milliseconds);
+    const onAbort = () => finish(abortError());
+    function finish(error) {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      error ? reject(error) : resolve();
+    }
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+function streamContinuationBackoffMs(attempt) {
+  return Math.min(
+    STREAM_CONTINUATION_BACKOFF_BASE_MS * (2 ** Math.max(0, attempt - 1)),
+    STREAM_CONTINUATION_BACKOFF_MAX_MS,
+  );
+}
+
+function emptyInterruptedProgress() {
+  return {
+    streamContinuations: 0,
+    toolCalls: 0,
+    toolNames: new Set(),
+    mutationToolCalls: 0,
+    rzMcpTools: new Set(),
+    subagentActivity: false,
+    forbiddenToolName: null,
+    peakContextTokens: 0,
+    generatedTokens: 0,
+    generationSeconds: 0,
+    durationSeconds: 0,
+  };
+}
+
+function accumulateInterruptedProgress(progress, source) {
+  progress.toolCalls += Number(source?.toolCalls || 0);
+  for (const name of source?.toolNames || []) progress.toolNames.add(name);
+  progress.mutationToolCalls += Number(source?.mutationToolCalls || 0);
+  for (const name of source?.rzMcpTools || []) progress.rzMcpTools.add(name);
+  progress.subagentActivity ||= source?.subagentActivity === true;
+  progress.forbiddenToolName ||= source?.forbiddenToolName || null;
+  progress.peakContextTokens = Math.max(progress.peakContextTokens, Number(source?.peakContextTokens || 0));
+  progress.generatedTokens += Number(source?.generatedTokens || 0);
+  progress.generationSeconds += Number(source?.generationSeconds || 0);
+  progress.durationSeconds += Number(source?.durationSeconds || 0);
+}
+
+function applyInterruptedProgress(target, progress) {
+  target.streamContinuations = progress.streamContinuations;
+  target.toolCalls = progress.toolCalls + Number(target.toolCalls || 0);
+  target.toolNames = [...new Set([...progress.toolNames, ...(target.toolNames || [])])];
+  target.mutationToolCalls = progress.mutationToolCalls + Number(target.mutationToolCalls || 0);
+  target.rzMcpTools = [...new Set([...progress.rzMcpTools, ...(target.rzMcpTools || [])])];
+  target.subagentActivity = progress.subagentActivity || target.subagentActivity === true;
+  target.forbiddenToolName = progress.forbiddenToolName || target.forbiddenToolName || null;
+  target.peakContextTokens = Math.max(progress.peakContextTokens, Number(target.peakContextTokens || 0));
+  target.generatedTokens = progress.generatedTokens + Number(target.generatedTokens || 0);
+  target.generationSeconds = progress.generationSeconds + Number(target.generationSeconds || 0);
+  target.durationSeconds = progress.durationSeconds + Number(target.durationSeconds || 0);
+  if (progress.streamContinuations > 0) {
+    target.routeCommitted = true;
+    target.safeToRetry = false;
+  }
+  return target;
+}
+
+function interruptedStreamContinuationPrompt(session) {
+  return `[Native Antigravity stream recovery]\nThe upstream stream was interrupted. Continue the same retained task and conversation from its current state. Task hash: ${session.activeTaskHash || "none"}. Do not repeat completed tool calls or file edits. Return when complete or concretely blocked.`;
+}
+
+async function runWithInterruptedStreamRecovery(
+  session,
+  prompt,
+  signal,
+  onProgress = () => {},
+  onRecovery = () => {},
+  options = {},
+) {
+  const now = options.now || Date.now;
+  const delay = options.delay || delayWithAbort;
+  const deadline = options.deadline || now() + REQUEST_TIMEOUT_MS;
+  const conversationId = session.init?.conversationId || null;
+  const progress = emptyInterruptedProgress();
+  let currentPrompt = prompt;
+  let attempt = 0;
+  for (;;) {
+    if (signal?.aborted) {
+      const error = applyInterruptedProgress(abortError(), progress);
+      session.close?.();
+      throw error;
+    }
+    const remainingMs = deadline - now();
+    if (remainingMs <= 0) {
+      const error = applyInterruptedProgress(
+        new BridgeError("Antigravity interrupted-stream recovery exceeded the request deadline", 504),
+        progress,
+      );
+      session.close?.();
+      throw error;
+    }
+    try {
+      const result = await session.run(
+        currentPrompt,
+        signal,
+        (event) => onProgress({ ...event, index: progress.toolCalls + event.index }),
+        remainingMs,
+      );
+      if ((result.conversationId || null) !== conversationId) {
+        session.close?.();
+        throw new BridgeError("Antigravity changed conversation during interrupted-stream recovery", 502);
+      }
+      const combined = applyInterruptedProgress(result, progress);
+      combined.outputTokensPerSecond = combined.generationSeconds > 0
+        ? combined.generatedTokens / combined.generationSeconds
+        : null;
+      return combined;
+    } catch (error) {
+      if (error?.sameSessionContinuation !== true) {
+        throw applyInterruptedProgress(error, progress);
+      }
+      accumulateInterruptedProgress(progress, error);
+      progress.streamContinuations += 1;
+      if (session.closed || (session.init?.conversationId || null) !== conversationId) {
+        throw applyInterruptedProgress(
+          new BridgeError("Antigravity lost the retained conversation after a stream interruption", 502),
+          progress,
+        );
+      }
+      attempt += 1;
+      const backoffMs = streamContinuationBackoffMs(attempt);
+      if (now() + backoffMs >= deadline) {
+        const deadlineError = applyInterruptedProgress(
+          new BridgeError("Antigravity remained stream-interrupted until the request deadline", 504),
+          progress,
+        );
+        session.close?.();
+        throw deadlineError;
+      }
+      onRecovery({ attempt, backoffMs, conversationId });
+      try {
+        await delay(backoffMs, signal);
+      } catch (delayError) {
+        const error = applyInterruptedProgress(delayError, progress);
+        if (error.status === 499) session.close?.();
+        throw error;
+      }
+      currentPrompt = interruptedStreamContinuationPrompt(session);
+    }
+  }
+}
+
 function sessionArguments(selectedModel) {
   return [
     "--input-format", "stream-json", "--output-format", "stream-json",
@@ -705,7 +873,7 @@ class AntigravitySession {
     if (event?.event === "result" && this.turn) this.finishTurn(event.result);
   }
 
-  run(prompt, signal, onProgress = () => {}) {
+  run(prompt, signal, onProgress = () => {}, timeoutMs = REQUEST_TIMEOUT_MS) {
     if (!this.init) throw new BridgeError("Antigravity session is not initialized", 500);
     if (this.turn) throw new BridgeError("Antigravity session already has an active turn", 409);
     if (signal?.aborted) throw new BridgeError("Client disconnected before Antigravity started", 499);
@@ -713,7 +881,7 @@ class AntigravitySession {
     return new Promise((resolve, reject) => {
       const onAbort = () => this.close(new BridgeError("Client disconnected while Antigravity was active", 499));
       signal?.addEventListener("abort", onAbort, { once: true });
-      const timeout = setTimeout(() => this.close(new BridgeError(`Antigravity exceeded ${REQUEST_TIMEOUT_MS}ms`, 504)), REQUEST_TIMEOUT_MS);
+      const timeout = setTimeout(() => this.close(new BridgeError(`Antigravity exceeded ${timeoutMs}ms`, 504)), timeoutMs);
       this.turn = {
         resolve,
         reject,
@@ -746,20 +914,26 @@ class AntigravitySession {
     if (!result || result.status !== "SUCCESS") {
       const detail = providerFailureDetail(result, this.stderr);
       const quotaFailure = MODEL_QUOTA_FAILURE.test(`${json(result || {})}\n${detail}`);
+      const interruptedStream = !quotaFailure
+        && INTERRUPTED_STREAM_FAILURE.test(`${json(result || {})}\n${detail}`);
       const error = attachTurnProgress(new BridgeError(
         quotaFailure
           ? `Antigravity model quota is depleted for ${this.model}${detail ? `: ${detail}` : ""}`
           : `Antigravity turn failed with status ${json(result?.status)}${detail ? `: ${detail}` : ""}`,
         quotaFailure ? 429 : 502,
       ), turn);
+      error.durationSeconds = Number(result?.duration_seconds || 0);
+      error.conversationId = result?.conversation_id || this.init?.conversationId || null;
       error.modelQuotaFailure = quotaFailure;
-      error.safeToRetry = error.mutationToolCalls === 0
+      error.sameSessionContinuation = interruptedStream;
+      error.safeToRetry = !interruptedStream
+        && error.mutationToolCalls === 0
         && error.rzMcpTools.length === 0
         && !error.subagentActivity
         && !error.forbiddenToolName;
-      error.routeCommitted = !error.safeToRetry;
+      error.routeCommitted = interruptedStream || !error.safeToRetry;
       turn.reject(error);
-      this.close();
+      if (!interruptedStream) this.close();
       return;
     }
     if (typeof result.response !== "string" || result.response.length === 0) {
@@ -775,6 +949,8 @@ class AntigravitySession {
       text: result.response,
       usage,
       peakContextTokens: turn.peakContextTokens,
+      generatedTokens: turn.generatedTokens,
+      generationSeconds: turn.generationSeconds,
       outputTokensPerSecond: turn.generationSeconds > 0 ? turn.generatedTokens / turn.generationSeconds : null,
       toolCalls: turn.toolStepKeys.size,
       toolNames: [...turn.toolNames],
@@ -982,6 +1158,10 @@ const runtime = {
   sessionsCreated: 0,
   sessionsReused: 0,
   quotaPoolSwitches: 0,
+  streamContinuations: 0,
+  lastStreamContinuations: 0,
+  lastStreamContinuationAt: null,
+  lastStreamContinuationConversationId: null,
   lastActualModel: null,
   lastActualModelLabel: null,
   lastAuthVerifiedAt: null,
@@ -1070,6 +1250,7 @@ async function handleResponses(request, response) {
   runtime.lastTaskId = context.taskState.activeTask?.id || null;
   runtime.lastTaskHash = context.taskState.activeTask?.hash || null;
   runtime.lastTaskDeliveryMode = context.taskState.activeTask?.deliveryMode || null;
+  runtime.lastStreamContinuations = 0;
   const responseId = `resp_${randomUUID()}`;
   response.writeHead(200, {
     "content-type": "text/event-stream; charset=utf-8",
@@ -1106,10 +1287,24 @@ async function handleResponses(request, response) {
     let diagnostics = diagnosticsFor(prompt, reused);
     runtime.lastCompleteTaskDelivered = diagnostics.completeTaskDelivered;
     let result;
-    try {
-      result = await session.run(prompt, controller.signal, ({ index, name }) => {
+    const deadline = Date.now() + REQUEST_TIMEOUT_MS;
+    const runSession = (currentSession, currentPrompt) => runWithInterruptedStreamRecovery(
+      currentSession,
+      currentPrompt,
+      controller.signal,
+      ({ index, name }) => {
         progress.emit(`Antigravity native tool ${index}: ${progressToolName(name)}.\n`);
-      });
+      },
+      ({ backoffMs, conversationId }) => {
+        runtime.streamContinuations += 1;
+        runtime.lastStreamContinuationAt = new Date().toISOString();
+        runtime.lastStreamContinuationConversationId = conversationId;
+        progress.emit(`Antigravity upstream stream interrupted; continuing the same conversation after ${backoffMs}ms.\n`);
+      },
+      { deadline },
+    );
+    try {
+      result = await runSession(session, prompt);
     } catch (error) {
       const modelQuotaFailure = error?.modelQuotaFailure === true;
       if (modelQuotaFailure) quotaRouter.markDepleted(session.model);
@@ -1123,9 +1318,7 @@ async function handleResponses(request, response) {
       progress.emit(`Antigravity quota route switched to ${session.modelLabel}.\n`);
       prompt = fullPrompt(context);
       diagnostics = diagnosticsFor(prompt, false);
-      result = await session.run(prompt, controller.signal, ({ index, name }) => {
-        progress.emit(`Antigravity native tool ${index}: ${progressToolName(name)}.\n`);
-      });
+      result = await runSession(session, prompt);
     }
     for (const key of context.messageKeys) session.seenMessageKeys.add(key);
     runtime.completed += 1;
@@ -1142,6 +1335,7 @@ async function handleResponses(request, response) {
     runtime.lastNativeToolNames = result.toolNames;
     runtime.lastMutationToolCalls = result.mutationToolCalls;
     runtime.lastRzMcpTools = result.rzMcpTools;
+    runtime.lastStreamContinuations = result.streamContinuations;
     runtime.lastConversationId = result.conversationId;
     runtime.lastCompleteTaskDelivered = diagnostics.completeTaskDelivered;
     runtime.lastProviderSessionReused = reused;
@@ -1156,6 +1350,7 @@ async function handleResponses(request, response) {
       auth_source: "Antigravity cached OAuth session",
       conversation_id: result.conversationId,
       provider_session_reused: reused,
+      interrupted_stream_continuations: result.streamContinuations,
       peak_turn_context_tokens: result.peakContextTokens,
       output_tokens_per_second: result.outputTokensPerSecond,
       native_tool_calls: result.toolCalls,
@@ -1184,6 +1379,7 @@ async function handleResponses(request, response) {
     runtime.lastNativeToolNames = Array.isArray(error?.toolNames) ? error.toolNames : [];
     runtime.lastMutationToolCalls = Number(error?.mutationToolCalls || 0);
     runtime.lastRzMcpTools = Array.isArray(error?.rzMcpTools) ? error.rzMcpTools : [];
+    runtime.lastStreamContinuations = Number(error?.streamContinuations || 0);
     writeSse(response, "response.failed", {
       response: {
         id: responseId,
@@ -1431,6 +1627,211 @@ async function selfTest() {
   }
   const capacityQuotaFailure = quotaFailureFor([], 0, "You have exhausted your capacity on this model.");
   if (!capacityQuotaFailure?.modelQuotaFailure) throw new Error("capacity quota classification failed");
+  const interruptionSession = new AntigravitySession(
+    "interruption-fixture",
+    process.cwd(),
+    "stream-task",
+    models.fallback,
+    () => {},
+  );
+  interruptionSession.init = { conversationId: "interruption-conversation" };
+  interruptionSession.initSettled = true;
+  let interruptionFailure;
+  interruptionSession.turn = {
+    cleanup: () => {},
+    reject: (error) => { interruptionFailure = error; },
+    generatedTokens: 12,
+    generationSeconds: 0.25,
+    peakContextTokens: 321,
+    toolNames: new Set(["replace_file_content"]),
+    toolStepKeys: new Set(["interruption-conversation:1"]),
+    mutationToolStepKeys: new Set(["interruption-conversation:1"]),
+    rzMcpTools: new Set(),
+    subagentActivity: false,
+    forbiddenToolName: null,
+    unknownToolSteps: 0,
+  };
+  interruptionSession.finishTurn({
+    status: "ERROR",
+    error: "The stream was interrupted. Please continue the task you were working on.",
+    duration_seconds: 0.5,
+    conversation_id: "interruption-conversation",
+  });
+  if (
+    !interruptionFailure?.sameSessionContinuation
+    || interruptionFailure.safeToRetry
+    || !interruptionFailure.routeCommitted
+    || interruptionFailure.mutationToolCalls !== 1
+    || interruptionFailure.generatedTokens !== 12
+    || interruptionFailure.durationSeconds !== 0.5
+    || interruptionSession.closed
+  ) {
+    throw new Error("same-session interrupted-stream classification failed");
+  }
+  interruptionSession.close();
+  let fakeNow = 1_000;
+  let recoveryRun = 0;
+  const recoveryCalls = [];
+  const recoveryDelays = [];
+  const recoveryEvents = [];
+  const recoveryToolEvents = [];
+  const interruptedError = (toolName, mutationToolCalls, generatedTokens) => Object.assign(
+    new BridgeError("fixture stream interruption", 502),
+    {
+      sameSessionContinuation: true,
+      safeToRetry: false,
+      routeCommitted: true,
+      toolCalls: 1,
+      toolNames: [toolName],
+      mutationToolCalls,
+      rzMcpTools: [],
+      subagentActivity: false,
+      forbiddenToolName: null,
+      peakContextTokens: 100 + recoveryRun,
+      generatedTokens,
+      generationSeconds: 0.1,
+      durationSeconds: 0.25,
+      conversationId: "recovery-conversation",
+    },
+  );
+  const recoverySession = {
+    activeTaskHash: "recovery-task-hash",
+    init: { conversationId: "recovery-conversation" },
+    closed: false,
+    run: async (currentPrompt, _signal, onProgress, timeoutMs) => {
+      recoveryCalls.push({ prompt: currentPrompt, timeoutMs });
+      recoveryRun += 1;
+      if (recoveryRun === 1) {
+        onProgress({ kind: "tool", index: 1, name: "replace_file_content" });
+        throw interruptedError("replace_file_content", 1, 10);
+      }
+      if (recoveryRun === 2) {
+        onProgress({ kind: "tool", index: 1, name: "view_file" });
+        throw interruptedError("view_file", 0, 5);
+      }
+      onProgress({ kind: "tool", index: 1, name: "grep_search" });
+      return {
+        text: "done",
+        usage: { input_tokens: 100, output_tokens: 20, thinking_tokens: 5, cache_read_tokens: 50, total_tokens: 120 },
+        peakContextTokens: 99,
+        generatedTokens: 5,
+        generationSeconds: 0.1,
+        outputTokensPerSecond: 50,
+        toolCalls: 1,
+        toolNames: ["grep_search"],
+        rzMcpTools: [],
+        mutationToolCalls: 0,
+        durationSeconds: 0.5,
+        conversationId: "recovery-conversation",
+      };
+    },
+  };
+  const recovered = await runWithInterruptedStreamRecovery(
+    recoverySession,
+    "original task payload",
+    undefined,
+    (event) => recoveryToolEvents.push(event),
+    (event) => recoveryEvents.push(event),
+    {
+      now: () => fakeNow,
+      deadline: 10_000,
+      delay: async (milliseconds) => {
+        recoveryDelays.push(milliseconds);
+        fakeNow += milliseconds;
+      },
+    },
+  );
+  if (
+    recoveryCalls.length !== 3
+    || recoveryCalls[0].prompt !== "original task payload"
+    || recoveryCalls.slice(1).some(({ prompt }) => prompt.includes("original task payload"))
+    || recoveryCalls.slice(1).some(({ prompt }) => !prompt.includes("recovery-task-hash"))
+    || recoveryCalls.map(({ timeoutMs }) => timeoutMs).join(",") !== "9000,8000,6000"
+    || recoveryDelays.join(",") !== "1000,2000"
+    || recoveryEvents.map(({ attempt }) => attempt).join(",") !== "1,2"
+    || recoveryToolEvents.map(({ index }) => index).join(",") !== "1,2,3"
+    || recovered.streamContinuations !== 2
+    || recovered.toolCalls !== 3
+    || recovered.mutationToolCalls !== 1
+    || recovered.toolNames.join(",") !== "replace_file_content,view_file,grep_search"
+    || recovered.generatedTokens !== 20
+    || Math.abs(recovered.generationSeconds - 0.3) > 0.0001
+    || Math.abs(recovered.outputTokensPerSecond - (20 / 0.3)) > 0.0001
+    || recovered.durationSeconds !== 1
+    || recovered.conversationId !== "recovery-conversation"
+  ) {
+    throw new Error("same-session interrupted-stream recovery failed");
+  }
+  let terminalRecoveryRun = 0;
+  let terminalRecoveryFailure;
+  const terminalRecoverySession = {
+    activeTaskHash: "terminal-recovery-task",
+    init: { conversationId: "terminal-recovery-conversation" },
+    closed: false,
+    run: async () => {
+      terminalRecoveryRun += 1;
+      if (terminalRecoveryRun === 1) {
+        throw Object.assign(new BridgeError("fixture stream interruption", 502), {
+          sameSessionContinuation: true,
+          safeToRetry: false,
+          routeCommitted: true,
+          toolCalls: 0,
+          toolNames: [],
+          mutationToolCalls: 0,
+          rzMcpTools: [],
+        });
+      }
+      throw Object.assign(new BridgeError("fixture terminal provider failure", 502), {
+        safeToRetry: true,
+        routeCommitted: false,
+        toolCalls: 0,
+        toolNames: [],
+        mutationToolCalls: 0,
+        rzMcpTools: [],
+      });
+    },
+  };
+  try {
+    await runWithInterruptedStreamRecovery(
+      terminalRecoverySession,
+      "terminal recovery task",
+      undefined,
+      undefined,
+      undefined,
+      { now: () => 1_000, deadline: 10_000, delay: async () => {} },
+    );
+  } catch (error) {
+    terminalRecoveryFailure = error;
+  }
+  if (
+    terminalRecoveryRun !== 2
+    || terminalRecoveryFailure?.streamContinuations !== 1
+    || terminalRecoveryFailure?.routeCommitted !== true
+    || terminalRecoveryFailure?.safeToRetry !== false
+  ) {
+    throw new Error("post-interruption terminal failure was eligible for unsafe replay");
+  }
+  const abortedRecoveryController = new AbortController();
+  abortedRecoveryController.abort();
+  let abortedRecoveryClosed = false;
+  let abortedRecoveryFailure;
+  try {
+    await runWithInterruptedStreamRecovery(
+      {
+        activeTaskHash: "aborted-recovery-task",
+        init: { conversationId: "aborted-recovery-conversation" },
+        closed: false,
+        close: () => { abortedRecoveryClosed = true; },
+      },
+      "aborted recovery task",
+      abortedRecoveryController.signal,
+    );
+  } catch (error) {
+    abortedRecoveryFailure = error;
+  }
+  if (!abortedRecoveryClosed || abortedRecoveryFailure?.status !== 499) {
+    throw new Error("aborted interrupted-stream recovery did not release its provider session");
+  }
   const initSession = new AntigravitySession("init-fixture", process.cwd(), "task", models.primary, () => {});
   let initResolved = false;
   let initRejected = false;
