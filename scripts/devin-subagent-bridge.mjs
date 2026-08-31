@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { spawn, spawnSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { homedir } from "node:os";
@@ -18,7 +18,7 @@ import {
 import {
   ActiveTaskRoutePins,
   fallbackForwardBody,
-  runProviderFallbackChain,
+  runOrderedProviderChain,
   runResponsesBridge,
   validateOAuthFallbackCompletion,
 } from "./native-subagent-provider-router.mjs";
@@ -26,7 +26,9 @@ import {
 const PROVIDER_ID = "devin";
 const MODEL_ALIAS = "@preset/codex-subagents";
 const DEVIN_FREE_MODEL_ALIAS = "@preset/codex-subagents-devin-free";
+const OLLAMA_MODEL_ALIAS = "@preset/codex-subagents-ollama";
 const REQUIRED_EFFORT = "high";
+const OLLAMA_REQUIRED_EFFORT = "max";
 const LEGACY_REQUEST_EFFORTS = new Set(["max"]);
 const DEFAULT_PORT = 54548;
 const MAX_REQUEST_BYTES = 32 * 1024 * 1024;
@@ -41,10 +43,14 @@ const FREE_ROUTE_CONCURRENCY = 2;
 const RESOURCE_BACKOFF_BASE_MS = 5 * 1000;
 const RESOURCE_BACKOFF_MAX_MS = 2 * 60 * 1000;
 const QUOTA_RECOVERY_PROBE_MS = 30 * 60 * 1000;
-const FALLBACK_BRIDGE_ENDPOINT = "http://127.0.0.1:54549/v1/responses";
-const FALLBACK_REQUIRED_AUTH_SOURCE = "Antigravity cached OAuth session";
-const FALLBACK_REQUIRED_EFFORT = "high";
-const FALLBACK_CONTEXT_WINDOW = 131_072;
+const ANTIGRAVITY_BRIDGE_ENDPOINT = "http://127.0.0.1:54549/v1/responses";
+const ANTIGRAVITY_REQUIRED_AUTH_SOURCE = "Antigravity cached OAuth session";
+const ANTIGRAVITY_REQUIRED_EFFORT = "high";
+const ANTIGRAVITY_CONTEXT_WINDOW = 131_072;
+const OLLAMA_RESPONSES_ENDPOINT = "http://127.0.0.1:11434/v1/responses";
+const OLLAMA_AUTH_SOURCE = "Ollama local signed-in session";
+const OLLAMA_CONTEXT_WINDOW = 1_048_576;
+const REQUIRED_AUTO_PROVIDER_ORDER = ["antigravity", "devin", "ollama", "devin-free"];
 const SCRIPT_DIRECTORY = dirname(fileURLToPath(import.meta.url));
 const CENTRAL_CONFIG = join(homedir(), ".codex", "subagent-models.json");
 const USER_DEVIN_CONFIG = join(process.env.APPDATA || join(homedir(), "AppData", "Roaming"), "devin", "config.json");
@@ -218,6 +224,7 @@ function sanitizedEnvironment(source = process.env) {
     "OPENAI_ORG_ID", "OPENAI_PROJECT_ID", "CODEX_API_KEY", "OPENROUTER_API_KEY",
     "TENCENT_API_KEY", "TENCENTCLOUD_SECRET_ID", "TENCENTCLOUD_SECRET_KEY",
     "CODEBUDDY_API_KEY", "OPENCODE_API_KEY", "COMMAND_CODE_API_KEY",
+    "OLLAMA_API_KEY",
   ]) delete env[key];
   return env;
 }
@@ -229,23 +236,49 @@ function centralRoute() {
   } catch (error) {
     throw new BridgeError(`Cannot read central subagent configuration: ${error.message}`, 500);
   }
-  const route = assertObject(parsed[PROVIDER_ID], `central route ${PROVIDER_ID}`);
-  const quotaFallbackProvider = requireString(route.quotaFallbackProvider, "quotaFallbackProvider");
-  if (quotaFallbackProvider !== "antigravity") {
-    throw new BridgeError(`Devin quota fallback provider must be antigravity, got ${json(quotaFallbackProvider)}`, 500);
+  const configuredOrder = parsed.autoProviderOrder;
+  if (
+    !Array.isArray(configuredOrder)
+    || configuredOrder.length !== REQUIRED_AUTO_PROVIDER_ORDER.length
+    || configuredOrder.some((provider, index) => provider !== REQUIRED_AUTO_PROVIDER_ORDER[index])
+  ) {
+    throw new BridgeError(
+      `autoProviderOrder must be ${json(REQUIRED_AUTO_PROVIDER_ORDER)}, got ${json(configuredOrder)}`,
+      500,
+    );
   }
-  const fallbackRoute = assertObject(parsed[quotaFallbackProvider], `central route ${quotaFallbackProvider}`);
+  const route = assertObject(parsed[PROVIDER_ID], `central route ${PROVIDER_ID}`);
+  const antigravityRoute = assertObject(parsed.antigravity, "central route antigravity");
+  const ollamaRoute = assertObject(parsed.ollama, "central route ollama");
   const inputModalities = route.inputModalities;
   if (!Array.isArray(inputModalities) || inputModalities.length !== 1 || inputModalities[0] !== "text") {
     throw new BridgeError("Devin managed route must declare exactly the text modality", 500);
   }
+  const ollamaInputModalities = ollamaRoute.inputModalities;
+  if (!Array.isArray(ollamaInputModalities) || ollamaInputModalities.length !== 1 || ollamaInputModalities[0] !== "text") {
+    throw new BridgeError("Ollama managed route must declare exactly the text modality", 500);
+  }
+  const ollamaEffort = requireString(ollamaRoute.reasoningEffort, "ollama.reasoningEffort");
+  if (ollamaEffort !== OLLAMA_REQUIRED_EFFORT) {
+    throw new BridgeError(`Ollama managed route must use ${OLLAMA_REQUIRED_EFFORT} reasoning`, 500);
+  }
+  if (!Array.isArray(ollamaRoute.responseModels) || ollamaRoute.responseModels.length === 0) {
+    throw new BridgeError("ollama.responseModels must contain at least one accepted response model", 500);
+  }
   return {
+    autoProviderOrder: [...configuredOrder],
     primaryModel: requireString(route.primaryModel, "primaryModel"),
-    quotaFallbackProvider,
-    fallbackModels: [
-      requireString(fallbackRoute.primaryModel, "antigravity.primaryModel"),
-      requireString(fallbackRoute.quotaFallbackModel, "antigravity.quotaFallbackModel"),
+    antigravityProvider: "antigravity",
+    antigravityModels: [
+      requireString(antigravityRoute.primaryModel, "antigravity.primaryModel"),
+      requireString(antigravityRoute.quotaFallbackModel, "antigravity.quotaFallbackModel"),
     ],
+    ollamaModel: requireString(ollamaRoute.model, "ollama.model"),
+    ollamaLabel: requireString(ollamaRoute.label, "ollama.label"),
+    ollamaResponseModels: ollamaRoute.responseModels.map((model, index) =>
+      requireString(model, `ollama.responseModels[${index}]`)),
+    ollamaEffort,
+    ollamaInputModalities,
     terminalFallbackModel: requireString(route.terminalFallbackModel, "terminalFallbackModel"),
     inputModalities,
   };
@@ -335,6 +368,9 @@ const runtime = {
   lastActualProvider: null, lastModelLabel: null, lastQuotaFallback: false,
   lastTerminalFallback: false, lastFallbackReason: null,
   fallbackAttempts: 0, fallbackCompleted: 0, fallbackFailed: 0, terminalFallbacks: 0,
+  providerAttempts: { antigravity: 0, devin: 0, ollama: 0, devinFree: 0 },
+  providerFailures: { antigravity: 0, devin: 0, ollama: 0, "devin-free": 0 },
+  lastProviderSequence: [],
   fallbackStreamCommits: 0, lastFallbackStreamCommitted: false,
   lastFallbackStreamedMessageCount: 0,
   quotaProbeSkips: 0, quotaRecoveryProbes: 0, quotaPinsReleased: 0,
@@ -345,10 +381,11 @@ const runtime = {
   lastInputTokens: null, lastCachedInputTokens: null, lastOutputTokens: null,
   lastPeakTurnContextTokens: null, lastOutputTokensPerSecond: null,
   lastNativeToolCalls: 0, lastNativeToolNames: [], lastRzMcpTools: [],
+  lastToolSchemaBytesIgnored: 0, lastToolSchemaBytesForwarded: 0,
   lastWorkingDirectory: null, lastTaskId: null, lastTaskName: null, lastTaskHash: null,
   lastTaskIntent: null, lastTaskDeliveryMode: null, lastTaskPartTypes: [],
   lastTaskPartLengths: [], lastCompleteTaskDelivered: false,
-  actualByConfiguredRoute: { auto: null, "devin-free": null },
+  actualByConfiguredRoute: { auto: null, ollama: null, "devin-free": null },
 };
 
 const terminalCapacity = { active: 0, waiters: [] };
@@ -492,11 +529,17 @@ function promptFrom(body) {
     ? "auto"
     : modelAlias === DEVIN_FREE_MODEL_ALIAS
       ? "devin-free"
-      : null;
+      : modelAlias === OLLAMA_MODEL_ALIAS
+        ? "ollama"
+        : null;
   if (!requestedRoute) throw new BridgeError(`Unknown managed model alias ${json(modelAlias)}`);
   const effort = body.reasoning?.effort;
-  if (effort !== undefined && effort !== REQUIRED_EFFORT && !LEGACY_REQUEST_EFFORTS.has(effort)) {
-    throw new BridgeError(`Devin subagents require centrally configured effort ${REQUIRED_EFFORT}`);
+  const effortAccepted = requestedRoute === "ollama"
+    ? effort === undefined || effort === OLLAMA_REQUIRED_EFFORT
+    : effort === undefined || effort === REQUIRED_EFFORT || LEGACY_REQUEST_EFFORTS.has(effort);
+  if (!effortAccepted) {
+    const requiredEffort = requestedRoute === "ollama" ? OLLAMA_REQUIRED_EFFORT : REQUIRED_EFFORT;
+    throw new BridgeError(`Managed subagents require centrally configured effort ${requiredEffort}`);
   }
   const input = typeof body.input === "string" ? [{ type: "message", role: "user", content: body.input }] : body.input;
   if (!Array.isArray(input)) throw new BridgeError("input must be a string or array");
@@ -513,7 +556,7 @@ function promptFrom(body) {
     ? body.client_metadata.thread_id
     : null;
   const sections = [
-    `[Native Devin delegation contract]\nRzCodex request ID: ${requestId}\nWork directly in the supplied workspace as the bounded native sub-agent. Use local Devin tools for files and commands. Do not spawn Devin subagents. For Unreal/RzMCP work, use only MCP server rzcodex-lazy: list that server's two proxy tools, call search_rzmcp_tools with an exact or focused query, then call only a discovered tool through call_rzmcp_tool. Never use or request the full RzMCP catalog. Return concise evidence as soon as the bounded task is complete or genuinely blocked.\nAuthoritative workspace: ${workingDirectory}`,
+    `[Native delegated coding contract]\nRzCodex request ID: ${requestId}\nWork directly in the supplied workspace as the bounded native sub-agent. Use the file and command tools available in this turn. Do not spawn provider-side subagents. For Unreal/RzMCP work, use only the lazy RzMCP proxy surface: search with an exact or focused query, then call only a discovered tool. Never use or request the full RzMCP catalog. Return concise evidence as soon as the bounded task is complete or genuinely blocked.\nAuthoritative workspace: ${workingDirectory}`,
   ];
   const roleInstructions = roleInstructionsFrom(body.instructions);
   if (roleInstructions) sections.push(`[Role instructions]\n${roleInstructions}`);
@@ -531,11 +574,22 @@ function promptFrom(body) {
       if (message.newTask && !message.checkpoint) continue;
       history.push({ index, checkpoint: message.checkpoint, text: `[Inter-agent message ${message.author} -> ${message.recipient}]\n${message.text}` });
     } else if (["function_call", "custom_tool_call", "tool_search_call"].includes(item.type)) {
-      history.push({ index, checkpoint: false, text: `[Prior Codex tool request ${item.name || "tool_search"}; call_id=${item.call_id}]` });
+      const requestInput = item.arguments ?? item.input ?? item.query ?? null;
+      const requestText = requestInput === null ? "" : `\n${outputText(requestInput)}`;
+      history.push({
+        index,
+        checkpoint: false,
+        text: `[Prior Codex tool request ${item.name || "tool_search"}; call_id=${item.call_id}]${requestText}`,
+      });
     } else if (["function_call_output", "custom_tool_call_output"].includes(item.type)) {
       history.push({ index, checkpoint: false, text: `[Prior Codex tool result; call_id=${item.call_id}]\n${outputText(item.output)}` });
     } else if (item.type === "tool_search_output") {
-      history.push({ index, checkpoint: false, text: `[Prior Codex tool search result; call_id=${item.call_id}]` });
+      const searchTools = item.tools ?? item.output ?? [];
+      history.push({
+        index,
+        checkpoint: false,
+        text: `[Prior Codex tool search result; call_id=${item.call_id}]\n${outputText(searchTools)}`,
+      });
     } else if (item.type === "reasoning") {
       const summary = Array.isArray(item.summary) ? item.summary.map((part) => part?.text || "").join("") : "";
       if (summary) history.push({ index, checkpoint: false, text: `[Prior reasoning summary]\n${summary}` });
@@ -585,27 +639,41 @@ function promptFrom(body) {
   };
 }
 
-function fallbackSelection(reason) {
+function antigravitySelection(reason) {
   return {
-    key: "fallback",
-    provider: route.quotaFallbackProvider,
+    key: "antigravity",
+    provider: route.antigravityProvider,
     model: { model_uid: MODEL_ALIAS, label: "Antigravity managed chain" },
     reason,
   };
 }
 
-function chooseRoute(context, quotaState = calendarQuotaState, taskPins = quotaTaskPins) {
+function ollamaSelection(reason) {
+  return {
+    key: "ollama",
+    provider: "ollama",
+    model: { model_uid: route.ollamaModel, label: route.ollamaLabel },
+    reason,
+  };
+}
+
+function terminalSelection(reason) {
+  return {
+    key: "terminal",
+    provider: "devin",
+    model: models.terminal,
+    reason,
+  };
+}
+
+function initialSelection(context) {
+  if (context.requestedRoute === "devin-free") return terminalSelection("explicit_devin_free_route");
+  if (context.requestedRoute === "ollama") return ollamaSelection("explicit_ollama_route");
+  return antigravitySelection("auto_primary_antigravity");
+}
+
+function chooseDevinStage(context, quotaState = calendarQuotaState, taskPins = quotaTaskPins) {
   runtime.lastQuotaPinCreated = false;
-  if (context.requestedRoute === "devin-free") {
-    runtime.lastQuotaProbeSkipped = true;
-    runtime.lastQuotaSkipScope = "explicit_devin_free_route";
-    return {
-      key: "terminal",
-      provider: "devin",
-      model: models.terminal,
-      reason: "explicit_devin_free_route",
-    };
-  }
   runtime.lastQuotaProbeSkipped = taskPins.has(
     context.threadId,
     context.taskDiagnostics.taskHash,
@@ -613,7 +681,7 @@ function chooseRoute(context, quotaState = calendarQuotaState, taskPins = quotaT
   runtime.lastQuotaSkipScope = runtime.lastQuotaProbeSkipped ? "active_task" : null;
   if (runtime.lastQuotaProbeSkipped) {
     runtime.quotaProbeSkips += 1;
-    return fallbackSelection("active_task_confirmed_devin_quota_failure");
+    return ollamaSelection("active_task_confirmed_devin_quota_failure");
   }
   if (quotaState.isActive()) {
     if (quotaState.claimRecoveryProbe()) {
@@ -631,9 +699,9 @@ function chooseRoute(context, quotaState = calendarQuotaState, taskPins = quotaT
     runtime.lastQuotaSkipScope = "calendar_quota";
     runtime.quotaProbeSkips += 1;
     runtime.calendarQuotaSkips += 1;
-    return fallbackSelection("persisted_calendar_devin_quota_failure");
+    return ollamaSelection("persisted_calendar_devin_quota_failure");
   }
-  return { key: "primary", provider: "devin", model: models.primary, reason: "all_tasks_primary" };
+  return { key: "primary", provider: "devin", model: models.primary, reason: "devin_quota_available" };
 }
 
 function dimension(metadata, uid) {
@@ -654,6 +722,235 @@ function uniqueToolCalls(toolRows) {
     }
   }
   return toolCalls;
+}
+
+function ollamaWireToolName(namespace, name) {
+  const fullName = namespace
+    ? (namespace.endsWith("_") || name.startsWith("_") ? `${namespace}${name}` : `${namespace}__${name}`)
+    : name;
+  if (fullName.length <= 64) return fullName;
+  const suffix = `__${createHash("sha256").update(fullName).digest("hex").slice(0, 12)}`;
+  return `${fullName.slice(0, 64 - suffix.length)}${suffix}`;
+}
+
+function ollamaFunctionDefinition(tool, namespace, label, kind) {
+  const originalName = requireString(tool.name, `${label}.name`);
+  const providerName = ollamaWireToolName(namespace, originalName);
+  const parameters = kind === "custom"
+    ? {
+      type: "object",
+      properties: { input: { type: "string", description: "The complete free-form input for this tool." } },
+      required: ["input"],
+      additionalProperties: false,
+    }
+    : assertObject(tool.parameters ?? tool.input_schema, `${label}.parameters`);
+  return {
+    definition: {
+      type: "function",
+      name: providerName,
+      description: typeof tool.description === "string" ? tool.description : "",
+      parameters,
+      ...(tool.strict === undefined ? {} : { strict: tool.strict }),
+    },
+    entry: { namespace, originalName, providerName, kind },
+  };
+}
+
+function addOllamaTool(normalized, responseTools, tool, namespace, label) {
+  if (!tool || typeof tool !== "object" || Array.isArray(tool)) {
+    throw new BridgeError(`${label} must be an object`);
+  }
+  if (!["function", "custom"].includes(tool.type)) {
+    throw new BridgeError(`${label} has unsupported Ollama tool type ${json(tool.type)}`);
+  }
+  const converted = ollamaFunctionDefinition(
+    tool,
+    namespace,
+    label,
+    tool.type === "custom" ? "custom" : "function",
+  );
+  const previous = responseTools.get(converted.entry.providerName);
+  if (previous) {
+    throw new BridgeError(
+      `${label} collides with ${json(`${previous.namespace ?? "<top-level>"}.${previous.originalName}`)} ` +
+      `on Ollama wire name ${json(converted.entry.providerName)}`,
+    );
+  }
+  normalized.push(converted.definition);
+  responseTools.set(converted.entry.providerName, converted.entry);
+}
+
+function normalizeOllamaTools(value) {
+  if (value === undefined) {
+    return { tools: [], responseTools: new Map(), forwardedBytes: 0, hostedWebSearchReplaced: false };
+  }
+  if (!Array.isArray(value)) throw new BridgeError("tools must be an array");
+  const tools = [];
+  const responseTools = new Map();
+  let hostedWebSearchReplaced = false;
+  for (let index = 0; index < value.length; index += 1) {
+    const tool = assertObject(value[index], `tools[${index}]`);
+    if (tool.type === "web_search") {
+      hostedWebSearchReplaced = true;
+      continue;
+    }
+    if (tool.type === "tool_search") {
+      const converted = ollamaFunctionDefinition(
+        {
+          name: "tool_search",
+          description: tool.description,
+          parameters: tool.parameters,
+          strict: false,
+        },
+        null,
+        `tools[${index}]`,
+        "tool_search",
+      );
+      if (responseTools.has(converted.entry.providerName)) {
+        throw new BridgeError(`tools[${index}] collides on Ollama wire name ${json(converted.entry.providerName)}`);
+      }
+      tools.push(converted.definition);
+      responseTools.set(converted.entry.providerName, converted.entry);
+      continue;
+    }
+    if (tool.type !== "namespace") {
+      addOllamaTool(tools, responseTools, tool, null, `tools[${index}]`);
+      continue;
+    }
+    const namespace = requireString(tool.name, `tools[${index}].name`);
+    if (!Array.isArray(tool.tools)) throw new BridgeError(`tools[${index}].tools must be an array`);
+    for (let nestedIndex = 0; nestedIndex < tool.tools.length; nestedIndex += 1) {
+      addOllamaTool(
+        tools,
+        responseTools,
+        tool.tools[nestedIndex],
+        namespace,
+        `tools[${index}].tools[${nestedIndex}]`,
+      );
+    }
+  }
+  if (
+    hostedWebSearchReplaced
+    && ![...responseTools.values()].some((entry) => entry.kind === "tool_search")
+  ) {
+    throw new BridgeError("Ollama cannot replace hosted web_search because Codex deferred tool_search is absent");
+  }
+  return {
+    tools,
+    responseTools,
+    forwardedBytes: Buffer.byteLength(json(tools)),
+    hostedWebSearchReplaced,
+  };
+}
+
+function normalizeOllamaToolChoice(value, responseTools) {
+  if (value === undefined || value === null || typeof value === "string") return value;
+  const choice = structuredClone(assertObject(value, "tool_choice"));
+  if (choice.type === "custom") choice.type = "function";
+  if (choice.type !== "function") return choice;
+  const target = choice.function === undefined ? choice : assertObject(choice.function, "tool_choice.function");
+  const namespace = target.namespace ?? choice.namespace;
+  if (namespace === undefined) return choice;
+  const originalName = requireString(target.name, "tool_choice.function.name");
+  const providerName = ollamaWireToolName(requireString(namespace, "tool_choice.namespace"), originalName);
+  if (!responseTools.has(providerName)) {
+    throw new BridgeError(`tool_choice references unknown namespaced tool ${json(`${namespace}.${originalName}`)}`);
+  }
+  target.name = providerName;
+  delete target.namespace;
+  if (target !== choice) delete choice.namespace;
+  return choice;
+}
+
+function ollamaRequest(requestBody, context) {
+  const normalized = normalizeOllamaTools(requestBody.tools);
+  const toolCompatibility = normalized.hostedWebSearchReplaced
+    ? "\n\n[Ollama tool compatibility]\nThe provider-hosted web_search tool is represented by Codex deferred tool_search. For web access, call tool_search with a focused query for the required web capability, then call only the discovered tool."
+    : "";
+  const body = {
+    model: route.ollamaModel,
+    stream: true,
+    input: [{
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: `${context.prompt}${toolCompatibility}` }],
+    }],
+    reasoning: { effort: route.ollamaEffort },
+  };
+  if (typeof requestBody.instructions === "string" && requestBody.instructions) {
+    body.instructions = requestBody.instructions;
+  }
+  if (normalized.tools.length > 0) body.tools = normalized.tools;
+  const toolChoice = normalizeOllamaToolChoice(requestBody.tool_choice, normalized.responseTools);
+  if (toolChoice !== undefined) body.tool_choice = toolChoice;
+  if (typeof requestBody.parallel_tool_calls === "boolean") {
+    body.parallel_tool_calls = requestBody.parallel_tool_calls;
+  }
+  if (Number.isInteger(requestBody.max_output_tokens) && requestBody.max_output_tokens > 0) {
+    body.max_output_tokens = requestBody.max_output_tokens;
+  }
+  return {
+    body,
+    responseTools: normalized.responseTools,
+    forwardedBytes: normalized.forwardedBytes,
+    hostedWebSearchReplaced: normalized.hostedWebSearchReplaced,
+  };
+}
+
+function restoreOllamaFunctionItem(item, responseTools) {
+  if (!item || item.type !== "function_call") return item;
+  const entry = responseTools.get(item.name);
+  if (!entry) return item;
+  const restored = { ...item, name: entry.originalName };
+  if (entry.namespace) restored.namespace = entry.namespace;
+  else delete restored.namespace;
+  if (entry.kind === "tool_search") {
+    let argumentsObject;
+    try {
+      argumentsObject = typeof item.arguments === "string" ? JSON.parse(item.arguments) : item.arguments;
+    } catch (error) {
+      throw new BridgeError(`Ollama returned invalid tool_search arguments: ${error.message}`, 502);
+    }
+    if (!argumentsObject || typeof argumentsObject !== "object" || Array.isArray(argumentsObject)) {
+      throw new BridgeError("Ollama returned tool_search without object arguments", 502);
+    }
+    restored.type = "tool_search_call";
+    restored.execution = "client";
+    restored.arguments = argumentsObject;
+    delete restored.name;
+    return restored;
+  }
+  if (entry.kind !== "custom") return restored;
+  let argumentsObject;
+  try {
+    argumentsObject = typeof item.arguments === "string" ? JSON.parse(item.arguments) : item.arguments;
+  } catch (error) {
+    throw new BridgeError(`Ollama returned invalid JSON for custom tool ${json(entry.originalName)}: ${error.message}`, 502);
+  }
+  if (!argumentsObject || typeof argumentsObject !== "object" || Array.isArray(argumentsObject) || typeof argumentsObject.input !== "string") {
+    throw new BridgeError(`Ollama returned custom tool ${json(entry.originalName)} without a string input`, 502);
+  }
+  restored.type = "custom_tool_call";
+  restored.input = argumentsObject.input;
+  delete restored.arguments;
+  return restored;
+}
+
+function validateOllamaCompletion(completion, responseTools) {
+  assertObject(completion, "Ollama completed response");
+  if (completion.status !== "completed") {
+    throw new BridgeError(`Ollama returned response status ${json(completion.status)}`, 502);
+  }
+  if (!route.ollamaResponseModels.includes(completion.model)) {
+    throw new BridgeError(`Ollama initialized unexpected model ${json(completion.model)}`, 502);
+  }
+  if (completion.reasoning?.effort !== undefined && completion.reasoning.effort !== route.ollamaEffort) {
+    throw new BridgeError(`Ollama returned reasoning effort ${json(completion.reasoning.effort)}`, 502);
+  }
+  if (!Array.isArray(completion.output) || completion.output.length === 0) {
+    throw new BridgeError("Ollama completed without output items", 502);
+  }
+  return { ...completion, output: completion.output.map((item) => restoreOllamaFunctionItem(item, responseTools)) };
 }
 
 function inspectSession(requestId) {
@@ -834,7 +1131,7 @@ async function runCliWithResourceRetries(context, selectedModel, onSpawn, onProg
   }
 }
 
-function fallbackResult(completion, reason) {
+function responsesResult(completion, selected, fallbackState, transport) {
   const usage = completion.usage || {};
   const inputTokens = Number(usage.input_tokens || 0);
   const cachedTokens = Number(usage.input_tokens_details?.cached_tokens || 0);
@@ -854,17 +1151,11 @@ function fallbackResult(completion, reason) {
   return {
     output: providerOutput,
     providerMetadata,
-    selected: {
-      ...fallbackSelection(reason),
-      model: {
-        model_uid: providerMetadata.actual_model,
-        label: providerMetadata.actual_model_label || providerMetadata.actual_model,
-      },
-    },
-    quotaFallback: true,
-    terminalFallback: false,
-    fallbackReason: "confirmed_devin_quota_failure",
-    fallbackFailure: null,
+    selected,
+    quotaFallback: fallbackState.quotaFallback,
+    terminalFallback: fallbackState.terminalFallback,
+    fallbackReason: fallbackState.fallbackReason,
+    fallbackFailure: fallbackState.fallbackFailure,
     creditCost: 0,
     acuCost: 0,
     inputTokens,
@@ -876,6 +1167,8 @@ function fallbackResult(completion, reason) {
     rzMcpTools: Array.isArray(providerMetadata.rzmcp_tools_called)
       ? providerMetadata.rzmcp_tools_called.filter((name) => typeof name === "string")
       : [],
+    toolSchemaBytesIgnored: transport.ignoredBytes,
+    toolSchemaBytesForwarded: transport.forwardedBytes,
   };
 }
 
@@ -922,6 +1215,8 @@ function finalizeDevinResult(selected, routeResult, fallbackState) {
       creditCost, acuCost,
       inputTokens, cachedTokens, outputTokens, peakTurnContextTokens, outputTokensPerSecond,
       toolCalls, nativeToolNames: toolCalls.map((call) => call.name), rzMcpTools,
+      toolSchemaBytesIgnored: fallbackState.toolSchemaBytesIgnored,
+      toolSchemaBytesForwarded: 0,
     };
   } catch (error) {
     throw preserveProviderCommit(error, session);
@@ -930,146 +1225,231 @@ function finalizeDevinResult(selected, routeResult, fallbackState) {
   }
 }
 
-async function executeProviderFallback(
-  context,
-  requestBody,
-  initialRoute,
-  onSpawn,
-  onProgress,
-  signal,
-  fallbackRelay,
-) {
-  let selected = initialRoute;
-  let routeResult;
-  runtime.fallbackAttempts += 1;
-  const fallback = await runProviderFallbackChain({
-    signal,
-    runFallback: async () => {
-      try {
-        const forwardedBody = fallbackForwardBody(requestBody, MODEL_ALIAS, FALLBACK_REQUIRED_EFFORT);
-        const completion = await runResponsesBridge({
-          endpoint: FALLBACK_BRIDGE_ENDPOINT,
-          body: forwardedBody,
-          signal,
-          onEvent: fallbackRelay.accept,
-        });
-        validateOAuthFallbackCompletion(completion, {
-          provider: route.quotaFallbackProvider,
-          models: route.fallbackModels,
-          authSource: FALLBACK_REQUIRED_AUTH_SOURCE,
-        });
-        return fallbackResult(completion, selected.reason);
-      } catch (error) {
-        if (fallbackRelay.committed) error.routeCommitted = true;
-        throw error;
-      }
-    },
-    runTerminal: async (fallbackError) => {
-      runtime.terminalFallbacks += 1;
-      selected = {
-        key: "terminal",
-        provider: "devin",
-        model: models.terminal,
-        reason: "antigravity_unavailable_after_devin_quota",
-      };
-      onProgress?.(`Antigravity became unavailable; switched to Devin ${selected.model.label}.\n`);
-      routeResult = await withRouteCapacity(selected, signal, () =>
-        runCliWithResourceRetries(
-          context,
-          selected.model,
-          onSpawn,
-          ({ index, name }) => onProgress?.(`Devin native tool ${index}: ${progressToolName(name)}.\n`),
-          signal,
-          Date.now() + REQUEST_TIMEOUT_MS,
-        ));
-      return finalizeDevinResult(selected, routeResult, {
-        quotaFallback: true,
-        terminalFallback: true,
-        fallbackReason: "antigravity_unavailable_after_confirmed_devin_quota_failure",
-        fallbackFailure: sanitizedProviderFailure(fallbackError),
-      });
-    },
-    onFallbackFailure: (error) => {
-      runtime.fallbackFailed += 1;
-      runtime.lastFallbackError = sanitizedProviderFailure(error);
-    },
-  });
-  if (fallback.stage === "fallback") {
-    runtime.fallbackCompleted += 1;
-    runtime.lastFallbackError = null;
-    return fallback.value;
-  }
-  return fallback.value;
+function fallbackState(context, failures, terminalFallback = false) {
+  const fallbackReason = failures.length > 0
+    ? failures.map((failure) => failure.stage).join("_then_")
+    : null;
+  const fallbackFailure = failures.length > 0
+    ? failures.map((failure) => `${failure.stage}: ${sanitizedProviderFailure(failure.error)}`).join(" | ").slice(0, 2_000)
+    : null;
+  return {
+    quotaFallback: failures.length > 0,
+    terminalFallback,
+    fallbackReason,
+    fallbackFailure,
+    toolSchemaBytesIgnored: context.toolSchemaBytes,
+  };
 }
 
-async function execute(context, requestBody, initialRoute, onSpawn, onProgress, signal, fallbackRelay) {
-  if (initialRoute.key === "fallback") {
-    onProgress?.("Native route selected Antigravity because the Devin quota is currently unavailable.\n");
-    return executeProviderFallback(
-      context,
-      requestBody,
-      initialRoute,
-      onSpawn,
-      onProgress,
+async function runAntigravityStage(context, requestBody, failures, onProgress, signal, streamRelay) {
+  runtime.providerAttempts.antigravity += 1;
+  runtime.lastProviderSequence.push("antigravity");
+  onProgress?.("Automatic route started Antigravity Claude/Gemini pool selection.\n");
+  try {
+    const forwardedBody = fallbackForwardBody(requestBody, MODEL_ALIAS, ANTIGRAVITY_REQUIRED_EFFORT);
+    const completion = await runResponsesBridge({
+      endpoint: ANTIGRAVITY_BRIDGE_ENDPOINT,
+      body: forwardedBody,
       signal,
-      fallbackRelay,
-    );
+      onEvent: streamRelay.accept,
+    });
+    validateOAuthFallbackCompletion(completion, {
+      provider: route.antigravityProvider,
+      models: route.antigravityModels,
+      authSource: ANTIGRAVITY_REQUIRED_AUTH_SOURCE,
+    });
+    const providerMetadata = completion.metadata || {};
+    const selected = {
+      ...antigravitySelection("auto_primary_antigravity"),
+      model: {
+        model_uid: providerMetadata.actual_model,
+        label: providerMetadata.actual_model_label || providerMetadata.actual_model,
+      },
+    };
+    return {
+      ...responsesResult(
+        completion,
+        selected,
+        fallbackState(context, failures),
+        { ignoredBytes: context.toolSchemaBytes, forwardedBytes: 0 },
+      ),
+      streamRelay,
+    };
+  } catch (error) {
+    if (streamRelay.committed) error.routeCommitted = true;
+    throw error;
   }
+}
 
-  onProgress?.(`Devin native worker started with ${initialRoute.model.label}.\n`);
-  const routeResult = await withRouteCapacity(initialRoute, signal, () =>
+async function runOllamaStage(context, requestBody, failures, onProgress, signal, streamRelay) {
+  runtime.providerAttempts.ollama += 1;
+  runtime.lastProviderSequence.push("ollama");
+  onProgress?.("Native route started the locally authenticated Ollama cloud model.\n");
+  const translated = ollamaRequest(requestBody, context);
+  try {
+    const rawCompletion = await runResponsesBridge({
+      endpoint: OLLAMA_RESPONSES_ENDPOINT,
+      body: translated.body,
+      signal,
+      onEvent: streamRelay.accept,
+    });
+    const completion = validateOllamaCompletion(rawCompletion, translated.responseTools);
+    const lazyProxyTools = [...translated.responseTools.values()]
+      .filter((entry) => ["search_rzmcp_tools", "call_rzmcp_tool"].includes(entry.originalName))
+      .length;
+    const deferredToolSearchForwarded = [...translated.responseTools.values()]
+      .some((entry) => entry.kind === "tool_search");
+    completion.metadata = {
+      ...(completion.metadata || {}),
+      actual_provider: "ollama",
+      actual_model: route.ollamaModel,
+      actual_model_label: route.ollamaLabel,
+      actual_reasoning_effort: route.ollamaEffort,
+      auth_source: OLLAMA_AUTH_SOURCE,
+      codex_tool_schema_bytes_forwarded: translated.forwardedBytes,
+      codex_tool_schema_bytes_ignored: 0,
+      lazy_rzmcp_proxy_tools: lazyProxyTools,
+      deferred_tool_search_forwarded: deferredToolSearchForwarded,
+      hosted_web_search_replaced_by_deferred_tool_search: translated.hostedWebSearchReplaced,
+    };
+    return {
+      ...responsesResult(
+        completion,
+        ollamaSelection(failures.length > 0 ? "auto_ollama_after_prior_provider_failure" : "explicit_ollama_route"),
+        fallbackState(context, failures),
+        { ignoredBytes: 0, forwardedBytes: translated.forwardedBytes },
+      ),
+      streamRelay,
+    };
+  } catch (error) {
+    if (streamRelay.committed) error.routeCommitted = true;
+    throw error;
+  }
+}
+
+async function runDevinStage(context, selected, failures, onSpawn, onProgress, signal, terminalFallback) {
+  const freeModel = selected.key === "terminal";
+  const providerKey = freeModel ? "devinFree" : "devin";
+  runtime.providerAttempts[providerKey] += 1;
+  runtime.lastProviderSequence.push(terminalFallback ? "devin-free" : "devin");
+  onProgress?.(`Devin native worker started with ${selected.model.label}.\n`);
+  const routeResult = await withRouteCapacity(selected, signal, () =>
     runCliWithResourceRetries(
       context,
-      initialRoute.model,
+      selected.model,
       onSpawn,
       ({ index, name }) => onProgress?.(`Devin native tool ${index}: ${progressToolName(name)}.\n`),
       signal,
       Date.now() + REQUEST_TIMEOUT_MS,
     ));
-  if (initialRoute.key === "terminal") {
-    return finalizeDevinResult(initialRoute, routeResult, {
-      quotaFallback: false,
-      terminalFallback: false,
-      fallbackReason: null,
-      fallbackFailure: null,
-    });
-  }
-  if (!isQuotaFailure(routeResult.cliResult)) {
-    if (!cliFailed(routeResult.cliResult) && calendarQuotaState.clear()) {
-      runtime.calendarQuotaClears += 1;
+  if (!freeModel && isQuotaFailure(routeResult.cliResult)) {
+    if (routeResult.session?.toolCalls?.some((call) => call?.name)) {
+      const error = preserveProviderCommit(
+        new BridgeError("Devin quota ended after executing native tools; the turn was not replayed", 502),
+        routeResult.session,
+      );
+      removeSession(routeResult.session.id);
+      throw error;
     }
-    return finalizeDevinResult(initialRoute, routeResult, {
-      quotaFallback: false,
-      terminalFallback: false,
-      fallbackReason: null,
-      fallbackFailure: null,
-    });
-  }
-
-  if (routeResult.session?.toolCalls?.some((call) => call?.name)) {
-    const error = preserveProviderCommit(
-      new BridgeError("Devin quota ended after executing native tools; provider fallback was not started", 502),
-      routeResult.session,
+    if (routeResult.session) removeSession(routeResult.session.id);
+    if (calendarQuotaState.record(routeResult.cliResult)) runtime.calendarQuotaActivations += 1;
+    runtime.lastQuotaPinCreated = quotaTaskPins.pin(
+      context.threadId,
+      context.taskDiagnostics.taskHash,
     );
-    removeSession(routeResult.session.id);
+    const error = new BridgeError("Devin paid quota is unavailable before native work", 503);
+    error.quotaFailure = true;
     throw error;
   }
-  if (routeResult.session) removeSession(routeResult.session.id);
-  if (calendarQuotaState.record(routeResult.cliResult)) runtime.calendarQuotaActivations += 1;
-  runtime.lastQuotaPinCreated = quotaTaskPins.pin(
-    context.threadId,
-    context.taskDiagnostics.taskHash,
+  if (!freeModel && !cliFailed(routeResult.cliResult) && calendarQuotaState.clear()) {
+    runtime.calendarQuotaClears += 1;
+  }
+  return finalizeDevinResult(
+    selected,
+    routeResult,
+    fallbackState(context, failures, terminalFallback),
   );
-  onProgress?.("Devin quota reached before native work; switched to Antigravity.\n");
-  return executeProviderFallback(
-    context,
-    requestBody,
-    fallbackSelection("devin_quota_antigravity_available"),
-    onSpawn,
-    onProgress,
+}
+
+async function executeAuto(context, requestBody, onSpawn, onProgress, signal, createStreamRelay) {
+  runtime.lastProviderSequence = [];
+  const chain = await runOrderedProviderChain({
     signal,
-    fallbackRelay,
-  );
+    stages: [
+      {
+        name: "antigravity",
+        run: ({ failures }) => runAntigravityStage(
+          context,
+          requestBody,
+          failures,
+          onProgress,
+          signal,
+          createStreamRelay(),
+        ),
+      },
+      {
+        name: "devin",
+        run: async ({ failures }) => {
+          const selected = chooseDevinStage(context);
+          if (selected.key !== "primary") {
+            const error = new BridgeError(`Devin paid route skipped: ${selected.reason}`, 503);
+            error.routeSkipped = true;
+            throw error;
+          }
+          return runDevinStage(context, selected, failures, onSpawn, onProgress, signal, false);
+        },
+      },
+      {
+        name: "ollama",
+        run: ({ failures }) => runOllamaStage(
+          context,
+          requestBody,
+          failures,
+          onProgress,
+          signal,
+          createStreamRelay({ forwardReasoningSummaries: true, providerLabel: "Ollama" }),
+        ),
+      },
+      {
+        name: "devin-free",
+        run: ({ failures }) => {
+          runtime.terminalFallbacks += 1;
+          const selected = terminalSelection("auto_terminal_devin_free");
+          return runDevinStage(context, selected, failures, onSpawn, onProgress, signal, true);
+        },
+      },
+    ],
+    onStageFailure: (stage, error) => {
+      runtime.providerFailures[stage] += 1;
+      runtime.fallbackFailed += 1;
+      runtime.lastFallbackError = `${stage}: ${sanitizedProviderFailure(error)}`;
+      if (!error.routeSkipped) onProgress?.(`${stage} was unavailable before committed work; trying the next configured provider.\n`);
+    },
+  });
+  if (chain.stage !== "antigravity") runtime.fallbackCompleted += 1;
+  runtime.lastFallbackError = chain.failures.length > 0
+    ? chain.failures.map((failure) => `${failure.stage}: ${sanitizedProviderFailure(failure.error)}`).join(" | ").slice(0, 2_000)
+    : null;
+  return chain.value;
+}
+
+async function execute(context, requestBody, initialRoute, onSpawn, onProgress, signal, createStreamRelay) {
+  runtime.lastProviderSequence = [];
+  if (initialRoute.key === "terminal") {
+    return runDevinStage(context, initialRoute, [], onSpawn, onProgress, signal, false);
+  }
+  if (initialRoute.key === "ollama") {
+    return runOllamaStage(
+      context,
+      requestBody,
+      [],
+      onProgress,
+      signal,
+      createStreamRelay({ forwardReasoningSummaries: true, providerLabel: "Ollama" }),
+    );
+  }
+  runtime.fallbackAttempts += 1;
+  return executeAuto(context, requestBody, onSpawn, onProgress, signal, createStreamRelay);
 }
 
 function usageFrom(result) {
@@ -1202,10 +1582,18 @@ function createProgressEmitter(response) {
   return { emit, finish, get added() { return added; } };
 }
 
-function createFallbackStreamRelay(response, responseId, modelAlias = MODEL_ALIAS, progress = null) {
+function createProviderStreamRelay(
+  response,
+  responseId,
+  modelAlias = MODEL_ALIAS,
+  progress = null,
+  { forwardReasoningSummaries = false, providerLabel = "Provider" } = {},
+) {
   const pendingMessages = new Map();
   const streamedMessageIds = new Set();
   const providerProgressIds = new Set();
+  const forwardedReasoningIds = new Set();
+  const announcedToolIds = new Set();
   let committed = false;
   const accept = async (event) => {
     const payload = event.payload || {};
@@ -1223,8 +1611,26 @@ function createFallbackStreamRelay(response, responseId, modelAlias = MODEL_ALIA
       return;
     }
     if (
+      forwardReasoningSummaries
+      && event.type === "response.output_item.added"
+      && payload.item?.type === "reasoning"
+      && typeof payload.item.id === "string"
+    ) {
+      forwardedReasoningIds.add(payload.item.id);
+      return;
+    }
+    if (
       event.type === "response.reasoning_summary_text.delta"
       && providerProgressIds.has(payload.item_id)
+      && typeof payload.delta === "string"
+      && payload.delta
+    ) {
+      progress?.emit(payload.delta);
+      return;
+    }
+    if (
+      event.type === "response.reasoning_summary_text.delta"
+      && forwardedReasoningIds.has(payload.item_id)
       && typeof payload.delta === "string"
       && payload.delta
     ) {
@@ -1234,6 +1640,21 @@ function createFallbackStreamRelay(response, responseId, modelAlias = MODEL_ALIA
     if (event.type === "response.output_item.added" && payload.item?.type === "message") {
       const itemId = requireString(payload.item.id, "fallback streamed message id");
       pendingMessages.set(itemId, { added: payload, part: null });
+      return;
+    }
+    if (
+      ["response.output_item.added", "response.output_item.done"].includes(event.type)
+      && ["function_call", "custom_tool_call", "tool_search_call"].includes(payload.item?.type)
+    ) {
+      committed = true;
+      const toolName = payload.item?.type === "tool_search_call"
+        ? "tool_search"
+        : progressToolName(payload.item?.name);
+      const toolId = payload.item?.id || payload.item?.call_id || `${payload.output_index}:${toolName}`;
+      if (!announcedToolIds.has(toolId)) {
+        announcedToolIds.add(toolId);
+        progress?.emit(`${providerLabel} requested native tool ${toolName}.\n`);
+      }
       return;
     }
     if (event.type === "response.content_part.added") {
@@ -1279,8 +1700,8 @@ async function handleResponses(request, response) {
   runtime.lastTaskPartTypes = context.taskDiagnostics.taskPartTypes;
   runtime.lastTaskPartLengths = context.taskDiagnostics.taskPartLengths;
   runtime.lastCompleteTaskDelivered = context.taskDiagnostics.completeTaskDelivered;
-  const selected = chooseRoute(context);
-  runtime.lastConfiguredRoute = selected.key;
+  const selected = initialSelection(context);
+  runtime.lastConfiguredRoute = context.requestedRoute;
   runtime.lastFallbackStreamCommitted = false;
   runtime.lastFallbackStreamedMessageCount = 0;
   let child = null;
@@ -1297,7 +1718,8 @@ async function handleResponses(request, response) {
   const responseId = `resp_${randomUUID()}`;
   writeSse(response, "response.created", { response: { id: responseId, object: "response", model: context.modelAlias, status: "in_progress" } });
   const progress = createProgressEmitter(response);
-  const fallbackRelay = createFallbackStreamRelay(response, responseId, context.modelAlias, progress);
+  const createStreamRelay = (options) =>
+    createProviderStreamRelay(response, responseId, context.modelAlias, progress, options);
   const heartbeat = setInterval(() => writeSseHeartbeat(response, responseId, context.modelAlias), SSE_HEARTBEAT_MS);
   heartbeat.unref();
   try {
@@ -1308,16 +1730,17 @@ async function handleResponses(request, response) {
       (spawned) => { child = spawned; },
       progress.emit,
       abortController.signal,
-      fallbackRelay,
+      createStreamRelay,
     );
     if (quotaTaskPins.releaseAfterFinalResponse(
       context.threadId,
       context.taskDiagnostics.taskHash,
       result.toolCalls.length,
     )) runtime.quotaPinsReleased += 1;
-    runtime.lastFallbackStreamCommitted = fallbackRelay.committed;
-    runtime.lastFallbackStreamedMessageCount = fallbackRelay.streamedMessageIds.size;
-    if (fallbackRelay.committed) runtime.fallbackStreamCommits += 1;
+    const streamRelay = result.streamRelay || { committed: false, streamedMessageIds: new Set() };
+    runtime.lastFallbackStreamCommitted = streamRelay.committed;
+    runtime.lastFallbackStreamedMessageCount = streamRelay.streamedMessageIds.size;
+    if (streamRelay.committed) runtime.fallbackStreamCommits += 1;
     runtime.completed += 1;
     runtime.lastActualProvider = result.selected.provider;
     runtime.lastActualModel = result.selected.model.model_uid;
@@ -1342,11 +1765,13 @@ async function handleResponses(request, response) {
     runtime.lastNativeToolCalls = result.nativeToolNames.length;
     runtime.lastNativeToolNames = [...new Set(result.nativeToolNames)];
     runtime.lastRzMcpTools = [...new Set(result.rzMcpTools)];
+    runtime.lastToolSchemaBytesIgnored = result.toolSchemaBytesIgnored;
+    runtime.lastToolSchemaBytesForwarded = result.toolSchemaBytesForwarded;
     const progressItem = progress.finish();
     const output = emitOutputItems(
       response,
       result,
-      fallbackRelay.streamedMessageIds,
+      streamRelay.streamedMessageIds,
       progressItem ? [progressItem] : [],
     );
     writeSse(response, "response.completed", { response: {
@@ -1363,8 +1788,9 @@ async function handleResponses(request, response) {
         peak_turn_context_tokens: result.peakTurnContextTokens, output_tokens_per_second: result.outputTokensPerSecond,
         native_tool_calls: result.nativeToolNames.length, native_tool_names: runtime.lastNativeToolNames,
         rzmcp_tools_called: runtime.lastRzMcpTools,
-        codex_tool_schema_bytes_ignored: context.toolSchemaBytes,
-        codex_tool_schema_bytes_forwarded: 0,
+        codex_tool_schema_bytes_original: context.toolSchemaBytes,
+        codex_tool_schema_bytes_ignored: result.toolSchemaBytesIgnored,
+        codex_tool_schema_bytes_forwarded: result.toolSchemaBytesForwarded,
         active_task_id: context.taskDiagnostics.taskId, active_task_hash: context.taskDiagnostics.taskHash,
         active_task_delivery_mode: context.taskDiagnostics.taskDeliveryMode,
         complete_active_task_delivered: context.taskDiagnostics.completeTaskDelivered,
@@ -1387,12 +1813,13 @@ function managedModelsResponse() {
   const managedContextWindow = Math.min(
     models.primary.max_context_tokens,
     models.terminal.max_context_tokens,
-    FALLBACK_CONTEXT_WINDOW,
+    ANTIGRAVITY_CONTEXT_WINDOW,
+    OLLAMA_CONTEXT_WINDOW,
   );
-  const modelDefinition = (slug, displayName, description, contextWindow) => ({
+  const modelDefinition = (slug, displayName, description, contextWindow, effort) => ({
     slug, display_name: displayName, description,
     base_instructions: "You are a bounded delegated coding sub-agent. Use local tools and return concise evidence.",
-    default_reasoning_level: REQUIRED_EFFORT, supported_reasoning_levels: [{ effort: REQUIRED_EFFORT, description: "Maximum" }],
+    default_reasoning_level: effort, supported_reasoning_levels: [{ effort, description: "Maximum configured effort" }],
     shell_type: "unified_exec", visibility: "none", supported_in_api: true, priority: 0, availability_nux: null,
     upgrade: null, include_skills_usage_instructions: false, include_plugin_usage_instructions: false,
     include_apps_usage_instructions: false, supports_reasoning_summary_parameter: false, default_reasoning_summary: "none",
@@ -1409,12 +1836,21 @@ function managedModelsResponse() {
       "Managed native subagent",
       "Centrally routed native subagent",
       managedContextWindow,
+      REQUIRED_EFFORT,
     ),
     modelDefinition(
       DEVIN_FREE_MODEL_ALIAS,
       "Devin free native subagent",
       `Direct ${models.terminal.label} native subagent`,
       models.terminal.max_context_tokens,
+      REQUIRED_EFFORT,
+    ),
+    modelDefinition(
+      OLLAMA_MODEL_ALIAS,
+      `Ollama ${route.ollamaLabel}`,
+      "Direct local Ollama Responses route using the signed-in Ollama session",
+      OLLAMA_CONTEXT_WINDOW,
+      OLLAMA_REQUIRED_EFFORT,
     ),
   ] };
 }
@@ -1422,26 +1858,50 @@ function managedModelsResponse() {
 function health(requestedRoute = "auto") {
   const defaultActual = requestedRoute === "devin-free"
     ? { provider: "devin", model: models.terminal.model_uid, label: models.terminal.label }
-    : calendarQuotaState.isActive()
-      ? { provider: route.quotaFallbackProvider, model: route.fallbackModels[0], label: route.fallbackModels[0] }
-      : { provider: "devin", model: models.primary.model_uid, label: models.primary.label };
+    : requestedRoute === "ollama"
+      ? { provider: "ollama", model: route.ollamaModel, label: route.ollamaLabel }
+      : { provider: route.antigravityProvider, model: route.antigravityModels[0], label: route.antigravityModels[0] };
   const routeActual = runtime.actualByConfiguredRoute[requestedRoute] || defaultActual;
   return {
     ok: true, provider: PROVIDER_ID, port, modelAlias: MODEL_ALIAS,
-    modelAliases: { auto: MODEL_ALIAS, devinFree: DEVIN_FREE_MODEL_ALIAS }, effort: REQUIRED_EFFORT,
+    modelAliases: { auto: MODEL_ALIAS, devinFree: DEVIN_FREE_MODEL_ALIAS, ollama: OLLAMA_MODEL_ALIAS },
+    effort: requestedRoute === "ollama" ? OLLAMA_REQUIRED_EFFORT : REQUIRED_EFFORT,
     lastActualProvider: routeActual.provider,
     lastActualModel: routeActual.model,
     lastActualModelLabel: routeActual.label,
-    auth, inputModalities: route.inputModalities,
+    auth: requestedRoute === "ollama"
+      ? { source: OLLAMA_AUTH_SOURCE, apiKeyRequired: false }
+      : auth,
+    providerAuth: {
+      antigravity: ANTIGRAVITY_REQUIRED_AUTH_SOURCE,
+      devin: auth.source,
+      ollama: OLLAMA_AUTH_SOURCE,
+    },
+    inputModalities: route.inputModalities,
     routing: {
-      primary: { uid: models.primary.model_uid, label: models.primary.label, cost: models.primary.cost_summary || models.primary.cost_tier },
-      quotaFallback: {
-        provider: route.quotaFallbackProvider,
-        uids: route.fallbackModels,
-        effort: FALLBACK_REQUIRED_EFFORT,
-        authSource: FALLBACK_REQUIRED_AUTH_SOURCE,
+      antigravity: {
+        provider: route.antigravityProvider,
+        uids: route.antigravityModels,
+        effort: ANTIGRAVITY_REQUIRED_EFFORT,
+        authSource: ANTIGRAVITY_REQUIRED_AUTH_SOURCE,
         explicitCostRequiredUsd: 0,
-        endpoint: FALLBACK_BRIDGE_ENDPOINT,
+        endpoint: ANTIGRAVITY_BRIDGE_ENDPOINT,
+      },
+      devin: {
+        provider: "devin",
+        uid: models.primary.model_uid,
+        label: models.primary.label,
+        cost: models.primary.cost_summary || models.primary.cost_tier,
+      },
+      ollama: {
+        provider: "ollama",
+        uid: route.ollamaModel,
+        label: route.ollamaLabel,
+        acceptedResponseModels: route.ollamaResponseModels,
+        effort: route.ollamaEffort,
+        authSource: OLLAMA_AUTH_SOURCE,
+        endpoint: OLLAMA_RESPONSES_ENDPOINT,
+        toolServing: "Codex deferred tool_search with on-demand namespaced tool forwarding",
       },
       terminalFallback: {
         provider: "devin",
@@ -1449,10 +1909,12 @@ function health(requestedRoute = "auto") {
         label: models.terminal.label,
         cost: models.terminal.cost_summary || models.terminal.cost_tier,
       },
-      orderedPolicy: "devin_primary_then_antigravity_on_quota_then_devin_free_on_antigravity_failure",
+      orderedPolicy: "antigravity_primary_then_antigravity_quota_fallback_then_devin_primary_then_ollama_then_devin_free",
+      configuredProviderOrder: route.autoProviderOrder,
       quotaDetection: "explicit_daily_or_weekly_quota_failure_with_single_bounded_recovery_probe_every_30_minutes",
     },
-    apiKeysStripped: true, isolatedConfigImports: ["agents_standard"], lazyRzMcpProxyTools: 2,
+    apiKeysStripped: true, ollamaApiKeyRequired: false,
+    isolatedConfigImports: ["agents_standard"], lazyRzMcpProxyTools: 2,
     rawPromptFilesRetained: false, ephemeralSessionsRemoved: true,
     activeThreadTurns: activeThreadTurns.size, pinnedQuotaTasks: quotaTaskPins.size,
     calendarQuotaState: calendarQuotaState.snapshot(), runtime,
@@ -1470,7 +1932,7 @@ async function selfTest() {
   const selfTestQuotaState = new CalendarQuotaState(null, () => fixedQuotaNow);
   const selfTestTaskPins = new ActiveTaskRoutePins();
   const selfTestRouteContext = { threadId: "thread-calendar", taskDiagnostics: { taskHash: "task-calendar" } };
-  if (chooseRoute(selfTestRouteContext, selfTestQuotaState, selfTestTaskPins).key !== "primary") {
+  if (chooseDevinStage(selfTestRouteContext, selfTestQuotaState, selfTestTaskPins).key !== "primary") {
     throw new Error("unified primary route failed");
   }
   const dailyQuotaFailure = { code: 1, stdout: "", stderr: "Daily usage quota reached" };
@@ -1478,7 +1940,7 @@ async function selfTest() {
   if (
     !selfTestQuotaState.record(dailyQuotaFailure)
     || selfTestQuotaState.snapshot().kind !== "daily"
-    || chooseRoute(selfTestRouteContext, selfTestQuotaState, selfTestTaskPins).key !== "fallback"
+    || chooseDevinStage(selfTestRouteContext, selfTestQuotaState, selfTestTaskPins).key !== "ollama"
     || runtime.lastQuotaSkipScope !== "calendar_quota"
   ) {
     throw new Error("daily calendar quota routing failed");
@@ -1487,11 +1949,11 @@ async function selfTest() {
   const recoveryProbeState = new CalendarQuotaState(null, () => recoveryProbeNow);
   recoveryProbeState.record(dailyQuotaFailure);
   recoveryProbeNow += QUOTA_RECOVERY_PROBE_MS;
-  const recoveryProbeRoute = chooseRoute(selfTestRouteContext, recoveryProbeState, selfTestTaskPins);
+  const recoveryProbeRoute = chooseDevinStage(selfTestRouteContext, recoveryProbeState, selfTestTaskPins);
   if (
     recoveryProbeRoute.key !== "primary"
     || recoveryProbeRoute.reason !== "calendar_quota_recovery_probe"
-    || chooseRoute(selfTestRouteContext, recoveryProbeState, selfTestTaskPins).key !== "fallback"
+    || chooseDevinStage(selfTestRouteContext, recoveryProbeState, selfTestTaskPins).key !== "ollama"
   ) {
     throw new Error("bounded calendar quota recovery probe routing failed");
   }
@@ -1520,8 +1982,11 @@ async function selfTest() {
     try { unlinkSync(`${quotaFixturePath}.${process.pid}.tmp`); } catch (error) { if (error?.code !== "ENOENT") throw error; }
   }
   if (
-    route.quotaFallbackProvider !== "antigravity"
-    || route.fallbackModels.length !== 2
+    route.antigravityProvider !== "antigravity"
+    || route.antigravityModels.length !== 2
+    || route.autoProviderOrder.join(",") !== REQUIRED_AUTO_PROVIDER_ORDER.join(",")
+    || route.ollamaEffort !== OLLAMA_REQUIRED_EFFORT
+    || !route.ollamaResponseModels.includes(route.ollamaModel)
     || !models.terminal.model_uid
   ) {
     throw new Error("ordered provider configuration failed");
@@ -1532,10 +1997,11 @@ async function selfTest() {
     OPENAI_ORG_ID: "must-not-survive",
     OPENAI_PROJECT_ID: "must-not-survive",
     CODEX_API_KEY: "must-not-survive",
+    OLLAMA_API_KEY: "must-not-survive",
     RETAINED_TEST_VALUE: "retained",
   });
-  if (["OPENAI_API_KEY", "OPENAI_ORG_ID", "OPENAI_PROJECT_ID", "CODEX_API_KEY"].some((key) => key in isolatedEnvironment)) {
-    throw new Error("OpenAI credential isolation failed");
+  if (["OPENAI_API_KEY", "OPENAI_ORG_ID", "OPENAI_PROJECT_ID", "CODEX_API_KEY", "OLLAMA_API_KEY"].some((key) => key in isolatedEnvironment)) {
+    throw new Error("provider credential isolation failed");
   }
   if (isolatedEnvironment.RETAINED_TEST_VALUE !== "retained") throw new Error("environment isolation removed unrelated values");
   if (!QUOTA_FAILURE.test("Daily usage quota reached")) throw new Error("quota detection failed");
@@ -1573,17 +2039,27 @@ async function selfTest() {
   });
   if (
     directFreeContext.requestedRoute !== "devin-free"
-    || chooseRoute(directFreeContext, selfTestQuotaState, selfTestTaskPins).key !== "terminal"
+    || initialSelection(directFreeContext).key !== "terminal"
   ) {
     throw new Error("direct Devin free route failed");
   }
+  const directOllamaContext = promptFrom({
+    stream: true,
+    model: OLLAMA_MODEL_ALIAS,
+    reasoning: { effort: OLLAMA_REQUIRED_EFFORT },
+    input: [{ type: "message", role: "user", content: "Use the direct Ollama route." }],
+  });
+  if (directOllamaContext.requestedRoute !== "ollama" || initialSelection(directOllamaContext).key !== "ollama") {
+    throw new Error("direct Ollama route failed");
+  }
   const advertisedModels = managedModelsResponse().models;
   if (
-    advertisedModels.length !== 2
+    advertisedModels.length !== 3
     || !advertisedModels.some((model) => model.slug === MODEL_ALIAS)
     || !advertisedModels.some((model) => model.slug === DEVIN_FREE_MODEL_ALIAS)
+    || !advertisedModels.some((model) => model.slug === OLLAMA_MODEL_ALIAS && model.default_reasoning_level === OLLAMA_REQUIRED_EFFORT)
   ) {
-    throw new Error("managed route aliases were not both advertised");
+    throw new Error("managed route aliases were not all advertised");
   }
   const uniqueCalls = uniqueToolCalls([
     { tool_calls: '[{"id":"call-1","name":"read"},{"id":"call-2","name":"edit"}]' },
@@ -1619,6 +2095,31 @@ async function selfTest() {
   const reversedTaskIndex = reversedPrompt.indexOf(task);
   const reversedCheckpointIndex = reversedPrompt.indexOf(checkpoint);
   if (!(reversedTaskIndex >= 0 && reversedTaskIndex < reversedCheckpointIndex)) throw new Error("checkpoint precedence failed");
+  const resumedPrompt = promptFrom({
+    stream: true,
+    model: OLLAMA_MODEL_ALIAS,
+    reasoning: { effort: OLLAMA_REQUIRED_EFFORT },
+    input: [
+      { type: "agent_message", id: "resume-task", author: "Codex", recipient: "/root/self_test", content: [{ type: "input_text", text: task }] },
+      { type: "function_call", call_id: "resume-call", name: "exec_command", arguments: json({ cmd: "rg needle file.cpp" }) },
+      { type: "function_call_output", call_id: "resume-call", output: "Exit code: 0\nOutput:\nneedle" },
+      { type: "tool_search_call", call_id: "search-call", execution: "client", arguments: { query: "RzMCP graph" } },
+      {
+        type: "tool_search_output",
+        call_id: "search-call",
+        status: "completed",
+        execution: "client",
+        tools: [{ type: "function", name: "rzmcp__inspect_graph", parameters: { type: "object" } }],
+      },
+    ],
+  }).prompt;
+  if (
+    !resumedPrompt.includes("rg needle file.cpp")
+    || !resumedPrompt.includes("Exit code: 0\nOutput:\nneedle")
+    || !resumedPrompt.includes("rzmcp__inspect_graph")
+  ) {
+    throw new Error("stateless provider resume lost tool request or result context");
+  }
   let supersededAbortCalls = 0;
   const firstTurn = { requestId: "first", abort: () => { supersededAbortCalls += 1; } };
   const secondTurn = { requestId: "second", abort: () => {} };
@@ -1639,7 +2140,7 @@ async function selfTest() {
     write: (value) => relayWrites.push(value),
   };
   const relayProgress = createProgressEmitter(relayResponse);
-  const relay = createFallbackStreamRelay(relayResponse, "resp-relay", MODEL_ALIAS, relayProgress);
+  const relay = createProviderStreamRelay(relayResponse, "resp-relay", MODEL_ALIAS, relayProgress);
   await relay.accept({
     type: "response.output_item.added",
     payload: {
@@ -1666,6 +2167,49 @@ async function selfTest() {
     || relayWrites.join("").includes("hidden provider reasoning")
   ) {
     throw new Error("fallback progress relay boundary failed");
+  }
+  const forwardedReasoningWrites = [];
+  const forwardedReasoningResponse = {
+    destroyed: false,
+    writableEnded: false,
+    write: (value) => forwardedReasoningWrites.push(value),
+  };
+  const forwardedReasoningProgress = createProgressEmitter(forwardedReasoningResponse);
+  const forwardedReasoningRelay = createProviderStreamRelay(
+    forwardedReasoningResponse,
+    "resp-reasoning-relay",
+    OLLAMA_MODEL_ALIAS,
+    forwardedReasoningProgress,
+    { forwardReasoningSummaries: true, providerLabel: "Ollama" },
+  );
+  await forwardedReasoningRelay.accept({
+    type: "response.output_item.added",
+    payload: { output_index: 0, item: { type: "reasoning", id: "rs-ollama", status: "in_progress", summary: [] } },
+  });
+  await forwardedReasoningRelay.accept({
+    type: "response.reasoning_summary_text.delta",
+    payload: { item_id: "rs-ollama", output_index: 0, summary_index: 0, delta: "inspect the target\n" },
+  });
+  if (!forwardedReasoningProgress.added || !forwardedReasoningWrites.join("").includes("inspect the target")) {
+    throw new Error("Ollama reasoning progress relay failed");
+  }
+  const streamedToolItem = {
+    type: "function_call",
+    id: "fc-progress-once",
+    call_id: "call-progress-once",
+    name: "exec_command",
+    arguments: "{}",
+  };
+  await forwardedReasoningRelay.accept({
+    type: "response.output_item.added",
+    payload: { output_index: 1, item: streamedToolItem },
+  });
+  await forwardedReasoningRelay.accept({
+    type: "response.output_item.done",
+    payload: { output_index: 1, item: streamedToolItem },
+  });
+  if (forwardedReasoningWrites.join("").split("Ollama requested native tool exec_command.").length - 1 !== 1) {
+    throw new Error("Ollama tool progress was not deduplicated");
   }
   await relay.accept({
     type: "response.output_item.added",
@@ -1700,7 +2244,13 @@ async function selfTest() {
   ) {
     throw new Error("fallback streamed output lifecycle replay failed");
   }
-  const fallbackFixture = fallbackResult({
+  const toolCommitRelay = createProviderStreamRelay(relayResponse, "resp-tool-relay", MODEL_ALIAS, relayProgress);
+  await toolCommitRelay.accept({
+    type: "response.output_item.added",
+    payload: { output_index: 0, item: { type: "function_call", id: "fc-commit", call_id: "call-commit", name: "exec_command", arguments: "{}" } },
+  });
+  if (!toolCommitRelay.committed) throw new Error("provider relay did not commit on a streamed tool call");
+  const fallbackCompletion = {
     status: "completed",
     output: [
       {
@@ -1713,10 +2263,10 @@ async function selfTest() {
     ],
     usage: { input_tokens: 100, input_tokens_details: { cached_tokens: 10 }, output_tokens: 20 },
     metadata: {
-      actual_provider: route.quotaFallbackProvider,
-      actual_model: route.fallbackModels[0],
+      actual_provider: route.antigravityProvider,
+      actual_model: route.antigravityModels[0],
       actual_model_label: "Claude Opus 4.6 (Thinking)",
-      auth_source: FALLBACK_REQUIRED_AUTH_SOURCE,
+      auth_source: ANTIGRAVITY_REQUIRED_AUTH_SOURCE,
       peak_turn_context_tokens: 110,
       output_tokens_per_second: 250,
       native_tool_names: ["exec_command"],
@@ -1724,9 +2274,23 @@ async function selfTest() {
       codex_tool_schema_bytes_forwarded: 0,
       lazy_rzmcp_proxy_tools: 2,
     },
-  });
+  };
+  const fallbackFixture = responsesResult(
+    fallbackCompletion,
+    {
+      ...antigravitySelection("fixture"),
+      model: { model_uid: route.antigravityModels[0], label: "Claude Opus 4.6 (Thinking)" },
+    },
+    {
+      quotaFallback: false,
+      terminalFallback: false,
+      fallbackReason: null,
+      fallbackFailure: null,
+    },
+    { ignoredBytes: 17_000, forwardedBytes: 0 },
+  );
   if (
-    fallbackFixture.selected.key !== "fallback"
+    fallbackFixture.selected.key !== "antigravity"
     || fallbackFixture.selected.provider !== "antigravity"
     || fallbackFixture.output.length !== 1
     || fallbackFixture.output[0]?.id !== "msg-fallback"
@@ -1736,6 +2300,97 @@ async function selfTest() {
     || fallbackFixture.outputTokensPerSecond !== 250
   ) {
     throw new Error("Antigravity result normalization failed");
+  }
+  const ollamaFixtureBody = {
+    stream: true,
+    model: OLLAMA_MODEL_ALIAS,
+    reasoning: { effort: OLLAMA_REQUIRED_EFFORT },
+    input: [
+      {
+        type: "agent_message",
+        id: "ollama-task",
+        author: "/root",
+        recipient: "/root/ollama_fixture",
+        content: [{ type: "input_text", text: task }],
+      },
+      { type: "compaction", encrypted_content: "provider-opaque" },
+    ],
+    tools: [
+      { type: "custom", name: "apply_patch", description: "Apply a patch", format: { type: "text" } },
+      {
+        type: "tool_search",
+        execution: "client",
+        description: "Search deferred tools",
+        parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] },
+      },
+      { type: "web_search", external_web_access: true },
+      {
+        type: "namespace",
+        name: "rzcodex_lazy",
+        tools: [{
+          type: "function",
+          name: "search_rzmcp_tools",
+          description: "Search lazy tools",
+          parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] },
+        }],
+      },
+    ],
+  };
+  const ollamaFixtureContext = promptFrom(ollamaFixtureBody);
+  const translatedOllamaFixture = ollamaRequest(ollamaFixtureBody, ollamaFixtureContext);
+  const translatedOllamaJson = json(translatedOllamaFixture.body);
+  if (
+    translatedOllamaFixture.body.model !== route.ollamaModel
+    || translatedOllamaFixture.body.reasoning.effort !== OLLAMA_REQUIRED_EFFORT
+    || translatedOllamaJson.includes('"agent_message"')
+    || translatedOllamaJson.includes('"compaction"')
+    || translatedOllamaFixture.body.input[0].content[0].text.split(task).length - 1 !== 1
+    || translatedOllamaFixture.body.tools.some((tool) => tool.type !== "function")
+    || translatedOllamaFixture.body.tools.some((tool) => tool.name === "web_search")
+    || translatedOllamaFixture.hostedWebSearchReplaced !== true
+    || !translatedOllamaFixture.body.input[0].content[0].text.includes("represented by Codex deferred tool_search")
+    || !translatedOllamaFixture.responseTools.has("apply_patch")
+    || !translatedOllamaFixture.responseTools.has("tool_search")
+    || !translatedOllamaFixture.responseTools.has("rzcodex_lazy__search_rzmcp_tools")
+    || translatedOllamaFixture.forwardedBytes <= 0
+  ) {
+    throw new Error("Ollama request normalization failed");
+  }
+  const restoredOllamaFixture = validateOllamaCompletion({
+    status: "completed",
+    model: route.ollamaResponseModels.at(-1),
+    reasoning: { effort: OLLAMA_REQUIRED_EFFORT },
+    output: [{
+      type: "function_call",
+      id: "fc-ollama",
+      call_id: "call-ollama",
+      name: "apply_patch",
+      arguments: json({ input: "*** Begin Patch\n*** End Patch" }),
+    }],
+  }, translatedOllamaFixture.responseTools);
+  if (
+    restoredOllamaFixture.output[0]?.type !== "custom_tool_call"
+    || restoredOllamaFixture.output[0]?.input !== "*** Begin Patch\n*** End Patch"
+  ) {
+    throw new Error("Ollama custom tool restoration failed");
+  }
+  const restoredToolSearchFixture = validateOllamaCompletion({
+    status: "completed",
+    model: route.ollamaResponseModels.at(-1),
+    output: [{
+      type: "function_call",
+      id: "fc-search",
+      call_id: "call-search",
+      name: "tool_search",
+      arguments: json({ query: "RzMCP blueprint graph" }),
+    }],
+  }, translatedOllamaFixture.responseTools);
+  if (
+    restoredToolSearchFixture.output[0]?.type !== "tool_search_call"
+    || restoredToolSearchFixture.output[0]?.execution !== "client"
+    || restoredToolSearchFixture.output[0]?.arguments?.query !== "RzMCP blueprint graph"
+  ) {
+    throw new Error("Ollama deferred tool search restoration failed");
   }
   const replayWrites = [];
   const replayOutput = emitOutputItems({
@@ -1801,7 +2456,7 @@ const server = createServer(async (request, response) => {
     const url = new URL(request.url || "/", `http://${request.headers.host || "127.0.0.1"}`);
     if (request.method === "GET" && url.pathname === "/health") {
       const requestedRoute = url.searchParams.get("route") || "auto";
-      if (!["auto", "devin-free"].includes(requestedRoute)) {
+      if (!["auto", "devin-free", "ollama"].includes(requestedRoute)) {
         return jsonResponse(response, 400, { error: { message: `Unknown health route ${json(requestedRoute)}` } });
       }
       return jsonResponse(response, 200, health(requestedRoute));

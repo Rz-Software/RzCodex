@@ -252,21 +252,32 @@ export function validateOAuthFallbackCompletion(completion, expected) {
   return completion;
 }
 
-export async function runProviderFallbackChain({
+export async function runOrderedProviderChain({
   signal,
-  runFallback,
-  runTerminal,
-  onFallbackFailure = () => {},
+  stages,
+  onStageFailure = () => {},
 }) {
-  try {
-    return { stage: "fallback", value: await runFallback(), fallbackError: null };
-  } catch (error) {
-    if (signal?.aborted || error?.name === "AbortError" || error?.status === 499) throw error;
-    if (error?.routeCommitted === true) {
-      onFallbackFailure(error);
-      throw error;
-    }
-    onFallbackFailure(error);
-    return { stage: "terminal", value: await runTerminal(error), fallbackError: error };
+  if (!Array.isArray(stages) || stages.length === 0) {
+    throw new ProviderRouteError("Ordered provider chain must contain at least one stage", 500);
   }
+  const failures = [];
+  for (let index = 0; index < stages.length; index += 1) {
+    const stage = requireObject(stages[index], `provider chain stage[${index}]`);
+    if (typeof stage.name !== "string" || stage.name.length === 0) {
+      throw new ProviderRouteError(`provider chain stage[${index}].name must be a non-empty string`, 500);
+    }
+    if (typeof stage.run !== "function") {
+      throw new ProviderRouteError(`provider chain stage ${JSON.stringify(stage.name)} has no run function`, 500);
+    }
+    try {
+      const value = await stage.run({ failures: [...failures], index });
+      return { stage: stage.name, value, failures };
+    } catch (error) {
+      if (signal?.aborted || error?.name === "AbortError" || error?.status === 499) throw error;
+      onStageFailure(stage.name, error, index);
+      if (error?.routeCommitted === true || index === stages.length - 1) throw error;
+      failures.push({ stage: stage.name, error });
+    }
+  }
+  throw new ProviderRouteError("Ordered provider chain exhausted without a result", 500);
 }

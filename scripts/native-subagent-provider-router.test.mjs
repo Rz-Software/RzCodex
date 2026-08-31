@@ -6,7 +6,7 @@ import {
   fallbackForwardBody,
   completedResponseFromSse,
   parseResponsesSse,
-  runProviderFallbackChain,
+  runOrderedProviderChain,
   runResponsesBridge,
   validateOAuthFallbackCompletion,
 } from "./native-subagent-provider-router.mjs";
@@ -194,55 +194,93 @@ test("OAuth fallback validation rejects provider, model, auth, eager tools, and 
   assert.throws(() => validateOAuthFallbackCompletion(completion({ output: [] }), EXPECTED), /without output items/);
 });
 
-test("quota fallback prefers Antigravity and does not touch the terminal Devin route", async () => {
-  let terminalCalls = 0;
-  const result = await runProviderFallbackChain({
-    runFallback: async () => "gemini",
-    runTerminal: async () => { terminalCalls += 1; return "glm"; },
+test("ordered routing stops after the first successful provider", async () => {
+  const calls = [];
+  const result = await runOrderedProviderChain({
+    stages: [
+      { name: "antigravity", run: async () => { calls.push("antigravity"); return "gemini"; } },
+      { name: "devin", run: async () => { calls.push("devin"); return "glm"; } },
+    ],
   });
-  assert.deepEqual(result, { stage: "fallback", value: "gemini", fallbackError: null });
-  assert.equal(terminalCalls, 0);
+  assert.deepEqual(result, { stage: "antigravity", value: "gemini", failures: [] });
+  assert.deepEqual(calls, ["antigravity"]);
 });
 
-test("any Antigravity availability failure reaches terminal Devin exactly once", async () => {
-  const failure = new Error("unreachable");
+test("ordered routing reaches each later provider exactly once after uncommitted failures", async () => {
+  const antigravityFailure = new Error("antigravity quota");
+  const devinFailure = new Error("devin quota");
   const observed = [];
-  let terminalCalls = 0;
-  const result = await runProviderFallbackChain({
-    runFallback: async () => { throw failure; },
-    runTerminal: async (error) => { terminalCalls += 1; assert.equal(error, failure); return "glm"; },
-    onFallbackFailure: (error) => observed.push(error),
+  const calls = [];
+  const result = await runOrderedProviderChain({
+    stages: [
+      { name: "antigravity", run: async () => { calls.push("antigravity"); throw antigravityFailure; } },
+      { name: "devin", run: async ({ failures }) => {
+        calls.push("devin");
+        assert.deepEqual(failures, [{ stage: "antigravity", error: antigravityFailure }]);
+        throw devinFailure;
+      } },
+      { name: "ollama", run: async ({ failures }) => {
+        calls.push("ollama");
+        assert.deepEqual(failures, [
+          { stage: "antigravity", error: antigravityFailure },
+          { stage: "devin", error: devinFailure },
+        ]);
+        return "glm-5.3-flash";
+      } },
+      { name: "devin-free", run: async () => { calls.push("devin-free"); return "glm-5.2"; } },
+    ],
+    onStageFailure: (stage, error) => observed.push({ stage, error }),
   });
-  assert.equal(result.stage, "terminal");
-  assert.equal(result.value, "glm");
-  assert.equal(result.fallbackError, failure);
-  assert.deepEqual(observed, [failure]);
-  assert.equal(terminalCalls, 1);
+  assert.equal(result.stage, "ollama");
+  assert.equal(result.value, "glm-5.3-flash");
+  assert.deepEqual(result.failures, [
+    { stage: "antigravity", error: antigravityFailure },
+    { stage: "devin", error: devinFailure },
+  ]);
+  assert.deepEqual(calls, ["antigravity", "devin", "ollama"]);
+  assert.deepEqual(observed, [
+    { stage: "antigravity", error: antigravityFailure },
+    { stage: "devin", error: devinFailure },
+  ]);
 });
 
-test("client abort never starts terminal fallback", async () => {
+test("client abort never starts the next ordered provider", async () => {
   const controller = new AbortController();
-  let terminalCalls = 0;
-  await assert.rejects(runProviderFallbackChain({
+  let laterCalls = 0;
+  await assert.rejects(runOrderedProviderChain({
     signal: controller.signal,
-    runFallback: async () => {
-      controller.abort();
-      throw new DOMException("aborted", "AbortError");
-    },
-    runTerminal: async () => { terminalCalls += 1; },
+    stages: [
+      { name: "antigravity", run: async () => {
+        controller.abort();
+        throw new DOMException("aborted", "AbortError");
+      } },
+      { name: "devin", run: async () => { laterCalls += 1; } },
+    ],
   }), /aborted/);
-  assert.equal(terminalCalls, 0);
+  assert.equal(laterCalls, 0);
 });
 
-test("a committed fallback stream fails explicitly instead of mixing in terminal output", async () => {
+test("a committed provider stream fails explicitly instead of mixing later output", async () => {
   const failure = Object.assign(new Error("stream failed after output"), { routeCommitted: true });
   const observed = [];
-  let terminalCalls = 0;
-  await assert.rejects(runProviderFallbackChain({
-    runFallback: async () => { throw failure; },
-    runTerminal: async () => { terminalCalls += 1; },
-    onFallbackFailure: (error) => observed.push(error),
+  let laterCalls = 0;
+  await assert.rejects(runOrderedProviderChain({
+    stages: [
+      { name: "ollama", run: async () => { throw failure; } },
+      { name: "devin-free", run: async () => { laterCalls += 1; } },
+    ],
+    onStageFailure: (stage, error) => observed.push({ stage, error }),
   }), /stream failed after output/);
-  assert.equal(terminalCalls, 0);
-  assert.deepEqual(observed, [failure]);
+  assert.equal(laterCalls, 0);
+  assert.deepEqual(observed, [{ stage: "ollama", error: failure }]);
+});
+
+test("the final provider failure is returned instead of being swallowed", async () => {
+  const terminalFailure = new Error("free provider unavailable");
+  await assert.rejects(runOrderedProviderChain({
+    stages: [
+      { name: "ollama", run: async () => { throw new Error("offline"); } },
+      { name: "devin-free", run: async () => { throw terminalFailure; } },
+    ],
+  }), (error) => error === terminalFailure);
 });
