@@ -1,4 +1,5 @@
 const DEFAULT_MAX_RESPONSE_BYTES = 32 * 1024 * 1024;
+const MAX_RECOVERED_PARTIAL_TEXT_CHARS = 64 * 1024;
 
 export class ProviderRouteError extends Error {
   constructor(message, status = 502, options) {
@@ -6,6 +7,99 @@ export class ProviderRouteError extends Error {
     this.name = "ProviderRouteError";
     this.status = status;
   }
+}
+
+function validateTimeout(value, label) {
+  if (value === undefined || value === null || value === 0) return 0;
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new ProviderRouteError(`${label} must be a positive number`, 500);
+  }
+  return value;
+}
+
+function streamObservation() {
+  return {
+    responseId: null,
+    responseModel: null,
+    eventCount: 0,
+    completedOutputItems: new Map(),
+    partialText: new Map(),
+  };
+}
+
+function observeStreamEvent(observation, event) {
+  observation.eventCount += 1;
+  const payload = event.payload || {};
+  if (event.type === "response.created") {
+    observation.responseId = payload.response?.id || observation.responseId;
+    observation.responseModel = payload.response?.model || observation.responseModel;
+  }
+  if (
+    ["response.incomplete", "response.completed"].includes(event.type)
+    && Array.isArray(payload.response?.output)
+  ) {
+    observation.responseId = payload.response.id || observation.responseId;
+    observation.responseModel = payload.response.model || observation.responseModel;
+    for (let index = 0; index < payload.response.output.length; index += 1) {
+      const item = payload.response.output[index];
+      const terminalItemCompleted = event.type === "response.completed" || item?.status === "completed";
+      if (terminalItemCompleted && !observation.completedOutputItems.has(index)) {
+        observation.completedOutputItems.set(index, item);
+      }
+    }
+  }
+  if (event.type === "response.output_item.done" && payload.item && Number.isInteger(payload.output_index)) {
+    observation.completedOutputItems.set(payload.output_index, payload.item);
+  }
+  if (event.type === "response.output_text.delta" && typeof payload.delta === "string" && payload.delta) {
+    const itemId = typeof payload.item_id === "string" ? payload.item_id : `output-${payload.output_index ?? "unknown"}`;
+    const previous = observation.partialText.get(itemId) || "";
+    observation.partialText.set(
+      itemId,
+      `${previous}${payload.delta}`.slice(-MAX_RECOVERED_PARTIAL_TEXT_CHARS),
+    );
+  }
+}
+
+function attachStreamObservation(error, observation, recoverable = false) {
+  error.responseId = observation.responseId;
+  error.responseModel = observation.responseModel;
+  error.observedEventCount = observation.eventCount;
+  error.completedOutputItems = [...observation.completedOutputItems.entries()]
+    .sort(([left], [right]) => left - right)
+    .map(([, item]) => item);
+  error.partialOutputText = [...observation.partialText.values()].join("\n").slice(-MAX_RECOVERED_PARTIAL_TEXT_CHARS);
+  if (recoverable) error.recoverableStreamFailure = true;
+  return error;
+}
+
+function incompleteStreamError(observation, detail = "Fallback bridge ended without a completed response") {
+  const error = new ProviderRouteError(detail);
+  error.incompleteStream = true;
+  return attachStreamObservation(error, observation, true);
+}
+
+export function completedResponseFromRecoverableStream(error) {
+  if (error?.recoverableStreamFailure !== true || !Array.isArray(error.completedOutputItems)) return null;
+  const output = error.completedOutputItems.filter((item) => item?.type !== "reasoning");
+  if (output.length === 0) return null;
+  return {
+    id: error.responseId || "resp_recovered_stream",
+    object: "response",
+    status: "completed",
+    model: error.responseModel || "unknown",
+    output,
+    usage: {
+      input_tokens: 0,
+      input_tokens_details: { cached_tokens: 0 },
+      output_tokens: 0,
+      output_tokens_details: { reasoning_tokens: 0 },
+      total_tokens: 0,
+    },
+    metadata: { recovered_from_completed_stream_items: true },
+    error: null,
+    incomplete_details: null,
+  };
 }
 
 export class ActiveTaskRoutePins {
@@ -163,46 +257,99 @@ export async function runResponsesBridge({
   signal,
   fetchImpl = globalThis.fetch,
   maxResponseBytes = DEFAULT_MAX_RESPONSE_BYTES,
+  inactivityTimeoutMs = 0,
+  requestTimeoutMs = 0,
   onEvent = async () => {},
 }) {
+  const inactivityMs = validateTimeout(inactivityTimeoutMs, "inactivityTimeoutMs");
+  const requestMs = validateTimeout(requestTimeoutMs, "requestTimeoutMs");
+  const controller = new AbortController();
+  const observation = streamObservation();
+  let localAbortError = null;
+  let inactivityTimer = null;
+  let requestTimer = null;
+  const abortWith = (error) => {
+    if (controller.signal.aborted) return;
+    localAbortError = attachStreamObservation(error, observation, true);
+    controller.abort(error);
+  };
+  const resetInactivityTimer = () => {
+    if (!inactivityMs) return;
+    clearTimeout(inactivityTimer);
+    inactivityTimer = setTimeout(() => abortWith(new ProviderRouteError(
+      `Fallback bridge stream was silent for ${inactivityMs}ms`,
+      504,
+    )), inactivityMs);
+    inactivityTimer.unref?.();
+  };
+  const onParentAbort = () => controller.abort(signal.reason);
+  if (signal?.aborted) onParentAbort();
+  else signal?.addEventListener("abort", onParentAbort, { once: true });
+  if (requestMs) {
+    requestTimer = setTimeout(() => abortWith(new ProviderRouteError(
+      `Fallback bridge recovery exceeded ${requestMs}ms`,
+      504,
+    )), requestMs);
+    requestTimer.unref?.();
+  }
+  resetInactivityTimer();
   let response;
   try {
     response = await fetchImpl(endpoint, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(body),
-      signal,
+      signal: controller.signal,
     });
+    resetInactivityTimer();
   } catch (error) {
+    clearTimeout(inactivityTimer);
+    clearTimeout(requestTimer);
+    signal?.removeEventListener("abort", onParentAbort);
+    if (localAbortError) throw localAbortError;
     if (signal?.aborted || error?.name === "AbortError") throw error;
     throw new ProviderRouteError(`Fallback bridge request failed: ${error.message}`, 502, { cause: error });
   }
-  if (!response.ok) {
-    const raw = await readBoundedResponse(response, maxResponseBytes);
-    const detail = raw.trim().slice(0, 2_000);
-    throw new ProviderRouteError(`Fallback bridge returned HTTP ${response.status}${detail ? `: ${detail}` : ""}`);
-  }
-  const contentType = response.headers.get("content-type") || "";
-  if (!contentType.toLowerCase().includes("text/event-stream")) {
-    throw new ProviderRouteError(`Fallback bridge returned unexpected content type ${JSON.stringify(contentType)}`);
-  }
-  if (!response.body) throw new ProviderRouteError("Fallback bridge returned an empty HTTP body");
-  const decoder = new ResponsesSseDecoder();
-  let completed = null;
-  let totalBytes = 0;
-  const accept = async (event) => {
-    if (event.type === "response.failed") {
-      const error = event.payload?.response?.error;
-      throw providerFailure(error);
-    }
-    if (event.type === "response.completed") {
-      if (completed) throw new ProviderRouteError("Fallback bridge returned more than one completed response");
-      completed = requireObject(event.payload?.response, "fallback completed response");
-    }
-    await onEvent(event);
-  };
   try {
+    if (!response.ok) {
+      const raw = await readBoundedResponse(response, maxResponseBytes);
+      const detail = raw.trim().slice(0, 2_000);
+      throw new ProviderRouteError(`Fallback bridge returned HTTP ${response.status}${detail ? `: ${detail}` : ""}`);
+    }
+    const contentType = response.headers.get("content-type") || "";
+    if (!contentType.toLowerCase().includes("text/event-stream")) {
+      throw new ProviderRouteError(`Fallback bridge returned unexpected content type ${JSON.stringify(contentType)}`);
+    }
+    if (!response.body) throw new ProviderRouteError("Fallback bridge returned an empty HTTP body");
+    const decoder = new ResponsesSseDecoder();
+    let completed = null;
+    let totalBytes = 0;
+    const accept = async (event) => {
+      observeStreamEvent(observation, event);
+      resetInactivityTimer();
+      if (event.type === "response.failed") {
+        const error = event.payload?.response?.error;
+        throw providerFailure(error);
+      }
+      if (event.type === "response.incomplete") {
+        const reason = event.payload?.response?.incomplete_details?.reason;
+        throw incompleteStreamError(
+          observation,
+          `Fallback bridge returned an incomplete response${reason ? `: ${reason}` : ""}`,
+        );
+      }
+      if (event.type === "response.completed") {
+        if (completed) throw new ProviderRouteError("Fallback bridge returned more than one completed response");
+        completed = requireObject(event.payload?.response, "fallback completed response");
+      }
+      try {
+        await onEvent(event);
+      } catch (error) {
+        throw new ProviderRouteError(`Fallback bridge event handler failed: ${error.message}`, 502, { cause: error });
+      }
+    };
     for await (const chunk of response.body) {
+      resetInactivityTimer();
       const bytes = Buffer.from(chunk);
       totalBytes += bytes.length;
       if (totalBytes > maxResponseBytes) {
@@ -212,13 +359,22 @@ export async function runResponsesBridge({
       for (const event of decoder.push(bytes)) await accept(event);
     }
     for (const event of decoder.finish()) await accept(event);
+    if (!completed) throw incompleteStreamError(observation);
+    return completed;
   } catch (error) {
+    if (localAbortError) throw localAbortError;
     if (signal?.aborted || error?.name === "AbortError") throw error;
     if (error instanceof ProviderRouteError) throw error;
-    throw new ProviderRouteError(`Fallback bridge stream failed: ${error.message}`, 502, { cause: error });
+    throw attachStreamObservation(
+      new ProviderRouteError(`Fallback bridge stream failed: ${error.message}`, 502, { cause: error }),
+      observation,
+      observation.eventCount > 0,
+    );
+  } finally {
+    clearTimeout(inactivityTimer);
+    clearTimeout(requestTimer);
+    signal?.removeEventListener("abort", onParentAbort);
   }
-  if (!completed) throw new ProviderRouteError("Fallback bridge ended without a completed response");
-  return completed;
 }
 
 export function validateOAuthFallbackCompletion(completion, expected) {

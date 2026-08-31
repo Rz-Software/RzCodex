@@ -22,6 +22,7 @@ import {
   authoritativeProgressReport,
   changedPathsFromApplyPatch,
   checkpointPromptSection,
+  isBridgeProgressReasoning,
   mutationContractPromptSection,
   normalizeAgentMessageContent,
   progressPromptSection,
@@ -703,8 +704,8 @@ function promptFrom(body, registry = providerConversations) {
   validateManagedToolSurface(toolInfo, route.inputModalities);
   const sections = [
     conversation.providerSessionStarted
-      ? "[Native delegation continuation]\nContinue the same delegated task in this retained CodeBuddy conversation. The full active task remains authoritative in the provider session; do not ask the parent to resend it. New Codex client results and control messages follow below. Use ToolSearch with the exact mcp__codex__ tool name before DeferExecuteTool. When its proxy reports DEFERRED_TO_CODEX_CLIENT, end this turn immediately; the parent will execute that call and resume this same conversation with the real result."
-      : "[Native delegation contract]\nWork as the delegated CodeBuddy sub-agent in the current workspace. Complete only the bounded task and return concise evidence to the parent. The MCP server named codex exposes the client-executed tools compatible with this managed model route. CodeBuddy serves those schemas lazily: use ToolSearch with the exact mcp__codex__ tool name before invoking it through DeferExecuteTool. When its proxy reports DEFERRED_TO_CODEX_CLIENT, immediately end the turn without retrying, fabricating a result, or calling another tool; the parent will execute it and resume you with the real result.",
+      ? "[Native delegation continuation]\nContinue the same delegated task in this retained CodeBuddy conversation. The full active task and project AGENTS.md ownership boundaries remain authoritative; do not ask the parent to resend them. New Codex client results and control messages follow below. Use ToolSearch with the exact mcp__codex__ tool name before DeferExecuteTool. When its proxy reports DEFERRED_TO_CODEX_CLIENT, end this turn immediately; the parent will execute that call and resume this same conversation with the real result."
+      : "[Native delegation contract]\nWork as the delegated CodeBuddy sub-agent in the current workspace. Complete only the bounded task and return concise evidence to the parent. Honor project AGENTS.md ownership boundaries exactly; when builds, tests, editor control, PIE, runtime validation, or RzMCP execution are reserved to the parent, do not invoke them and instead report the exact checks the parent should run. On Windows, use PowerShell-native commands, single-quote ripgrep patterns containing |, and never assume Unix-only commands such as head are installed. The MCP server named codex exposes the client-executed tools compatible with this managed model route. CodeBuddy serves those schemas lazily: use ToolSearch with the exact mcp__codex__ tool name before invoking it through DeferExecuteTool. When its proxy reports DEFERRED_TO_CODEX_CLIENT, immediately end the turn without retrying, fabricating a result, or calling another tool; the parent will execute it and resume you with the real result.",
   ];
   const roleInstructions = roleInstructionsFrom(body.instructions);
   if (roleInstructions && !conversation.providerSessionStarted) {
@@ -757,6 +758,7 @@ function promptFrom(body, registry = providerConversations) {
       if (message.newTask && !message.checkpoint) continue;
       pushHistory(`[Inter-agent message ${message.author} -> ${message.recipient}]\n${message.text}`);
     } else if (item.type === "reasoning") {
+      if (isBridgeProgressReasoning(item)) continue;
       const summary = Array.isArray(item.summary)
         ? item.summary.filter((part) => part?.type === "summary_text" && typeof part.text === "string")
           .map((part) => part.text).join("") : "";
@@ -1536,6 +1538,25 @@ function selfTest() {
     || plaintextTask.prompt.split(plaintextPayload).length - 1 !== 1
   ) {
     throw new Error("self-test failed: plaintext V2 task delivery regressed");
+  }
+  const reasoningBoundary = normalizeSelfTestRequest([
+    plaintextTaskItem,
+    {
+      type: "reasoning",
+      id: "progress_codebuddy_fixture",
+      summary: [{ type: "summary_text", text: "BRIDGE_PROGRESS_MUST_NOT_REENTER" }],
+    },
+    {
+      type: "reasoning",
+      id: "rs_parent_codebuddy_fixture",
+      summary: [{ type: "summary_text", text: "PORTABLE_PARENT_REASONING" }],
+    },
+  ]);
+  if (
+    reasoningBoundary.prompt.includes("BRIDGE_PROGRESS_MUST_NOT_REENTER")
+    || !reasoningBoundary.prompt.includes("PORTABLE_PARENT_REASONING")
+  ) {
+    throw new Error("self-test failed: bridge progress re-entered the CodeBuddy provider prompt");
   }
   const resumeRegistry = new ProviderConversationRegistry();
   const resumeThread = "self-test-resume-thread";

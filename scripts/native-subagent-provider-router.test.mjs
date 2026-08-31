@@ -3,6 +3,7 @@ import { createServer } from "node:http";
 import test from "node:test";
 import {
   ActiveTaskRoutePins,
+  completedResponseFromRecoverableStream,
   fallbackForwardBody,
   completedResponseFromSse,
   parseResponsesSse,
@@ -128,6 +129,106 @@ test("the loopback Responses client accepts a chunked fallback completion", asyn
     });
     assert.deepEqual(result, completion());
     assert.equal(progressArrivedBeforeCompletion, true);
+  });
+});
+
+test("completed output items survive a stream that closes before response.completed", async () => {
+  const tool = completion().output[0];
+  await withServer((_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.end([
+      sse("response.created", { response: { id: "resp-cut", model: MODEL_ALIAS, status: "in_progress" } }),
+      sse("response.output_item.done", { output_index: 0, item: tool }),
+    ].join(""));
+  }, async (endpoint) => {
+    let failure;
+    try {
+      await runResponsesBridge({ endpoint, body: {} });
+    } catch (error) {
+      failure = error;
+    }
+    assert.equal(failure?.incompleteStream, true);
+    assert.equal(failure?.recoverableStreamFailure, true);
+    assert.equal(failure?.observedEventCount, 2);
+    assert.deepEqual(completedResponseFromRecoverableStream(failure)?.output, [tool]);
+  });
+});
+
+test("an incomplete terminal response recovers only completed output items", async () => {
+  const completedTool = { ...completion().output[0], status: "completed" };
+  const incompleteMessage = {
+    type: "message",
+    id: "msg-partial",
+    role: "assistant",
+    status: "incomplete",
+    content: [{ type: "output_text", text: "partial" }],
+  };
+  await withServer((_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.end(sse("response.incomplete", {
+      response: {
+        id: "resp-incomplete",
+        model: MODEL_ALIAS,
+        status: "incomplete",
+        incomplete_details: { reason: "max_output_tokens" },
+        output: [completedTool, incompleteMessage],
+      },
+    }));
+  }, async (endpoint) => {
+    let failure;
+    try {
+      await runResponsesBridge({ endpoint, body: {} });
+    } catch (error) {
+      failure = error;
+    }
+    assert.match(failure?.message || "", /max_output_tokens/);
+    assert.deepEqual(completedResponseFromRecoverableStream(failure)?.output, [completedTool]);
+  });
+});
+
+test("consumer callback failures are explicit protocol errors, not resumable stream failures", async () => {
+  await withServer((_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.end(sse("response.in_progress", { response: { status: "in_progress" } }));
+  }, async (endpoint) => {
+    await assert.rejects(
+      runResponsesBridge({
+        endpoint,
+        body: {},
+        onEvent: async () => { throw new Error("fixture callback rejected"); },
+      }),
+      (error) => error.recoverableStreamFailure !== true && /event handler failed/.test(error.message),
+    );
+  });
+});
+
+test("a silent stream times out while periodic provider activity may run longer", async () => {
+  await withServer((_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.write(sse("response.created", { response: { id: "resp-silent", status: "in_progress" } }));
+  }, async (endpoint) => {
+    await assert.rejects(
+      runResponsesBridge({ endpoint, body: {}, inactivityTimeoutMs: 30 }),
+      (error) => error.recoverableStreamFailure === true && /silent for 30ms/.test(error.message),
+    );
+  });
+
+  await withServer((_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    let heartbeats = 0;
+    const timer = setInterval(() => {
+      heartbeats += 1;
+      response.write(sse("response.in_progress", { response: { status: "in_progress" } }));
+      if (heartbeats === 7) {
+        clearInterval(timer);
+        response.end(sse("response.completed", { response: completion() }));
+      }
+    }, 20);
+  }, async (endpoint) => {
+    assert.deepEqual(
+      await runResponsesBridge({ endpoint, body: {}, inactivityTimeoutMs: 100 }),
+      completion(),
+    );
   });
 });
 

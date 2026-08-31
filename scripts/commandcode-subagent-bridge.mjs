@@ -6,7 +6,10 @@ import { createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { basename, isAbsolute, join } from "node:path";
 import { existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from "node:fs";
-import { normalizeAgentMessageContent } from "./codebuddy-subagent-task-state.mjs";
+import {
+  isBridgeProgressReasoning,
+  normalizeAgentMessageContent,
+} from "./codebuddy-subagent-task-state.mjs";
 
 const COMMAND_CODE_PACKAGE_NAME = "command-code";
 const MINIMUM_COMMAND_CODE_VERSION = "1.33.0";
@@ -15,6 +18,7 @@ const COMMAND_CODE_GENERATE_URL = "https://api.commandcode.ai/alpha/generate";
 const OPENCODE_RESPONSES_URL = "https://opencode.ai/zen/v1/responses";
 const OPENCODE_CHAT_COMPLETIONS_URL = "https://opencode.ai/zen/v1/chat/completions";
 const SUBAGENT_MODEL_ALIAS = "@preset/codex-subagents";
+const NATIVE_DELEGATION_CONTRACT = "[Native delegation contract]\nWork as the bounded native sub-agent in the current workspace. Honor project AGENTS.md ownership boundaries exactly; when builds, tests, editor control, PIE, runtime validation, or RzMCP execution are reserved to the parent, do not invoke them and instead report the exact checks the parent should run. On Windows, use PowerShell-native commands, single-quote ripgrep patterns containing |, and never assume Unix-only commands such as head are installed. Complete only the assigned scope and return a concise result or concrete blocker.";
 const SUBAGENT_MODEL_ROUTES_FILE = join(
   process.env.CODEX_HOME || join(homedir(), ".codex"),
   "subagent-models.json",
@@ -607,6 +611,7 @@ function textOutput(value, label) {
 }
 
 function openCodeReasoningSummary(item, label) {
+  if (isBridgeProgressReasoning(item)) return "";
   const summary = Array.isArray(item.summary) ? item.summary : [];
   return summary.map((entry, summaryIndex) => {
     const summaryEntry = assertObject(entry, `${label}.summary[${summaryIndex}]`);
@@ -677,7 +682,7 @@ function translateResponsesRequest(body) {
   const toolsByWireName = new Map(translatedTools.map((tool) => [tool.wireName, tool]));
   const toolCalls = new Map();
   const messages = [];
-  const systemParts = [];
+  const systemParts = [NATIVE_DELEGATION_CONTRACT];
   if (body.instructions !== undefined) systemParts.push(requireString(body.instructions, "instructions"));
 
   for (let index = 0; index < inputItems.length; index += 1) {
@@ -709,6 +714,7 @@ function translateResponsesRequest(body) {
     }
 
     if (item.type === "reasoning") {
+      if (isBridgeProgressReasoning(item)) continue;
       const summary = Array.isArray(item.summary) ? item.summary : [];
       const text = summary.map((entry, summaryIndex) => {
         const summaryEntry = assertObject(entry, `${label}.summary[${summaryIndex}]`);
@@ -1004,7 +1010,7 @@ function emitUpstreamEvent(response, event, state, context) {
   if (type === "reasoning-start") {
     finishText(response, state);
     finishReasoning(response, state);
-    state.reasoningItemId = `rs_${randomUUID()}`;
+    state.reasoningItemId = `progress_commandcode_${randomUUID()}`;
     state.reasoningText = "";
     return writeSse(response, "response.output_item.added", {
       item: { type: "reasoning", id: state.reasoningItemId, summary: [] },
@@ -1014,7 +1020,7 @@ function emitUpstreamEvent(response, event, state, context) {
   if (type === "reasoning-delta") {
     const delta = requireString(event.text ?? "", "CommandCode reasoning-delta.text");
     if (!state.reasoningItemId) {
-      state.reasoningItemId = `rs_${randomUUID()}`;
+      state.reasoningItemId = `progress_commandcode_${randomUUID()}`;
       state.reasoningText = "";
       if (!writeSse(response, "response.output_item.added", {
         item: { type: "reasoning", id: state.reasoningItemId, summary: [] },
@@ -1207,7 +1213,7 @@ function cursorPromptFrom(body) {
   if (!Array.isArray(items)) throw new BridgeError("input must be a string or array");
 
   const sections = [
-    "[Native delegation contract]\nWork as the delegated Cursor sub-agent in the current workspace. Use your native tools, follow the workspace rules Cursor loads, complete the bounded task end to end, and return a concise final report to the parent agent.",
+    NATIVE_DELEGATION_CONTRACT,
   ];
   if (body.instructions !== undefined) {
     const instructions = requireString(body.instructions, "instructions");
@@ -1232,6 +1238,7 @@ function cursorPromptFrom(body) {
       continue;
     }
     if (item.type === "reasoning") {
+      if (isBridgeProgressReasoning(item)) continue;
       const summary = Array.isArray(item.summary) ? item.summary.map((entry, summaryIndex) => {
         const part = assertObject(entry, `${label}.summary[${summaryIndex}]`);
         if (part.type !== "summary_text") {
@@ -2485,7 +2492,11 @@ function transformOpenCodeChatSseBlock(block, state, toolInfo) {
         if (reasoning.length > 0) {
           if (state.textItem) events.push(...openCodeChatFinishText(state));
           if (!state.reasoningItem) {
-            state.reasoningItem = { id: `rs_${randomUUID()}`, outputIndex: state.nextOutputIndex++, text: "" };
+            state.reasoningItem = {
+              id: `progress_commandcode_${randomUUID()}`,
+              outputIndex: state.nextOutputIndex++,
+              text: "",
+            };
           }
           ensureReasoningItem();
           state.reasoningItem.text += reasoning;
@@ -2727,6 +2738,47 @@ function selfTest() {
   ) {
     throw new Error("self-test failed: Cursor encrypted task and compaction portability");
   }
+  const reasoningBoundaryInput = [
+    { type: "message", role: "user", content: [{ type: "input_text", text: "continue" }] },
+    {
+      type: "reasoning",
+      id: "progress_commandcode_fixture",
+      summary: [{ type: "summary_text", text: "BRIDGE_PROGRESS_MUST_NOT_REENTER" }],
+    },
+    {
+      type: "reasoning",
+      id: "rs_parent_commandcode_fixture",
+      summary: [{ type: "summary_text", text: "PORTABLE_PARENT_REASONING" }],
+    },
+  ];
+  const commandCodeReasoningBoundary = jsonString(translateResponsesRequest({
+    model: "commandcode/test-model",
+    input: reasoningBoundaryInput,
+    stream: true,
+  }).upstream.params.messages);
+  const cursorReasoningBoundary = cursorPromptFrom({
+    model: "cursor/test-model",
+    input: reasoningBoundaryInput,
+    stream: true,
+    client_metadata: { cwd: process.cwd() },
+  }).prompt;
+  const openCodeReasoningBoundary = jsonString(normalizeOpenCodeRequest({
+    model: "opencode/muse-spark-1.2-contributor-free",
+    input: reasoningBoundaryInput,
+    stream: true,
+  }).body.input);
+  for (const [label, normalized] of [
+    ["CommandCode", commandCodeReasoningBoundary],
+    ["Cursor", cursorReasoningBoundary],
+    ["OpenCode", openCodeReasoningBoundary],
+  ]) {
+    if (
+      normalized.includes("BRIDGE_PROGRESS_MUST_NOT_REENTER")
+      || !normalized.includes("PORTABLE_PARENT_REASONING")
+    ) {
+      throw new Error(`self-test failed: bridge progress re-entered the ${label} provider prompt`);
+    }
+  }
   const cursorCommittedError = preserveCursorCommit(
     new BridgeError("fixture", 502),
     ["read_file", "apply_patch", "apply_patch"],
@@ -2920,8 +2972,8 @@ function selfTest() {
     openCodeChatAgentMessage.responseTools,
   );
   if (
-    openCodeChatAgentRequest.body.messages[0]?.role !== "user" ||
-    openCodeChatAgentRequest.body.messages[0]?.content?.[0]?.text !== "delegated"
+    openCodeChatAgentRequest.body.messages[0]?.role !== "user"
+    || openCodeChatAgentRequest.body.messages[0]?.content?.[0]?.text !== "delegated"
   ) {
     throw new Error("self-test failed: OpenCode Chat native agent message translation");
   }

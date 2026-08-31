@@ -18,6 +18,12 @@ export class TaskStateError extends Error {
   }
 }
 
+export function isBridgeProgressReasoning(item) {
+  return item?.type === "reasoning"
+    && typeof item.id === "string"
+    && item.id.startsWith("progress_");
+}
+
 function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
 }

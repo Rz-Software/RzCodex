@@ -11,12 +11,14 @@ import { DatabaseSync } from "node:sqlite";
 import {
   TaskStateError,
   activeTaskPromptSection,
+  isBridgeProgressReasoning,
   normalizeAgentMessageContent,
   taskDeliveryDiagnostics,
   taskStateFromInput,
 } from "./codebuddy-subagent-task-state.mjs";
 import {
   ActiveTaskRoutePins,
+  completedResponseFromRecoverableStream,
   fallbackForwardBody,
   runOrderedProviderChain,
   runResponsesBridge,
@@ -37,11 +39,14 @@ const MAX_ACTIVE_TASK_CHARS = 40_000;
 const OUTPUT_LIMIT = 2 * 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 30 * 60 * 1000;
 const SSE_HEARTBEAT_MS = 15 * 1000;
+const PROVIDER_STREAM_INACTIVITY_MS = 20 * 1000;
+const PROVIDER_RECOVERY_BUDGET_MS = 45 * 1000;
+const PROVIDER_RECOVERY_BACKOFF_MS = 1 * 1000;
 const NATIVE_PROGRESS_POLL_MS = 1 * 1000;
 const MAX_PROGRESS_EVENTS = 256;
 const FREE_ROUTE_CONCURRENCY = 2;
 const RESOURCE_BACKOFF_BASE_MS = 5 * 1000;
-const RESOURCE_BACKOFF_MAX_MS = 2 * 60 * 1000;
+const RESOURCE_BACKOFF_MAX_MS = 10 * 1000;
 const QUOTA_RECOVERY_PROBE_MS = 30 * 60 * 1000;
 const ANTIGRAVITY_BRIDGE_ENDPOINT = "http://127.0.0.1:54549/v1/responses";
 const ANTIGRAVITY_REQUIRED_AUTH_SOURCE = "Antigravity cached OAuth session";
@@ -62,6 +67,7 @@ const DEVIN_EXE = join(process.env.LOCALAPPDATA || join(homedir(), "AppData", "L
 const DEVIN_DB = join(process.env.APPDATA || join(homedir(), "AppData", "Roaming"), "devin", "cli", "sessions.db");
 const QUOTA_FAILURE = /(?:daily|weekly|included|usage)[\s\S]{0,100}quota[\s\S]{0,100}(?:exhaust|exceed|reach|limit)|quota[\s\S]{0,100}(?:exhaust|exceed|reach|limit)/i;
 const RESOURCE_EXHAUSTED = /cognition\.ai\/errorKind[\s\S]{0,100}resource_exhausted|resource_exhausted[\s\S]{0,100}cognition\.ai\/retryable[\s\S]{0,20}true/i;
+const INTERRUPTED_STREAM = /stream (?:was )?interrupted|stream disconnected|connection (?:closed|reset)|unexpected end of (?:file|stream)|please continue the task you were working on/i;
 const QUOTA_STATE_VERSION = 2;
 
 class BridgeError extends Error {
@@ -287,6 +293,7 @@ function centralRoute() {
 function modelCatalog() {
   const result = spawnSync(DEVIN_EXE, ["models", "list", "--format", "json"], {
     env: sanitizedEnvironment(), windowsHide: true, encoding: "utf8", maxBuffer: 8 * 1024 * 1024,
+    timeout: 15_000,
   });
   if (result.status !== 0) throw new BridgeError(`Cannot query Devin models: ${result.stderr || result.stdout}`, 500);
   const parsed = JSON.parse(result.stdout);
@@ -296,6 +303,7 @@ function modelCatalog() {
 function authStatus() {
   const result = spawnSync(DEVIN_EXE, ["auth", "status"], {
     env: sanitizedEnvironment(), windowsHide: true, encoding: "utf8", maxBuffer: 1024 * 1024,
+    timeout: 15_000,
   });
   const output = `${result.stdout || ""}\n${result.stderr || ""}`;
   if (result.status !== 0 || !output.includes("Logged in (via Devin).")) {
@@ -361,9 +369,10 @@ const runtime = {
   incomingRequests: 0, requests: 0, completed: 0, failed: 0, rejected: 0,
   activeRequests: 0, activeFreeRequests: 0, queuedFreeRequests: 0,
   supersededTurns: 0,
-  resourceRetries: 0, activeResourceBackoffs: 0,
+  resourceRetries: 0, streamContinuations: 0, activeResourceBackoffs: 0,
   lastResourceModel: null, lastResourceRetryAttempt: 0,
   lastResourceBackoffMs: 0, lastResourceRetryAt: null,
+  lastStreamContinuationAt: null, lastStreamContinuationSessionHash: null,
   lastRejectedError: null, lastConfiguredRoute: null, lastActualModel: null,
   lastActualProvider: null, lastModelLabel: null, lastQuotaFallback: false,
   lastTerminalFallback: false, lastFallbackReason: null,
@@ -372,6 +381,7 @@ const runtime = {
   providerFailures: { antigravity: 0, devin: 0, ollama: 0, "devin-free": 0 },
   lastProviderSequence: [],
   fallbackStreamCommits: 0, lastFallbackStreamCommitted: false,
+  lastFallbackProviderOutputObserved: false,
   lastFallbackStreamedMessageCount: 0,
   quotaProbeSkips: 0, quotaRecoveryProbes: 0, quotaPinsReleased: 0,
   calendarQuotaSkips: 0, calendarQuotaActivations: 0, calendarQuotaClears: 0,
@@ -556,7 +566,7 @@ function promptFrom(body) {
     ? body.client_metadata.thread_id
     : null;
   const sections = [
-    `[Native delegated coding contract]\nRzCodex request ID: ${requestId}\nWork directly in the supplied workspace as the bounded native sub-agent. Use the file and command tools available in this turn. Do not spawn provider-side subagents. For Unreal/RzMCP work, use only the lazy RzMCP proxy surface: search with an exact or focused query, then call only a discovered tool. Never use or request the full RzMCP catalog. Return concise evidence as soon as the bounded task is complete or genuinely blocked.\nAuthoritative workspace: ${workingDirectory}`,
+    `[Native delegated coding contract]\nRzCodex request ID: ${requestId}\nWork directly in the supplied workspace as the bounded native sub-agent. Use the file and command tools available in this turn. Do not spawn provider-side subagents. Honor project AGENTS.md ownership boundaries exactly; when builds, tests, editor control, PIE, runtime validation, or RzMCP execution are reserved to the parent, do not invoke them and instead report the exact checks the parent should run. For Unreal/RzMCP work that is within your assigned ownership, use only the lazy RzMCP proxy surface: search with an exact or focused query, then call only a discovered tool. Never use or request the full RzMCP catalog. On Windows, use PowerShell-native commands, single-quote ripgrep patterns containing |, and never assume Unix-only commands such as head are installed. Return concise evidence as soon as the bounded task is complete or genuinely blocked.\nAuthoritative workspace: ${workingDirectory}`,
   ];
   const roleInstructions = roleInstructionsFrom(body.instructions);
   if (roleInstructions) sections.push(`[Role instructions]\n${roleInstructions}`);
@@ -591,6 +601,7 @@ function promptFrom(body) {
         text: `[Prior Codex tool search result; call_id=${item.call_id}]\n${outputText(searchTools)}`,
       });
     } else if (item.type === "reasoning") {
+      if (isBridgeProgressReasoning(item)) continue;
       const summary = Array.isArray(item.summary) ? item.summary.map((part) => part?.text || "").join("") : "";
       if (summary) history.push({ index, checkpoint: false, text: `[Prior reasoning summary]\n${summary}` });
     } else if (!["compaction", "context_compaction", "compaction_trigger"].includes(item.type)) {
@@ -999,12 +1010,20 @@ function removeSession(sessionId) {
   if (result.status !== 0) throw new BridgeError(`Failed to remove ephemeral Devin session ${sessionId}`, 502);
 }
 
-function runCli(context, selectedModel, onSpawn, onProgress, timeoutMs = REQUEST_TIMEOUT_MS) {
-  const promptPath = join(REQUEST_DIRECTORY, `${context.requestId}.txt`);
-  writeFileSync(promptPath, context.prompt, { encoding: "utf8", flag: "wx" });
+function runCli(
+  context,
+  selectedModel,
+  onSpawn,
+  onProgress,
+  timeoutMs = REQUEST_TIMEOUT_MS,
+  { resumeSessionId = null, prompt = context.prompt } = {},
+) {
+  const promptPath = join(REQUEST_DIRECTORY, `${context.requestId}-${randomUUID()}.txt`);
+  writeFileSync(promptPath, prompt, { encoding: "utf8", flag: "wx" });
   const args = [
     "--config", ISOLATED_CONFIG, "--model", selectedModel.model_uid,
     "--permission-mode", "dangerous", "--respect-workspace-trust", "false",
+    ...(resumeSessionId ? ["--resume", resumeSessionId] : []),
     "-p", "--prompt-file", promptPath,
   ];
   const child = spawn(DEVIN_EXE, args, {
@@ -1075,6 +1094,14 @@ function isRetryableResourceFailure(cliResult) {
   return cliFailed(cliResult) && !QUOTA_FAILURE.test(combined) && RESOURCE_EXHAUSTED.test(combined);
 }
 
+function isInterruptedStreamFailure(cliResult) {
+  return cliFailed(cliResult) && INTERRUPTED_STREAM.test(`${cliResult.stdout}\n${cliResult.stderr}`);
+}
+
+function devinStreamContinuationPrompt(context) {
+  return `[Native Devin stream recovery]\nContinue the same retained conversation and active task after the interrupted provider stream. Task hash: ${context.taskDiagnostics.taskHash}. Do not restart the investigation or repeat completed tool calls or file edits. Return the next required tool call or the concise final result.`;
+}
+
 function sanitizedProviderFailure(error) {
   return String(error?.message || error)
     .replace(/(authorization\s*[:=]\s*bearer\s+)[^\s,;]+/gi, "$1[REDACTED]")
@@ -1094,40 +1121,88 @@ function preserveProviderCommit(error, session) {
   return error;
 }
 
-async function runCliWithResourceRetries(context, selectedModel, onSpawn, onProgress, signal, deadline) {
+async function runCliWithProviderRecovery(
+  context,
+  selectedModel,
+  onSpawn,
+  onProgress,
+  signal,
+  deadline,
+  options = {},
+) {
+  const run = options.runCli || runCli;
+  const findSession = options.waitForSession || waitForSession;
+  const remove = options.removeSession || removeSession;
+  const now = options.now || Date.now;
+  const delay = options.delay || delayWithAbort;
   let attempt = 0;
+  let recoveryDeadline = null;
+  let resumeSession = null;
   while (true) {
     throwIfAborted(signal);
-    const remainingMs = deadline - Date.now();
-    if (remainingMs <= 0) throw new BridgeError("Devin resource retry deadline exceeded", 504);
-    const cliResult = await runCli(context, selectedModel, onSpawn, onProgress, remainingMs);
-    const session = await waitForSession(context.requestId);
-    if (!isRetryableResourceFailure(cliResult)) return { cliResult, session };
-    if (session?.toolCalls?.some((call) => call?.name)) {
-      const error = preserveProviderCommit(
-        new BridgeError("Devin became resource exhausted after executing native tools; the turn was not replayed", 502),
-        session,
+    const activeDeadline = recoveryDeadline || deadline;
+    const remainingMs = activeDeadline - now();
+    if (remainingMs <= 0) throw new BridgeError("Devin provider recovery deadline exceeded", 504);
+    let cliResult;
+    try {
+      cliResult = await run(
+        context,
+        selectedModel,
+        onSpawn,
+        onProgress,
+        remainingMs,
+        resumeSession
+          ? { resumeSessionId: resumeSession.id, prompt: devinStreamContinuationPrompt(context) }
+          : undefined,
       );
-      removeSession(session.id);
+    } catch (error) {
+      const session = await findSession(context.requestId) || resumeSession;
+      const preserved = preserveProviderCommit(error, session);
+      if (session) remove(session.id);
+      throw preserved;
+    }
+    const session = await findSession(context.requestId) || resumeSession;
+    const resourceFailure = isRetryableResourceFailure(cliResult);
+    const streamFailure = isInterruptedStreamFailure(cliResult);
+    if (!resourceFailure && !streamFailure) return { cliResult, session };
+    if (streamFailure && !session) {
+      const error = new BridgeError("Devin stream was interrupted but its conversation could not be recovered", 502);
+      error.routeCommitted = true;
       throw error;
     }
-    if (session) removeSession(session.id);
+    if (recoveryDeadline === null) {
+      recoveryDeadline = Math.min(deadline, now() + PROVIDER_RECOVERY_BUDGET_MS);
+    }
     attempt += 1;
     const backoffMs = resourceBackoffMs(attempt);
-    if (Date.now() + backoffMs >= deadline) {
-      throw new BridgeError("Devin remained resource exhausted until the request deadline", 504);
+    if (now() + backoffMs >= recoveryDeadline) {
+      const error = preserveProviderCommit(
+        new BridgeError(
+          `Devin provider recovery exceeded its ${PROVIDER_RECOVERY_BUDGET_MS / 1000}-second budget`,
+          504,
+        ),
+        session,
+      );
+      if (session) remove(session.id);
+      throw error;
     }
-    runtime.resourceRetries += 1;
+    if (resourceFailure) runtime.resourceRetries += 1;
+    if (streamFailure) {
+      runtime.streamContinuations += 1;
+      runtime.lastStreamContinuationAt = new Date(now()).toISOString();
+      runtime.lastStreamContinuationSessionHash = createHash("sha256").update(session.id).digest("hex");
+    }
     runtime.lastResourceModel = selectedModel.model_uid;
     runtime.lastResourceRetryAttempt = attempt;
     runtime.lastResourceBackoffMs = backoffMs;
-    runtime.lastResourceRetryAt = Date.now() + backoffMs;
+    runtime.lastResourceRetryAt = now() + backoffMs;
     runtime.activeResourceBackoffs += 1;
     try {
-      await delayWithAbort(backoffMs, signal);
+      await delay(backoffMs, signal);
     } finally {
       runtime.activeResourceBackoffs = Math.max(0, runtime.activeResourceBackoffs - 1);
     }
+    resumeSession = session;
   }
 }
 
@@ -1281,18 +1356,87 @@ async function runAntigravityStage(context, requestBody, failures, onProgress, s
   }
 }
 
+function ollamaStreamContinuationBody(body, error, taskHash) {
+  const input = Array.isArray(body.input) ? [...body.input] : [];
+  if (typeof error?.partialOutputText === "string" && error.partialOutputText.trim()) {
+    input.push({
+      type: "message",
+      role: "assistant",
+      content: [{ type: "output_text", text: error.partialOutputText }],
+    });
+  }
+  input.push({
+    type: "message",
+    role: "user",
+    content: [{
+      type: "input_text",
+      text: `[Native Ollama stream recovery]\nThe previous stateless provider stream ended before its terminal response. Continue the same active task from the authoritative Codex history above. Task hash: ${taskHash}. Do not restart the investigation or repeat completed client tool calls. Return the next required tool call or the concise final result.`,
+    }],
+  });
+  return { ...body, input };
+}
+
+async function runOllamaResponsesWithRecovery(body, taskHash, signal, onEvent, onProgress) {
+  try {
+    return {
+      completion: await runResponsesBridge({
+        endpoint: OLLAMA_RESPONSES_ENDPOINT,
+        body,
+        signal,
+        inactivityTimeoutMs: PROVIDER_STREAM_INACTIVITY_MS,
+        onEvent,
+      }),
+      recovered: false,
+    };
+  } catch (error) {
+    if (error?.recoverableStreamFailure !== true) throw error;
+    const completed = completedResponseFromRecoverableStream(error);
+    if (completed) {
+      return { completion: completed, recovered: true, recoveredCompletedItems: true };
+    }
+    const deadline = Date.now() + PROVIDER_RECOVERY_BUDGET_MS;
+    onProgress?.(`Ollama stream ended without a terminal response; reconstructing one continuation after ${PROVIDER_RECOVERY_BACKOFF_MS}ms.\n`);
+    await delayWithAbort(PROVIDER_RECOVERY_BACKOFF_MS, signal);
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) {
+      throw error;
+    }
+    const continuationBody = ollamaStreamContinuationBody(body, error, taskHash);
+    try {
+      const completion = await runResponsesBridge({
+        endpoint: OLLAMA_RESPONSES_ENDPOINT,
+        body: continuationBody,
+        signal,
+        inactivityTimeoutMs: Math.min(PROVIDER_STREAM_INACTIVITY_MS, remainingMs),
+        requestTimeoutMs: remainingMs,
+        onEvent,
+      });
+      return { completion, recovered: true, recoveredCompletedItems: false };
+    } catch (recoveryError) {
+      const recoveredCompletion = completedResponseFromRecoverableStream(recoveryError);
+      if (recoveredCompletion) {
+        return { completion: recoveredCompletion, recovered: true, recoveredCompletedItems: true };
+      }
+      recoveryError.streamRecoveryAttempted = true;
+      throw recoveryError;
+    }
+  }
+}
+
 async function runOllamaStage(context, requestBody, failures, onProgress, signal, streamRelay) {
   runtime.providerAttempts.ollama += 1;
   runtime.lastProviderSequence.push("ollama");
   onProgress?.("Native route started the locally authenticated Ollama cloud model.\n");
   const translated = ollamaRequest(requestBody, context);
   try {
-    const rawCompletion = await runResponsesBridge({
-      endpoint: OLLAMA_RESPONSES_ENDPOINT,
-      body: translated.body,
+    const streamResult = await runOllamaResponsesWithRecovery(
+      translated.body,
+      context.taskDiagnostics.taskHash,
       signal,
-      onEvent: streamRelay.accept,
-    });
+      streamRelay.accept,
+      onProgress,
+    );
+    const rawCompletion = streamResult.completion;
     const completion = validateOllamaCompletion(rawCompletion, translated.responseTools);
     const lazyProxyTools = [...translated.responseTools.values()]
       .filter((entry) => ["search_rzmcp_tools", "call_rzmcp_tool"].includes(entry.originalName))
@@ -1311,6 +1455,8 @@ async function runOllamaStage(context, requestBody, failures, onProgress, signal
       lazy_rzmcp_proxy_tools: lazyProxyTools,
       deferred_tool_search_forwarded: deferredToolSearchForwarded,
       hosted_web_search_replaced_by_deferred_tool_search: translated.hostedWebSearchReplaced,
+      interrupted_stream_recovered: streamResult.recovered,
+      interrupted_stream_recovered_completed_items: streamResult.recoveredCompletedItems === true,
     };
     return {
       ...responsesResult(
@@ -1334,7 +1480,7 @@ async function runDevinStage(context, selected, failures, onSpawn, onProgress, s
   runtime.lastProviderSequence.push(terminalFallback ? "devin-free" : "devin");
   onProgress?.(`Devin native worker started with ${selected.model.label}.\n`);
   const routeResult = await withRouteCapacity(selected, signal, () =>
-    runCliWithResourceRetries(
+    runCliWithProviderRecovery(
       context,
       selected.model,
       onSpawn,
@@ -1594,7 +1740,7 @@ function createProviderStreamRelay(
   const providerProgressIds = new Set();
   const forwardedReasoningIds = new Set();
   const announcedToolIds = new Set();
-  let committed = false;
+  let providerOutputObserved = false;
   const accept = async (event) => {
     const payload = event.payload || {};
     if (event.type === "response.in_progress") {
@@ -1646,7 +1792,7 @@ function createProviderStreamRelay(
       ["response.output_item.added", "response.output_item.done"].includes(event.type)
       && ["function_call", "custom_tool_call", "tool_search_call"].includes(payload.item?.type)
     ) {
-      committed = true;
+      providerOutputObserved = true;
       const toolName = payload.item?.type === "tool_search_call"
         ? "tool_search"
         : progressToolName(payload.item?.name);
@@ -1665,12 +1811,13 @@ function createProviderStreamRelay(
     if (event.type !== "response.output_text.delta" || typeof payload.delta !== "string" || !payload.delta) return;
     const pending = pendingMessages.get(payload.item_id);
     if (!pending?.part) throw new BridgeError("Fallback provider streamed text before its message lifecycle", 502);
-    committed = true;
+    providerOutputObserved = true;
   };
   return {
     accept,
     streamedMessageIds,
-    get committed() { return committed; },
+    get committed() { return false; },
+    get providerOutputObserved() { return providerOutputObserved; },
   };
 }
 
@@ -1703,6 +1850,7 @@ async function handleResponses(request, response) {
   const selected = initialSelection(context);
   runtime.lastConfiguredRoute = context.requestedRoute;
   runtime.lastFallbackStreamCommitted = false;
+  runtime.lastFallbackProviderOutputObserved = false;
   runtime.lastFallbackStreamedMessageCount = 0;
   let child = null;
   const abortController = new AbortController();
@@ -1739,6 +1887,7 @@ async function handleResponses(request, response) {
     )) runtime.quotaPinsReleased += 1;
     const streamRelay = result.streamRelay || { committed: false, streamedMessageIds: new Set() };
     runtime.lastFallbackStreamCommitted = streamRelay.committed;
+    runtime.lastFallbackProviderOutputObserved = streamRelay.providerOutputObserved === true;
     runtime.lastFallbackStreamedMessageCount = streamRelay.streamedMessageIds.size;
     if (streamRelay.committed) runtime.fallbackStreamCommits += 1;
     runtime.completed += 1;
@@ -2019,7 +2168,94 @@ async function selfTest() {
     stderr: '{"cognition.ai/errorKind":"resource_exhausted","cognition.ai/retryable":true}',
   };
   if (!isRetryableResourceFailure(transientResourceFailure)) throw new Error("transient capacity classification failed");
-  if (resourceBackoffMs(1) !== 5_000 || resourceBackoffMs(6) !== 120_000 || resourceBackoffMs(20) !== 120_000) throw new Error("resource backoff schedule failed");
+  const interruptedStreamFailure = {
+    code: 1,
+    stdout: "",
+    stderr: "The stream was interrupted. Please continue the task you were working on.",
+  };
+  if (!isInterruptedStreamFailure(interruptedStreamFailure)) throw new Error("interrupted Devin stream classification failed");
+  if (resourceBackoffMs(1) !== 5_000 || resourceBackoffMs(6) !== 10_000 || resourceBackoffMs(20) !== 10_000) throw new Error("resource backoff schedule failed");
+  const recoveryContext = {
+    requestId: "devin-recovery-fixture",
+    taskDiagnostics: { taskHash: "devin-recovery-task-hash" },
+  };
+  const recoveryModel = { model_uid: "recovery-model" };
+  const recoverySession = { id: "devin-recovery-session", toolCalls: [{ name: "apply_patch" }] };
+  const refreshedRecoverySession = {
+    ...recoverySession,
+    toolCalls: [...recoverySession.toolCalls, { name: "exec_command" }],
+  };
+  const recoveryCalls = [];
+  const recoveryDelays = [];
+  let recoverySessionReads = 0;
+  let recoveryNow = 1_000;
+  const recoveredCli = await runCliWithProviderRecovery(
+    recoveryContext,
+    recoveryModel,
+    () => {},
+    () => {},
+    undefined,
+    100_000,
+    {
+      now: () => recoveryNow,
+      delay: async (milliseconds) => {
+        recoveryDelays.push(milliseconds);
+        recoveryNow += milliseconds;
+      },
+      waitForSession: async () => {
+        recoverySessionReads += 1;
+        return recoverySessionReads === 1 ? recoverySession : refreshedRecoverySession;
+      },
+      removeSession: () => { throw new Error("recovered Devin session was removed"); },
+      runCli: async (_context, _model, _onSpawn, _onProgress, timeoutMs, options) => {
+        recoveryCalls.push({ timeoutMs, options });
+        return recoveryCalls.length === 1
+          ? interruptedStreamFailure
+          : { code: 0, stdout: "recovered", stderr: "" };
+      },
+    },
+  );
+  if (
+    recoveredCli.session !== refreshedRecoverySession
+    || recoveryCalls.length !== 2
+    || recoveryCalls[0].options !== undefined
+    || recoveryCalls[1].options?.resumeSessionId !== recoverySession.id
+    || !recoveryCalls[1].options?.prompt.includes(recoveryContext.taskDiagnostics.taskHash)
+    || recoveryCalls.map(({ timeoutMs }) => timeoutMs).join(",") !== "99000,40000"
+    || recoveryDelays.join(",") !== "5000"
+  ) {
+    throw new Error("same-session Devin stream recovery failed");
+  }
+  let exhaustedNow = 1_000;
+  let exhaustedRemoved = 0;
+  let exhaustedFailure;
+  try {
+    await runCliWithProviderRecovery(
+      recoveryContext,
+      recoveryModel,
+      () => {},
+      () => {},
+      undefined,
+      100_000,
+      {
+        now: () => exhaustedNow,
+        delay: async (milliseconds) => { exhaustedNow += milliseconds; },
+        waitForSession: async () => recoverySession,
+        removeSession: () => { exhaustedRemoved += 1; },
+        runCli: async () => interruptedStreamFailure,
+      },
+    );
+  } catch (error) {
+    exhaustedFailure = error;
+  }
+  if (
+    exhaustedFailure?.status !== 504
+    || exhaustedFailure?.routeCommitted !== true
+    || exhaustedNow - 1_000 >= PROVIDER_RECOVERY_BUDGET_MS
+    || exhaustedRemoved !== 1
+  ) {
+    throw new Error("Devin interrupted-stream recovery budget failed");
+  }
   const environmentWorkspace = promptFrom({
     stream: true,
     model: MODEL_ALIAS,
@@ -2101,6 +2337,16 @@ async function selfTest() {
     reasoning: { effort: OLLAMA_REQUIRED_EFFORT },
     input: [
       { type: "agent_message", id: "resume-task", author: "Codex", recipient: "/root/self_test", content: [{ type: "input_text", text: task }] },
+      {
+        type: "reasoning",
+        id: "progress_self_test",
+        summary: [{ type: "summary_text", text: "BRIDGE_PROGRESS_MUST_NOT_REENTER" }],
+      },
+      {
+        type: "reasoning",
+        id: "rs_parent_self_test",
+        summary: [{ type: "summary_text", text: "PORTABLE_PARENT_REASONING" }],
+      },
       { type: "function_call", call_id: "resume-call", name: "exec_command", arguments: json({ cmd: "rg needle file.cpp" }) },
       { type: "function_call_output", call_id: "resume-call", output: "Exit code: 0\nOutput:\nneedle" },
       { type: "tool_search_call", call_id: "search-call", execution: "client", arguments: { query: "RzMCP graph" } },
@@ -2114,7 +2360,9 @@ async function selfTest() {
     ],
   }).prompt;
   if (
-    !resumedPrompt.includes("rg needle file.cpp")
+    resumedPrompt.includes("BRIDGE_PROGRESS_MUST_NOT_REENTER")
+    || !resumedPrompt.includes("PORTABLE_PARENT_REASONING")
+    || !resumedPrompt.includes("rg needle file.cpp")
     || !resumedPrompt.includes("Exit code: 0\nOutput:\nneedle")
     || !resumedPrompt.includes("rzmcp__inspect_graph")
   ) {
@@ -2163,6 +2411,7 @@ async function selfTest() {
   if (
     !relayProgress.added
     || relay.committed
+    || relay.providerOutputObserved
     || !relayWrites.join("").includes("safe native progress")
     || relayWrites.join("").includes("hidden provider reasoning")
   ) {
@@ -2229,7 +2478,9 @@ async function selfTest() {
     type: "response.output_text.delta",
     payload: { item_id: "msg-relay", output_index: 1, content_index: 0, delta: "streamed" },
   });
-  if (!relay.committed || relay.streamedMessageIds.size !== 0) throw new Error("fallback relay did not retain provider output for ordered completion");
+  if (relay.committed || !relay.providerOutputObserved || relay.streamedMessageIds.size !== 0) {
+    throw new Error("fallback relay confused buffered provider output with client commitment");
+  }
   const streamedFixture = {
     output: [responseMessageItem("msg-relay", "streamed", "completed")],
   };
@@ -2249,7 +2500,9 @@ async function selfTest() {
     type: "response.output_item.added",
     payload: { output_index: 0, item: { type: "function_call", id: "fc-commit", call_id: "call-commit", name: "exec_command", arguments: "{}" } },
   });
-  if (!toolCommitRelay.committed) throw new Error("provider relay did not commit on a streamed tool call");
+  if (toolCommitRelay.committed || !toolCommitRelay.providerOutputObserved) {
+    throw new Error("provider relay committed before the streamed tool call was replayed to Codex");
+  }
   const fallbackCompletion = {
     status: "completed",
     output: [
@@ -2355,6 +2608,20 @@ async function selfTest() {
     || translatedOllamaFixture.forwardedBytes <= 0
   ) {
     throw new Error("Ollama request normalization failed");
+  }
+  const ollamaContinuationFixture = ollamaStreamContinuationBody(
+    translatedOllamaFixture.body,
+    { partialOutputText: "partial provider answer" },
+    ollamaFixtureContext.taskDiagnostics.taskHash,
+  );
+  const ollamaContinuationJson = json(ollamaContinuationFixture);
+  if (
+    ollamaContinuationFixture.input.length !== translatedOllamaFixture.body.input.length + 2
+    || !ollamaContinuationJson.includes("partial provider answer")
+    || !ollamaContinuationJson.includes(ollamaFixtureContext.taskDiagnostics.taskHash)
+    || ollamaContinuationFixture.input[0].content[0].text.split(task).length - 1 !== 1
+  ) {
+    throw new Error("Ollama interrupted-stream continuation normalization failed");
   }
   const restoredOllamaFixture = validateOllamaCompletion({
     status: "completed",

@@ -9,6 +9,7 @@ import { isAbsolute, join, normalize } from "node:path";
 import {
   TaskStateError,
   activeTaskPromptSection,
+  isBridgeProgressReasoning,
   normalizeAgentMessageContent,
   taskDeliveryDiagnostics,
   taskStateFromInput,
@@ -38,7 +39,8 @@ const MODEL_QUOTA_FAILURE = /RESOURCE_EXHAUSTED|LLM_CALL_QUOTA_EXCEEDED|individu
 const PROVIDER_FAILURE_SIGNAL = /RESOURCE_EXHAUSTED|LLM_CALL_QUOTA_EXCEEDED|individual quota reached|exhausted your (?:capacity|quota)|agent executor error|calling model:/i;
 const INTERRUPTED_STREAM_FAILURE = /the stream was interrupted\.\s*please continue the task you were working on\./i;
 const STREAM_CONTINUATION_BACKOFF_BASE_MS = 1_000;
-const STREAM_CONTINUATION_BACKOFF_MAX_MS = 30_000;
+const STREAM_CONTINUATION_BACKOFF_MAX_MS = 10_000;
+const STREAM_CONTINUATION_RECOVERY_BUDGET_MS = 45_000;
 const CENTRAL_CONFIG = join(homedir(), ".codex", "subagent-models.json");
 const AGY_EXE = join(process.env.LOCALAPPDATA || join(homedir(), "AppData", "Local"), "agy", "bin", "agy.exe");
 const MCP_CONFIG = join(homedir(), ".gemini", "config", "mcp_config.json");
@@ -68,7 +70,7 @@ inheritCustomizations: false
 
 # RzCodex native worker
 
-You are already a bounded native sub-agent owned by a separate Codex main agent. Work directly on the assigned task. Never delegate, invoke another agent, define an agent, or create background work. Use run_command for read-only inspection only; never edit, create, move, delete, build, test, or invoke a side-effecting script through it. A long run_command may be moved to the background by the client runtime; manage only that command with manage_task and do not poll it repeatedly. Use the dedicated file tools for file mutations. Keep each reasoning/tool cycle focused, return promptly when the task is complete, and return a concise concrete blocker or question when the main agent must decide something.
+You are already a bounded native sub-agent owned by a separate Codex main agent. Work directly on the assigned task. Never delegate, invoke another agent, define an agent, or create background work. Honor project AGENTS.md ownership boundaries exactly; when builds, tests, editor control, PIE, runtime validation, or RzMCP execution are reserved to the parent, do not invoke them and instead report the exact checks the parent should run. Use run_command for read-only inspection only; never edit, create, move, delete, build, test, or invoke a side-effecting script through it. On Windows, use PowerShell-native commands, single-quote ripgrep patterns containing |, and never assume Unix-only commands such as head are installed. A long run_command may be moved to the background by the client runtime; manage only that command with manage_task and do not poll it repeatedly. Use the dedicated file tools for file mutations. Keep each reasoning/tool cycle focused, return promptly when the task is complete, and return a concise concrete blocker or question when the main agent must decide something.
 `;
 const MUTATION_TOOLS = new Set(["multi_replace_file_content", "replace_file_content", "sed_file", "write_to_file"]);
 const FORBIDDEN_AGENT_TOOLS = new Set([
@@ -193,6 +195,7 @@ function centralRoute() {
 function verifyModelAvailable(model) {
   const result = spawnSync(AGY_EXE, ["models"], {
     env: sanitizedEnvironment(), windowsHide: true, encoding: "utf8", maxBuffer: 4 * 1024 * 1024,
+    timeout: 15_000,
   });
   if (result.status !== 0) {
     throw new BridgeError(`Cannot query Antigravity models: ${result.stderr || result.stdout}`, 500);
@@ -422,6 +425,7 @@ function historyEntries(input, taskState) {
     } else if (item.type === "tool_search_output") {
       text = `[Prior Codex tool search result; call_id=${item.call_id}]`;
     } else if (item.type === "reasoning") {
+      if (isBridgeProgressReasoning(item)) continue;
       const summary = Array.isArray(item.summary) ? item.summary.map((part) => part?.text || "").join("") : "";
       if (!summary) continue;
       text = `[Prior reasoning summary]\n${summary}`;
@@ -632,18 +636,21 @@ async function runWithInterruptedStreamRecovery(
 ) {
   const now = options.now || Date.now;
   const delay = options.delay || delayWithAbort;
-  const deadline = options.deadline || now() + REQUEST_TIMEOUT_MS;
+  const requestDeadline = options.deadline || now() + REQUEST_TIMEOUT_MS;
+  const recoveryBudgetMs = options.recoveryBudgetMs || STREAM_CONTINUATION_RECOVERY_BUDGET_MS;
   const conversationId = session.init?.conversationId || null;
   const progress = emptyInterruptedProgress();
   let currentPrompt = prompt;
   let attempt = 0;
+  let recoveryDeadline = null;
   for (;;) {
     if (signal?.aborted) {
       const error = applyInterruptedProgress(abortError(), progress);
       session.close?.();
       throw error;
     }
-    const remainingMs = deadline - now();
+    const activeDeadline = recoveryDeadline || requestDeadline;
+    const remainingMs = activeDeadline - now();
     if (remainingMs <= 0) {
       const error = applyInterruptedProgress(
         new BridgeError("Antigravity interrupted-stream recovery exceeded the request deadline", 504),
@@ -674,6 +681,9 @@ async function runWithInterruptedStreamRecovery(
       }
       accumulateInterruptedProgress(progress, error);
       progress.streamContinuations += 1;
+      if (recoveryDeadline === null) {
+        recoveryDeadline = Math.min(requestDeadline, now() + recoveryBudgetMs);
+      }
       if (session.closed || (session.init?.conversationId || null) !== conversationId) {
         throw applyInterruptedProgress(
           new BridgeError("Antigravity lost the retained conversation after a stream interruption", 502),
@@ -682,7 +692,7 @@ async function runWithInterruptedStreamRecovery(
       }
       attempt += 1;
       const backoffMs = streamContinuationBackoffMs(attempt);
-      if (now() + backoffMs >= deadline) {
+      if (now() + backoffMs >= recoveryDeadline) {
         const deadlineError = applyInterruptedProgress(
           new BridgeError("Antigravity remained stream-interrupted until the request deadline", 504),
           progress,
@@ -1734,7 +1744,7 @@ async function selfTest() {
     (event) => recoveryEvents.push(event),
     {
       now: () => fakeNow,
-      deadline: 10_000,
+      deadline: 100_000,
       delay: async (milliseconds) => {
         recoveryDelays.push(milliseconds);
         fakeNow += milliseconds;
@@ -1746,7 +1756,7 @@ async function selfTest() {
     || recoveryCalls[0].prompt !== "original task payload"
     || recoveryCalls.slice(1).some(({ prompt }) => prompt.includes("original task payload"))
     || recoveryCalls.slice(1).some(({ prompt }) => !prompt.includes("recovery-task-hash"))
-    || recoveryCalls.map(({ timeoutMs }) => timeoutMs).join(",") !== "9000,8000,6000"
+    || recoveryCalls.map(({ timeoutMs }) => timeoutMs).join(",") !== "99000,44000,42000"
     || recoveryDelays.join(",") !== "1000,2000"
     || recoveryEvents.map(({ attempt }) => attempt).join(",") !== "1,2"
     || recoveryToolEvents.map(({ index }) => index).join(",") !== "1,2,3"
@@ -1920,6 +1930,30 @@ async function selfTest() {
     throw new Error("bounded encrypted task delivery failed");
   }
   if (context.toolSchemaBytes < 100_000) throw new Error("tool-schema fixture is too small");
+  const reasoningBoundaryContext = requestContext({
+    ...fixture,
+    tools: [],
+    input: [
+      {
+        type: "reasoning",
+        id: "progress_antigravity_fixture",
+        summary: [{ type: "summary_text", text: "BRIDGE_PROGRESS_MUST_NOT_REENTER" }],
+      },
+      {
+        type: "reasoning",
+        id: "rs_parent_antigravity_fixture",
+        summary: [{ type: "summary_text", text: "PORTABLE_PARENT_REASONING" }],
+      },
+      fixture.input.at(-1),
+    ],
+  });
+  const reasoningBoundaryPrompt = fullPrompt(reasoningBoundaryContext);
+  if (
+    reasoningBoundaryPrompt.includes("BRIDGE_PROGRESS_MUST_NOT_REENTER")
+    || !reasoningBoundaryPrompt.includes("PORTABLE_PARENT_REASONING")
+  ) {
+    throw new Error("bridge progress re-entered the Antigravity provider prompt");
+  }
   const retainedSession = { seenMessageKeys: new Set(context.messageKeys) };
   const resumed = resumePrompt(context, retainedSession);
   const resumedDiagnostics = taskDeliveryDiagnostics(context.taskState, resumed, {
