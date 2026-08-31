@@ -35,7 +35,7 @@ pub(super) fn truncated_path_variants(path: &str) -> Vec<String> {
         .collect()
 }
 
-pub(super) fn normalize_snapshot_paths(text: impl Into<String>) -> String {
+pub(crate) fn normalize_snapshot_paths(text: impl Into<String>) -> String {
     let mut text = text
         .into()
         .replace("Ask RzCodex to do anything", "Ask Codex to do anything");

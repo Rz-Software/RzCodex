@@ -2271,6 +2271,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "codex-apply-patch",
+ "codex-async-utils",
  "codex-exec-server",
  "codex-install-context",
  "codex-linux-sandbox",
@@ -2704,6 +2705,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "codex-config-schema"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "codex-config",
+]
+
+[[package]]
 name = "codex-connectors"
 version = "0.0.0"
 dependencies = [
@@ -2759,7 +2769,6 @@ dependencies = [
  "base64 0.22.1",
  "bm25",
  "chrono",
- "clap",
  "codex-agent-graph-store",
  "codex-agent-roles",
  "codex-analytics",
@@ -2783,6 +2792,7 @@ dependencies = [
  "codex-feedback",
  "codex-file-system",
  "codex-git-utils",
+ "codex-guardian-context",
  "codex-history",
  "codex-home",
  "codex-hooks",
@@ -3345,6 +3355,7 @@ dependencies = [
  "codex-core",
  "codex-extension-api",
  "codex-features",
+ "codex-guardian-context",
  "codex-history",
  "codex-http-client",
  "codex-login",
@@ -3645,12 +3656,15 @@ dependencies = [
 name = "codex-mcp-extension"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
+ "axum",
  "codex-config",
  "codex-connectors",
  "codex-connectors-extension",
  "codex-core",
  "codex-core-plugins",
  "codex-exec-server",
+ "codex-exec-server-test-support",
  "codex-extension-api",
  "codex-features",
  "codex-login",
@@ -3659,11 +3673,13 @@ dependencies = [
  "codex-protocol",
  "codex-utils-absolute-path",
  "codex-utils-path-uri",
+ "futures",
  "pretty_assertions",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 
@@ -4039,6 +4055,19 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "codex-realtime-webrtc"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "codex-install-context",
+ "codex-utils-pty",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -4799,6 +4828,20 @@ version = "0.0.0"
 dependencies = [
  "pretty_assertions",
  "v8",
+]
+
+[[package]]
+name = "codex-voice-host"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "codex-install-context",
+ "codex-process-hardening",
+ "codex-realtime-webrtc",
+ "codex-utils-cargo-bin",
+ "pretty_assertions",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

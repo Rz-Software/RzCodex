@@ -90,6 +90,7 @@ use codex_network_proxy::normalize_host;
 use codex_otel::current_span_trace_id;
 use codex_otel::current_span_w3c_trace_context;
 use codex_otel::set_parent_from_w3c_trace_context;
+use codex_protocol::ResponseUsageMetadata;
 use codex_protocol::SessionId;
 use codex_protocol::ThreadId;
 use codex_protocol::approvals::ElicitationRequest;
@@ -349,6 +350,7 @@ use codex_protocol::protocol::ModelVerificationEvent;
 use codex_protocol::protocol::NetworkApprovalContext;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RateLimitSnapshot;
+use codex_protocol::protocol::RawResponseCompletedEvent;
 use codex_protocol::protocol::RequestUserInputEvent;
 use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::SandboxPolicy;
@@ -360,6 +362,7 @@ use codex_protocol::protocol::ThreadMemoryMode;
 use codex_protocol::protocol::TokenCountEvent;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TokenUsageInfo;
+use codex_protocol::protocol::TokenUsageRecord;
 use codex_protocol::protocol::TurnModerationMetadataEvent;
 use codex_protocol::protocol::WarningEvent;
 use codex_protocol::turn_input::TurnInputMode;
@@ -478,28 +481,34 @@ const CYBER_SAFETY_URL: &str = "https://developers.openai.com/codex/concepts/cyb
 
 impl Session {
     /// Spawn and initialize a new session.
-    pub(crate) async fn spawn(args: SessionSpawnArgs) -> CodexResult<(Arc<Self>, SessionIo)> {
-        let parent_trace = match args.parent_trace {
-            Some(trace) => {
-                if codex_otel::context_from_w3c_trace_context(&trace).is_some() {
-                    Some(trace)
-                } else {
-                    warn!("ignoring invalid thread spawn trace carrier");
-                    None
+    /// Hide the concrete startup future from callers while keeping initialization lazy.
+    #[inline(never)]
+    pub(crate) fn spawn(
+        args: SessionSpawnArgs,
+    ) -> BoxFuture<'static, CodexResult<(Arc<Self>, SessionIo)>> {
+        Box::pin(async move {
+            let parent_trace = match args.parent_trace {
+                Some(trace) => {
+                    if codex_otel::context_from_w3c_trace_context(&trace).is_some() {
+                        Some(trace)
+                    } else {
+                        warn!("ignoring invalid thread spawn trace carrier");
+                        None
+                    }
                 }
+                None => None,
+            };
+            let thread_spawn_span = info_span!("thread_spawn", otel.name = "thread_spawn");
+            if let Some(trace) = parent_trace.as_ref() {
+                let _ = set_parent_from_w3c_trace_context(&thread_spawn_span, trace);
             }
-            None => None,
-        };
-        let thread_spawn_span = info_span!("thread_spawn", otel.name = "thread_spawn");
-        if let Some(trace) = parent_trace.as_ref() {
-            let _ = set_parent_from_w3c_trace_context(&thread_spawn_span, trace);
-        }
-        Self::spawn_internal(SessionSpawnArgs {
-            parent_trace,
-            ..args
+            Self::spawn_internal(SessionSpawnArgs {
+                parent_trace,
+                ..args
+            })
+            .instrument(thread_spawn_span)
+            .await
         })
-        .instrument(thread_spawn_span)
-        .await
     }
 
     async fn spawn_internal(args: SessionSpawnArgs) -> CodexResult<(Arc<Self>, SessionIo)> {
@@ -668,6 +677,10 @@ impl Session {
         let model_info = models_manager
             .get_model_info(model.as_str(), &config.to_models_manager_config())
             .await;
+        // Intentionally resolve `enabled` and `use_history_notes_extension` only at
+        // thread startup. Both activation flags stay fixed for this thread runtime,
+        // even if the selected model changes later.
+        token_budget::apply_model_defaults(Arc::make_mut(&mut config), &model_info);
         let configured_config = Arc::clone(&config);
         let multi_agent_version = config.multi_agent_version_override().or_else(|| {
             resolve_multi_agent_version(&conversation_history, inherited_multi_agent_version)
@@ -1323,6 +1336,26 @@ impl Session {
         }
     }
 
+    /// Render the request copy without changing instructions persisted or inherited by forks.
+    pub(crate) async fn get_prompt_base_instructions(&self) -> BaseInstructions {
+        let config = self.get_config().await;
+        let instructions = self.get_base_instructions().await;
+        if !config.update_plan_enabled
+            && config.model_catalog.is_none()
+            && matches!(
+                instructions.provenance,
+                Some(BaseInstructionsProvenance::Model { .. })
+            )
+        {
+            BaseInstructions {
+                text: crate::context::without_update_plan_instructions(&instructions.text),
+                ..instructions
+            }
+        } else {
+            instructions
+        }
+    }
+
     // Merges connector IDs into the session-level explicit connector selection.
     #[tracing::instrument(
         level = "trace",
@@ -1419,6 +1452,8 @@ impl Session {
                     let mut state = self.state.lock().await;
                     state.set_token_info(Some(info));
                 }
+                self.state.lock().await.latest_token_usage_record =
+                    Self::last_token_usage_record_from_rollout(&rollout_items);
 
                 // Defer seeding the session's initial context until the first turn starts so
                 // turn/start overrides can be merged before we write to the rollout.
@@ -1439,6 +1474,8 @@ impl Session {
                     let mut state = self.state.lock().await;
                     state.set_token_info(Some(info));
                 }
+                self.state.lock().await.latest_token_usage_record =
+                    Self::last_token_usage_record_from_rollout(&rollout_items);
 
                 let thread_settings_applied =
                     RolloutItem::EventMsg(thread_settings::applied_event(self).await);
@@ -1601,6 +1638,21 @@ impl Session {
             RolloutItem::EventMsg(EventMsg::TokenCount(ev)) => ev.info.clone(),
             _ => None,
         })
+    }
+
+    fn last_token_usage_record_from_rollout(
+        rollout_items: &[RolloutItem],
+    ) -> Option<TokenUsageRecord> {
+        for item in rollout_items.iter().rev() {
+            match item {
+                RolloutItem::TokenUsageRecord(record) => return Some(record.clone()),
+                RolloutItem::Compacted(compacted) => {
+                    return compacted.latest_token_usage_record.clone();
+                }
+                _ => {}
+            }
+        }
+        None
     }
 
     async fn previous_turn_settings(&self) -> Option<PreviousTurnSettings> {
@@ -3647,6 +3699,8 @@ impl Session {
                 .previous_window_id
                 .map(|id| id.to_string()),
             window_id: Some(metadata.window_ids.window_id.to_string()),
+            compaction_response_id: metadata.compaction_response_id,
+            latest_token_usage_record: self.state.lock().await.latest_token_usage_record.clone(),
         };
         // Wait for accepted updates to finish persisting, then keep later updates from
         // overtaking the current settings snapshot while its checkpoint is written.
@@ -4097,6 +4151,7 @@ impl Session {
                 message: String::new(),
                 window_number,
                 window_ids,
+                compaction_response_id: None,
             },
         )
         .await;
@@ -4209,6 +4264,40 @@ impl Session {
             .await;
         self.send_token_count_event(turn_context).await;
         result
+    }
+
+    pub(crate) async fn record_observed_response_completed(
+        &self,
+        turn_context: &TurnContext,
+        response_id: &str,
+        usage: Option<&TokenUsage>,
+        usage_metadata: Option<&ResponseUsageMetadata>,
+    ) {
+        self.send_event(
+            turn_context,
+            EventMsg::RawResponseCompleted(RawResponseCompletedEvent {
+                response_id: response_id.to_string(),
+                token_usage: usage.cloned(),
+                usage_metadata: usage_metadata.cloned(),
+            }),
+        )
+        .await;
+        let Some(usage) = usage else {
+            return;
+        };
+        let record = self.state.lock().await.record_token_usage(
+            self.thread_id,
+            &turn_context.sub_id,
+            self.session_id(),
+            turn_context
+                .turn_metadata_state
+                .root_turn_id()
+                .unwrap_or_else(|| turn_context.sub_id.clone()),
+            response_id.to_string(),
+            usage,
+        );
+        self.persist_rollout_items(&[RolloutItem::TokenUsageRecord(record)])
+            .await;
     }
 
     pub(crate) async fn record_token_usage_info(

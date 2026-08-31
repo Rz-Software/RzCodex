@@ -213,6 +213,7 @@ pub(crate) use agents_overview::AGENTS_OVERVIEW_VIEW_ID;
 mod app_server_event_targets;
 mod app_server_events;
 pub(crate) mod app_server_requests;
+mod backend_banner_fallback;
 mod background_requests;
 mod config_persistence;
 mod connector_mentions;
@@ -228,7 +229,9 @@ mod permission_shortcuts;
 mod pets;
 mod platform_actions;
 mod plugin_mentions;
+mod rate_limit_refresh;
 mod recap;
+mod reconnect;
 mod replay_filter;
 mod resize_reflow;
 mod safety_buffering;
@@ -590,6 +593,7 @@ pub(crate) struct App {
     feedback_audience: FeedbackAudience,
     environment_manager: Arc<EnvironmentManager>,
     app_server_target: AppServerTarget,
+    reconnect: reconnect::ReconnectState,
     /// Set when the user confirms an update; propagated on exit.
     pub(crate) pending_update_action: Option<UpdateAction>,
 
@@ -629,6 +633,7 @@ pub(crate) struct App {
     startup_pending_protected_request: bool,
     /// Invalidates in-flight full rate-limit reads when a newer rolling hard stop arrives.
     rate_limit_hard_stop_generation: u64,
+    rate_limit_refresh_state: rate_limit_refresh::RateLimitRefreshState,
     // Serialize plugin enablement writes per plugin so stale completions cannot
     // overwrite a newer toggle, even if the plugin is toggled from different
     // cwd contexts.
@@ -786,6 +791,18 @@ impl App {
         app_server: &mut AppServerSession,
         event: TuiEvent,
     ) -> Result<AppRunControl> {
+        if self.reconnect.offline
+            && let TuiEvent::Key(key) = &event
+            && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && let KeyCode::Char(character) = key.code
+            && (character.eq_ignore_ascii_case(&'c')
+                || (character.eq_ignore_ascii_case(&'d')
+                    && self.chat_widget.composer_is_empty()
+                    && self.chat_widget.no_modal_or_popup_active()))
+        {
+            return Ok(AppRunControl::Exit(ExitReason::UserRequested));
+        }
         let screen_size = tui.screen_size_for_event(&event)?;
         if !matches!(
             &event,
@@ -803,6 +820,17 @@ impl App {
         } else {
             event
         };
+
+        if self.reconnect.offline
+            && let TuiEvent::Key(key) = &event
+        {
+            if self.reconnect.presentation == reconnect::ReconnectPresentation::Overview {
+                self.chat_widget.handle_disconnected_view_key(*key);
+            } else {
+                self.chat_widget.handle_disconnected_key(*key);
+            }
+            return Ok(AppRunControl::Continue);
+        }
 
         match &event {
             TuiEvent::FocusLost => {
@@ -839,6 +867,15 @@ impl App {
                     // [iTerm2]: https://github.com/gnachman/iTerm2/blob/5d0c0d9f68523cbd0494dad5422998964a2ecd8d/sources/iTermPasteHelper.m#L206-L216
                     let pasted = pasted.replace("\r\n", "\n").replace('\r', "\n");
                     self.chat_widget.handle_paste(pasted);
+                    if self.reconnect.offline
+                        && self.reconnect.presentation
+                            == reconnect::ReconnectPresentation::Conversation
+                    {
+                        self.chat_widget.handle_disconnected_key(KeyEvent::new(
+                            KeyCode::Null,
+                            KeyModifiers::NONE,
+                        ));
+                    }
                 }
                 TuiEvent::Draw | TuiEvent::Resume | TuiEvent::Resize(_) | TuiEvent::FocusGained => {
                     if self.backtrack_render_pending {

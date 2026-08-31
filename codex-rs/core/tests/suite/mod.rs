@@ -72,6 +72,7 @@ mod external_auth;
 mod fork_thread;
 mod git_enrichment;
 mod guardian_authorization;
+mod guardian_history;
 mod guardian_mcp_elicitation;
 #[cfg(not(target_os = "windows"))]
 mod guardian_review;
@@ -165,6 +166,7 @@ mod stream_no_completed;
 mod subagent_notifications;
 mod subagent_service_tier;
 mod token_budget;
+mod token_usage_rollout;
 mod tool_harness;
 mod tool_lifecycle;
 mod tool_parallelism;

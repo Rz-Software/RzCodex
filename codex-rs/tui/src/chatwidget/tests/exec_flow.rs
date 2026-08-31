@@ -2,6 +2,208 @@ use super::*;
 use pretty_assertions::assert_eq;
 
 #[tokio::test]
+async fn replayed_command_completion_preserves_tracking_without_duplicate_starts() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.on_task_started();
+    let mut item =
+        begin_unified_exec_startup(&mut chat, "call-replay", "process-replay", "cat replay");
+    if let AppServerThreadItem::CommandExecution { status, .. } = &mut item {
+        *status = AppServerCommandExecutionStatus::Completed;
+    }
+
+    chat.handle_server_notification(
+        ServerNotification::ItemCompleted(ItemCompletedNotification {
+            thread_id: String::new(),
+            turn_id: "turn-1".to_string(),
+            completed_at_ms: 0,
+            item,
+        }),
+        Some(ReplayKind::ThreadSnapshot),
+    );
+
+    assert!(chat.running_commands.is_empty());
+    assert!(chat.unified_exec_processes.is_empty());
+    let history = drain_insert_history(&mut rx)
+        .iter()
+        .map(|lines| lines_to_single_string(lines))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        history,
+        vec!["• Ran cat replay\n  └ (no output)\n".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn replayed_completion_preserves_unrelated_running_command() {
+    for active_mcp in [false, true] {
+        let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+        chat.on_task_started();
+        let mut completed = begin_exec(&mut chat, "call-running", "sleep 5");
+        if active_mcp {
+            chat.transcript.active_cell = Some(Box::new(history_cell::new_active_mcp_tool_call(
+                "mcp-running".to_string(),
+                McpInvocation {
+                    server: "server".to_string(),
+                    tool: "tool".to_string(),
+                    arguments: None,
+                },
+                /*animations_enabled*/ false,
+            )));
+        }
+        if let AppServerThreadItem::CommandExecution {
+            id,
+            command,
+            status,
+            ..
+        } = &mut completed
+        {
+            *id = "call-completed".to_string();
+            *command = "printf completed".to_string();
+            *status = AppServerCommandExecutionStatus::Completed;
+        }
+
+        chat.replay_thread_item(completed, "turn-1".to_string(), ReplayKind::ThreadSnapshot);
+
+        assert_eq!(drain_insert_history(&mut rx).len(), 1);
+        assert!(active_blob(&chat).contains(if active_mcp {
+            "Calling"
+        } else {
+            "Running sleep 5"
+        }));
+    }
+}
+
+#[tokio::test]
+async fn failed_exploration_keeps_overlapping_commands_active_until_all_finish() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.on_task_started();
+
+    let failed = begin_exec(&mut chat, "call-failed", "ls missing");
+    let running = begin_exec(&mut chat, "call-running", "cat foo.txt");
+    end_exec(&mut chat, failed, "", "missing\n", /*exit_code*/ 1);
+    let followup = begin_exec(&mut chat, "call-followup", "cat bar.txt");
+
+    assert!(drain_insert_history(&mut rx).is_empty());
+    chat.on_exec_command_output_delta("call-running", "streamed output\n");
+    let transcript = chat
+        .active_cell_transcript_lines(/*width*/ 80)
+        .expect("overlapping command should remain active");
+    let transcript = lines_to_single_string(&transcript);
+    assert!(transcript.contains("missing"));
+    assert!(transcript.contains("streamed output"));
+
+    end_exec(&mut chat, running, "finished\n", "", /*exit_code*/ 0);
+    assert!(drain_insert_history(&mut rx).is_empty());
+    end_exec(&mut chat, followup, "followup\n", "", /*exit_code*/ 0);
+
+    let cells = drain_insert_history(&mut rx);
+    assert_eq!(cells.len(), 1);
+    let history = lines_to_single_string(&cells[0]);
+    insta::assert_snapshot!(history, @r"
+• Explored
+  └ List missing
+    Read foo.txt, bar.txt
+");
+
+    let later = begin_exec(&mut chat, "call-after-failure", "cat later.txt");
+    end_exec(&mut chat, later, "later\n", "", /*exit_code*/ 0);
+    insta::assert_snapshot!(active_blob(&chat), @r"
+• Explored
+  └ Read later.txt
+");
+}
+
+#[tokio::test]
+async fn replayed_commands_preserve_individual_output_and_failure_status() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let cwd = chat.config.cwd.clone();
+    let replayed_command =
+        |id: &str, output: &str, source: ExecCommandSource| AppServerThreadItem::CommandExecution {
+            id: id.to_string(),
+            command: format!("printf {output}"),
+            cwd: cwd.clone().into(),
+            process_id: None,
+            plugin_id: None,
+            script_path: None,
+            source,
+            status: AppServerCommandExecutionStatus::Completed,
+            command_actions: Vec::new(),
+            aggregated_output: Some(format!("{output}\n")),
+            exit_code: Some(0),
+            duration_ms: Some(5),
+        };
+    let mut declined = replayed_command("call-declined", "declined", ExecCommandSource::Agent);
+    let mut failed = replayed_command(
+        "call-failed",
+        "failure",
+        ExecCommandSource::UnifiedExecStartup,
+    );
+    if let AppServerThreadItem::CommandExecution {
+        status, exit_code, ..
+    } = &mut failed
+    {
+        *status = AppServerCommandExecutionStatus::Failed;
+        *exit_code = Some(7);
+    }
+    if let AppServerThreadItem::CommandExecution {
+        status, exit_code, ..
+    } = &mut declined
+    {
+        *status = AppServerCommandExecutionStatus::Declined;
+        *exit_code = None;
+    }
+    let turn = AppServerTurn {
+        items: vec![
+            replayed_command("call-first", "first", ExecCommandSource::Agent),
+            replayed_command(
+                "call-second",
+                "second",
+                ExecCommandSource::UnifiedExecStartup,
+            ),
+            failed,
+            declined,
+        ],
+        ..app_server_turn(
+            "turn-1",
+            AppServerTurnStatus::Completed,
+            /*duration_ms*/ None,
+            /*error*/ None,
+        )
+    };
+
+    chat.replay_thread_turns(vec![turn], ReplayKind::ResumeInitialMessages);
+
+    let cells = std::iter::from_fn(|| rx.try_recv().ok())
+        .filter_map(|event| match event {
+            AppEvent::InsertHistoryCell(cell) => Some(cell),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(cells.len(), 4);
+    let transcript = cells
+        .iter()
+        .map(|cell| lines_to_single_string(&cell.transcript_lines(/*width*/ 80)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    insta::assert_snapshot!(transcript, @r"$ printf first
+first
+✓ • 5ms
+
+$ printf second
+second
+✓ • 5ms
+
+$ printf failure
+failure
+✗ (7) • 5ms
+
+$ printf declined
+declined
+✗ (1) • 5ms
+");
+}
+
+#[tokio::test]
 async fn exec_approval_emits_proposed_command_and_decision_history() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
@@ -673,35 +875,43 @@ async fn unified_exec_wait_before_streamed_agent_message_snapshot() {
 
 #[tokio::test]
 async fn final_worked_for_uses_cumulative_turn_duration_snapshot() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    handle_turn_started(&mut chat, "turn-1");
+    for duration_ms in [Some(125_000), None] {
+        let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+        handle_turn_started(&mut chat, "turn-1");
 
-    let exec = begin_exec_with_source(
-        &mut chat,
-        "call-1",
-        "echo preparing",
-        ExecCommandSource::Agent,
-    );
-    end_exec(&mut chat, exec, "preparing\n", "", /*exit_code*/ 0);
+        let exec = begin_exec_with_source(
+            &mut chat,
+            "call-1",
+            "echo preparing",
+            ExecCommandSource::Agent,
+        );
+        end_exec(&mut chat, exec, "preparing\n", "", /*exit_code*/ 0);
 
-    complete_assistant_message(
-        &mut chat,
-        "msg-final",
-        "Final response.",
-        Some(MessagePhase::FinalAnswer),
-    );
-    handle_turn_completed(&mut chat, "turn-1", Some(125_000));
+        chat.bottom_pane
+            .reset_status_timer(Duration::from_secs(/*secs*/ 125));
+        handle_agent_message_delta(&mut chat, "Final response.\n");
+        chat.on_commit_tick();
+        assert!(!chat.bottom_pane.status_indicator_visible());
 
-    let cells = drain_insert_history(&mut rx);
-    let combined = cells
-        .iter()
-        .map(|lines| lines_to_single_string(lines))
-        .collect::<String>();
-    assert!(
-        combined.contains("Worked for 2m 05s"),
-        "expected final separator to use cumulative turn duration, got:\n{combined}"
-    );
-    assert_chatwidget_snapshot!("final_worked_for_uses_cumulative_turn_duration", combined);
+        complete_assistant_message(
+            &mut chat,
+            "msg-final",
+            "Final response.",
+            Some(MessagePhase::FinalAnswer),
+        );
+        handle_turn_completed(&mut chat, "turn-1", duration_ms);
+
+        let cells = drain_insert_history(&mut rx);
+        let combined = cells
+            .iter()
+            .map(|lines| lines_to_single_string(lines))
+            .collect::<String>();
+        assert!(
+            combined.contains("Worked for 2m 05s"),
+            "expected final separator to use cumulative turn duration, got:\n{combined}"
+        );
+        assert_chatwidget_snapshot!("final_worked_for_uses_cumulative_turn_duration", combined);
+    }
 }
 
 #[tokio::test]

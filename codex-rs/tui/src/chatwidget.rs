@@ -354,6 +354,7 @@ mod goal_menu;
 mod ide_context;
 use self::ide_context::IdeContextState;
 mod input_queue;
+mod reconnect;
 use self::input_queue::InputQueueState;
 mod input_flow;
 mod input_restore;
@@ -394,6 +395,7 @@ mod permission_shortcuts;
 mod permissions_menu;
 pub(crate) use self::permissions_menu::auto_review_available;
 pub(crate) use self::permissions_menu::cyber_model_approval_reviewer;
+mod backend_banners;
 mod protocol;
 mod protocol_requests;
 mod rate_limits;
@@ -595,9 +597,11 @@ pub(crate) struct ChatWidget {
     codex_rate_limit_reached_type: Option<RateLimitReachedType>,
     codex_spend_control_reached: Option<bool>,
     rate_limit_warnings: RateLimitWarningState,
+    backend_banner_state: backend_banners::BackendBannerState,
+    backend_banner_notice_model: Option<String>,
     warning_display_state: WarningDisplayState,
     rate_limit_switch_prompt: RateLimitSwitchPromptState,
-    add_credits_nudge_email_in_flight: Option<AddCreditsNudgeCreditType>,
+    add_credits_nudge_email_in_flight: Option<rate_limits::PendingCreditsNudge>,
     adaptive_chunking: AdaptiveChunkingPolicy,
     // Stream lifecycle controller
     stream_controller: Option<StreamController>,
@@ -1241,6 +1245,18 @@ impl ChatWidget {
         }
     }
 
+    fn flush_completed_command_activity(&mut self) {
+        if self
+            .transcript
+            .active_cell
+            .as_ref()
+            .and_then(|cell| cell.as_any().downcast_ref::<ExecCell>())
+            .is_some_and(|cell| !cell.is_active())
+        {
+            self.flush_active_cell();
+        }
+    }
+
     pub(crate) fn add_to_history(&mut self, cell: impl HistoryCell + 'static) {
         self.add_boxed_history(Box::new(cell));
     }
@@ -1270,6 +1286,15 @@ impl ChatWidget {
                 self.flush_active_cell();
             }
             self.transcript.needs_final_message_separator = true;
+        } else if !keep_placeholder_header_active
+            && self
+                .transcript
+                .active_cell
+                .as_ref()
+                .is_some_and(|active_cell| active_cell.as_any().is::<ExecCell>())
+            && !cell.transcript_lines(history_width).is_empty()
+        {
+            self.flush_completed_command_activity();
         }
         self.app_event_tx.send(AppEvent::InsertHistoryCell(cell));
     }
