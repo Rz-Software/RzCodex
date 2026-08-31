@@ -320,7 +320,7 @@ function catalogModel(uid, expectedLabel, mustBeFree) {
 }
 
 const models = {
-  primary: catalogModel(route.primaryModel, "GPT-5.6 Sol High Thinking", false),
+  primary: catalogModel(route.primaryModel, "GLM-5.3 Flash Max", false),
   terminal: catalogModel(route.terminalFallbackModel, "GLM-5.2 High", true),
 };
 
