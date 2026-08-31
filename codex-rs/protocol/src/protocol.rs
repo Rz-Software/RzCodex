@@ -254,8 +254,16 @@ pub struct ConversationStartParams {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConversationStartTransport {
     Websocket,
-    Webrtc { sdp: String },
-    ExistingCall { call_id: String },
+    Webrtc {
+        sdp: String,
+    },
+    ExistingCall {
+        call_id: String,
+        /// Endpoint selected by the embedding runtime for this call's sideband.
+        /// This is an in-process override, not a client-supplied API parameter.
+        /// `None` uses the configured endpoint or the default public API.
+        sideband_base_url: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
@@ -440,6 +448,13 @@ pub enum RealtimeEvent {
     ConversationItemDone {
         item_id: String,
     },
+    /// Canonical display history produced by Core, separate from provider events.
+    HistoryItemStarted(crate::realtime::RealtimeItem),
+    HistoryTranscriptDelta {
+        item_id: String,
+        delta: String,
+    },
+    HistoryItemCompleted(crate::realtime::RealtimeItem),
     HandoffRequested(RealtimeHandoffRequested),
     NoopRequested(RealtimeNoopRequested),
     Error(String),
