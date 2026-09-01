@@ -96,6 +96,32 @@ use wiremock::matchers::path;
 const TEST_CHATGPT_ID_TOKEN: &str = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJlbWFpbCI6InVzZXJAZXhhbXBsZS5jb20iLCJlbWFpbF92ZXJpZmllZCI6dHJ1ZSwiaHR0cHM6Ly9hcGkub3BlbmFpLmNvbS9hdXRoIjp7ImNoYXRncHRfdXNlcl9pZCI6InVzZXItMTIzNDUiLCJ1c2VyX2lkIjoidXNlci0xMjM0NSIsImNoYXRncHRfcGxhbl90eXBlIjoicHJvIiwiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjb3VudC0xMjMifX0.c2ln";
 const TEST_INSTALLATION_ID: &str = "11111111-1111-4111-8111-111111111111";
 
+#[test]
+fn native_openai_request_drops_bridge_progress_reasoning_ids() {
+    let mut input = vec![
+        serde_json::from_value(json!({
+            "type": "reasoning",
+            "id": "progress_external_provider_fixture",
+            "summary": [{ "type": "summary_text", "text": "local progress" }]
+        }))
+        .expect("bridge progress reasoning should deserialize"),
+        serde_json::from_value(json!({
+            "type": "reasoning",
+            "id": "rs_openai_fixture",
+            "summary": [{ "type": "summary_text", "text": "server reasoning" }]
+        }))
+        .expect("OpenAI reasoning should deserialize"),
+    ];
+
+    ModelClient::remove_bridge_progress_reasoning(&mut input);
+
+    assert_eq!(input.len(), 1);
+    assert_eq!(
+        input[0].id().map(codex_protocol::ResponseItemId::as_str),
+        Some("rs_openai_fixture")
+    );
+}
+
 fn test_model_client(session_source: SessionSource) -> ModelClient {
     test_model_client_with_thread_id(ThreadId::new(), session_source)
 }

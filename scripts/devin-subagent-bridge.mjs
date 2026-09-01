@@ -11,8 +11,11 @@ import { DatabaseSync } from "node:sqlite";
 import {
   TaskStateError,
   activeTaskPromptSection,
+  checkpointPromptSection,
   isBridgeProgressReasoning,
+  mutationContractPromptSection,
   normalizeAgentMessageContent,
+  progressPromptSection,
   taskDeliveryDiagnostics,
   taskStateFromInput,
   validateTerminalCompletion,
@@ -36,7 +39,10 @@ const OLLAMA_REQUIRED_EFFORT = "max";
 const LEGACY_REQUEST_EFFORTS = new Set(["max"]);
 const DEFAULT_PORT = 54548;
 const MAX_REQUEST_BYTES = 32 * 1024 * 1024;
-const MAX_PROMPT_CHARS = 40_000;
+// Keep enough task-local tool history for complex implementation work without approaching the
+// providers' very large context windows. About 120k characters is roughly the requested 30k-token
+// working context; trivial turns remain much smaller because this is only a cap.
+const MAX_PROMPT_CHARS = 120_000;
 const MAX_ACTIVE_TASK_CHARS = 40_000;
 const OUTPUT_LIMIT = 2 * 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 30 * 60 * 1000;
@@ -57,13 +63,10 @@ const ANTIGRAVITY_BRIDGE_ENDPOINT = "http://127.0.0.1:54549/v1/responses";
 const ANTIGRAVITY_REQUIRED_AUTH_SOURCE = "Antigravity cached OAuth session";
 const ANTIGRAVITY_REQUIRED_EFFORT = "high";
 const ANTIGRAVITY_CONTEXT_WINDOW = 131_072;
-const CODEBUDDY_BRIDGE_ENDPOINT = "http://127.0.0.1:54547/v1/responses";
-const CODEBUDDY_REQUIRED_AUTH_SOURCE = "www.codebuddy.ai";
-const CODEBUDDY_REQUIRED_EFFORT = "max";
 const OLLAMA_RESPONSES_ENDPOINT = "http://127.0.0.1:11434/v1/responses";
 const OLLAMA_AUTH_SOURCE = "Ollama local signed-in session";
 const OLLAMA_CONTEXT_WINDOW = 1_048_576;
-const REQUIRED_AUTO_PROVIDER_ORDER = ["antigravity", "devin", "ollama", "devin-free", "codebuddy"];
+const REQUIRED_AUTO_PROVIDER_ORDER = ["antigravity", "devin", "ollama", "devin-free"];
 const SCRIPT_DIRECTORY = dirname(fileURLToPath(import.meta.url));
 const CENTRAL_CONFIG = join(homedir(), ".codex", "subagent-models.json");
 const USER_DEVIN_CONFIG = join(process.env.APPDATA || join(homedir(), "AppData", "Roaming"), "devin", "config.json");
@@ -292,7 +295,6 @@ function centralRoute() {
   }
   const route = assertObject(parsed[PROVIDER_ID], `central route ${PROVIDER_ID}`);
   const antigravityRoute = assertObject(parsed.antigravity, "central route antigravity");
-  const codebuddyRoute = assertObject(parsed.codebuddy, "central route codebuddy");
   const ollamaRoute = assertObject(parsed.ollama, "central route ollama");
   const autoRoute = assertObject(parsed.routes?.auto, "central managed route auto");
   const inputModalities = route.inputModalities;
@@ -316,10 +318,6 @@ function centralRoute() {
       500,
     );
   }
-  const codebuddyInputModalities = codebuddyRoute.inputModalities;
-  if (!Array.isArray(codebuddyInputModalities) || codebuddyInputModalities.length !== 1 || codebuddyInputModalities[0] !== "text") {
-    throw new BridgeError("CodeBuddy managed route must declare exactly the text modality", 500);
-  }
   const nativeFallbackRoute = requireString(autoRoute.nativeFallbackRoute, "routes.auto.nativeFallbackRoute");
   const nativeRoute = assertObject(parsed.routes?.[nativeFallbackRoute], `central managed route ${nativeFallbackRoute}`);
   if (nativeFallbackRoute === "auto" || nativeRoute.modelProvider !== "openai") {
@@ -333,8 +331,6 @@ function centralRoute() {
       requireString(antigravityRoute.primaryModel, "antigravity.primaryModel"),
       requireString(antigravityRoute.quotaFallbackModel, "antigravity.quotaFallbackModel"),
     ],
-    codebuddyModel: requireString(codebuddyRoute.model, "codebuddy.model"),
-    codebuddyInputModalities,
     nativeFallbackRoute,
     ollamaModel: requireString(ollamaRoute.model, "ollama.model"),
     ollamaLabel: requireString(ollamaRoute.label, "ollama.label"),
@@ -438,8 +434,8 @@ const runtime = {
   lastActualProvider: null, lastModelLabel: null, lastQuotaFallback: false,
   lastTerminalFallback: false, lastFallbackReason: null,
   fallbackAttempts: 0, fallbackCompleted: 0, fallbackFailed: 0, terminalFallbacks: 0,
-  providerAttempts: { antigravity: 0, devin: 0, ollama: 0, devinFree: 0, codebuddy: 0 },
-  providerFailures: { antigravity: 0, devin: 0, ollama: 0, "devin-free": 0, codebuddy: 0 },
+  providerAttempts: { antigravity: 0, devin: 0, ollama: 0, devinFree: 0 },
+  providerFailures: { antigravity: 0, devin: 0, ollama: 0, "devin-free": 0 },
   lastProviderSequence: [],
   fallbackStreamCommits: 0, lastFallbackStreamCommitted: false,
   lastFallbackProviderOutputObserved: false,
@@ -741,6 +737,12 @@ function promptFrom(body) {
   } else {
     sections.push(...retained.map((item) => item.text));
   }
+  const progress = progressPromptSection(taskState);
+  if (progress) sections.push(progress);
+  const mutationContract = mutationContractPromptSection(taskState);
+  if (mutationContract) sections.push(mutationContract);
+  const checkpoint = checkpointPromptSection(taskState);
+  if (checkpoint) sections.push(checkpoint);
   const prompt = sections.join("\n\n");
   let taskDiagnostics;
   try {
@@ -778,15 +780,6 @@ function ollamaSelection(reason) {
     key: "ollama",
     provider: "ollama",
     model: { model_uid: route.ollamaModel, label: route.ollamaLabel },
-    reason,
-  };
-}
-
-function codebuddySelection(reason) {
-  return {
-    key: "codebuddy",
-    provider: "codebuddy",
-    model: { model_uid: route.codebuddyModel, label: route.codebuddyModel },
     reason,
   };
 }
@@ -1722,53 +1715,6 @@ async function runOllamaStage(
   }
 }
 
-function validateCodeBuddyCompletion(completion) {
-  if (!completion || completion.status !== "completed") {
-    throw new BridgeError(`CodeBuddy returned response status ${json(completion?.status)}`, 502);
-  }
-  const metadata = assertObject(completion.metadata, "CodeBuddy response metadata");
-  if (metadata.codebuddy_initialized_model !== route.codebuddyModel) {
-    throw new BridgeError(`CodeBuddy initialized unexpected model ${json(metadata.codebuddy_initialized_model)}`, 502);
-  }
-  if (metadata.codebuddy_auth_source !== CODEBUDDY_REQUIRED_AUTH_SOURCE) {
-    throw new BridgeError(`CodeBuddy used unexpected auth source ${json(metadata.codebuddy_auth_source)}`, 502);
-  }
-  if (Number(metadata.codebuddy_total_cost_usd) !== 0) {
-    throw new BridgeError(`CodeBuddy reported non-zero explicit cost ${json(metadata.codebuddy_total_cost_usd)}`, 502);
-  }
-  if (!Array.isArray(completion.output) || completion.output.length === 0) {
-    throw new BridgeError("CodeBuddy completed without output items", 502);
-  }
-  return completion;
-}
-
-async function runCodeBuddyStage(context, requestBody, failures, onProgress, signal, streamRelay) {
-  runtime.providerAttempts.codebuddy += 1;
-  runtime.lastProviderSequence.push("codebuddy");
-  onProgress?.("Automatic route started CodeBuddy Hy4 through its authenticated included access.\n");
-  try {
-    const completion = validateCodeBuddyCompletion(await runResponsesBridge({
-      endpoint: CODEBUDDY_BRIDGE_ENDPOINT,
-      body: fallbackForwardBody(requestBody, MODEL_ALIAS, CODEBUDDY_REQUIRED_EFFORT),
-      signal,
-      inactivityTimeoutMs: PROVIDER_STREAM_INACTIVITY_MS,
-      onEvent: streamRelay.accept,
-    }));
-    return {
-      ...responsesResult(
-        completion,
-        codebuddySelection("auto_codebuddy_after_prior_provider_failure"),
-        fallbackState(context, failures),
-        { ignoredBytes: context.toolSchemaBytes, forwardedBytes: 0 },
-      ),
-      streamRelay,
-    };
-  } catch (error) {
-    if (streamRelay.committed) error.routeCommitted = true;
-    throw error;
-  }
-}
-
 async function runDevinStage(
   context,
   selected,
@@ -1883,17 +1829,6 @@ async function executeAuto(context, requestBody, onSpawn, onProgress, signal, cr
           { skipIfBusy: true },
         );
       },
-    },
-    {
-      name: "codebuddy",
-      run: ({ failures }) => runCodeBuddyStage(
-        context,
-        requestBody,
-        failures,
-        onProgress,
-        signal,
-        createStreamRelay(),
-      ),
     },
   ];
   const pinnedIndex = stages.findIndex((stage) => stage.name === pinnedStage);
@@ -2395,7 +2330,6 @@ function health(requestedRoute = "auto") {
       antigravity: ANTIGRAVITY_REQUIRED_AUTH_SOURCE,
       devin: auth.source,
       ollama: OLLAMA_AUTH_SOURCE,
-      codebuddy: CODEBUDDY_REQUIRED_AUTH_SOURCE,
     },
     inputModalities: route.inputModalities,
     routing: {
@@ -2431,20 +2365,11 @@ function health(requestedRoute = "auto") {
         cost: models.terminal.cost_summary || models.terminal.cost_tier,
         maxConcurrency: FREE_ROUTE_CONCURRENCY,
       },
-      codebuddy: {
-        provider: "codebuddy",
-        uid: route.codebuddyModel,
-        effort: CODEBUDDY_REQUIRED_EFFORT,
-        authSource: CODEBUDDY_REQUIRED_AUTH_SOURCE,
-        endpoint: CODEBUDDY_BRIDGE_ENDPOINT,
-        explicitCostRequiredUsd: 0,
-        toolServing: "CodeBuddy ToolSearch and DeferExecuteTool lazy MCP adapter",
-      },
       nativeFallback: {
         route: route.nativeFallbackRoute,
         activation: "Codex in-process provider switch after every external stage fails before committed work",
       },
-      orderedPolicy: "antigravity_primary_then_antigravity_quota_fallback_then_devin_primary_then_ollama_then_devin_free_then_codebuddy_then_native_openai",
+      orderedPolicy: "antigravity_primary_then_antigravity_quota_fallback_then_devin_primary_then_ollama_then_devin_free_then_native_openai",
       configuredProviderOrder: route.autoProviderOrder,
       capacityPolicy: {
         autoWhenSaturated: "continue_to_next_provider",
@@ -2528,7 +2453,6 @@ async function selfTest() {
     || route.ollamaEffort !== OLLAMA_REQUIRED_EFFORT
     || route.ollamaMaxConcurrency !== OLLAMA_CLOUD_CONCURRENCY
     || !route.ollamaResponseModels.includes(route.ollamaModel)
-    || route.codebuddyModel.length === 0
     || route.nativeFallbackRoute !== "native"
     || !models.terminal.model_uid
   ) {
@@ -2827,6 +2751,13 @@ async function selfTest() {
   const checkpointIndex = prompt.indexOf(checkpoint);
   if (!(staleIndex >= 0 && staleIndex < taskIndex && taskIndex < checkpointIndex)) throw new Error("active task precedence failed");
   if (prompt.indexOf(task, taskIndex + task.length) !== -1) throw new Error("active task duplication failed");
+  if (
+    !prompt.includes("[Authoritative progress since active task]")
+    || !prompt.includes("[Mutation convergence contract]")
+    || !prompt.includes("[On-demand checkpoint requested]")
+  ) {
+    throw new Error("managed convergence state was not delivered to the provider");
+  }
   const reversedPrompt = promptFrom({
     stream: true,
     model: MODEL_ALIAS,
@@ -3199,18 +3130,6 @@ async function selfTest() {
   ) {
     throw new Error("Devin native-tool commitment classification failed");
   }
-  const codebuddyFixture = validateCodeBuddyCompletion({
-    status: "completed",
-    output: [{ type: "message", id: "msg-codebuddy", role: "assistant", content: [] }],
-    metadata: {
-      codebuddy_initialized_model: route.codebuddyModel,
-      codebuddy_auth_source: CODEBUDDY_REQUIRED_AUTH_SOURCE,
-      codebuddy_total_cost_usd: 0,
-    },
-  });
-  if (codebuddyFixture.metadata.codebuddy_total_cost_usd !== 0) {
-    throw new Error("CodeBuddy included-access validation failed");
-  }
   let concurrentFreeCalls = 0;
   let peakConcurrentFreeCalls = 0;
   const freeRoute = { key: "terminal" };
@@ -3259,10 +3178,10 @@ async function selfTest() {
           { skipIfBusy: true },
         ),
       },
-      { name: "codebuddy", run: async () => "next-provider" },
+      { name: "next-provider", run: async () => "next-provider" },
     ],
   });
-  if (saturatedAutoChain.stage !== "codebuddy" || saturatedAutoChain.value !== "next-provider") {
+  if (saturatedAutoChain.stage !== "next-provider" || saturatedAutoChain.value !== "next-provider") {
     throw new Error("saturated auto chain did not continue to the next provider");
   }
   let boundedCapacityError;

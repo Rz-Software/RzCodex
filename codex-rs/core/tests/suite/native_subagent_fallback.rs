@@ -39,6 +39,43 @@ async fn spawned_subagent_continues_same_turn_on_native_route_before_external_co
             sse(vec![
                 ev_response_created("external-response"),
                 json!({
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": {
+                        "type": "reasoning",
+                        "id": "progress_external-provider-fixture",
+                        "status": "in_progress",
+                        "summary": []
+                    }
+                }),
+                json!({
+                    "type": "response.reasoning_summary_text.delta",
+                    "item_id": "progress_external-provider-fixture",
+                    "output_index": 0,
+                    "summary_index": 0,
+                    "delta": "External provider selection was attempted."
+                }),
+                json!({
+                    "type": "response.reasoning_summary_text.done",
+                    "item_id": "progress_external-provider-fixture",
+                    "output_index": 0,
+                    "summary_index": 0,
+                    "text": "External provider selection was attempted."
+                }),
+                json!({
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": {
+                        "type": "reasoning",
+                        "id": "progress_external-provider-fixture",
+                        "status": "completed",
+                        "summary": [{
+                            "type": "summary_text",
+                            "text": "External provider selection was attempted."
+                        }]
+                    }
+                }),
+                json!({
                     "type": "response.failed",
                     "response": {
                         "id": "external-response",
@@ -89,7 +126,9 @@ async fn spawned_subagent_continues_same_turn_on_native_route_before_external_co
                 .insert("bridge".to_string(), bridge_provider);
 
             let mut native_provider = config.model_provider.clone();
-            native_provider.name = "test native OpenAI".to_string();
+            // Preserve the built-in provider identity: request normalization is intentionally
+            // OpenAI-specific and must run on the real native fallback path.
+            native_provider.name = "OpenAI".to_string();
             native_provider.base_url = Some(native_base_url);
             native_provider.supports_websockets = false;
             native_provider.request_max_retries = Some(0);
@@ -216,6 +255,7 @@ async fn spawned_subagent_continues_same_turn_on_native_route_before_external_co
     assert_eq!(native_request["reasoning"]["effort"], "max");
     let native_input = serde_json::to_string(&native_request["input"])?;
     assert_eq!(native_input.matches(CHILD_PROMPT).count(), 1);
+    assert!(!native_input.contains("progress_external-provider-fixture"));
 
     child.thread.shutdown_and_wait().await?;
     test.thread_manager

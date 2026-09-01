@@ -310,7 +310,7 @@ export function progressPromptSection(taskState) {
 
 export function mutationContractPromptSection(taskState) {
   if (taskState.activeTask?.intent !== "mutation") return "";
-  return `[Mutation convergence contract]\nThe recorded apply_patch results above are authoritative. If you return a final answer while the recorded successful mutation count is zero, include exactly one single-line marker:\nNO_MUTATION_REASON: {"category":"policy|permission|tool|missing_input|semantic","detail":"specific blocker","resolvable_tool":null}\nDo not claim a blocker when you have already identified a safe in-scope tool call that resolves it; make that call instead. If resolvable_tool would not be null, continue the task rather than returning.`;
+  return `[Mutation convergence contract]\nThe recorded tool and apply_patch results above are authoritative. Do not repeat a completed read, search, or status inspection whose result is already present in this turn. Converge on the requested mutation once the necessary signatures and ownership are established. If you return a final answer while the recorded successful mutation count is zero, include exactly one single-line marker:\nNO_MUTATION_REASON: {"category":"policy|permission|tool|missing_input|semantic","detail":"specific blocker","resolvable_tool":null}\nDo not claim a blocker when you have already identified a safe in-scope tool call that resolves it; make that call instead. If resolvable_tool would not be null, continue the task rather than returning.`;
 }
 
 export function checkpointPromptSection(taskState) {

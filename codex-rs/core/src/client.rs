@@ -978,6 +978,9 @@ impl ModelClient {
     ) -> Result<ResponsesApiRequest> {
         let mut input = prompt.get_formatted_input_for_request(model_info.use_responses_lite);
         let is_openai = self.state.provider.info().is_openai();
+        if is_openai {
+            Self::remove_bridge_progress_reasoning(&mut input);
+        }
         let (instructions, tools) = if model_info.use_responses_lite {
             // These prompt-only items are rebuilt on every request. Hash their visible payloads
             // within the thread so retries and resumed sessions preserve their identity.
@@ -1084,6 +1087,20 @@ impl ModelClient {
                 item.clear_content_item_kinds();
             }
         }
+    }
+
+    /// External subagent bridges emit local-only reasoning items with `progress_*` IDs so the
+    /// parent can display provider progress while a turn is running. Those IDs are not OpenAI
+    /// Responses item IDs (reasoning IDs must be server-issued `rs_*` values), so carrying them
+    /// across the terminal native-provider fallback makes the fallback fail before inference.
+    fn remove_bridge_progress_reasoning(input: &mut Vec<ResponseItem>) {
+        input.retain(|item| {
+            !matches!(
+                item,
+                ResponseItem::Reasoning { id: Some(id), .. }
+                    if id.as_str().starts_with("progress_")
+            )
+        });
     }
 
     /// Returns whether the Responses-over-WebSocket transport is active for this session.

@@ -41,7 +41,9 @@ const MAX_PROMPT_CHARS = 120_000;
 const MAX_ACTIVE_TASK_CHARS = 40_000;
 const STDERR_LIMIT = 16 * 1024;
 const REQUEST_TIMEOUT_MS = 30 * 60 * 1000;
-const PROVIDER_SILENCE_TIMEOUT_MS = 55_000;
+// Finish before the outer managed-route inactivity budget (55s) so CodeBuddy can report an
+// authoritative provider failure and the router can continue to the native fallback cleanly.
+const PROVIDER_SILENCE_TIMEOUT_MS = 45_000;
 const FINAL_REPORT_START = "RZCODEX_FINAL_REPORT_BEGIN";
 const FINAL_REPORT_END = "RZCODEX_FINAL_REPORT_END";
 const TEXT_TOOL_NAME = "tool_search";
@@ -72,6 +74,7 @@ const runtime = {
   requests: 0,
   completed: 0,
   failed: 0,
+  lastFailure: null,
   rejected: 0,
   lastRejectedError: null,
   lastModel: null,
@@ -1316,6 +1319,7 @@ async function handleResponses(request, response) {
   runtime.lastProviderProgressEvents = 0;
   runtime.lastStreamedTextChars = 0;
   runtime.lastCompletionEnvelopeAccepted = false;
+  runtime.lastFailure = null;
   runtime.lastProviderSessionHash = sha256(context.providerSessionId);
   runtime.lastProviderSessionResumed = context.providerSessionStarted;
   runtime.lastInputItemCount = context.conversation.inputItemCount;
@@ -1509,6 +1513,7 @@ async function handleResponses(request, response) {
     if (clientGone) return;
     providerConversations.resetProvider(context);
     runtime.failed += 1;
+    runtime.lastFailure = redactSecrets(error.message);
     writeSse(response, "response.failed", {
       response: { id: responseId, object: "response", status: "failed", error: { type: "bridge_error", message: redactSecrets(error.message) } },
     });
@@ -2144,6 +2149,7 @@ function start() {
           explicitCostRequiredUsd: 0, codexManagedLazyTools: true,
           promptTransport: "stream-json-resume-delta", transientProviderSessions: true,
           incrementalVisibleOutput: false,
+          providerSilenceTimeoutMs: PROVIDER_SILENCE_TIMEOUT_MS,
           providerProgressHeartbeatMaxHz: 1, runtime,
         });
         return;

@@ -477,15 +477,8 @@ command = "attacker-command"
     );
     assert_eq!(config.model.as_deref(), Some("role-model"));
     assert_eq!(config.permissions, parent.permissions);
-    assert_eq!(config.model_provider_id, "ollama");
-    assert_eq!(
-        config.model_provider,
-        parent
-            .model_providers
-            .get("ollama")
-            .cloned()
-            .expect("ollama provider should exist")
-    );
+    assert_eq!(config.model_provider_id, parent.model_provider_id);
+    assert_eq!(config.model_provider, parent.model_provider);
     assert_eq!(config.model_providers, parent.model_providers);
     assert_eq!(config.approvals_reviewer, parent.approvals_reviewer);
     assert_eq!(config.mcp_servers, parent.mcp_servers);
@@ -508,6 +501,7 @@ command = "attacker-command"
         "notify",
         "apps",
         "mcp_servers",
+        "model_provider",
     ] {
         assert_eq!(
             role_layer.config.get(key),
@@ -515,14 +509,10 @@ command = "attacker-command"
             "role must not control {key}"
         );
     }
-    assert_eq!(
-        role_layer.config.get("model_provider"),
-        Some(&TomlValue::String("ollama".to_string()))
-    );
 }
 
 #[tokio::test]
-async fn apply_role_rejects_unknown_model_provider() {
+async fn apply_role_ignores_unknown_model_provider() {
     let (home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
     let role_path = write_role_config(
         &home,
@@ -541,11 +531,10 @@ async fn apply_role_rejects_unknown_model_provider() {
     let parent_provider_id = config.model_provider_id.clone();
     let parent_provider = config.model_provider.clone();
 
-    let error = apply_role_to_config(&mut config, Some("custom"))
+    apply_role_to_config(&mut config, Some("custom"))
         .await
-        .expect_err("an unknown provider must be rejected");
+        .expect("role provider selection must be ignored");
 
-    assert_eq!(error, AGENT_TYPE_UNAVAILABLE_ERROR);
     assert_eq!(config.model_provider_id, parent_provider_id);
     assert_eq!(config.model_provider, parent_provider);
 }
