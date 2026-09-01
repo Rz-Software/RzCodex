@@ -329,6 +329,16 @@ fn use_bedrock_provider(turn: &mut TurnContext) {
     turn.provider = create_model_provider(provider_info, turn.auth_manager.clone());
 }
 
+fn use_openrouter_provider(turn: &mut TurnContext) {
+    let provider_info =
+        ModelProviderInfo::create_openai_provider(Some("https://openrouter.ai/api/v1".to_string()));
+    update_config(turn, |config| {
+        config.model_provider_id = "openrouter".to_string();
+        config.model_provider = provider_info.clone();
+    });
+    turn.provider = create_model_provider(provider_info, turn.auth_manager.clone());
+}
+
 struct TestNamespaceExtensionTool {
     namespace: &'static str,
     tool_name: &'static str,
@@ -1432,6 +1442,35 @@ async fn mcp_and_tool_search_follow_direct_and_deferred_tool_exposure() {
     )
     .await;
     missing_model_capability.assert_visible_lacks(&["tool_search"]);
+
+    let openrouter_fallback_metadata = probe_with(
+        |turn| {
+            update_turn_settings_for_test(turn, |settings| {
+                let model_info = Arc::make_mut(&mut settings.model_info);
+                model_info.supports_search_tool = false;
+                model_info.used_fallback_model_metadata = true;
+            });
+            use_openrouter_provider(turn);
+        },
+        searchable_mcp(),
+    )
+    .await;
+    openrouter_fallback_metadata.assert_visible_contains(&["tool_search"]);
+    openrouter_fallback_metadata.assert_visible_lacks(&["mcp__searchable"]);
+
+    let openrouter_explicitly_unsupported = probe_with(
+        |turn| {
+            update_turn_settings_for_test(turn, |settings| {
+                let model_info = Arc::make_mut(&mut settings.model_info);
+                model_info.supports_search_tool = false;
+                model_info.used_fallback_model_metadata = false;
+            });
+            use_openrouter_provider(turn);
+        },
+        searchable_mcp(),
+    )
+    .await;
+    openrouter_explicitly_unsupported.assert_visible_lacks(&["tool_search"]);
 
     let missing_deferred_tools = probe(|turn| {
         set_feature(turn, Feature::Collab, /*enabled*/ false);

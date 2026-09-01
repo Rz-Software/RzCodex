@@ -105,6 +105,7 @@ use tracing::instrument;
 const MULTI_AGENT_V2_NAMESPACE_DESCRIPTION: &str = "Tools for spawning and managing sub-agents.";
 const IMAGE_GEN_NAMESPACE: &str = "image_gen";
 const IMAGEGEN_TOOL_NAME: &str = "imagegen";
+const OPENROUTER_PROVIDER_ID: &str = "openrouter";
 
 #[derive(Clone, Copy)]
 struct CoreToolPlanContext<'a> {
@@ -626,7 +627,10 @@ fn hosted_model_tool_specs(
 }
 
 pub(crate) fn search_tool_enabled(turn_context: &TurnContext, model_info: &ModelInfo) -> bool {
-    model_info.supports_search_tool && namespace_tools_enabled(turn_context)
+    let provider_supplies_unknown_model_search = model_info.used_fallback_model_metadata
+        && turn_context.config.model_provider_id == OPENROUTER_PROVIDER_ID;
+    (model_info.supports_search_tool || provider_supplies_unknown_model_search)
+        && namespace_tools_enabled(turn_context)
 }
 
 pub(crate) fn tool_suggest_enabled(turn_context: &TurnContext) -> bool {
