@@ -14,6 +14,13 @@ import {
   taskStateFromInput,
   validateTerminalCompletion,
 } from "./codebuddy-subagent-task-state.mjs";
+import {
+  NativeCliAgentError,
+  nativeCliAgentContext,
+  nativeCliUsage,
+  runCommandCodeNativeAgent,
+  runOpenCodeNativeAgent,
+} from "./native-cli-agent-runner.mjs";
 
 const COMMAND_CODE_PACKAGE_NAME = "command-code";
 const MINIMUM_COMMAND_CODE_VERSION = "1.33.0";
@@ -22,6 +29,8 @@ const COMMAND_CODE_GENERATE_URL = "https://api.commandcode.ai/alpha/generate";
 const OPENCODE_RESPONSES_URL = "https://opencode.ai/zen/v1/responses";
 const OPENCODE_CHAT_COMPLETIONS_URL = "https://opencode.ai/zen/v1/chat/completions";
 const SUBAGENT_MODEL_ALIAS = "@preset/codex-subagents";
+const COMMANDCODE_REQUIRED_EFFORT = "max";
+const OPENCODE_REQUIRED_EFFORT = "xhigh";
 const MAX_ACTIVE_TASK_CHARS = 40_000;
 const NATIVE_DELEGATION_CONTRACT = "[Native delegation contract]\nWork as the bounded native sub-agent in the current workspace. Honor project AGENTS.md ownership boundaries exactly; when builds, tests, editor control, PIE, runtime validation, or RzMCP execution are reserved to the parent, do not invoke them and instead report the exact checks the parent should run. On Windows, use PowerShell-native commands, single-quote ripgrep patterns containing |, and never assume Unix-only commands such as head are installed. Complete only the assigned scope and return a concise result or concrete blocker.";
 const SUBAGENT_MODEL_ROUTES_FILE = join(
@@ -1525,7 +1534,7 @@ async function handleCursorResponses(request, response) {
   }
 }
 
-async function handleResponses(request, response) {
+async function handleLegacyCommandCodeResponses(request, response) {
   const authorization = bearerFrom(request);
   const body = await readJsonRequest(request);
   const translated = translateResponsesRequest(body);
@@ -2676,7 +2685,7 @@ function transformOpenCodeChatSseBlock(block, state, toolInfo) {
   return events.join("");
 }
 
-async function handleOpenCodeResponses(request, response) {
+async function handleLegacyOpenCodeResponses(request, response) {
   const authorization = bearerFrom(request);
   const translated = normalizeOpenCodeRequest(await readJsonRequest(request));
   const taskState = translated.taskState;
@@ -2780,6 +2789,201 @@ async function handleOpenCodeResponses(request, response) {
   }
 }
 
+function nativeCliProgressEmitter(response) {
+  const itemId = `progress_${randomUUID()}`;
+  let added = false;
+  let text = "";
+  const emit = (delta) => {
+    if (typeof delta !== "string" || !delta) return;
+    if (!added) {
+      added = true;
+      writeSse(response, "response.output_item.added", {
+        output_index: 0,
+        item: { type: "reasoning", id: itemId, status: "in_progress", summary: [] },
+      });
+    }
+    text += delta;
+    writeSse(response, "response.reasoning_summary_text.delta", {
+      item_id: itemId,
+      output_index: 0,
+      summary_index: 0,
+      delta,
+    });
+  };
+  const finish = () => {
+    if (!added) return null;
+    const item = {
+      type: "reasoning",
+      id: itemId,
+      status: "completed",
+      summary: text ? [{ type: "summary_text", text }] : [],
+    };
+    writeSse(response, "response.reasoning_summary_text.done", {
+      item_id: itemId,
+      output_index: 0,
+      summary_index: 0,
+      text,
+    });
+    writeSse(response, "response.output_item.done", { output_index: 0, item });
+    return item;
+  };
+  return { emit, finish, get added() { return added; } };
+}
+
+function nativeCliToolEvent(event) {
+  if (event?.type === "tool_use" && event.part?.state?.status === "completed") {
+    return { id: event.part.callID || event.part.id, name: event.part.tool };
+  }
+  const payload = event?.type === "event" ? event.event : null;
+  if (payload?.type === "tool_running") {
+    return { id: payload.toolCallId, name: payload.toolName };
+  }
+  return null;
+}
+
+async function handleNativeCliResponses(request, response, provider) {
+  const body = await readJsonRequest(request);
+  const commandCode = provider === "commandcode";
+  const requiredEffort = commandCode ? COMMANDCODE_REQUIRED_EFFORT : OPENCODE_REQUIRED_EFFORT;
+  const model = resolveSubagentModelAlias(body.model, provider);
+  let context;
+  try {
+    context = nativeCliAgentContext(body, { provider, model, requiredEffort });
+  } catch (error) {
+    if (error instanceof NativeCliAgentError) throw new BridgeError(error.message, error.status);
+    throw error;
+  }
+  const abortController = new AbortController();
+  let clientGone = false;
+  const abort = () => {
+    clientGone = true;
+    abortController.abort();
+  };
+  request.once("aborted", abort);
+  response.once("close", () => {
+    if (!response.writableEnded) abort();
+  });
+  response.writeHead(200, {
+    "content-type": "text/event-stream; charset=utf-8",
+    "cache-control": "no-cache, no-transform",
+    connection: "keep-alive",
+  });
+  const responseId = `resp_${randomUUID()}`;
+  writeSse(response, "response.created", {
+    response: { id: responseId, object: "response", model: body.model, status: "in_progress" },
+  });
+  const progress = nativeCliProgressEmitter(response);
+  const announcedTools = new Set();
+  let lastHeartbeatAt = 0;
+  const onEvent = (event) => {
+    const now = Date.now();
+    if (now - lastHeartbeatAt >= 5_000) {
+      lastHeartbeatAt = now;
+      writeSse(response, "response.in_progress", {
+        response: { id: responseId, object: "response", model: body.model, status: "in_progress" },
+      });
+    }
+    const tool = nativeCliToolEvent(event);
+    if (!tool?.name) return;
+    const key = tool.id || `${tool.name}:${announcedTools.size}`;
+    if (announcedTools.has(key)) return;
+    announcedTools.add(key);
+    progress.emit(`${provider} native tool ${announcedTools.size}: ${tool.name}.\n`);
+  };
+  try {
+    const result = commandCode
+      ? await runCommandCodeNativeAgent(context, { signal: abortController.signal, onEvent })
+      : await runOpenCodeNativeAgent(context, { providerKind: "opencode", signal: abortController.signal, onEvent });
+    if (clientGone) return;
+    const output = [];
+    const progressItem = progress.finish();
+    if (progressItem) output.push(progressItem);
+    const outputIndex = output.length;
+    const itemId = `msg_${randomUUID()}`;
+    writeSse(response, "response.output_item.added", {
+      output_index: outputIndex,
+      item: responseMessageItem(itemId, ""),
+    });
+    writeSse(response, "response.content_part.added", {
+      item_id: itemId,
+      output_index: outputIndex,
+      content_index: 0,
+      part: { type: "output_text", text: "", annotations: [] },
+    });
+    writeSse(response, "response.output_text.delta", {
+      item_id: itemId,
+      output_index: outputIndex,
+      content_index: 0,
+      delta: result.finalText,
+    });
+    writeSse(response, "response.output_text.done", {
+      item_id: itemId,
+      output_index: outputIndex,
+      content_index: 0,
+      text: result.finalText,
+    });
+    writeSse(response, "response.content_part.done", {
+      item_id: itemId,
+      output_index: outputIndex,
+      content_index: 0,
+      part: { type: "output_text", text: result.finalText, annotations: [] },
+    });
+    const message = responseMessageItem(itemId, result.finalText, "completed");
+    writeSse(response, "response.output_item.done", { output_index: outputIndex, item: message });
+    output.push(message);
+    writeSse(response, "response.completed", {
+      response: {
+        id: responseId,
+        object: "response",
+        model: body.model,
+        status: "completed",
+        usage: nativeCliUsage(result),
+        output,
+        metadata: {
+          actual_provider: provider,
+          actual_model: result.model,
+          actual_reasoning_effort: requiredEffort,
+          native_cli_single_execution: true,
+          native_tool_names: result.toolNames,
+          native_tool_count: result.toolNames.length,
+          provider_mutation_count: result.mutationCount,
+          peak_turn_context_tokens: result.peakTurnInputTokens,
+          normalized_prompt_chars: context.prompt.length,
+          codex_tool_schema_bytes_forwarded: 0,
+          codex_tool_schema_bytes_ignored: context.toolSchemaBytesIgnored,
+          lazy_rzmcp_proxy_tools: commandCode || context.executionPolicy.rzMcpMode !== "disabled" ? 2 : 0,
+          complete_active_task_delivered: context.taskDiagnostics.completeTaskDelivered,
+          active_task_hash: context.taskDiagnostics.taskHash,
+        },
+      },
+    });
+    response.end();
+  } catch (error) {
+    if (clientGone || error?.status === 499) return;
+    const message = redactSecrets(error.message || String(error));
+    writeSse(response, "response.failed", {
+      response: {
+        id: responseId,
+        object: "response",
+        model: body.model,
+        status: "failed",
+        error: { type: "bridge_error", message },
+      },
+    });
+    response.end();
+  } finally {
+    request.removeListener("aborted", abort);
+  }
+}
+
+async function handleResponses(request, response) {
+  return handleNativeCliResponses(request, response, "commandcode");
+}
+
+async function handleOpenCodeResponses(request, response) {
+  return handleNativeCliResponses(request, response, "opencode");
+}
+
 function selfTest() {
   readCommandCodeInstallation();
   const cursorTaskPayload = "Message Type: NEW_TASK\nTask name: /root/worker\nPayload:\nInspect the bounded active Cursor task.";
@@ -2815,6 +3019,33 @@ function selfTest() {
     recipient: "/root/worker",
     content: [{ type: "input_text", text }],
   });
+  const nativeTaskPayload = "Message Type: NEW_TASK\nTask name: /root/native-cli-fixture\nPayload:\nRead the bounded fixture and report exactly once.";
+  const nativeContext = nativeCliAgentContext({
+    model: "@preset/codex-subagents",
+    reasoning: { effort: COMMANDCODE_REQUIRED_EFFORT },
+    stream: true,
+    instructions: "<external_cli_route_instructions>Act as the bounded builder.</external_cli_route_instructions>",
+    input: [
+      { type: "message", role: "user", content: [{ type: "input_text", text: `inherited-${"x".repeat(130_000)}` }] },
+      { type: "compaction", encrypted_content: "provider-opaque-compaction" },
+      taskItem(nativeTaskPayload),
+    ],
+    tools: [{ type: "function", name: "large_parent_schema", parameters: { type: "object", description: "z".repeat(50_000) } }],
+    client_metadata: { cwd: process.cwd() },
+  }, {
+    provider: "commandcode",
+    model: "z-ai/glm-5.3-flash",
+    requiredEffort: COMMANDCODE_REQUIRED_EFFORT,
+  });
+  if (
+    nativeContext.prompt.split(nativeTaskPayload).length !== 2
+    || nativeContext.prompt.includes("provider-opaque-compaction")
+    || nativeContext.prompt.includes("inherited-")
+    || nativeContext.toolSchemaBytesIgnored < 50_000
+    || nativeContext.taskDiagnostics.completeTaskDelivered !== true
+  ) {
+    throw new Error("self-test failed: native CLI must pin the complete task exactly once outside inherited history and parent schemas");
+  }
   const commandCodeAnalysis = translateResponsesRequest({
     model: "commandcode/test-model",
     input: [taskItem(analysisTaskText)],

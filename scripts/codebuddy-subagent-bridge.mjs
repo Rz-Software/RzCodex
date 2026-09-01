@@ -53,7 +53,10 @@ const SESSION_MARKER_DIRECTORY = join(CODEX_HOME, "codebuddy-bridge", "sessions"
 const CODEBUDDY_HOME = join(homedir(), ".codebuddy");
 const MANAGED_SESSION_PREFIX = "rzcodex-";
 const SCRIPT_DIRECTORY = dirname(fileURLToPath(import.meta.url));
-const MCP_SERVER_SCRIPT = join(SCRIPT_DIRECTORY, "codebuddy-codex-tools-mcp.mjs");
+const MCP_SERVER_SCRIPT = join(SCRIPT_DIRECTORY, "devin-rzmcp-lazy-proxy.mjs");
+const EXPLICIT_READ_ONLY_TASK = /\bread[- ]only\b|\bno[- ]mutation\b|\bno\s+(?:edits?|modifications?|writes?|mutations?|file\s+changes|source\s+changes)\b|\b(?:do not|must not|never)\s+(?:edit|modify|write|mutate)(?:\s+(?:any|the|source|project|workspace|files?)){0,3}(?:[.;,]|$)/i;
+const RZMCP_RESTRICTED_TASK = /\b(?:do not|must not|never)[^.\n]{0,160}\b(?:use|invoke|control|call)\s+(?:any\s+|the\s+)?(?:editor|rzmcp)\b|\bno\s+[^.\n]{0,120}\b(?:editor|rzmcp|pie|sie)\b/i;
+const PROVIDER_MUTATION_TOOL = /^(?:Edit|Write|NotebookEdit|mcp__rzmcp__call_rzmcp_tool)$/i;
 const CODEBUDDY_SCRIPT = join(
   process.env.APPDATA || join(homedir(), "AppData", "Roaming"),
   "npm", "node_modules", "@tencent-ai", "codebuddy-code", "bin", "codebuddy",
@@ -65,6 +68,19 @@ class BridgeError extends Error {
     this.name = "BridgeError";
     this.status = status;
   }
+}
+
+function executionPolicy(taskState) {
+  const task = taskState.activeTask?.text || "";
+  const readOnly = taskState.activeTask?.intent === "analysis" || EXPLICIT_READ_ONLY_TASK.test(task);
+  return {
+    readOnly,
+    rzMcpMode: RZMCP_RESTRICTED_TASK.test(task)
+      ? "disabled"
+      : readOnly
+        ? "read-only"
+        : "no-validation",
+  };
 }
 
 const runtime = {
@@ -118,6 +134,7 @@ const runtime = {
   completionEnvelopeFailures: 0,
   lastCompletionEnvelopeAccepted: false,
   activeRequests: 0,
+  staleRequestArtifactsCleaned: 0,
   activeProviderSessions: 0,
   providerSessionsStarted: 0,
   providerSessionResumes: 0,
@@ -768,13 +785,12 @@ function promptFrom(body, registry = providerConversations) {
     : incomingToolInfo;
   runtime.lastIncomingCodexToolCount = incomingToolInfo.definitions.length;
   runtime.lastRetainedToolSurfaceUsed = retainedToolSurfaceUsed;
-  validateManagedToolSurface(toolInfo, route.inputModalities);
   conversation.state.toolInfo = toolInfo;
   if (retainedToolSurfaceUsed) runtime.retainedToolSurfaceUses += 1;
   const sections = [
     conversation.providerSessionStarted
-      ? "[Native delegation continuation]\nContinue the same delegated task in this retained CodeBuddy conversation. The full active task and project AGENTS.md ownership boundaries remain authoritative; do not ask the parent to resend them. New Codex client results and control messages follow below. Use ToolSearch with the exact mcp__codex__ tool name before DeferExecuteTool. When its proxy reports DEFERRED_TO_CODEX_CLIENT, end this turn immediately; the parent will execute that call and resume this same conversation with the real result."
-      : "[Native delegation contract]\nWork as the delegated CodeBuddy sub-agent in the current workspace. Complete only the bounded task and return concise evidence to the parent. Honor project AGENTS.md ownership boundaries exactly; when builds, tests, editor control, PIE, runtime validation, or RzMCP execution are reserved to the parent, do not invoke them and instead report the exact checks the parent should run. On Windows, use PowerShell-native commands, single-quote ripgrep patterns containing |, and never assume Unix-only commands such as head are installed. The MCP server named codex exposes the client-executed tools compatible with this managed model route. CodeBuddy serves those schemas lazily: use ToolSearch with the exact mcp__codex__ tool name before invoking it through DeferExecuteTool. When its proxy reports DEFERRED_TO_CODEX_CLIENT, immediately end the turn without retrying, fabricating a result, or calling another tool; the parent will execute it and resume you with the real result.",
+      ? "[Native delegation continuation]\nContinue the same delegated task in this retained CodeBuddy conversation. Use your own local tools directly and return only when the bounded task is complete, the requested checkpoint is ready, or a concrete blocker requires parent input. Never delegate to another agent, teammate, swarm, or background worker."
+      : "[Single native-agent execution contract]\nWork as the delegated CodeBuddy sub-agent in the current workspace and complete this bounded task in this one CLI execution. Use CodeBuddy's own Read, Write, Edit, Bash, Glob, and Grep tools directly. Never delegate to another agent, teammate, swarm, or background worker. Do not ask the parent to execute an ordinary file or shell operation. Honor project AGENTS.md ownership boundaries exactly; when builds, tests, editor control, PIE, runtime validation, or RzMCP execution are reserved to the parent, do not invoke them and instead report the exact checks the parent should run. On Windows, use PowerShell-native commands and never assume Unix-only commands such as head are installed. RzMCP is exposed lazily as only search_rzmcp_tools and call_rzmcp_tool through the rzmcp MCP server; search first, then call the selected tool only when the task allows RzMCP.",
   ];
   sections.push(
     `[Terminal completion envelope]\nA turn that requests a Codex client tool must not use this envelope. ` +
@@ -793,10 +809,9 @@ function promptFrom(body, registry = providerConversations) {
   if (activeTaskSection) sections.push(activeTaskSection);
   sections.push(...taskControlPromptSections(taskState));
   if (toolInfo.definitions.length > 0) {
-    const providerNames = toolInfo.definitions.map((tool) => `mcp__codex__${tool.name}`);
     sections.push(
-      `[Codex client tools available this turn]\n${providerNames.join("\n")}\n` +
-      "These are names only; load an exact name with ToolSearch before calling it.",
+      `[Codex client tool surface intentionally internalized]\n${toolInfo.definitions.length} parent tool schemas were not forwarded. ` +
+      "Use CodeBuddy's native tools instead; RzMCP remains available only through its two lazy proxy tools.",
     );
   }
   if (toolInfo.hosted.has("web_search")) {
@@ -923,23 +938,24 @@ function promptFrom(body, registry = providerConversations) {
     providerSessionStarted: conversation.providerSessionStarted,
     incomingCodexToolCount: incomingToolInfo.definitions.length,
     retainedToolSurfaceUsed,
+    executionPolicy: executionPolicy(taskState),
   };
 }
 
 function requestArtifacts(context) {
   mkdirSync(REQUEST_DIRECTORY, { recursive: true });
   const requestId = randomUUID();
-  const definitionsPath = join(REQUEST_DIRECTORY, `${requestId}-tools.json`);
   const configPath = join(REQUEST_DIRECTORY, `${requestId}-mcp.json`);
-  writeFileSync(definitionsPath, jsonString({ tools: context.toolInfo.definitions }), { encoding: "utf8", flag: "wx" });
   const mcpConfig = {
-    mcpServers: { codex: { command: process.execPath, args: [MCP_SERVER_SCRIPT, definitionsPath] } },
+    mcpServers: context.executionPolicy.rzMcpMode === "disabled"
+      ? {}
+      : { rzmcp: { command: process.execPath, args: [MCP_SERVER_SCRIPT] } },
   };
   writeFileSync(configPath, jsonString(mcpConfig), { encoding: "utf8", flag: "wx" });
   return {
     mcpConfig: configPath,
     cleanup: () => {
-      for (const path of [definitionsPath, configPath]) {
+      for (const path of [configPath]) {
         try { unlinkSync(path); } catch (error) {
           if (error?.code !== "ENOENT") process.stderr.write(`CodeBuddy request cleanup failed: ${redactSecrets(error.message)}\n`);
         }
@@ -948,12 +964,28 @@ function requestArtifacts(context) {
   };
 }
 
-function sanitizedEnvironment() {
+function cleanupStaleRequestArtifacts() {
+  mkdirSync(REQUEST_DIRECTORY, { recursive: true });
+  const generatedRequestArtifact = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-(?:mcp|tools)\.json$/i;
+  let cleaned = 0;
+  for (const entry of readdirSync(REQUEST_DIRECTORY, { withFileTypes: true })) {
+    if (!entry.isFile() || !generatedRequestArtifact.test(entry.name)) continue;
+    unlinkSync(join(REQUEST_DIRECTORY, entry.name));
+    cleaned += 1;
+  }
+  runtime.staleRequestArtifactsCleaned += cleaned;
+  return cleaned;
+}
+
+function sanitizedEnvironment(context) {
   const env = { ...process.env };
   for (const key of [
     "OPENROUTER_API_KEY", "TENCENT_API_KEY", "TENCENTCLOUD_SECRET_ID",
     "TENCENTCLOUD_SECRET_KEY", "CODEBUDDY_API_KEY",
   ]) delete env[key];
+  if (context?.executionPolicy?.rzMcpMode) {
+    env.RZCODEX_SUBAGENT_RZMCP_MODE = context.executionPolicy.rzMcpMode;
+  }
   return env;
 }
 
@@ -1027,7 +1059,7 @@ function providerToolCallKey(call) {
 }
 
 function codeBuddyArguments(context, mcpConfig) {
-  const tools = ["ToolSearch", "DeferExecuteTool"];
+  const tools = ["Read", "Write", "Edit", "Bash", "Glob", "Grep", "ToolSearch", "DeferExecuteTool"];
   if (context.toolInfo.hosted.has("web_search")) tools.push("WebSearch");
   const sessionArguments = context.providerSessionStarted
     ? ["--resume", context.providerSessionId]
@@ -1036,6 +1068,7 @@ function codeBuddyArguments(context, mcpConfig) {
     CODEBUDDY_SCRIPT,
     "--print", "--input-format", "stream-json", "--output-format", "stream-json", "--include-partial-messages",
     "--dangerously-skip-permissions", "--tools", tools.join(","),
+    "--disallowedTools", "Agent", "Task", "TaskCreate", "TaskUpdate", "TaskList", "SendMessage",
     "--model", context.model, "--effort", REQUIRED_EFFORT,
     "--mcp-config", mcpConfig, "--strict-mcp-config", ...sessionArguments,
   ];
@@ -1065,7 +1098,7 @@ function runCodeBuddy(context, onSpawn, onProviderEvent = () => {}) {
   const args = codeBuddyArguments(context, artifacts.mcpConfig);
   const child = spawn(process.execPath, args, {
     cwd: context.workingDirectory,
-    env: sanitizedEnvironment(),
+    env: sanitizedEnvironment(context),
     windowsHide: true,
     stdio: ["pipe", "pipe", "pipe"],
   });
@@ -1082,12 +1115,19 @@ function runCodeBuddy(context, onSpawn, onProviderEvent = () => {}) {
     let requestTimer = null;
     let silenceTimer = null;
     const calls = new Map();
+    const nativeToolNames = [];
+    const nativeChangedPaths = [];
+    const nativeToolIds = new Set();
     const finish = (error, value) => {
       if (settled) return;
       settled = true;
       clearTimeout(requestTimer);
       clearInterval(silenceTimer);
       artifacts.cleanup();
+      if (error) {
+        error.nativeToolNames = [...nativeToolNames];
+        error.providerMutationCount = nativeToolNames.filter((name) => PROVIDER_MUTATION_TOOL.test(name)).length;
+      }
       error ? reject(error) : resolve(value);
     };
     const parseLine = (line) => {
@@ -1097,6 +1137,7 @@ function runCodeBuddy(context, onSpawn, onProviderEvent = () => {}) {
         stderr = `${stderr}${line}\n`.slice(-STDERR_LIMIT);
         return;
       }
+      lastProviderActivityAt = Date.now();
       if (event.type === "system" && event.subtype === "init") {
         try { validateInit(context, event); } catch (error) { child.kill(); finish(error); return; }
         initEvent = event;
@@ -1115,6 +1156,17 @@ function runCodeBuddy(context, onSpawn, onProviderEvent = () => {}) {
           .map((part) => part.text).join("");
         if (text && !text.includes("DEFERRED_TO_CODEX_CLIENT")) finalText = text;
         for (const part of event.message.content.filter((item) => item?.type === "tool_use")) {
+          const nativeToolId = typeof part.id === "string"
+            ? part.id
+            : `${part.name || "unknown"}:${jsonString(part.input || {})}`;
+          if (typeof part.name === "string" && !nativeToolIds.has(nativeToolId)) {
+            nativeToolIds.add(nativeToolId);
+            nativeToolNames.push(part.name);
+            if (PROVIDER_MUTATION_TOOL.test(part.name)) {
+              const changedPath = part.input?.file_path ?? part.input?.filePath ?? part.input?.path;
+              if (typeof changedPath === "string" && changedPath) nativeChangedPaths.push(changedPath);
+            }
+          }
           const call = providerToolCall(part, context);
           if (call) {
             const callKey = providerToolCallKey(call);
@@ -1141,7 +1193,6 @@ function runCodeBuddy(context, onSpawn, onProviderEvent = () => {}) {
     silenceTimer.unref?.();
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (chunk) => {
-      lastProviderActivityAt = Date.now();
       stdoutBuffer += chunk;
       for (;;) {
         const newline = stdoutBuffer.indexOf("\n");
@@ -1152,7 +1203,6 @@ function runCodeBuddy(context, onSpawn, onProviderEvent = () => {}) {
     });
     child.stderr.setEncoding("utf8");
     child.stderr.on("data", (chunk) => {
-      lastProviderActivityAt = Date.now();
       stderr = `${stderr}${chunk}`.slice(-STDERR_LIMIT);
     });
     child.stdin.on("error", (error) => {
@@ -1178,6 +1228,9 @@ function runCodeBuddy(context, onSpawn, onProviderEvent = () => {}) {
         initEvent,
         resultEvent,
         maxTurnInputTokens,
+        nativeToolNames,
+        nativeChangedPaths: [...new Set(nativeChangedPaths)],
+        mutationCount: nativeToolNames.filter((name) => PROVIDER_MUTATION_TOOL.test(name)).length,
       });
     });
     child.stdin.end(codeBuddyInput(context.prompt, context.images));
@@ -1334,6 +1387,45 @@ async function handleResponses(request, response) {
   });
   const responseId = `resp_${randomUUID()}`;
   writeSse(response, "response.created", { response: { id: responseId, object: "response", model: context.model, status: "in_progress" } });
+  const progressItemId = `progress_${randomUUID()}`;
+  let progressAdded = false;
+  let progressText = "";
+  let nativeProgressTools = 0;
+  const nativeProgressToolIds = new Set();
+  const emitProgress = (delta) => {
+    if (!delta || clientGone) return;
+    if (!progressAdded) {
+      progressAdded = true;
+      writeSse(response, "response.output_item.added", {
+        output_index: 0,
+        item: { type: "reasoning", id: progressItemId, status: "in_progress", summary: [] },
+      });
+    }
+    progressText += delta;
+    writeSse(response, "response.reasoning_summary_text.delta", {
+      item_id: progressItemId,
+      output_index: 0,
+      summary_index: 0,
+      delta,
+    });
+  };
+  const finishProgress = () => {
+    if (!progressAdded) return null;
+    const item = {
+      type: "reasoning",
+      id: progressItemId,
+      status: "completed",
+      summary: [{ type: "summary_text", text: progressText }],
+    };
+    writeSse(response, "response.reasoning_summary_text.done", {
+      item_id: progressItemId,
+      output_index: 0,
+      summary_index: 0,
+      text: progressText,
+    });
+    writeSse(response, "response.output_item.done", { output_index: 0, item });
+    return item;
+  };
   let streamedMessageId = null;
   let streamedText = "";
   let lastProgressAt = 0;
@@ -1362,6 +1454,34 @@ async function handleResponses(request, response) {
     });
   };
   const onProviderEvent = (event) => {
+    if (event?.type === "assistant" && Array.isArray(event.message?.content)) {
+      const nativeTools = event.message.content.filter((part) => part?.type === "tool_use" && typeof part.name === "string");
+      if (nativeTools.length > 0) {
+        const now = Date.now();
+        runtime.lastProviderActivity = `native_tool:${nativeTools.at(-1).name}`;
+        runtime.lastProviderActivityAt = now;
+        runtime.lastProviderProgressEvents += 1;
+        for (const tool of nativeTools) {
+          const toolId = typeof tool.id === "string"
+            ? tool.id
+            : `${tool.name}:${jsonString(tool.input || {})}`;
+          if (nativeProgressToolIds.has(toolId)) continue;
+          nativeProgressToolIds.add(toolId);
+          nativeProgressTools += 1;
+          emitProgress(`CodeBuddy native tool ${nativeProgressTools}: ${tool.name}.\n`);
+        }
+        writeSse(response, "response.in_progress", {
+          response: {
+            id: responseId,
+            object: "response",
+            model: context.model,
+            status: "in_progress",
+            metadata: { provider_activity: runtime.lastProviderActivity },
+          },
+        });
+      }
+      return;
+    }
     if (event?.type !== "stream_event" || !event.event) return;
     const providerEvent = event.event;
     let activity = providerEvent.type;
@@ -1403,6 +1523,9 @@ async function handleResponses(request, response) {
     runtime.lastDurationApiMs = result.resultEvent.duration_api_ms ?? null;
     runtime.lastMaxTurnInputTokens = result.maxTurnInputTokens;
     runtime.maxObservedTurnInputTokens = Math.max(runtime.maxObservedTurnInputTokens, result.maxTurnInputTokens);
+    runtime.lastSuccessfulMutationCount = context.taskState.progress.successfulMutationCount + result.mutationCount;
+    runtime.lastChangedPaths = [...new Set([...context.taskState.progress.changedPaths, ...result.nativeChangedPaths])];
+    runtime.lastCompletedTool = result.nativeToolNames.at(-1) || context.taskState.progress.lastCompletedTool;
     let providerFinalText;
     try {
       providerFinalText = validatedCompletionReport(result.finalText, result.resultEvent, result.calls);
@@ -1417,6 +1540,7 @@ async function handleResponses(request, response) {
         context.taskState,
         providerFinalText,
         result.calls,
+        { providerMutationCount: result.mutationCount },
       );
     } catch (error) {
       if (error instanceof TaskStateError) throw new BridgeError(error.message, 502);
@@ -1427,13 +1551,17 @@ async function handleResponses(request, response) {
       runtime.lastNoMutationReasonDetailHash = noMutationReason.detailHash;
       runtime.lastNoMutationReasonDetailLength = noMutationReason.detailLength;
     }
-    const progressReport = authoritativeProgressReport(context.taskState, noMutationReason);
+    const progressReport = result.mutationCount > 0
+      ? `[Authoritative native-provider progress]\nTask ID: ${context.taskDiagnostics.taskId}\nTask hash: ${context.taskDiagnostics.taskHash}\nNative tool calls: ${result.nativeToolNames.length}\nSuccessful native mutations: ${result.mutationCount}\nChanged paths: ${result.nativeChangedPaths.join(", ") || "not reported by provider"}\nLast completed native tool: ${result.nativeToolNames.at(-1) || "none"}`
+      : authoritativeProgressReport(context.taskState, noMutationReason);
     const finalText = providerFinalText && progressReport
       ? `${providerFinalText}\n\n${progressReport}`
       : providerFinalText;
     runtime.completed += 1;
     const output = [];
-    let outputIndex = 0;
+    const progressItem = finishProgress();
+    if (progressItem) output.push(progressItem);
+    let outputIndex = output.length;
     if (finalText) {
       const itemId = streamedMessageId || `msg_${randomUUID()}`;
       if (!streamedMessageId) {
@@ -1467,6 +1595,11 @@ async function handleResponses(request, response) {
         id: responseId, object: "response", model: context.model, status: "completed",
         usage: usageFrom(result.resultEvent), output,
         metadata: {
+          actual_provider: PROVIDER_ID,
+          actual_model: result.initEvent.model,
+          actual_model_label: result.initEvent.model,
+          actual_reasoning_effort: REQUIRED_EFFORT,
+          auth_source: result.initEvent.apiKeySource,
           codebuddy_initialized_model: result.initEvent.model,
           codebuddy_auth_source: result.initEvent.apiKeySource,
           codebuddy_total_cost_usd: result.resultEvent.total_cost_usd,
@@ -1475,6 +1608,13 @@ async function handleResponses(request, response) {
           codex_client_tool_surface_retained: context.retainedToolSurfaceUsed,
           codex_client_tool_schema_bytes: Buffer.byteLength(jsonString(context.toolInfo.definitions)),
           codebuddy_max_turn_input_tokens: result.maxTurnInputTokens,
+          native_cli_single_execution: true,
+          native_tool_names: result.nativeToolNames,
+          native_tool_count: result.nativeToolNames.length,
+          provider_mutation_count: result.mutationCount,
+          provider_changed_paths: result.nativeChangedPaths,
+          codex_client_tool_schema_bytes_forwarded: 0,
+          lazy_rzmcp_proxy_tools: context.executionPolicy.rzMcpMode === "disabled" ? 0 : 2,
           active_task_id: context.taskDiagnostics.taskId,
           active_task_name: context.taskDiagnostics.taskName,
           active_task_hash: context.taskDiagnostics.taskHash,
@@ -1486,9 +1626,9 @@ async function handleResponses(request, response) {
           active_task_included_this_turn: context.taskDiagnostics.activeTaskIncludedThisTurn,
           active_task_retained_in_provider_session: context.taskDiagnostics.retainedInProviderSession,
           tool_calls_since_active_task: context.taskState.progress.toolCallsSinceTask,
-          successful_apply_patch_mutations: context.taskState.progress.successfulMutationCount,
-          changed_paths: context.taskState.progress.changedPaths,
-          last_completed_tool: context.taskState.progress.lastCompletedTool,
+          successful_apply_patch_mutations: context.taskState.progress.successfulMutationCount + result.mutationCount,
+          changed_paths: [...new Set([...context.taskState.progress.changedPaths, ...result.nativeChangedPaths])],
+          last_completed_tool: result.nativeToolNames.at(-1) || context.taskState.progress.lastCompletedTool,
           checkpoint_requested: context.taskState.checkpointRequested,
           no_mutation_reason_category: noMutationReason?.category ?? null,
           no_mutation_reason_detail_hash: noMutationReason?.detailHash ?? null,
@@ -1512,7 +1652,16 @@ async function handleResponses(request, response) {
     runtime.failed += 1;
     runtime.lastFailure = redactSecrets(error.message);
     writeSse(response, "response.failed", {
-      response: { id: responseId, object: "response", status: "failed", error: { type: "bridge_error", message: redactSecrets(error.message) } },
+      response: {
+        id: responseId,
+        object: "response",
+        status: "failed",
+        error: {
+          code: Number(error?.providerMutationCount || 0) > 0 ? "provider_state_changed" : "external_provider_error",
+          type: "bridge_error",
+          message: redactSecrets(error.message),
+        },
+      },
     });
     response.end();
   } finally {
@@ -1816,14 +1965,12 @@ function selfTest() {
   } catch (error) {
     if (!String(error.message).includes("without an active NEW_TASK")) throw error;
   }
-  try {
-    normalizeSelfTestRequest(
-      [plaintextTaskItem],
-      { registry: new ProviderConversationRegistry(), threadId: "self-test-tool-less-first-turn", tools: [] },
-    );
-    throw new Error("self-test failed: a first provider turn without native capabilities must fail loudly");
-  } catch (error) {
-    if (!String(error.message).includes("required native capabilities")) throw error;
+  const toolLessNativeTurn = normalizeSelfTestRequest(
+    [plaintextTaskItem],
+    { registry: new ProviderConversationRegistry(), threadId: "self-test-tool-less-first-turn", tools: [] },
+  );
+  if (!toolLessNativeTurn.prompt.includes("Single native-agent execution contract")) {
+    throw new Error("self-test failed: CodeBuddy native tools must not depend on parent tool schemas");
   }
   const taskChangeRegistry = new ProviderConversationRegistry();
   const taskChangeThread = "self-test-task-change-tools";
@@ -2101,7 +2248,8 @@ function selfTest() {
   if (
     !longPromptArgs.includes("--input-format") ||
     !longPromptArgs.includes("stream-json") ||
-    !longPromptArgs.includes("ToolSearch,DeferExecuteTool,WebSearch") ||
+    !longPromptArgs.includes("Read,Write,Edit,Bash,Glob,Grep,ToolSearch,DeferExecuteTool,WebSearch") ||
+    !longPromptArgs.includes("Agent") ||
     longPromptArgs.some((argument) => argument.includes(longPrompt)) ||
     longPromptInput.message?.content?.[0]?.text !== longPrompt
   ) {
@@ -2159,6 +2307,7 @@ function selfTest() {
 function start() {
   const port = configuredPort();
   cleanupOrphanedManagedSessions();
+  cleanupStaleRequestArtifacts();
   const server = createServer(async (request, response) => {
     try {
       if (request.method === "GET" && request.url === "/health") {
@@ -2168,8 +2317,8 @@ function start() {
           inputModalities: resolveRoute(MODEL_ALIAS).inputModalities,
           authSourceRequired: REQUIRED_AUTH_SOURCE, fallbackModel: null,
           explicitCostRequiredUsd: 0, codexManagedLazyTools: true,
-          promptTransport: "stream-json-resume-delta", transientProviderSessions: true,
-          incrementalVisibleOutput: false,
+          promptTransport: "single-native-cli-execution", transientProviderSessions: true,
+          incrementalVisibleOutput: true,
           providerSilenceTimeoutMs: PROVIDER_SILENCE_TIMEOUT_MS,
           providerProgressHeartbeatMaxHz: 1, runtime,
         });

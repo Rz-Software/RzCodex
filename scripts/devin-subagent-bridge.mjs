@@ -27,6 +27,11 @@ import {
   runResponsesBridge,
   validateOAuthFallbackCompletion,
 } from "./native-subagent-provider-router.mjs";
+import {
+  NativeCliAgentError,
+  nativeCliAgentContext,
+  runOpenCodeNativeAgent,
+} from "./native-cli-agent-runner.mjs";
 
 const PROVIDER_ID = "devin";
 const MODEL_ALIAS = "@preset/codex-subagents";
@@ -64,7 +69,10 @@ const ANTIGRAVITY_CONTEXT_WINDOW = 131_072;
 const OLLAMA_RESPONSES_ENDPOINT = "http://127.0.0.1:11434/v1/responses";
 const OLLAMA_AUTH_SOURCE = "Ollama local signed-in session";
 const OLLAMA_CONTEXT_WINDOW = 1_048_576;
-const REQUIRED_AUTO_PROVIDER_ORDER = ["antigravity", "devin", "ollama", "devin-free"];
+const CODEBUDDY_BRIDGE_ENDPOINT = "http://127.0.0.1:54547/v1/responses";
+const CODEBUDDY_REQUIRED_AUTH_SOURCE = "www.codebuddy.ai";
+const CODEBUDDY_REQUIRED_EFFORT = "max";
+const REQUIRED_AUTO_PROVIDER_ORDER = ["antigravity", "devin", "ollama", "devin-free", "codebuddy"];
 const SCRIPT_DIRECTORY = dirname(fileURLToPath(import.meta.url));
 const CENTRAL_CONFIG = join(homedir(), ".codex", "subagent-models.json");
 const USER_DEVIN_CONFIG = join(process.env.APPDATA || join(homedir(), "AppData", "Roaming"), "devin", "config.json");
@@ -294,6 +302,7 @@ function centralRoute() {
   const route = assertObject(parsed[PROVIDER_ID], `central route ${PROVIDER_ID}`);
   const antigravityRoute = assertObject(parsed.antigravity, "central route antigravity");
   const ollamaRoute = assertObject(parsed.ollama, "central route ollama");
+  const codeBuddyRoute = assertObject(parsed.codebuddy, "central route codebuddy");
   const autoRoute = assertObject(parsed.routes?.auto, "central managed route auto");
   const inputModalities = route.inputModalities;
   if (!Array.isArray(inputModalities) || inputModalities.length !== 1 || inputModalities[0] !== "text") {
@@ -329,6 +338,7 @@ function centralRoute() {
       requireString(antigravityRoute.primaryModel, "antigravity.primaryModel"),
       requireString(antigravityRoute.quotaFallbackModel, "antigravity.quotaFallbackModel"),
     ],
+    codeBuddyModel: requireString(codeBuddyRoute.model, "codebuddy.model"),
     nativeFallbackRoute,
     ollamaModel: requireString(ollamaRoute.model, "ollama.model"),
     ollamaLabel: requireString(ollamaRoute.label, "ollama.label"),
@@ -432,8 +442,8 @@ const runtime = {
   lastActualProvider: null, lastModelLabel: null, lastQuotaFallback: false,
   lastTerminalFallback: false, lastFallbackReason: null,
   fallbackAttempts: 0, fallbackCompleted: 0, fallbackFailed: 0, terminalFallbacks: 0,
-  providerAttempts: { antigravity: 0, devin: 0, ollama: 0, devinFree: 0 },
-  providerFailures: { antigravity: 0, devin: 0, ollama: 0, "devin-free": 0 },
+  providerAttempts: { antigravity: 0, devin: 0, ollama: 0, devinFree: 0, codebuddy: 0 },
+  providerFailures: { antigravity: 0, devin: 0, ollama: 0, "devin-free": 0, codebuddy: 0 },
   lastProviderSequence: [],
   fallbackStreamCommits: 0, lastFallbackStreamCommitted: false,
   lastFallbackProviderOutputObserved: false,
@@ -1578,6 +1588,51 @@ async function runAntigravityStage(context, requestBody, failures, onProgress, s
   }
 }
 
+async function runCodeBuddyStage(context, requestBody, failures, onProgress, signal, streamRelay) {
+  runtime.providerAttempts.codebuddy += 1;
+  runtime.lastProviderSequence.push("codebuddy");
+  onProgress?.("Automatic route started one self-contained CodeBuddy native CLI execution.\n");
+  try {
+    const forwardedBody = fallbackForwardBody(requestBody, MODEL_ALIAS, CODEBUDDY_REQUIRED_EFFORT);
+    const completion = await runResponsesBridge({
+      endpoint: CODEBUDDY_BRIDGE_ENDPOINT,
+      body: forwardedBody,
+      signal,
+      inactivityTimeoutMs: PROVIDER_STREAM_INACTIVITY_MS,
+      onEvent: streamRelay.accept,
+    });
+    validateOAuthFallbackCompletion(completion, {
+      provider: "codebuddy",
+      models: [route.codeBuddyModel],
+      authSource: CODEBUDDY_REQUIRED_AUTH_SOURCE,
+      lazyRzMcpProxyTools: context.executionPolicy.rzMcpMode === "disabled" ? 0 : 2,
+    });
+    const providerMetadata = completion.metadata || {};
+    const selected = {
+      key: "codebuddy",
+      reason: "auto_codebuddy_after_prior_provider_failure",
+      provider: "codebuddy",
+      model: {
+        model_uid: providerMetadata.actual_model,
+        label: providerMetadata.actual_model_label || providerMetadata.actual_model,
+      },
+      maxConcurrency: null,
+    };
+    return {
+      ...responsesResult(
+        completion,
+        selected,
+        fallbackState(context, failures),
+        { ignoredBytes: context.toolSchemaBytes, forwardedBytes: 0 },
+      ),
+      streamRelay,
+    };
+  } catch (error) {
+    if (streamRelay.committed) error.routeCommitted = true;
+    throw error;
+  }
+}
+
 function ollamaStreamContinuationBody(body, error, taskHash) {
   const input = Array.isArray(body.input) ? [...body.input] : [];
   if (typeof error?.partialOutputText === "string" && error.partialOutputText.trim()) {
@@ -1661,49 +1716,66 @@ async function runOllamaStage(
     return await withRouteCapacity(selected, signal, async () => {
       runtime.providerAttempts.ollama += 1;
       runtime.lastProviderSequence.push("ollama");
-      onProgress?.("Native route started the locally authenticated Ollama cloud model.\n");
-      const translated = ollamaRequest(requestBody, context);
-      const streamResult = await runOllamaResponsesWithRecovery(
-        translated.body,
-        context.taskDiagnostics.taskHash,
+      onProgress?.("Ollama native CLI agent started one self-contained execution.\n");
+      let nativeContext;
+      try {
+        nativeContext = nativeCliAgentContext(requestBody, {
+          provider: "ollama",
+          model: route.ollamaModel,
+          requiredEffort: route.ollamaEffort,
+        });
+      } catch (error) {
+        if (error instanceof NativeCliAgentError) throw new BridgeError(error.message, error.status);
+        throw error;
+      }
+      const announcedTools = new Set();
+      const nativeResult = await runOpenCodeNativeAgent(nativeContext, {
+        providerKind: "ollama",
         signal,
-        streamRelay.accept,
-        onProgress,
-      );
-      const rawCompletion = streamResult.completion;
-      const completion = validateOllamaCompletion(rawCompletion, translated.responseTools);
-      const lazyProxyTools = [...translated.responseTools.values()]
-        .filter((entry) => ["search_rzmcp_tools", "call_rzmcp_tool"].includes(entry.originalName))
-        .length;
-      const deferredToolSearchForwarded = [...translated.responseTools.values()]
-        .some((entry) => entry.kind === "tool_search");
-      completion.metadata = {
-        ...(completion.metadata || {}),
+        onEvent: (event) => {
+          if (event?.type !== "tool_use" || event.part?.state?.status !== "completed") return;
+          const key = event.part.callID || event.part.id;
+          if (key && announcedTools.has(key)) return;
+          if (key) announcedTools.add(key);
+          onProgress?.(`Ollama native tool ${announcedTools.size}: ${progressToolName(event.part.tool)}.\n`);
+        },
+      });
+      const providerMetadata = {
         actual_provider: "ollama",
         actual_model: route.ollamaModel,
         actual_model_label: route.ollamaLabel,
         actual_reasoning_effort: route.ollamaEffort,
         auth_source: OLLAMA_AUTH_SOURCE,
-        codex_tool_schema_bytes_forwarded: translated.forwardedBytes,
-        codex_tool_schema_bytes_ignored: 0,
-        lazy_rzmcp_proxy_tools: lazyProxyTools,
-        deferred_tool_search_forwarded: deferredToolSearchForwarded,
-        hosted_web_search_replaced_by_deferred_tool_search: translated.hostedWebSearchReplaced,
-        interrupted_stream_recovered: streamResult.recovered,
-        interrupted_stream_recovered_completed_items: streamResult.recoveredCompletedItems === true,
+        native_cli_single_execution: true,
+        native_tool_names: nativeResult.toolNames,
+        provider_mutation_count: nativeResult.mutationCount,
+        peak_turn_context_tokens: nativeResult.peakTurnInputTokens,
+        codex_tool_schema_bytes_forwarded: 0,
+        codex_tool_schema_bytes_ignored: context.toolSchemaBytes,
+        lazy_rzmcp_proxy_tools: nativeContext.executionPolicy.rzMcpMode === "disabled" ? 0 : 2,
       };
       return {
-        ...responsesResult(
-          completion,
-          selected,
-          fallbackState(context, failures),
-          { ignoredBytes: 0, forwardedBytes: translated.forwardedBytes },
-        ),
+        text: nativeResult.finalText,
+        selected,
+        providerMetadata,
+        ...fallbackState(context, failures),
+        creditCost: 0,
+        acuCost: 0,
+        inputTokens: nativeResult.inputTokens,
+        cachedTokens: 0,
+        outputTokens: nativeResult.outputTokens,
+        peakTurnContextTokens: nativeResult.peakTurnInputTokens,
+        outputTokensPerSecond: null,
+        toolCalls: [],
+        nativeToolNames: nativeResult.toolNames,
+        rzMcpTools: nativeResult.toolNames.filter((name) => name === "call_rzmcp_tool"),
+        toolSchemaBytesIgnored: context.toolSchemaBytes,
+        toolSchemaBytesForwarded: 0,
         streamRelay,
       };
     }, capacityOptions);
   } catch (error) {
-    if (streamRelay.committed) error.routeCommitted = true;
+    if (streamRelay.committed || Number(error?.providerMutationCount || 0) > 0) error.routeCommitted = true;
     throw error;
   }
 }
@@ -1822,6 +1894,17 @@ async function executeAuto(context, requestBody, onSpawn, onProgress, signal, cr
           { skipIfBusy: true },
         );
       },
+    },
+    {
+      name: "codebuddy",
+      run: ({ failures }) => runCodeBuddyStage(
+        context,
+        requestBody,
+        failures,
+        onProgress,
+        signal,
+        createStreamRelay(),
+      ),
     },
   ];
   const pinnedIndex = stages.findIndex((stage) => stage.name === pinnedStage);
@@ -2323,6 +2406,7 @@ function health(requestedRoute = "auto") {
       antigravity: ANTIGRAVITY_REQUIRED_AUTH_SOURCE,
       devin: auth.source,
       ollama: OLLAMA_AUTH_SOURCE,
+      codebuddy: CODEBUDDY_REQUIRED_AUTH_SOURCE,
     },
     inputModalities: route.inputModalities,
     routing: {
@@ -2347,9 +2431,9 @@ function health(requestedRoute = "auto") {
         acceptedResponseModels: route.ollamaResponseModels,
         effort: route.ollamaEffort,
         authSource: OLLAMA_AUTH_SOURCE,
-        endpoint: OLLAMA_RESPONSES_ENDPOINT,
+        endpoint: "OpenCode CLI -> authenticated local Ollama service",
         maxConcurrency: route.ollamaMaxConcurrency,
-        toolServing: "Codex deferred tool_search with on-demand namespaced tool forwarding",
+        toolServing: "Provider-native file/shell tools plus two-tool lazy RzMCP proxy in one CLI execution",
       },
       terminalFallback: {
         provider: "devin",
@@ -2358,11 +2442,19 @@ function health(requestedRoute = "auto") {
         cost: models.terminal.cost_summary || models.terminal.cost_tier,
         maxConcurrency: FREE_ROUTE_CONCURRENCY,
       },
+      codebuddy: {
+        provider: "codebuddy",
+        uid: route.codeBuddyModel,
+        effort: CODEBUDDY_REQUIRED_EFFORT,
+        authSource: CODEBUDDY_REQUIRED_AUTH_SOURCE,
+        endpoint: CODEBUDDY_BRIDGE_ENDPOINT,
+        toolServing: "Provider-native file/shell tools plus two-tool lazy RzMCP proxy in one CLI execution",
+      },
       nativeFallback: {
         route: route.nativeFallbackRoute,
         activation: "Codex in-process provider switch after every external stage fails before committed work",
       },
-      orderedPolicy: "antigravity_primary_then_antigravity_quota_fallback_then_devin_primary_then_ollama_then_devin_free_then_native_openai",
+      orderedPolicy: "antigravity_primary_then_antigravity_quota_fallback_then_devin_primary_then_ollama_then_devin_free_then_codebuddy_then_native_openai",
       configuredProviderOrder: route.autoProviderOrder,
       capacityPolicy: {
         autoWhenSaturated: "continue_to_next_provider",

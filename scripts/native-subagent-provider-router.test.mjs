@@ -318,6 +318,13 @@ test("OAuth fallback validation rejects provider, model, auth, eager tools, and 
     metadata: { ...completion().metadata, actual_model: EXPECTED.models[1] },
   });
   assert.deepEqual(validateOAuthFallbackCompletion(geminiCompletion, EXPECTED), geminiCompletion);
+  const rzMcpDisabledCompletion = completion({
+    metadata: { ...completion().metadata, lazy_rzmcp_proxy_tools: 0 },
+  });
+  assert.deepEqual(
+    validateOAuthFallbackCompletion(rzMcpDisabledCompletion, { ...EXPECTED, lazyRzMcpProxyTools: 0 }),
+    rzMcpDisabledCompletion,
+  );
   assert.throws(() => validateOAuthFallbackCompletion(completion({
     metadata: { ...completion().metadata, actual_provider: "codebuddy" },
   }), EXPECTED), /unexpected provider/);

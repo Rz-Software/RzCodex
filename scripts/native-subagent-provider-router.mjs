@@ -448,7 +448,11 @@ export function validateOAuthFallbackCompletion(completion, expected) {
       `Fallback bridge used unexpected auth source ${JSON.stringify(metadata.auth_source)}`,
     );
   }
-  if (metadata.codex_tool_schema_bytes_forwarded !== 0 || metadata.lazy_rzmcp_proxy_tools !== 2) {
+  const expectedLazyRzMcpTools = expected.lazyRzMcpProxyTools ?? 2;
+  if (
+    metadata.codex_tool_schema_bytes_forwarded !== 0
+    || metadata.lazy_rzmcp_proxy_tools !== expectedLazyRzMcpTools
+  ) {
     throw new ProviderRouteError("Fallback bridge did not preserve lazy RzMCP tool serving");
   }
   if (!Array.isArray(completion.output) || completion.output.length === 0) {
