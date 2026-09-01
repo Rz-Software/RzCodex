@@ -7,7 +7,10 @@ const PAYLOAD_HEADER = /(?:^|\n)Payload:\s*\n/;
 const MUTATION_INTENT = /\b(?:implement|fix|patch|edit|modify|create|write|replace|delete|repair|refactor|apply_patch)\b/gi;
 const NEGATED_MUTATION_PREFIX = /\b(?:do not|don't|must not|never|cannot|can't|not allowed to)\s+(?:[a-z][a-z0-9_-]*\s+){0,4}$/i;
 const CHECKPOINT_REQUEST = /\b(?:checkpoint(?:\/report)?|status report|progress report)\b/i;
-const IMMEDIATE_RETURN = /\b(?:return|report|respond)\b[\s\S]{0,80}\b(?:immediately|now|current|where)\b/i;
+const IMMEDIATE_RETURN = [
+  /\b(?:return|report|respond)\b[\s\S]{0,120}\b(?:immediately|right now|now)\b/i,
+  /\b(?:immediately|right now|now)\b[\s\S]{0,120}\b(?:return|report|respond)\b/i,
+];
 const NO_MUTATION_REASON = /(?:^|\n)NO_MUTATION_REASON:\s*(\{[^\r\n]+\})\s*(?:\r?\n|$)/;
 const NO_MUTATION_CATEGORIES = new Set(["policy", "permission", "tool", "missing_input", "semantic"]);
 const NON_TERMINAL_COMPLETION = /^(?:i(?:\s+need\s+to|\s+will|(?:'|’)ll|\s+am\s+going\s+to)|let\s+me|continuing\b|investigation\s+deferred\b|awaiting\b)/i;
@@ -43,7 +46,15 @@ function payloadFrom(text) {
 
 function isCheckpointRequest(text) {
   const payload = payloadFrom(text);
-  return CHECKPOINT_REQUEST.test(payload) && IMMEDIATE_RETURN.test(payload);
+  return CHECKPOINT_REQUEST.test(payload) && (
+    isImmediateReturnRequest(text)
+    || /\b(?:return|send|provide|give|request(?:ing)?|need)\b[\s\S]{0,100}\b(?:checkpoint(?:\/report)?|status report|progress report)\b/i.test(payload)
+  );
+}
+
+function isImmediateReturnRequest(text) {
+  const payload = payloadFrom(text);
+  return IMMEDIATE_RETURN.some((pattern) => pattern.test(payload));
 }
 
 export function normalizeAgentMessageContent(content, label) {
@@ -112,6 +123,8 @@ function messageState(item, index) {
   const normalized = normalizeAgentMessageContent(item.content, `input[${index}].content`);
   const newTask = NEW_TASK_HEADER.test(normalized.text);
   const checkpoint = isCheckpointRequest(normalized.text);
+  const immediateReturn = isImmediateReturnRequest(normalized.text);
+  const intent = taskIntent(normalized.text);
   return {
     ...normalized,
     index,
@@ -122,6 +135,8 @@ function messageState(item, index) {
     recipient: typeof item.recipient === "string" ? item.recipient : "CodeBuddy worker",
     newTask,
     checkpoint,
+    immediateReturn,
+    intent,
   };
 }
 
@@ -195,12 +210,13 @@ export function taskStateFromInput(input, maxActiveTaskChars) {
     if (!item || typeof item !== "object" || item.type !== "agent_message") continue;
     const message = messageState(item, index);
     messages.push(message);
-    if (message.newTask && !message.checkpoint) activeTask = message;
+    if (message.newTask) activeTask = message;
   }
   if (!activeTask) {
     return {
       activeTask: null,
       checkpointRequested: false,
+      immediateReturnRequested: false,
       messages,
       progress: {
         toolCallsSinceTask: 0,
@@ -224,13 +240,27 @@ export function taskStateFromInput(input, maxActiveTaskChars) {
   const latestControlMessage = messages
     .filter((message) => message.index > activeTask.index)
     .at(-1);
+  const activeTaskCanBeTerminalControl = activeTask.intent === "analysis";
   const checkpointRequested = Boolean(
-    latestControlMessage?.checkpoint
-      && (MESSAGE_HEADER.test(latestControlMessage.text) || latestControlMessage.newTask),
+    (activeTaskCanBeTerminalControl && activeTask.checkpoint)
+    || (
+      latestControlMessage?.checkpoint
+      && latestControlMessage.intent === "analysis"
+      && (MESSAGE_HEADER.test(latestControlMessage.text) || latestControlMessage.newTask)
+    ),
+  );
+  const immediateReturnRequested = Boolean(
+    (activeTaskCanBeTerminalControl && activeTask.immediateReturn)
+    || (
+      latestControlMessage?.immediateReturn
+      && latestControlMessage.intent === "analysis"
+      && (MESSAGE_HEADER.test(latestControlMessage.text) || latestControlMessage.newTask)
+    ),
   );
   return {
     activeTask,
     checkpointRequested,
+    immediateReturnRequested,
     messages,
     progress: progressFrom(input, activeTask.index),
   };
@@ -313,9 +343,29 @@ export function mutationContractPromptSection(taskState) {
   return `[Mutation convergence contract]\nThe recorded tool and apply_patch results above are authoritative. Do not repeat a completed read, search, or status inspection whose result is already present in this turn. Converge on the requested mutation once the necessary signatures and ownership are established. If you return a final answer while the recorded successful mutation count is zero, include exactly one single-line marker:\nNO_MUTATION_REASON: {"category":"policy|permission|tool|missing_input|semantic","detail":"specific blocker","resolvable_tool":null}\nDo not claim a blocker when you have already identified a safe in-scope tool call that resolves it; make that call instead. If resolvable_tool would not be null, continue the task rather than returning.`;
 }
 
+export function analysisContractPromptSection(taskState) {
+  if (taskState.activeTask?.intent !== "analysis") return "";
+  return "[Analysis convergence contract]\nTreat completed tool results already present in this turn as authoritative; do not repeat the same read, search, or status inspection. Use the narrowest targeted evidence that can answer the bounded deliverable. Do not launch broad recursive binary-asset scans or exhaustive repository-wide inspection when a source file, project index, known artifact, or focused query can establish the result, unless the task explicitly requires an exhaustive inventory. Once the evidence supports the requested verdict, return it and state any residual uncertainty instead of continuing exploratory work. If the requested conclusion cannot be established, return the concrete missing input, semantic uncertainty, or tool limitation so the parent can decide the next step.";
+}
+
 export function checkpointPromptSection(taskState) {
   if (!taskState.checkpointRequested) return "";
   return "[On-demand checkpoint requested]\nDo not start another tool call or investigation branch. Return the requested report now using the authoritative progress above, then wait for the parent to resume the active task.";
+}
+
+export function immediateReturnPromptSection(taskState) {
+  if (!taskState.immediateReturnRequested) return "";
+  return "[Immediate terminal report required]\nDo not call another tool, continue investigating, wait for more evidence, or start a new branch. Return the best current verdict now from the authoritative evidence already recorded. Separate proved facts from remaining uncertainty; if evidence is insufficient, report the concrete blocker or question. The parent can resume the task later if needed.";
+}
+
+export function taskControlPromptSections(taskState) {
+  return [
+    progressPromptSection(taskState),
+    mutationContractPromptSection(taskState),
+    analysisContractPromptSection(taskState),
+    checkpointPromptSection(taskState),
+    immediateReturnPromptSection(taskState),
+  ].filter(Boolean);
 }
 
 export function validateNoMutationCompletion(taskState, finalText, pendingCalls) {

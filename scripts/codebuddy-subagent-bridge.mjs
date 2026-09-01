@@ -21,11 +21,9 @@ import {
   applyPatchSucceeded,
   authoritativeProgressReport,
   changedPathsFromApplyPatch,
-  checkpointPromptSection,
   isBridgeProgressReasoning,
-  mutationContractPromptSection,
   normalizeAgentMessageContent,
-  progressPromptSection,
+  taskControlPromptSections,
   taskDeliveryDiagnostics,
   taskStateFromInput,
   validateTerminalCompletion,
@@ -411,6 +409,7 @@ class ProviderConversationRegistry {
         inFlight: false,
         activeTask: null,
         checkpointRequested: false,
+        immediateReturnRequested: false,
         progress: emptyProgress(),
         callNames: new Map(),
         countedCalls: new Set(),
@@ -433,7 +432,8 @@ class ProviderConversationRegistry {
         partTypes: [...incomingTask.partTypes],
         partLengths: [...incomingTask.partLengths],
       };
-      state.checkpointRequested = false;
+      state.checkpointRequested = incomingTaskState.checkpointRequested;
+      state.immediateReturnRequested = incomingTaskState.immediateReturnRequested;
       state.progress = emptyProgress();
       state.callNames.clear();
       state.countedCalls.clear();
@@ -448,7 +448,8 @@ class ProviderConversationRegistry {
 
     for (const message of incomingTaskState.messages) {
       if (message.index < relevantStart || state.seenInputKeys.has(keys[message.index])) continue;
-      state.checkpointRequested = message.checkpoint;
+      state.checkpointRequested = message.intent === "analysis" && message.checkpoint;
+      state.immediateReturnRequested = message.intent === "analysis" && message.immediateReturn;
     }
 
     for (let index = relevantStart; index < input.length; index += 1) {
@@ -507,6 +508,7 @@ class ProviderConversationRegistry {
       taskState: {
         activeTask: state.activeTask,
         checkpointRequested: state.checkpointRequested,
+        immediateReturnRequested: state.immediateReturnRequested,
         messages: incomingTaskState.messages,
         progress: {
           ...state.progress,
@@ -789,12 +791,7 @@ function promptFrom(body, registry = providerConversations) {
     ? activeTaskPromptSection(taskState)
     : "";
   if (activeTaskSection) sections.push(activeTaskSection);
-  const progressSection = progressPromptSection(taskState);
-  if (progressSection) sections.push(progressSection);
-  const mutationContractSection = mutationContractPromptSection(taskState);
-  if (mutationContractSection) sections.push(mutationContractSection);
-  const checkpointSection = checkpointPromptSection(taskState);
-  if (checkpointSection) sections.push(checkpointSection);
+  sections.push(...taskControlPromptSections(taskState));
   if (toolInfo.definitions.length > 0) {
     const providerNames = toolInfo.definitions.map((tool) => `mcp__codex__${tool.name}`);
     sections.push(
@@ -829,7 +826,7 @@ function promptFrom(body, registry = providerConversations) {
         newTask: false,
         checkpoint: false,
       };
-      if (message.newTask && !message.checkpoint) continue;
+      if (message.newTask) continue;
       pushHistory(`[Inter-agent message ${message.author} -> ${message.recipient}]\n${message.text}`);
     } else if (item.type === "reasoning") {
       if (isBridgeProgressReasoning(item)) continue;
@@ -1625,6 +1622,30 @@ function selfTest() {
   ) {
     throw new Error(
       `self-test failed: negated mutation intent classification read_only=${readOnlyTask.taskState.activeTask.intent} bounded_mutation=${boundedMutationTask.taskState.activeTask.intent}`,
+    );
+  }
+  if (
+    !readOnlyTask.prompt.includes("[Analysis convergence contract]")
+    || readOnlyTask.prompt.includes("[Immediate terminal report required]")
+  ) {
+    throw new Error("self-test failed: CodeBuddy analysis convergence control");
+  }
+  const immediateReadOnlyTask = normalizeSelfTestRequest([{
+    type: "agent_message",
+    id: "self-test-immediate-read-only",
+    author: "Codex",
+    recipient: "/root/read_only",
+    content: [{
+      type: "input_text",
+      text: "Message Type: NEW_TASK\nTask name: /root/read_only\nPayload:\nReturn your current implementation verdict immediately. Do not investigate further.",
+    }],
+  }]);
+  if (
+    !immediateReadOnlyTask.taskState.immediateReturnRequested
+    || !immediateReadOnlyTask.prompt.includes("[Immediate terminal report required]")
+  ) {
+    throw new Error(
+      `self-test failed: CodeBuddy immediate terminal report control state=${immediateReadOnlyTask.taskState.immediateReturnRequested} prompt=${immediateReadOnlyTask.prompt.includes("[Immediate terminal report required]")}`,
     );
   }
   const context = normalizeSelfTestRequest([

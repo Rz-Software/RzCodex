@@ -11,11 +11,9 @@ import { DatabaseSync } from "node:sqlite";
 import {
   TaskStateError,
   activeTaskPromptSection,
-  checkpointPromptSection,
   isBridgeProgressReasoning,
-  mutationContractPromptSection,
   normalizeAgentMessageContent,
-  progressPromptSection,
+  taskControlPromptSections,
   taskDeliveryDiagnostics,
   taskStateFromInput,
   validateTerminalCompletion,
@@ -690,7 +688,7 @@ function promptFrom(body) {
         ...normalizeAgentMessageContent(item.content, `input[${index}].content`),
         author: item.author || "Codex", recipient: item.recipient || "managed worker", newTask: false, checkpoint: false,
       };
-      if (message.newTask && !message.checkpoint) continue;
+      if (message.newTask) continue;
       history.push({ index, checkpoint: message.checkpoint, text: `[Inter-agent message ${message.author} -> ${message.recipient}]\n${message.text}` });
     } else if (["function_call", "custom_tool_call", "tool_search_call"].includes(item.type)) {
       const requestInput = item.arguments ?? item.input ?? item.query ?? null;
@@ -737,12 +735,7 @@ function promptFrom(body) {
   } else {
     sections.push(...retained.map((item) => item.text));
   }
-  const progress = progressPromptSection(taskState);
-  if (progress) sections.push(progress);
-  const mutationContract = mutationContractPromptSection(taskState);
-  if (mutationContract) sections.push(mutationContract);
-  const checkpoint = checkpointPromptSection(taskState);
-  if (checkpoint) sections.push(checkpoint);
+  sections.push(...taskControlPromptSections(taskState));
   const prompt = sections.join("\n\n");
   let taskDiagnostics;
   try {
@@ -2755,8 +2748,48 @@ async function selfTest() {
     !prompt.includes("[Authoritative progress since active task]")
     || !prompt.includes("[Mutation convergence contract]")
     || !prompt.includes("[On-demand checkpoint requested]")
+    || !prompt.includes("[Immediate terminal report required]")
   ) {
     throw new Error("managed convergence state was not delivered to the provider");
+  }
+  const analysisPrompt = promptFrom({
+    stream: true,
+    model: MODEL_ALIAS,
+    reasoning: { effort: REQUIRED_EFFORT },
+    input: [{
+      type: "agent_message",
+      id: "self-test-analysis",
+      author: "Codex",
+      recipient: "/root/self_test",
+      content: [{
+        type: "input_text",
+        text: "Message Type: NEW_TASK\nTask name: /root/self_test\nPayload:\nInspect the bounded evidence and report only when complete.",
+      }],
+    }],
+  });
+  if (
+    !analysisPrompt.prompt.includes("[Analysis convergence contract]")
+    || analysisPrompt.prompt.includes("[Immediate terminal report required]")
+  ) {
+    throw new Error("analysis convergence control produced a false immediate return");
+  }
+  const mutationReturnWhenDone = promptFrom({
+    stream: true,
+    model: MODEL_ALIAS,
+    reasoning: { effort: REQUIRED_EFFORT },
+    input: [{
+      type: "agent_message",
+      id: "self-test-mutation-return-when-done",
+      author: "Codex",
+      recipient: "/root/self_test",
+      content: [{
+        type: "input_text",
+        text: "Message Type: NEW_TASK\nTask name: /root/self_test\nPayload:\nImplement the bounded patch and return immediately when complete.",
+      }],
+    }],
+  });
+  if (mutationReturnWhenDone.prompt.includes("[Immediate terminal report required]")) {
+    throw new Error("mutation completion wording falsely triggered immediate return");
   }
   const reversedPrompt = promptFrom({
     stream: true,

@@ -11,6 +11,7 @@ import {
   activeTaskPromptSection,
   isBridgeProgressReasoning,
   normalizeAgentMessageContent,
+  taskControlPromptSections,
   taskDeliveryDiagnostics,
   taskStateFromInput,
   validateTerminalCompletion,
@@ -467,7 +468,7 @@ function historyEntries(input, taskState) {
         newTask: false,
         checkpoint: false,
       };
-      if (message.newTask && !message.checkpoint) continue;
+      if (message.newTask) continue;
       checkpoint = message.checkpoint;
       text = `[Inter-agent message ${message.author} -> ${message.recipient}]\n${message.text}`;
     } else if (["function_call", "custom_tool_call", "tool_search_call"].includes(item.type)) {
@@ -551,9 +552,11 @@ function fullPrompt(context) {
   const sections = [delegationContract(context.requestId, context.workingDirectory)];
   if (context.roleInstructions) sections.push(`[Role instructions]\n${context.roleInstructions}`);
   const activeTask = activeTaskPromptSection(context.taskState);
-  const mandatorySectionCount = sections.length + (activeTask ? 1 : 0);
+  const taskControlSections = taskControlPromptSections(context.taskState);
+  const mandatorySectionCount = sections.length + (activeTask ? 1 : 0) + taskControlSections.length;
   const mandatoryChars = sections.reduce((sum, section) => sum + section.length, 0)
     + activeTask.length
+    + taskControlSections.reduce((sum, section) => sum + section.length, 0)
     + Math.max(0, mandatorySectionCount - 1) * 2;
   const retained = boundedEntries(
     context.entries,
@@ -570,6 +573,7 @@ function fullPrompt(context) {
   } else {
     sections.push(...retained.map((entry) => entry.text));
   }
+  sections.push(...taskControlSections);
   const prompt = sections.join("\n\n");
   if (prompt.length > MAX_PROMPT_CHARS) throw new BridgeError("Normalized Antigravity prompt exceeded its hard limit", 500);
   return prompt;
@@ -577,11 +581,18 @@ function fullPrompt(context) {
 
 function resumePrompt(context, session) {
   const unseen = context.entries.filter((entry) => !session.seenMessageKeys.has(entry.key));
-  const retained = boundedEntries(unseen, MAX_RESUME_PROMPT_CHARS, context.taskState.activeTask?.text);
+  const taskControlSections = taskControlPromptSections(context.taskState);
+  const controlChars = taskControlSections.reduce((sum, section) => sum + section.length + 2, 0);
+  const retained = boundedEntries(
+    unseen,
+    MAX_RESUME_PROMPT_CHARS - controlChars,
+    context.taskState.activeTask?.text,
+  );
   const sections = [
     `[Native Antigravity resume]\nContinue the retained active task in ${context.workingDirectory}. Task hash: ${context.taskState.activeTask?.hash || "none"}. The original task remains authoritative; do not restart the investigation.`,
     ...retained.filter((entry) => !entry.checkpoint).map((entry) => entry.text),
     ...retained.filter((entry) => entry.checkpoint).map((entry) => entry.text),
+    ...taskControlSections,
   ];
   if (retained.length === 0) sections.push("Continue from the retained provider state and return when complete or concretely blocked.");
   return sections.join("\n\n");
@@ -2208,6 +2219,56 @@ async function selfTest() {
   });
   if (!resumedDiagnostics.completeTaskDelivered || resumed.includes(task)) {
     throw new Error("provider-session task retention failed");
+  }
+  const analysisTask = "Message Type: NEW_TASK\nTask name: /root/agy_analysis\nPayload:\nInspect the bounded evidence and report only when complete.";
+  const immediateMessage = "Message Type: MESSAGE\nTask name: /root/agy_analysis\nPayload:\nStop further investigation and immediately return your current verdict.";
+  const analysisContext = requestContext({
+    stream: true,
+    model: MODEL_ALIAS,
+    reasoning: { effort: REQUIRED_EFFORT },
+    client_metadata: { cwd: process.cwd(), thread_id: "thread-agy-analysis" },
+    input: [{
+      type: "agent_message",
+      id: "agy-analysis-task",
+      author: "Codex",
+      recipient: "/root/agy_analysis",
+      content: [{ type: "input_text", text: analysisTask }],
+    }],
+  });
+  const analysisFirst = fullPrompt(analysisContext);
+  if (
+    !analysisFirst.includes("[Analysis convergence contract]")
+    || analysisFirst.includes("[Immediate terminal report required]")
+  ) {
+    throw new Error("Antigravity analysis convergence control failed");
+  }
+  const immediateContext = requestContext({
+    stream: true,
+    model: MODEL_ALIAS,
+    reasoning: { effort: REQUIRED_EFFORT },
+    client_metadata: { cwd: process.cwd(), thread_id: "thread-agy-analysis" },
+    input: [
+      {
+        type: "agent_message",
+        id: "agy-analysis-task",
+        author: "Codex",
+        recipient: "/root/agy_analysis",
+        content: [{ type: "input_text", text: analysisTask }],
+      },
+      {
+        type: "agent_message",
+        id: "agy-analysis-immediate",
+        author: "Codex",
+        recipient: "/root/agy_analysis",
+        content: [{ type: "input_text", text: immediateMessage }],
+      },
+    ],
+  });
+  const immediateResume = resumePrompt(immediateContext, {
+    seenMessageKeys: new Set(analysisContext.messageKeys),
+  });
+  if (!immediateResume.includes("[Immediate terminal report required]")) {
+    throw new Error("Antigravity resumed immediate terminal report control failed");
   }
   const isolated = sanitizedEnvironment({
     GEMINI_API_KEY: "secret",

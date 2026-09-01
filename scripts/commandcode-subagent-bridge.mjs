@@ -10,6 +10,7 @@ import {
   TaskStateError,
   isBridgeProgressReasoning,
   normalizeAgentMessageContent,
+  taskControlPromptSections,
   taskStateFromInput,
   validateTerminalCompletion,
 } from "./codebuddy-subagent-task-state.mjs";
@@ -689,6 +690,7 @@ function translateResponsesRequest(body) {
   const messages = [];
   const systemParts = [NATIVE_DELEGATION_CONTRACT];
   if (body.instructions !== undefined) systemParts.push(requireString(body.instructions, "instructions"));
+  systemParts.push(...taskControlPromptSections(taskState));
 
   for (let index = 0; index < inputItems.length; index += 1) {
     const item = assertObject(inputItems[index], `input[${index}]`);
@@ -1271,6 +1273,7 @@ function cursorPromptFrom(body) {
     if (PROVIDER_OPAQUE_INPUT_TYPES.has(item.type)) continue;
     throw new BridgeError(`${label} has unsupported Cursor input type ${JSON.stringify(item.type)}`);
   }
+  sections.push(...taskControlPromptSections(taskState));
   const prompt = sections.filter(Boolean).join("\n\n");
   if (!prompt) throw new BridgeError("Cursor prompt is empty");
   const workingDirectory = workingDirectoryFrom(body);
@@ -1726,6 +1729,11 @@ function openCodeTransport(model) {
 function normalizeOpenCodeRequest(body) {
   assertObject(body, "request body");
   if (body.stream !== true) throw new BridgeError("The OpenCode bridge only supports stream=true Responses requests");
+  const taskInput = typeof body.input === "string"
+    ? [{ type: "message", role: "user", content: body.input }]
+    : body.input;
+  if (!Array.isArray(taskInput)) throw new BridgeError("input must be a string or array");
+  const taskState = taskStateFromInput(taskInput, MAX_ACTIVE_TASK_CHARS);
   body.model = openCodeModelId(body.model);
   if (body.reasoning?.summary === "none") delete body.reasoning.summary;
   if (body.reasoning?.effort === "none" || (body.reasoning && Object.keys(body.reasoning).length === 0)) delete body.reasoning;
@@ -1853,7 +1861,15 @@ function normalizeOpenCodeRequest(body) {
     body.input = normalizedInput;
   }
   if (body.tool_choice?.type === "custom") body.tool_choice.type = "function";
-  return { body, customTools, responseTools };
+  const taskControlSections = taskControlPromptSections(taskState);
+  const instructionSections = [
+    taskState.activeTask ? NATIVE_DELEGATION_CONTRACT : "",
+    typeof body.instructions === "string" ? body.instructions : "",
+    ...taskControlSections,
+  ].filter(Boolean);
+  if (instructionSections.length > 0) body.instructions = instructionSections.join("\n\n");
+  else delete body.instructions;
+  return { body, customTools, responseTools, taskState };
 }
 
 const OPENCODE_CHAT_IMAGE_MODELS = new Set([
@@ -2663,10 +2679,7 @@ function transformOpenCodeChatSseBlock(block, state, toolInfo) {
 async function handleOpenCodeResponses(request, response) {
   const authorization = bearerFrom(request);
   const translated = normalizeOpenCodeRequest(await readJsonRequest(request));
-  const taskInput = typeof translated.body.input === "string"
-    ? [{ type: "message", role: "user", content: translated.body.input }]
-    : translated.body.input;
-  const taskState = taskStateFromInput(taskInput, MAX_ACTIVE_TASK_CHARS);
+  const taskState = translated.taskState;
   const transport = openCodeTransport(translated.body.model);
   const chatRequest = transport === "chat-completions"
     ? openCodeChatRequest(translated.body, translated.customTools)
@@ -2769,7 +2782,7 @@ async function handleOpenCodeResponses(request, response) {
 
 function selfTest() {
   readCommandCodeInstallation();
-  const cursorTaskPayload = "<agent_message type=\"new_task\">\nactive-cursor-task\n</agent_message>";
+  const cursorTaskPayload = "Message Type: NEW_TASK\nTask name: /root/worker\nPayload:\nInspect the bounded active Cursor task.";
   const cursorTask = cursorPromptFrom({
     model: "cursor/test-model",
     input: [
@@ -2792,6 +2805,54 @@ function selfTest() {
     || cursorTask.prompt.includes("provider-opaque")
   ) {
     throw new Error("self-test failed: Cursor encrypted task and compaction portability");
+  }
+  const analysisTaskText = "Message Type: NEW_TASK\nTask name: /root/worker\nPayload:\nInspect the bounded evidence and report only when complete.";
+  const immediateTaskText = "Message Type: NEW_TASK\nTask name: /root/worker\nPayload:\nReturn your current implementation verdict immediately. Do not investigate further.";
+  const taskItem = (text) => ({
+    type: "agent_message",
+    id: `task-${text.length}`,
+    author: "/root",
+    recipient: "/root/worker",
+    content: [{ type: "input_text", text }],
+  });
+  const commandCodeAnalysis = translateResponsesRequest({
+    model: "commandcode/test-model",
+    input: [taskItem(analysisTaskText)],
+    stream: true,
+  }).upstream.params.system;
+  const cursorAnalysis = cursorPromptFrom({
+    model: "cursor/test-model",
+    input: [taskItem(analysisTaskText)],
+    stream: true,
+    client_metadata: { cwd: process.cwd() },
+  }).prompt;
+  const openCodeAnalysis = normalizeOpenCodeRequest({
+    model: "opencode/muse-spark-1.2-contributor-free",
+    input: [taskItem(analysisTaskText)],
+    stream: true,
+  });
+  for (const [label, normalized] of [
+    ["CommandCode", commandCodeAnalysis],
+    ["Cursor", cursorAnalysis],
+    ["OpenCode", openCodeAnalysis.body.instructions],
+  ]) {
+    if (
+      !normalized.includes("[Analysis convergence contract]")
+      || normalized.includes("[Immediate terminal report required]")
+    ) {
+      throw new Error(`self-test failed: ${label} analysis convergence control`);
+    }
+  }
+  if (!openCodeAnalysis.taskState.activeTask || openCodeAnalysis.taskState.activeTask.text !== analysisTaskText) {
+    throw new Error("self-test failed: OpenCode lost native task state during normalization");
+  }
+  const immediatePrompts = [
+    translateResponsesRequest({ model: "commandcode/test-model", input: [taskItem(immediateTaskText)], stream: true }).upstream.params.system,
+    cursorPromptFrom({ model: "cursor/test-model", input: [taskItem(immediateTaskText)], stream: true, client_metadata: { cwd: process.cwd() } }).prompt,
+    normalizeOpenCodeRequest({ model: "opencode/muse-spark-1.2-contributor-free", input: [taskItem(immediateTaskText)], stream: true }).body.instructions,
+  ];
+  if (immediatePrompts.some((prompt) => !prompt.includes("[Immediate terminal report required]"))) {
+    throw new Error("self-test failed: immediate terminal report control did not reach every CLI bridge");
   }
   const reasoningBoundaryInput = [
     { type: "message", role: "user", content: [{ type: "input_text", text: "continue" }] },
@@ -3026,9 +3087,9 @@ function selfTest() {
     openCodeChatAgentMessage.customTools,
     openCodeChatAgentMessage.responseTools,
   );
+  const openCodeChatAgentUserMessage = openCodeChatAgentRequest.body.messages.find((message) => message.role === "user");
   if (
-    openCodeChatAgentRequest.body.messages[0]?.role !== "user"
-    || openCodeChatAgentRequest.body.messages[0]?.content?.[0]?.text !== "delegated"
+    openCodeChatAgentUserMessage?.content?.[0]?.text !== "delegated"
   ) {
     throw new Error("self-test failed: OpenCode Chat native agent message translation");
   }
@@ -3495,7 +3556,7 @@ function selfTest() {
   const replayRequest = openCodeChatRequest(replayNormalized.body, replayNormalized.customTools);
   const replayAssistant = replayRequest.body.messages[2];
   if (
-    replayRequest.body.messages[0]?.content !== "system\n\ndeveloper" ||
+    !replayRequest.body.messages[0]?.content?.endsWith("system\n\ndeveloper") ||
     replayAssistant?.role !== "assistant" ||
     replayAssistant.content !== null ||
     replayAssistant.reasoning_content !== "think" ||
