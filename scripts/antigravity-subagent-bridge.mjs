@@ -108,11 +108,14 @@ function isBoundedTaskWait(parameters, conversationId) {
   const durationSeconds = Number(parameters.DurationSeconds ?? parameters.duration_seconds);
   const prompt = String(parameters.Prompt ?? parameters.prompt ?? "").trim();
   const timerCondition = String(parameters.TimerCondition ?? parameters.timer_condition ?? "").trim();
-  const prefix = `${conversationId}/task-`;
   if (!Number.isInteger(durationSeconds) || durationSeconds < 1 || durationSeconds > MAX_BOUNDED_WAIT_SECONDS) return false;
-  if (!timerCondition.startsWith(prefix)) return false;
-  const taskNumber = timerCondition.slice(prefix.length);
-  if (!/^\d+$/.test(taskNumber)) return false;
+  const qualifiedPrefix = `${conversationId}/task-`;
+  const taskNumber = timerCondition.startsWith(qualifiedPrefix)
+    ? timerCondition.slice(qualifiedPrefix.length)
+    : /^task-\d+$/.test(timerCondition)
+      ? timerCondition.slice("task-".length)
+      : null;
+  if (taskNumber === null || !/^\d+$/.test(taskNumber)) return false;
   return new RegExp(`^wait (?:briefly )?for task-${taskNumber} to (?:finish|complete)[.!]?$`, "i").test(prompt);
 }
 
@@ -900,7 +903,6 @@ class AntigravitySession {
         const parameters = step.tool_info?.parameters || {};
         const stepIndex = Number.isInteger(step.step_index) ? step.step_index : `unknown-${this.turn.unknownToolSteps++}`;
         const stepKey = `${step.conversation_id || this.init?.conversationId || "unknown"}:${stepIndex}`;
-        const conversationId = step.conversation_id || this.init?.conversationId || null;
         const firstObservation = !this.turn.toolStepKeys.has(stepKey);
         this.turn.toolStepKeys.add(stepKey);
         if (typeof name === "string") this.turn.toolNames.add(name);
@@ -915,7 +917,9 @@ class AntigravitySession {
           this.turn.mutationToolStepKeys.add(stepKey);
           clearUncommittedRouteTimer(this.turn);
         }
-        const invalidBoundedWait = name === BOUNDED_WAIT_TOOL && !isBoundedTaskWait(parameters, conversationId);
+        const invalidBoundedWait = name === BOUNDED_WAIT_TOOL
+          && step.state === "DONE"
+          && !isBoundedTaskWait(parameters, this.init?.conversationId);
         if (firstObservation && (FORBIDDEN_AGENT_TOOLS.has(name) || invalidBoundedWait)) {
           this.turn.forbiddenToolName = name;
           const error = attachTurnProgress(
@@ -2031,6 +2035,20 @@ async function selfTest() {
   boundedWaitSession.consumeEvent({
     event: "step_update",
     step_update: {
+      conversation_id: "bounded-wait-fixture/task-30",
+      step_index: 0,
+      state: "RUNNING",
+      step_type: "tool",
+      tool_name: BOUNDED_WAIT_TOOL,
+      tool_info: { name: BOUNDED_WAIT_TOOL },
+    },
+  });
+  if (boundedWaitFailure) {
+    throw new Error("incomplete running Antigravity wait metadata was rejected before its DONE update");
+  }
+  boundedWaitSession.consumeEvent({
+    event: "step_update",
+    step_update: {
       conversation_id: "bounded-wait-fixture",
       step_index: 0,
       state: "DONE",
@@ -2048,6 +2066,20 @@ async function selfTest() {
   });
   if (boundedWaitFailure || boundedWaitSession.turn?.forbiddenToolName || !boundedWaitSession.turn?.toolNames.has(BOUNDED_WAIT_TOOL)) {
     throw new Error("bounded Antigravity command wait was rejected as orchestration");
+  }
+  if (!isBoundedTaskWait({
+    DurationSeconds: MAX_BOUNDED_WAIT_SECONDS,
+    Prompt: "Wait for task-30 to finish",
+    TimerCondition: "task-30",
+  }, "bounded-wait-fixture")) {
+    throw new Error("conversation-local Antigravity task wait was rejected");
+  }
+  if (isBoundedTaskWait({
+    DurationSeconds: MAX_BOUNDED_WAIT_SECONDS,
+    Prompt: "Wait for task-30 to finish",
+    TimerCondition: "another-conversation/task-30",
+  }, "bounded-wait-fixture")) {
+    throw new Error("cross-conversation Antigravity task wait was accepted");
   }
   if (isBoundedTaskWait({
     DurationSeconds: MAX_BOUNDED_WAIT_SECONDS + 1,
