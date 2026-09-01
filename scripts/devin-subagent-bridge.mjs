@@ -45,6 +45,7 @@ const PROVIDER_RECOVERY_BUDGET_MS = 45 * 1000;
 const PROVIDER_RECOVERY_BACKOFF_MS = 1 * 1000;
 const ROUTE_CAPACITY_WAIT_MS = PROVIDER_RECOVERY_BUDGET_MS;
 const NATIVE_PROGRESS_POLL_MS = 1 * 1000;
+const NATIVE_PROVIDER_INACTIVITY_MS = 60 * 1000;
 const MAX_PROGRESS_EVENTS = 256;
 const FREE_ROUTE_CONCURRENCY = 2;
 const OLLAMA_CLOUD_CONCURRENCY = 3;
@@ -1088,7 +1089,7 @@ function inspectSession(requestId) {
   const db = new DatabaseSync(DEVIN_DB, { readOnly: true });
   try {
     const session = db.prepare(`
-      SELECT s.id, s.model, s.metadata
+      SELECT s.id, s.model, s.metadata, s.last_activity_at
       FROM sessions s
       JOIN message_nodes m ON m.session_id = s.id
       WHERE instr(m.chat_message, ?) > 0
@@ -1107,7 +1108,14 @@ function inspectSession(requestId) {
       WHERE session_id = ? AND json_type(chat_message, '$.tool_calls') = 'array'
     `).all(session.id);
     const toolCalls = uniqueToolCalls(toolRows);
-    return { id: session.id, model: session.model, metadata: JSON.parse(session.metadata || "{}"), metrics, toolCalls };
+    return {
+      id: session.id,
+      model: session.model,
+      metadata: JSON.parse(session.metadata || "{}"),
+      metrics,
+      toolCalls,
+      lastActivityAt: Number(session.last_activity_at || 0) * 1000,
+    };
   } finally {
     db.close();
   }
@@ -1158,6 +1166,7 @@ function runCli(
     let stdout = "";
     let stderr = "";
     let settled = false;
+    let lastProviderActivityAt = Date.now();
     const seenToolCalls = new Set();
     const reportProgress = () => {
       let session;
@@ -1166,13 +1175,24 @@ function runCli(
       } catch {
         return;
       }
+      if (session?.lastActivityAt > lastProviderActivityAt) {
+        lastProviderActivityAt = session.lastActivityAt;
+      }
       for (const [index, call] of (session?.toolCalls || []).entries()) {
         if (!call?.name) continue;
         const key = typeof call.id === "string" && call.id ? call.id : `${call.name}:${index}`;
         if (seenToolCalls.has(key)) continue;
         seenToolCalls.add(key);
+        lastProviderActivityAt = Date.now();
         onProgress?.({ kind: "tool", index: seenToolCalls.size, name: call.name });
       }
+      if (Date.now() - lastProviderActivityAt < NATIVE_PROVIDER_INACTIVITY_MS) return;
+      child.kill();
+      finish(undefined, {
+        code: 1,
+        stdout: stdout.trim(),
+        stderr: `Devin stream was interrupted after ${NATIVE_PROVIDER_INACTIVITY_MS}ms without provider activity`,
+      });
     };
     const finish = (error, value) => {
       if (settled) return;
@@ -1192,9 +1212,15 @@ function runCli(
     const progressTimer = setInterval(reportProgress, NATIVE_PROGRESS_POLL_MS);
     progressTimer.unref();
     child.stdout.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => { stdout = `${stdout}${chunk}`.slice(-OUTPUT_LIMIT); });
+    child.stdout.on("data", (chunk) => {
+      lastProviderActivityAt = Date.now();
+      stdout = `${stdout}${chunk}`.slice(-OUTPUT_LIMIT);
+    });
     child.stderr.setEncoding("utf8");
-    child.stderr.on("data", (chunk) => { stderr = `${stderr}${chunk}`.slice(-OUTPUT_LIMIT); });
+    child.stderr.on("data", (chunk) => {
+      lastProviderActivityAt = Date.now();
+      stderr = `${stderr}${chunk}`.slice(-OUTPUT_LIMIT);
+    });
     child.once("error", (error) => finish(new BridgeError(`Devin failed to start: ${error.message}`, 502)));
     child.once("close", (code) => finish(undefined, { code, stdout: stdout.trim(), stderr: stderr.trim() }));
   });
