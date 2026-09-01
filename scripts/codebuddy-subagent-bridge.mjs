@@ -41,6 +41,9 @@ const MAX_PROMPT_CHARS = 120_000;
 const MAX_ACTIVE_TASK_CHARS = 40_000;
 const STDERR_LIMIT = 16 * 1024;
 const REQUEST_TIMEOUT_MS = 30 * 60 * 1000;
+const PROVIDER_SILENCE_TIMEOUT_MS = 55_000;
+const FINAL_REPORT_START = "RZCODEX_FINAL_REPORT_BEGIN";
+const FINAL_REPORT_END = "RZCODEX_FINAL_REPORT_END";
 const TEXT_TOOL_NAME = "tool_search";
 const WIRE_TEXT_TOOL_NAME = "search_tools";
 const CODEX_HOME = process.env.CODEX_HOME || join(homedir(), ".codex");
@@ -109,6 +112,10 @@ const runtime = {
   lastProviderActivityAt: null,
   lastProviderProgressEvents: 0,
   lastStreamedTextChars: 0,
+  providerSilenceTimeouts: 0,
+  lastProviderSilenceTimeoutAt: null,
+  completionEnvelopeFailures: 0,
+  lastCompletionEnvelopeAccepted: false,
   activeRequests: 0,
   activeProviderSessions: 0,
   providerSessionsStarted: 0,
@@ -764,6 +771,13 @@ function promptFrom(body, registry = providerConversations) {
       ? "[Native delegation continuation]\nContinue the same delegated task in this retained CodeBuddy conversation. The full active task and project AGENTS.md ownership boundaries remain authoritative; do not ask the parent to resend them. New Codex client results and control messages follow below. Use ToolSearch with the exact mcp__codex__ tool name before DeferExecuteTool. When its proxy reports DEFERRED_TO_CODEX_CLIENT, end this turn immediately; the parent will execute that call and resume this same conversation with the real result."
       : "[Native delegation contract]\nWork as the delegated CodeBuddy sub-agent in the current workspace. Complete only the bounded task and return concise evidence to the parent. Honor project AGENTS.md ownership boundaries exactly; when builds, tests, editor control, PIE, runtime validation, or RzMCP execution are reserved to the parent, do not invoke them and instead report the exact checks the parent should run. On Windows, use PowerShell-native commands, single-quote ripgrep patterns containing |, and never assume Unix-only commands such as head are installed. The MCP server named codex exposes the client-executed tools compatible with this managed model route. CodeBuddy serves those schemas lazily: use ToolSearch with the exact mcp__codex__ tool name before invoking it through DeferExecuteTool. When its proxy reports DEFERRED_TO_CODEX_CLIENT, immediately end the turn without retrying, fabricating a result, or calling another tool; the parent will execute it and resume you with the real result.",
   ];
+  sections.push(
+    `[Terminal completion envelope]\nA turn that requests a Codex client tool must not use this envelope. ` +
+    `For a genuine terminal completion, put the concise parent-facing report between these exact sentinel lines:\n` +
+    `${FINAL_REPORT_START}\n<completed result, concrete blocker, or requested checkpoint; never a future-tense work plan>\n${FINAL_REPORT_END}\n` +
+    `Do not write anything after ${FINAL_REPORT_END}. Text before ${FINAL_REPORT_START} is discarded. ` +
+    "A successful provider turn without this envelope is rejected as incomplete.",
+  );
   const roleInstructions = roleInstructionsFrom(body.instructions);
   if (roleInstructions && !conversation.providerSessionStarted) {
     sections.push(`[Role instructions]\n${roleInstructions}`);
@@ -959,7 +973,11 @@ function validateInit(context, initEvent) {
 function validateResult(context, initEvent, resultEvent) {
   validateInit(context, initEvent);
   if (!resultEvent || resultEvent.subtype !== "success" || resultEvent.is_error === true) {
-    throw new BridgeError(`CodeBuddy failed: ${resultEvent?.result || "no successful result event"}`, 502);
+    const errors = Array.isArray(resultEvent?.errors)
+      ? resultEvent.errors.map((error) => typeof error === "string" ? error : jsonString(error))
+      : [];
+    const detail = [resultEvent?.result, ...errors].find((value) => typeof value === "string" && value.trim());
+    throw new BridgeError(`CodeBuddy failed: ${detail || "no successful result event"}`, 502);
   }
   if (resultEvent.total_cost_usd !== 0) {
     throw new BridgeError(`CodeBuddy reported a non-zero or unknown explicit cost: ${JSON.stringify(resultEvent.total_cost_usd)}`, 502);
@@ -968,6 +986,27 @@ function validateResult(context, initEvent, resultEvent) {
   if (usedModels.length !== 1 || usedModels[0] !== context.model) {
     throw new BridgeError(`CodeBuddy model usage indicates fallback: ${JSON.stringify(usedModels)}`, 502);
   }
+}
+
+function validatedCompletionReport(providerText, resultEvent, calls) {
+  if (calls.length > 0) return "";
+  const resultText = typeof resultEvent?.result === "string" && resultEvent.result.trim()
+    ? resultEvent.result
+    : typeof providerText === "string" ? providerText : "";
+  const end = resultText.lastIndexOf(FINAL_REPORT_END);
+  const start = end < 0 ? -1 : resultText.lastIndexOf(FINAL_REPORT_START, end);
+  const after = end < 0 ? "" : resultText.slice(end + FINAL_REPORT_END.length).trim();
+  if (start < 0 || end < start || after) {
+    throw new BridgeError(
+      "CodeBuddy completed without a terminal final-report envelope; refusing to treat planning narration as task completion",
+      502,
+    );
+  }
+  const report = resultText.slice(start + FINAL_REPORT_START.length, end).trim();
+  if (!report) {
+    throw new BridgeError("CodeBuddy returned an empty terminal final-report envelope", 502);
+  }
+  return report;
 }
 
 function providerToolCall(part, context) {
@@ -1039,11 +1078,15 @@ function runCodeBuddy(context, onSpawn, onProviderEvent = () => {}) {
     let initEvent = null;
     let resultEvent = null;
     let maxTurnInputTokens = 0;
+    let lastProviderActivityAt = Date.now();
+    let requestTimer = null;
+    let silenceTimer = null;
     const calls = new Map();
     const finish = (error, value) => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
+      clearTimeout(requestTimer);
+      clearInterval(silenceTimer);
       artifacts.cleanup();
       error ? reject(error) : resolve(value);
     };
@@ -1081,12 +1124,24 @@ function runCodeBuddy(context, onSpawn, onProviderEvent = () => {}) {
       }
       if (event.type === "result") resultEvent = event;
     };
-    const timer = setTimeout(() => {
+    requestTimer = setTimeout(() => {
       child.kill();
       finish(new BridgeError(`CodeBuddy exceeded ${REQUEST_TIMEOUT_MS}ms`, 504));
     }, REQUEST_TIMEOUT_MS);
+    silenceTimer = setInterval(() => {
+      if (Date.now() - lastProviderActivityAt < PROVIDER_SILENCE_TIMEOUT_MS) return;
+      runtime.providerSilenceTimeouts += 1;
+      runtime.lastProviderSilenceTimeoutAt = Date.now();
+      child.kill();
+      finish(new BridgeError(
+        `CodeBuddy produced no provider activity for ${PROVIDER_SILENCE_TIMEOUT_MS}ms`,
+        504,
+      ));
+    }, 1_000);
+    silenceTimer.unref?.();
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (chunk) => {
+      lastProviderActivityAt = Date.now();
       stdoutBuffer += chunk;
       for (;;) {
         const newline = stdoutBuffer.indexOf("\n");
@@ -1096,7 +1151,10 @@ function runCodeBuddy(context, onSpawn, onProviderEvent = () => {}) {
       }
     });
     child.stderr.setEncoding("utf8");
-    child.stderr.on("data", (chunk) => { stderr = `${stderr}${chunk}`.slice(-STDERR_LIMIT); });
+    child.stderr.on("data", (chunk) => {
+      lastProviderActivityAt = Date.now();
+      stderr = `${stderr}${chunk}`.slice(-STDERR_LIMIT);
+    });
     child.stdin.on("error", (error) => {
       if (error?.code !== "EPIPE") finish(new BridgeError(`CodeBuddy stdin failed: ${error.message}`, 502));
     });
@@ -1257,6 +1315,7 @@ async function handleResponses(request, response) {
   runtime.lastProviderActivityAt = null;
   runtime.lastProviderProgressEvents = 0;
   runtime.lastStreamedTextChars = 0;
+  runtime.lastCompletionEnvelopeAccepted = false;
   runtime.lastProviderSessionHash = sha256(context.providerSessionId);
   runtime.lastProviderSessionResumed = context.providerSessionStarted;
   runtime.lastInputItemCount = context.conversation.inputItemCount;
@@ -1335,8 +1394,6 @@ async function handleResponses(request, response) {
     const result = await runCodeBuddy(context, (spawned) => { child = spawned; }, onProviderEvent);
     if (clientGone) return;
     providerConversations.commit(context);
-    if (result.calls.length === 0 && result.finalText) emitText(result.finalText);
-    runtime.completed += 1;
     runtime.lastModel = result.initEvent.model;
     runtime.lastAuthSource = result.initEvent.apiKeySource;
     runtime.lastCostUsd = result.resultEvent.total_cost_usd;
@@ -1345,7 +1402,14 @@ async function handleResponses(request, response) {
     runtime.lastDurationApiMs = result.resultEvent.duration_api_ms ?? null;
     runtime.lastMaxTurnInputTokens = result.maxTurnInputTokens;
     runtime.maxObservedTurnInputTokens = Math.max(runtime.maxObservedTurnInputTokens, result.maxTurnInputTokens);
-    const providerFinalText = result.finalText;
+    let providerFinalText;
+    try {
+      providerFinalText = validatedCompletionReport(result.finalText, result.resultEvent, result.calls);
+      runtime.lastCompletionEnvelopeAccepted = result.calls.length === 0;
+    } catch (error) {
+      runtime.completionEnvelopeFailures += 1;
+      throw error;
+    }
     let noMutationReason;
     try {
       noMutationReason = validateNoMutationCompletion(
@@ -1366,6 +1430,7 @@ async function handleResponses(request, response) {
     const finalText = providerFinalText && progressReport
       ? `${providerFinalText}\n\n${progressReport}`
       : providerFinalText;
+    runtime.completed += 1;
     const output = [];
     let outputIndex = 0;
     if (finalText) {
@@ -1483,6 +1548,25 @@ function selfTest() {
     || providerVisibleTextDelta(thinkingDelta) !== null
   ) {
     throw new Error("self-test failed: provider stream exposed non-visible reasoning");
+  }
+  const envelopedCompletion = validatedCompletionReport(
+    `discarded planning narration\n${FINAL_REPORT_START}\nCompleted with evidence.\n${FINAL_REPORT_END}`,
+    {
+      result: `discarded planning narration\n${FINAL_REPORT_START}\nCompleted with evidence.\n${FINAL_REPORT_END}`,
+    },
+    [],
+  );
+  if (envelopedCompletion !== "Completed with evidence.") {
+    throw new Error("self-test failed: terminal completion envelope did not remove planning narration");
+  }
+  if (validatedCompletionReport("tool turn", {}, [{ callId: "call-1" }]) !== "") {
+    throw new Error("self-test failed: client tool turns must not emit terminal completion text");
+  }
+  try {
+    validatedCompletionReport("I'll inspect the files next.", { result: "I'll inspect the files next." }, []);
+    throw new Error("self-test failed: planning narration must not count as terminal completion");
+  } catch (error) {
+    if (!String(error.message).includes("without a terminal final-report envelope")) throw error;
   }
   const selfTestTools = [
     { type: "web_search" },
