@@ -9,7 +9,6 @@ import {
   taskControlPromptSections,
   taskDeliveryDiagnostics,
   taskStateFromInput,
-  validateTerminalCompletion,
 } from "./codebuddy-subagent-task-state.mjs";
 
 const MAX_ACTIVE_TASK_CHARS = 40_000;
@@ -240,14 +239,6 @@ function nativeProcess({ command, args, cwd, env, signal, onEvent, parseLine, la
 
 function validateResult(context, result) {
   if (!result.finalText?.trim()) throw new NativeCliAgentError(`${context.provider} CLI completed without a final report`);
-  try {
-    validateTerminalCompletion(context.taskState, result.finalText, [], {
-      providerMutationCount: result.mutationCount,
-    });
-  } catch (error) {
-    if (error instanceof TaskStateError) throw new NativeCliAgentError(error.message);
-    throw error;
-  }
   return result;
 }
 

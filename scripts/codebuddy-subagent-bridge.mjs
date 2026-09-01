@@ -26,7 +26,6 @@ import {
   taskControlPromptSections,
   taskDeliveryDiagnostics,
   taskStateFromInput,
-  validateTerminalCompletion,
 } from "./codebuddy-subagent-task-state.mjs";
 
 const PROVIDER_ID = "codebuddy";
@@ -42,8 +41,6 @@ const REQUEST_TIMEOUT_MS = 30 * 60 * 1000;
 // Finish before the outer managed-route inactivity budget (55s) so CodeBuddy can report an
 // authoritative provider failure and the router can continue to the native fallback cleanly.
 const PROVIDER_SILENCE_TIMEOUT_MS = 45_000;
-const FINAL_REPORT_START = "RZCODEX_FINAL_REPORT_BEGIN";
-const FINAL_REPORT_END = "RZCODEX_FINAL_REPORT_END";
 const TEXT_TOOL_NAME = "tool_search";
 const WIRE_TEXT_TOOL_NAME = "search_tools";
 const CODEX_HOME = process.env.CODEX_HOME || join(homedir(), ".codex");
@@ -122,17 +119,12 @@ const runtime = {
   lastChangedPaths: [],
   lastCompletedTool: null,
   lastCheckpointRequested: false,
-  lastNoMutationReasonCategory: null,
-  lastNoMutationReasonDetailHash: null,
-  lastNoMutationReasonDetailLength: null,
   lastProviderActivity: null,
   lastProviderActivityAt: null,
   lastProviderProgressEvents: 0,
   lastStreamedTextChars: 0,
   providerSilenceTimeouts: 0,
   lastProviderSilenceTimeoutAt: null,
-  completionEnvelopeFailures: 0,
-  lastCompletionEnvelopeAccepted: false,
   activeRequests: 0,
   staleRequestArtifactsCleaned: 0,
   activeProviderSessions: 0,
@@ -792,13 +784,6 @@ function promptFrom(body, registry = providerConversations) {
       ? "[Native delegation continuation]\nContinue the same delegated task in this retained CodeBuddy conversation. Use your own local tools directly and return only when the bounded task is complete, the requested checkpoint is ready, or a concrete blocker requires parent input. Never delegate to another agent, teammate, swarm, or background worker."
       : "[Single native-agent execution contract]\nWork as the delegated CodeBuddy sub-agent in the current workspace and complete this bounded task in this one CLI execution. Use CodeBuddy's own Read, Write, Edit, Bash, Glob, and Grep tools directly. Never delegate to another agent, teammate, swarm, or background worker. Do not ask the parent to execute an ordinary file or shell operation. Honor project AGENTS.md ownership boundaries exactly; when builds, tests, editor control, PIE, runtime validation, or RzMCP execution are reserved to the parent, do not invoke them and instead report the exact checks the parent should run. On Windows, use PowerShell-native commands and never assume Unix-only commands such as head are installed. RzMCP is exposed lazily as only search_rzmcp_tools and call_rzmcp_tool through the rzmcp MCP server; search first, then call the selected tool only when the task allows RzMCP.",
   ];
-  sections.push(
-    `[Terminal completion envelope]\nA turn that requests a Codex client tool must not use this envelope. ` +
-    `For a genuine terminal completion, put the concise parent-facing report between these exact sentinel lines:\n` +
-    `${FINAL_REPORT_START}\n<completed result, concrete blocker, or requested checkpoint; never a future-tense work plan>\n${FINAL_REPORT_END}\n` +
-    `Do not write anything after ${FINAL_REPORT_END}. Text before ${FINAL_REPORT_START} is discarded. ` +
-    "A successful provider turn without this envelope is rejected as incomplete.",
-  );
   const roleInstructions = roleInstructionsFrom(body.instructions);
   if (roleInstructions && !conversation.providerSessionStarted) {
     sections.push(`[Role instructions]\n${roleInstructions}`);
@@ -1020,25 +1005,15 @@ function validateResult(context, initEvent, resultEvent) {
   }
 }
 
-function validatedCompletionReport(providerText, resultEvent, calls) {
-  if (calls.length > 0) return "";
+function providerCompletionReport(providerText, resultEvent, calls) {
+  if (calls.length > 0) {
+    throw new BridgeError("CodeBuddy attempted an unavailable Codex parent tool", 502);
+  }
   const resultText = typeof resultEvent?.result === "string" && resultEvent.result.trim()
     ? resultEvent.result
     : typeof providerText === "string" ? providerText : "";
-  const end = resultText.lastIndexOf(FINAL_REPORT_END);
-  const start = end < 0 ? -1 : resultText.lastIndexOf(FINAL_REPORT_START, end);
-  const after = end < 0 ? "" : resultText.slice(end + FINAL_REPORT_END.length).trim();
-  if (start < 0 || end < start || after) {
-    throw new BridgeError(
-      "CodeBuddy completed without a terminal final-report envelope; refusing to treat planning narration as task completion",
-      502,
-    );
-  }
-  const report = resultText.slice(start + FINAL_REPORT_START.length, end).trim();
-  if (!report) {
-    throw new BridgeError("CodeBuddy returned an empty terminal final-report envelope", 502);
-  }
-  return report;
+  if (!resultText.trim()) throw new BridgeError("CodeBuddy completed without assistant output", 502);
+  return resultText.trim();
 }
 
 function providerToolCall(part, context) {
@@ -1361,14 +1336,10 @@ async function handleResponses(request, response) {
   runtime.lastChangedPaths = context.taskState.progress.changedPaths;
   runtime.lastCompletedTool = context.taskState.progress.lastCompletedTool;
   runtime.lastCheckpointRequested = context.taskState.checkpointRequested;
-  runtime.lastNoMutationReasonCategory = null;
-  runtime.lastNoMutationReasonDetailHash = null;
-  runtime.lastNoMutationReasonDetailLength = null;
   runtime.lastProviderActivity = null;
   runtime.lastProviderActivityAt = null;
   runtime.lastProviderProgressEvents = 0;
   runtime.lastStreamedTextChars = 0;
-  runtime.lastCompletionEnvelopeAccepted = false;
   runtime.lastFailure = null;
   runtime.lastProviderSessionHash = sha256(context.providerSessionId);
   runtime.lastProviderSessionResumed = context.providerSessionStarted;
@@ -1526,34 +1497,10 @@ async function handleResponses(request, response) {
     runtime.lastSuccessfulMutationCount = context.taskState.progress.successfulMutationCount + result.mutationCount;
     runtime.lastChangedPaths = [...new Set([...context.taskState.progress.changedPaths, ...result.nativeChangedPaths])];
     runtime.lastCompletedTool = result.nativeToolNames.at(-1) || context.taskState.progress.lastCompletedTool;
-    let providerFinalText;
-    try {
-      providerFinalText = validatedCompletionReport(result.finalText, result.resultEvent, result.calls);
-      runtime.lastCompletionEnvelopeAccepted = result.calls.length === 0;
-    } catch (error) {
-      runtime.completionEnvelopeFailures += 1;
-      throw error;
-    }
-    let noMutationReason;
-    try {
-      noMutationReason = validateTerminalCompletion(
-        context.taskState,
-        providerFinalText,
-        result.calls,
-        { providerMutationCount: result.mutationCount },
-      );
-    } catch (error) {
-      if (error instanceof TaskStateError) throw new BridgeError(error.message, 502);
-      throw error;
-    }
-    if (noMutationReason) {
-      runtime.lastNoMutationReasonCategory = noMutationReason.category;
-      runtime.lastNoMutationReasonDetailHash = noMutationReason.detailHash;
-      runtime.lastNoMutationReasonDetailLength = noMutationReason.detailLength;
-    }
+    const providerFinalText = providerCompletionReport(result.finalText, result.resultEvent, result.calls);
     const progressReport = result.mutationCount > 0
       ? `[Authoritative native-provider progress]\nTask ID: ${context.taskDiagnostics.taskId}\nTask hash: ${context.taskDiagnostics.taskHash}\nNative tool calls: ${result.nativeToolNames.length}\nSuccessful native mutations: ${result.mutationCount}\nChanged paths: ${result.nativeChangedPaths.join(", ") || "not reported by provider"}\nLast completed native tool: ${result.nativeToolNames.at(-1) || "none"}`
-      : authoritativeProgressReport(context.taskState, noMutationReason);
+      : authoritativeProgressReport(context.taskState);
     const finalText = providerFinalText && progressReport
       ? `${providerFinalText}\n\n${progressReport}`
       : providerFinalText;
@@ -1630,9 +1577,6 @@ async function handleResponses(request, response) {
           changed_paths: [...new Set([...context.taskState.progress.changedPaths, ...result.nativeChangedPaths])],
           last_completed_tool: result.nativeToolNames.at(-1) || context.taskState.progress.lastCompletedTool,
           checkpoint_requested: context.taskState.checkpointRequested,
-          no_mutation_reason_category: noMutationReason?.category ?? null,
-          no_mutation_reason_detail_hash: noMutationReason?.detailHash ?? null,
-          no_mutation_reason_detail_length: noMutationReason?.detailLength ?? null,
           provider_session_resumed: context.providerSessionStarted,
           provider_session_hash: sha256(context.providerSessionId),
           normalized_input_items: context.conversation.inputItemCount,
@@ -1700,24 +1644,19 @@ function selfTest() {
   ) {
     throw new Error("self-test failed: provider stream exposed non-visible reasoning");
   }
-  const envelopedCompletion = validatedCompletionReport(
-    `discarded planning narration\n${FINAL_REPORT_START}\nCompleted with evidence.\n${FINAL_REPORT_END}`,
-    {
-      result: `discarded planning narration\n${FINAL_REPORT_START}\nCompleted with evidence.\n${FINAL_REPORT_END}`,
-    },
+  const providerReport = providerCompletionReport(
+    "I'll inspect the files next.",
+    { result: "I'll inspect the files next." },
     [],
   );
-  if (envelopedCompletion !== "Completed with evidence.") {
-    throw new Error("self-test failed: terminal completion envelope did not remove planning narration");
-  }
-  if (validatedCompletionReport("tool turn", {}, [{ callId: "call-1" }]) !== "") {
-    throw new Error("self-test failed: client tool turns must not emit terminal completion text");
+  if (providerReport !== "I'll inspect the files next.") {
+    throw new Error("self-test failed: successful provider output was semantically filtered");
   }
   try {
-    validatedCompletionReport("I'll inspect the files next.", { result: "I'll inspect the files next." }, []);
-    throw new Error("self-test failed: planning narration must not count as terminal completion");
+    providerCompletionReport("tool turn", {}, [{ callId: "call-1" }]);
+    throw new Error("self-test failed: unavailable parent tool call was accepted");
   } catch (error) {
-    if (!String(error.message).includes("without a terminal final-report envelope")) throw error;
+    if (!String(error.message).includes("unavailable Codex parent tool")) throw error;
   }
   const selfTestTools = [
     { type: "web_search" },
@@ -2096,7 +2035,7 @@ function selfTest() {
     || firstPatch.taskState.progress.changedPaths.join(",") !== "C:/fixture/proof.txt"
     || !firstPatch.taskState.checkpointRequested
     || !firstPatch.prompt.includes("Do not start another tool call")
-    || !authoritativeProgressReport(firstPatch.taskState, null).includes("Successful apply_patch mutations: 1")
+    || !authoritativeProgressReport(firstPatch.taskState).includes("Successful apply_patch mutations: 1")
   ) {
     throw new Error("self-test failed: checkpoint lost authoritative first-patch progress");
   }
@@ -2165,38 +2104,6 @@ function selfTest() {
   ) {
     throw new Error("self-test failed: task diagnostics are missing hashes/types or persisted raw content");
   }
-  const zeroMutation = normalizeSelfTestRequest([mutationTaskItem]);
-  try {
-    validateTerminalCompletion(zeroMutation.taskState, "I stopped without editing.", []);
-    throw new Error("self-test failed: zero-mutation completion requires a structured reason");
-  } catch (error) {
-    if (!String(error.message).includes("no structured no_mutation_reason")) throw error;
-  }
-  const recordedReason = validateTerminalCompletion(
-    zeroMutation.taskState,
-    "Blocked.\nNO_MUTATION_REASON: {\"category\":\"missing_input\",\"detail\":\"parent must choose the target\",\"resolvable_tool\":null}",
-    [],
-  );
-  if (!recordedReason || recordedReason.category !== "missing_input" || "detail" in recordedReason) {
-    throw new Error("self-test failed: no-mutation diagnostics must be structured and sanitized");
-  }
-  for (const preamble of [
-    "I need to find the actual log before I can continue.",
-    "I'll continue the investigation and make the edit next.",
-    "Investigation deferred to the client runtime; awaiting the real command result before proceeding.",
-  ]) {
-    try {
-      validateTerminalCompletion(readOnlyTask.taskState, preamble, []);
-      throw new Error("self-test failed: non-terminal provider narration was accepted");
-    } catch (error) {
-      if (!String(error.message).includes("intention or deferred-work preamble")) throw error;
-    }
-  }
-  validateTerminalCompletion(
-    readOnlyTask.taskState,
-    "Confirmed: the requested symbol is defined once in the bounded source file.",
-    [],
-  );
   if (
     context.toolInfo.definitions.length !== 6 ||
     !context.toolInfo.byWire.has("apply_patch") ||

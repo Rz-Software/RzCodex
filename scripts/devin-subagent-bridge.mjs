@@ -16,7 +16,6 @@ import {
   taskControlPromptSections,
   taskDeliveryDiagnostics,
   taskStateFromInput,
-  validateTerminalCompletion,
 } from "./codebuddy-subagent-task-state.mjs";
 import {
   ActiveTaskProviderPins,
@@ -1501,15 +1500,6 @@ function finalizeDevinResult(context, selected, routeResult, fallbackState) {
     const measuredOutputTokens = session.metrics.reduce((sum, metric) => sum + Number(metric.output_tokens || 0), 0);
     const outputTokensPerSecond = generationSeconds > 0 ? measuredOutputTokens / generationSeconds : null;
     const toolCalls = session.toolCalls.filter((call) => call?.name);
-    const mutationToolCalls = providerMutationToolCalls(session);
-    try {
-      validateTerminalCompletion(context.taskState, cliResult.stdout, [], {
-        providerMutationCount: mutationToolCalls.length,
-      });
-    } catch (error) {
-      if (error instanceof TaskStateError) throw new BridgeError(error.message, 502);
-      throw error;
-    }
     const rzMcpTools = toolCalls
       .filter((call) => call.name === "mcp_call_tool" && call.arguments?.tool_name === "call_rzmcp_tool")
       .map((call) => call.arguments?.arguments?.name).filter((name) => typeof name === "string");

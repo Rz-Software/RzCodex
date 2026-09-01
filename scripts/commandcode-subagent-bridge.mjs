@@ -12,7 +12,6 @@ import {
   normalizeAgentMessageContent,
   taskControlPromptSections,
   taskStateFromInput,
-  validateTerminalCompletion,
 } from "./codebuddy-subagent-task-state.mjs";
 import {
   NativeCliAgentError,
@@ -1471,14 +1470,6 @@ async function handleCursorResponses(request, response) {
   try {
     const result = await runCursorAgent(context, (spawned) => { child = spawned; });
     if (clientGone) return;
-    try {
-      const providerMutationCount = result.nativeToolNames.filter((name) =>
-        /^(?:apply_patch|edit|write_file|create_file|delete_file|move_file|mcp_call_tool)$/i.test(name)).length;
-      validateTerminalCompletion(context.taskState, result.text, [], { providerMutationCount });
-    } catch (error) {
-      if (error instanceof TaskStateError) throw new BridgeError(error.message, 502);
-      throw error;
-    }
     cursorRuntime.completed += 1;
     cursorRuntime.lastInitializedModel = result.initializedModel || null;
     cursorRuntime.lastInputTokens = Number.isInteger(result.usage?.inputTokens) ? result.usage.inputTokens : null;
@@ -1617,16 +1608,6 @@ async function handleLegacyCommandCodeResponses(request, response) {
       }
     }
     if (!state.finished) throw new BridgeError("CommandCode stream ended without a finish event", 502);
-    try {
-      validateTerminalCompletion(
-        translated.context.taskState,
-        state.lastCompletedText,
-        Array.from({ length: state.toolCallCount }),
-      );
-    } catch (error) {
-      if (error instanceof TaskStateError) throw new BridgeError(error.message, 502);
-      throw error;
-    }
     const finish = state.finish;
     const finishReason = finish.finishReason ?? finish.rawFinishReason;
     const status = finishReason === "length" || finishReason === "max_tokens" ? "incomplete" : "completed";
@@ -2500,23 +2481,6 @@ function openCodeChatComplete(state) {
   return sseEvent("response.completed", { response });
 }
 
-function validateOpenCodeTerminal(taskState, output) {
-  const text = output
-    .filter((item) => item?.type === "message")
-    .flatMap((item) => Array.isArray(item.content) ? item.content : [])
-    .filter((part) => part?.type === "output_text" && typeof part.text === "string")
-    .map((part) => part.text)
-    .join("\n");
-  const calls = output.filter((item) =>
-    ["function_call", "custom_tool_call", "tool_search_call"].includes(item?.type));
-  try {
-    validateTerminalCompletion(taskState, text, calls);
-  } catch (error) {
-    if (error instanceof TaskStateError) throw new BridgeError(error.message, 502);
-    throw error;
-  }
-}
-
 function transformOpenCodeChatSseBlock(block, state, toolInfo) {
   const payload = openCodeChatPayload(block);
   if (payload === null) return "";
@@ -2744,7 +2708,6 @@ async function handleLegacyOpenCodeResponses(request, response) {
         if (clientGone) return;
         const transformed = transformOpenCodeChatSseBlock(block, state, chatRequest.toolInfo);
         if (!transformed) continue;
-        if (state.completed) validateOpenCodeTerminal(taskState, state.completedItems);
         if (!response.write(transformed)) await new Promise((resolve) => response.once("drain", resolve));
       }
       if (!state.completed) throw new BridgeError("OpenCode Chat Completions stream ended without a completed response", 502);
@@ -2759,9 +2722,6 @@ async function handleLegacyOpenCodeResponses(request, response) {
       const payload = openCodeChatPayload(block);
       const transformed = transformOpenCodeSseBlock(block, translated.customTools, suppressedItemIds, translated.responseTools);
       if (transformed === null) continue;
-      if (payload?.type === "response.completed") {
-        validateOpenCodeTerminal(taskState, payload.response?.output || []);
-      }
       if (!response.write(transformed)) {
         await new Promise((resolve) => response.once("drain", resolve));
       }

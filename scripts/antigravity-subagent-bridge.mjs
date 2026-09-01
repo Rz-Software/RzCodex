@@ -14,7 +14,6 @@ import {
   taskControlPromptSections,
   taskDeliveryDiagnostics,
   taskStateFromInput,
-  validateTerminalCompletion,
 } from "./codebuddy-subagent-task-state.mjs";
 
 const PROVIDER_ID = "antigravity";
@@ -1424,14 +1423,6 @@ async function handleResponses(request, response) {
       prompt = fullPrompt(context);
       diagnostics = diagnosticsFor(prompt, false);
       result = await runSession(session, prompt);
-    }
-    try {
-      validateTerminalCompletion(context.taskState, result.text, [], {
-        providerMutationCount: result.mutationToolCalls + result.rzMcpTools.length,
-      });
-    } catch (error) {
-      if (error instanceof TaskStateError) throw new BridgeError(error.message, 502);
-      throw error;
     }
     for (const key of context.messageKeys) session.seenMessageKeys.add(key);
     runtime.completed += 1;

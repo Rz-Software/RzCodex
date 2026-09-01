@@ -11,9 +11,6 @@ const IMMEDIATE_RETURN = [
   /\b(?:return|report|respond)\b[\s\S]{0,120}\b(?:immediately|right now|now)\b/i,
   /\b(?:immediately|right now|now)\b[\s\S]{0,120}\b(?:return|report|respond)\b/i,
 ];
-const NO_MUTATION_REASON = /(?:^|\n)NO_MUTATION_REASON:\s*(\{[^\r\n]+\})\s*(?:\r?\n|$)/;
-const NO_MUTATION_CATEGORIES = new Set(["policy", "permission", "tool", "missing_input", "semantic"]);
-const NON_TERMINAL_COMPLETION = /^(?:i(?:\s+need\s+to|\s+will|(?:'|’)ll|\s+am\s+going\s+to)|let\s+me|continuing\b|investigation\s+deferred\b|awaiting\b)/i;
 
 export class TaskStateError extends Error {
   constructor(message) {
@@ -368,69 +365,9 @@ export function taskControlPromptSections(taskState) {
   ].filter(Boolean);
 }
 
-export function validateNoMutationCompletion(taskState, finalText, pendingCalls) {
-  if (
-    taskState.activeTask?.intent !== "mutation"
-    || taskState.progress.successfulMutationCount > 0
-    || pendingCalls.length > 0
-    || !finalText
-  ) {
-    return null;
-  }
-  const match = NO_MUTATION_REASON.exec(finalText);
-  if (!match) {
-    throw new TaskStateError(
-      `mutation task ${taskState.activeTask.id} ended with zero recorded mutations and no structured no_mutation_reason`,
-    );
-  }
-  let reason;
-  try {
-    reason = JSON.parse(match[1]);
-  } catch (error) {
-    throw new TaskStateError(`no_mutation_reason is not valid JSON: ${error.message}`);
-  }
-  if (!NO_MUTATION_CATEGORIES.has(reason.category)) {
-    throw new TaskStateError(`no_mutation_reason category is invalid: ${JSON.stringify(reason.category)}`);
-  }
-  if (typeof reason.detail !== "string" || reason.detail.trim().length === 0) {
-    throw new TaskStateError("no_mutation_reason detail must be a non-empty string");
-  }
-  if (reason.resolvable_tool !== null) {
-    throw new TaskStateError("no_mutation_reason is invalid because resolvable_tool is not null");
-  }
-  return {
-    category: reason.category,
-    detailHash: sha256(reason.detail),
-    detailLength: reason.detail.length,
-  };
-}
-
-export function validateTerminalCompletion(
-  taskState,
-  finalText,
-  pendingCalls = [],
-  { providerMutationCount = 0 } = {},
-) {
-  const text = typeof finalText === "string" ? finalText.trim() : "";
-  if (pendingCalls.length > 0) return null;
-  if (!text) {
-    throw new TaskStateError("provider completed without a terminal report");
-  }
-  if (NON_TERMINAL_COMPLETION.test(text)) {
-    throw new TaskStateError(
-      "provider returned an intention or deferred-work preamble instead of a terminal result or concrete blocker",
-    );
-  }
-  if (providerMutationCount > 0) return null;
-  return validateNoMutationCompletion(taskState, text, pendingCalls);
-}
-
-export function authoritativeProgressReport(taskState, noMutationReason) {
+export function authoritativeProgressReport(taskState) {
   if (!taskState.activeTask) return "";
   const progress = taskState.progress;
   const paths = progress.changedPaths.length > 0 ? progress.changedPaths.join(", ") : "none";
-  const reason = noMutationReason
-    ? `${noMutationReason.category} (${noMutationReason.detailLength} chars, sha256 ${noMutationReason.detailHash})`
-    : "none";
-  return `[Authoritative Codex progress]\nTask ID: ${taskState.activeTask.id}\nTask hash: ${taskState.activeTask.hash}\nTool calls since task: ${progress.toolCallsSinceTask}\nSuccessful apply_patch mutations: ${progress.successfulMutationCount}\nChanged paths: ${paths}\nLast completed tool: ${progress.lastCompletedTool ?? "none"}\nRecorded no-mutation reason: ${reason}`;
+  return `[Authoritative Codex progress]\nTask ID: ${taskState.activeTask.id}\nTask hash: ${taskState.activeTask.hash}\nTool calls since task: ${progress.toolCallsSinceTask}\nSuccessful apply_patch mutations: ${progress.successfulMutationCount}\nChanged paths: ${paths}\nLast completed tool: ${progress.lastCompletedTool ?? "none"}`;
 }
