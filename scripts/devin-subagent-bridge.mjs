@@ -444,6 +444,7 @@ const runtime = {
   fallbackAttempts: 0, fallbackCompleted: 0, fallbackFailed: 0, terminalFallbacks: 0,
   providerAttempts: { antigravity: 0, devin: 0, ollama: 0, devinFree: 0, codebuddy: 0 },
   providerFailures: { antigravity: 0, devin: 0, ollama: 0, "devin-free": 0, codebuddy: 0 },
+  recentProviderFailures: [],
   lastProviderSequence: [],
   fallbackStreamCommits: 0, lastFallbackStreamCommitted: false,
   lastFallbackProviderOutputObserved: false,
@@ -1719,7 +1720,8 @@ async function runOllamaStage(
       onProgress?.("Ollama native CLI agent started one self-contained execution.\n");
       let nativeContext;
       try {
-        nativeContext = nativeCliAgentContext(requestBody, {
+        const forwardedBody = fallbackForwardBody(requestBody, requestBody.model, route.ollamaEffort);
+        nativeContext = nativeCliAgentContext(forwardedBody, {
           provider: "ollama",
           model: route.ollamaModel,
           requiredEffort: route.ollamaEffort,
@@ -1922,6 +1924,13 @@ async function executeAuto(context, requestBody, onSpawn, onProgress, signal, cr
         runtime.providerFailures[stage] += 1;
         runtime.fallbackFailed += 1;
         runtime.lastFallbackError = `${stage}: ${sanitizedProviderFailure(error)}`;
+        runtime.recentProviderFailures.push({
+          at: Date.now(),
+          taskHash: context.taskDiagnostics.taskHash,
+          stage,
+          error: sanitizedProviderFailure(error),
+        });
+        runtime.recentProviderFailures = runtime.recentProviderFailures.slice(-20);
         if (!error.routeSkipped) onProgress?.(`${stage} was unavailable before committed work; trying the next configured provider.\n`);
       },
     });
@@ -2542,6 +2551,23 @@ async function selfTest() {
     || !models.terminal.model_uid
   ) {
     throw new Error("ordered provider configuration failed");
+  }
+  const autoEffortFixture = {
+    model: MODEL_ALIAS,
+    reasoning: { effort: REQUIRED_EFFORT },
+    stream: true,
+  };
+  const forwardedOllamaFixture = fallbackForwardBody(
+    autoEffortFixture,
+    autoEffortFixture.model,
+    route.ollamaEffort,
+  );
+  if (
+    autoEffortFixture.reasoning.effort !== REQUIRED_EFFORT
+    || forwardedOllamaFixture.reasoning.effort !== OLLAMA_REQUIRED_EFFORT
+    || forwardedOllamaFixture.model !== MODEL_ALIAS
+  ) {
+    throw new Error("auto route did not translate the Ollama stage to its required effort");
   }
   if (!LEGACY_REQUEST_EFFORTS.has("max") || LEGACY_REQUEST_EFFORTS.has("xhigh")) throw new Error("legacy effort compatibility failed");
   const isolatedEnvironment = sanitizedEnvironment({
