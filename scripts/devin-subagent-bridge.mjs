@@ -74,9 +74,9 @@ const DEVIN_DB = join(process.env.APPDATA || join(homedir(), "AppData", "Roaming
 const QUOTA_FAILURE = /(?:daily|weekly|included|usage)[\s\S]{0,100}quota[\s\S]{0,100}(?:exhaust|exceed|reach|limit)|quota[\s\S]{0,100}(?:exhaust|exceed|reach|limit)/i;
 const RESOURCE_EXHAUSTED = /cognition\.ai\/errorKind[\s\S]{0,100}resource_exhausted|resource_exhausted[\s\S]{0,100}cognition\.ai\/retryable[\s\S]{0,20}true/i;
 const INTERRUPTED_STREAM = /stream (?:was )?interrupted|stream disconnected|connection (?:closed|reset)|unexpected end of (?:file|stream)|please continue the task you were working on/i;
-const EXPLICIT_READ_ONLY_TASK = /\bread[- ]only\b|\bno[- ]mutation\b|\b(?:do not|must not|never)\s+(?:edit|modify|write|mutate)(?:\s+(?:any|the|source|project|workspace|files?)){0,3}(?:[.;,]|$)/i;
-const VALIDATION_RESTRICTED_TASK = /\b(?:do not|must not|never)[^.\n]{0,160}\b(?:build|compile|run\s+(?:the\s+)?tests?|test|control\s+(?:the\s+)?editor|use\s+(?:the\s+)?editor|pie|sie)\b/i;
-const RZMCP_RESTRICTED_TASK = /\b(?:do not|must not|never)[^.\n]{0,160}\b(?:use|invoke|control|call)\s+(?:any\s+|the\s+)?(?:editor|rzmcp)\b/i;
+const EXPLICIT_READ_ONLY_TASK = /\bread[- ]only\b|\bno[- ]mutation\b|\bno\s+(?:edits?|modifications?|writes?|mutations?|file\s+changes|source\s+changes)\b|\b(?:do not|must not|never)\s+(?:edit|modify|write|mutate)(?:\s+(?:any|the|source|project|workspace|files?)){0,3}(?:[.;,]|$)/i;
+const VALIDATION_RESTRICTED_TASK = /\b(?:do not|must not|never)[^.\n]{0,160}\b(?:build|compile|run\s+(?:the\s+)?tests?|test|control\s+(?:the\s+)?editor|use\s+(?:the\s+)?editor|pie|sie)\b|\bno\s+(?:build|compile|tests?|editor|pie|sie)\b/i;
+const RZMCP_RESTRICTED_TASK = /\b(?:do not|must not|never)[^.\n]{0,160}\b(?:use|invoke|control|call)\s+(?:any\s+|the\s+)?(?:editor|rzmcp)\b|\bno\s+[^.\n]{0,120}\brzmcp\b/i;
 const QUOTA_STATE_VERSION = 2;
 
 class BridgeError extends Error {
@@ -2445,6 +2445,12 @@ async function selfTest() {
   const scopedMutationPolicy = executionPolicyFromTaskState({
     activeTask: { text: "Implement the fix. Do not edit unrelated files." },
   });
+  const shorthandMutationPolicy = executionPolicyFromTaskState({
+    activeTask: { text: "Implement the bounded fix. No build/test/Editor/RzMCP/stage/commit." },
+  });
+  const shorthandReadOnlyPolicy = executionPolicyFromTaskState({
+    activeTask: { text: "Review the bounded diff. No edits/build/test/Editor/RzMCP." },
+  });
   if (
     readOnlyPolicy.permissionMode !== "auto"
     || readOnlyPolicy.rzMcpMode !== "disabled"
@@ -2453,6 +2459,10 @@ async function selfTest() {
     || unrestrictedMutationPolicy.permissionMode !== "dangerous"
     || unrestrictedMutationPolicy.rzMcpMode !== "full"
     || scopedMutationPolicy.permissionMode !== "dangerous"
+    || shorthandMutationPolicy.permissionMode !== "accept-edits"
+    || shorthandMutationPolicy.rzMcpMode !== "disabled"
+    || shorthandReadOnlyPolicy.permissionMode !== "auto"
+    || shorthandReadOnlyPolicy.rzMcpMode !== "disabled"
   ) {
     throw new Error("task execution permission policy failed");
   }
