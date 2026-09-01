@@ -25,9 +25,11 @@ use crate::tools::registry::AnyToolResult;
 use crate::tools::registry::ToolArgumentDiffConsumer;
 use crate::tools::router::ToolCall;
 use crate::tools::router::ToolCallSource;
+use crate::tools::router::ToolRouter;
 use codex_history::ResponseItemEnvelope;
 use codex_protocol::error::CodexErr;
 use codex_protocol::models::ResponseInputItem;
+use codex_protocol::models::ResponseItem;
 
 struct ToolCallTimingGuard {
     started_at: Instant,
@@ -68,6 +70,23 @@ impl ToolCallRuntime {
         self.step_context
             .tool_router
             .create_diff_consumer(tool_name)
+    }
+
+    pub(crate) fn prepare_tool_call(
+        &self,
+        item: ResponseItem,
+    ) -> (ResponseItem, Result<Option<ToolCall>, FunctionCallError>) {
+        match self
+            .step_context
+            .tool_router
+            .normalize_response_tool_call(item.clone())
+        {
+            Ok(item) => {
+                let call = ToolRouter::build_tool_call(item.clone());
+                (item, call)
+            }
+            Err(err) => (item, Err(err)),
+        }
     }
 
     #[instrument(level = "trace", skip_all)]

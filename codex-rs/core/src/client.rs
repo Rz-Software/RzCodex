@@ -125,6 +125,7 @@ use crate::context::BaseInstructionsFragment;
 use crate::context::ContextualUserFragment;
 use crate::cyber_access_program;
 use crate::feedback_tags;
+use crate::openrouter_compat;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::subagent_header_value;
 use crate::util::emit_feedback_auth_recovery_tags;
@@ -977,7 +978,15 @@ impl ModelClient {
         responses_metadata: &CodexResponsesMetadata,
     ) -> Result<ResponsesApiRequest> {
         let mut input = prompt.get_formatted_input_for_request(model_info.use_responses_lite);
-        let is_openai = self.state.provider.info().is_openai();
+        let provider_info = self.state.provider.info();
+        let is_openai = provider_info.is_openai();
+        let openrouter_tools = provider_info
+            .is_openrouter()
+            .then(|| openrouter_compat::tools_for_request(&prompt.tools, &input))
+            .transpose()?;
+        if openrouter_tools.is_some() {
+            openrouter_compat::adapt_input_for_request(&mut input)?;
+        }
         if is_openai {
             Self::remove_bridge_progress_reasoning(&mut input);
         }
@@ -988,7 +997,9 @@ impl ModelClient {
                 &Uuid::NAMESPACE_OID,
                 self.state.thread_id.to_string().as_bytes(),
             );
-            let tools = if self.state.provider.capabilities().namespace_tools {
+            let tools = if let Some(tools) = &openrouter_tools {
+                tools.clone()
+            } else if self.state.provider.capabilities().namespace_tools {
                 create_tools_json_for_responses_lite(&prompt.tools)?
             } else {
                 create_tools_json_for_responses_api(&prompt.tools)?
@@ -1014,10 +1025,15 @@ impl ModelClient {
             input.splice(0..0, prefix);
             (String::new(), None)
         } else {
-            (
-                prompt.base_instructions.text.clone(),
-                Some(create_tools_raw_json_for_responses_api(&prompt.tools)?.into()),
-            )
+            let tools = match openrouter_tools {
+                Some(tools) => {
+                    let raw: Arc<serde_json::value::RawValue> =
+                        Arc::from(serde_json::value::to_raw_value(&tools)?);
+                    raw.into()
+                }
+                None => create_tools_raw_json_for_responses_api(&prompt.tools)?.into(),
+            };
+            (prompt.base_instructions.text.clone(), Some(tools))
         };
         if !is_openai {
             for item in &mut input {

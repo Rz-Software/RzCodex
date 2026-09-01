@@ -9,6 +9,7 @@ use crate::tools::handlers::McpHandler;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::RegisteredTool;
 use crate::tools::registry::ToolExposure;
+use crate::tools::registry::ToolRegistry;
 use crate::tools::spec_plan::append_source_tools;
 use crate::tools::spec_plan::build_core_tool_registry;
 use crate::tools::spec_plan::extension_tool_executors;
@@ -294,6 +295,90 @@ async fn build_custom_tool_call_uses_namespace_for_registry_name() -> anyhow::Re
         }
     );
 
+    Ok(())
+}
+
+#[test]
+fn normalizes_function_encoded_tool_search_to_native_client_call() -> anyhow::Result<()> {
+    let router = ToolRouter::from_parts(
+        ToolRegistry::empty_for_test(),
+        vec![ToolSpec::ToolSearch {
+            execution: "client".to_string(),
+            description: "Find deferred tools.".to_string(),
+            parameters: codex_tools::JsonSchema::object(
+                Default::default(),
+                None,
+                Some(false.into()),
+            ),
+        }],
+        codex_protocol::openai_models::ToolMode::Direct,
+        BTreeMap::new(),
+        None,
+        &[],
+    );
+
+    let item = router.normalize_response_tool_call(ResponseItem::FunctionCall {
+        id: None,
+        name: "tool_search".to_string(),
+        namespace: None,
+        arguments: json!({ "query": "project index", "limit": 3 }).to_string(),
+        encrypted_function_args: None,
+        call_id: "call-search".to_string(),
+        internal_chat_message_metadata_passthrough: None,
+    })?;
+    let ResponseItem::ToolSearchCall {
+        call_id,
+        execution,
+        arguments,
+        ..
+    } = &item
+    else {
+        panic!("expected native tool search call")
+    };
+    assert_eq!(call_id.as_deref(), Some("call-search"));
+    assert_eq!(execution, "client");
+    assert_eq!(arguments, &json!({ "query": "project index", "limit": 3 }));
+
+    let call = ToolRouter::build_tool_call(item)?.expect("tool search call should dispatch");
+    assert_eq!(call.tool_name, ToolName::plain("tool_search"));
+    assert!(matches!(call.payload, ToolPayload::ToolSearch { .. }));
+    Ok(())
+}
+
+#[tokio::test]
+async fn normalizes_flattened_function_name_to_registered_namespace() -> anyhow::Result<()> {
+    let (_, turn) = make_session_and_context().await;
+    let turn = Arc::new(turn);
+    let step_context = StepContext::for_test(Arc::clone(&turn));
+    let router = test_tool_router(
+        step_context.as_ref(),
+        vec![mcp_runtime(mcp_tool_info(
+            "rzmcp",
+            /*supports_parallel_tool_calls*/ true,
+            "mcp__rzmcp__",
+            "search_project_index",
+        ))],
+        Vec::new(),
+        &turn.dynamic_tools,
+    );
+
+    let item = router.normalize_response_tool_call(ResponseItem::FunctionCall {
+        id: None,
+        name: "mcp__rzmcp__search_project_index".to_string(),
+        namespace: None,
+        arguments: "{}".to_string(),
+        encrypted_function_args: None,
+        call_id: "call-index".to_string(),
+        internal_chat_message_metadata_passthrough: None,
+    })?;
+    let ResponseItem::FunctionCall {
+        name, namespace, ..
+    } = item
+    else {
+        panic!("expected function call")
+    };
+    assert_eq!(name, "search_project_index");
+    assert_eq!(namespace.as_deref(), Some("mcp__rzmcp__"));
     Ok(())
 }
 

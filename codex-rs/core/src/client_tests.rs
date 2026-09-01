@@ -377,6 +377,72 @@ fn responses_lite_prefix_ids_track_thread_and_payload() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[test]
+fn openrouter_request_uses_function_wire_for_client_tool_search() -> anyhow::Result<()> {
+    let mut provider =
+        ModelProviderInfo::create_openai_provider(Some("https://openrouter.ai/api/v1".to_string()));
+    provider.name = "OpenRouter".to_string();
+    let client = ModelClient::new(
+        /*auth_manager*/ None,
+        AgentIdentityAuthPolicy::JwtOnly,
+        ThreadId::new(),
+        provider,
+        SessionSource::Cli,
+        "test_originator".to_string(),
+        /*model_verbosity*/ None,
+        /*content_item_kinds_enabled*/ true,
+        /*enable_request_compression*/ false,
+        /*include_timing_metrics*/ false,
+        /*beta_features_header*/ None,
+        /*concurrent_reasoning_summaries_enabled*/ false,
+        /*attestation_provider*/ None,
+        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+    );
+    let prompt = Prompt {
+        input: vec![ResponseItem::ToolSearchOutput {
+            id: None,
+            call_id: Some("call-search".to_string()),
+            status: "completed".to_string(),
+            execution: "client".to_string(),
+            tools: Vec::new(),
+            internal_chat_message_metadata_passthrough: None,
+        }],
+        tools: vec![codex_tools::ToolSpec::ToolSearch {
+            execution: "client".to_string(),
+            description: "Find deferred tools.".to_string(),
+            parameters: codex_tools::JsonSchema::object(
+                Default::default(),
+                None,
+                Some(false.into()),
+            ),
+        }]
+        .into(),
+        ..Default::default()
+    };
+
+    let request = client.build_responses_request(
+        &prompt,
+        &test_model_info(),
+        /*effort*/ None,
+        codex_protocol::config_types::ReasoningSummary::None,
+        /*service_tier*/ None,
+        &test_responses_metadata_for_client(
+            &client,
+            /*turn_id*/ None,
+            format!("{}:0", client.state.thread_id),
+            /*parent_thread_id*/ None,
+            TestCodexResponsesRequestKind::Turn,
+        ),
+    )?;
+    let request = serde_json::to_value(request)?;
+
+    assert_eq!(request["tools"][0]["type"], "function");
+    assert_eq!(request["tools"][0]["name"], "tool_search");
+    assert_eq!(request["input"][0]["type"], "function_call_output");
+    assert_eq!(request["input"][0]["call_id"], "call-search");
+    Ok(())
+}
+
 fn test_session_telemetry() -> SessionTelemetry {
     SessionTelemetry::new(
         ThreadId::new(),

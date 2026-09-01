@@ -14,7 +14,6 @@ use crate::parse_turn_item;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::tools::parallel::ToolCallRuntime;
-use crate::tools::router::ToolRouter;
 use crate::tools::router::tool_log_payload;
 use codex_memories_read::citations::parse_memory_citation;
 use codex_memories_read::citations::thread_ids_from_memory_citation;
@@ -294,8 +293,9 @@ pub(crate) async fn handle_output_item_done(
 ) -> Result<OutputItemResult> {
     let mut output = OutputItemResult::default();
     let plan_mode = ctx.turn_context.mode() == ModeKind::Plan;
+    let (item, tool_call) = ctx.tool_runtime.prepare_tool_call(item);
 
-    match ToolRouter::build_tool_call(item.clone()) {
+    match tool_call {
         // The model emitted a tool call; log it, persist the item immediately, and queue the tool execution.
         Ok(Some(call)) => {
             ctx.sess

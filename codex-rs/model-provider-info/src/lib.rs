@@ -35,6 +35,8 @@ const MAX_STREAM_MAX_RETRIES: u64 = 100;
 const MAX_REQUEST_MAX_RETRIES: u64 = 100;
 
 const OPENAI_PROVIDER_NAME: &str = "OpenAI";
+const OPENROUTER_PROVIDER_NAME: &str = "OpenRouter";
+const OPENROUTER_BASE_URL: &str = "https://openrouter.ai";
 const OPENAI_ACTOR_AUTHORIZATION_HEADER: &str = "x-openai-actor-authorization";
 pub const OPENAI_PROVIDER_ID: &str = "openai";
 pub const CHATGPT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
@@ -466,6 +468,17 @@ impl ModelProviderInfo {
 
     pub fn is_openai(&self) -> bool {
         self.name == OPENAI_PROVIDER_NAME
+    }
+
+    pub fn is_openrouter(&self) -> bool {
+        self.name.eq_ignore_ascii_case(OPENROUTER_PROVIDER_NAME)
+            || self.base_url.as_deref().is_some_and(|base_url| {
+                let base_url = base_url.trim().trim_end_matches('/');
+                base_url == OPENROUTER_BASE_URL
+                    || base_url
+                        .strip_prefix(OPENROUTER_BASE_URL)
+                        .is_some_and(|suffix| suffix.starts_with('/'))
+            })
     }
 
     pub fn supports_codex_backend_routes(&self) -> bool {

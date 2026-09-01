@@ -7,6 +7,7 @@ use crate::session::turn_context::TurnContext;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
+use crate::tools::flat_tool_name;
 #[cfg(test)]
 use crate::tools::handlers::ToolSearchHandlerCache;
 use crate::tools::registry::AnyToolResult;
@@ -15,6 +16,7 @@ use crate::tools::registry::ToolArgumentDiffConsumer;
 use crate::tools::registry::ToolRegistry;
 #[cfg(test)]
 use crate::tools::spec_plan::finalize_tool_router;
+use codex_protocol::DEFAULT_FUNCTION_NAMESPACE;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::models::SearchToolCallParams;
 #[cfg(test)]
@@ -238,6 +240,86 @@ impl ToolRouter {
 
     pub(crate) fn tool_runtime(&self, tool_name: &ToolName) -> Option<Arc<dyn CoreToolRuntime>> {
         self.registry.tool(tool_name)
+    }
+
+    pub(crate) fn normalize_response_tool_call(
+        &self,
+        item: ResponseItem,
+    ) -> Result<ResponseItem, FunctionCallError> {
+        let ResponseItem::FunctionCall {
+            id,
+            name,
+            namespace,
+            arguments,
+            encrypted_function_args,
+            call_id,
+            internal_chat_message_metadata_passthrough,
+        } = item
+        else {
+            return Ok(item);
+        };
+
+        let uses_default_namespace = namespace.as_deref().is_none_or(|namespace| {
+            namespace.is_empty() || namespace == DEFAULT_FUNCTION_NAMESPACE
+        });
+        if uses_default_namespace
+            && name == "tool_search"
+            && self
+                .model_visible_specs
+                .iter()
+                .any(|spec| matches!(spec, ToolSpec::ToolSearch { .. }))
+        {
+            let arguments = serde_json::from_str(&arguments).map_err(|err| {
+                FunctionCallError::RespondToModel(format!(
+                    "failed to parse tool_search arguments: {err}"
+                ))
+            })?;
+            return Ok(ResponseItem::ToolSearchCall {
+                id,
+                call_id: Some(call_id),
+                status: Some("completed".to_string()),
+                execution: "client".to_string(),
+                arguments,
+                internal_chat_message_metadata_passthrough,
+            });
+        }
+
+        let (name, namespace) = if uses_default_namespace {
+            self.resolve_flattened_function_name(&name)
+                .map(|tool_name| (tool_name.name, tool_name.namespace))
+                .unwrap_or((name, namespace))
+        } else {
+            (name, namespace)
+        };
+        Ok(ResponseItem::FunctionCall {
+            id,
+            name,
+            namespace,
+            arguments,
+            encrypted_function_args,
+            call_id,
+            internal_chat_message_metadata_passthrough,
+        })
+    }
+
+    fn resolve_flattened_function_name(&self, flattened_name: &str) -> Option<ToolName> {
+        if self
+            .registry
+            .tool(&ToolName::plain(flattened_name))
+            .is_some()
+        {
+            return None;
+        }
+
+        let mut matches = self
+            .registry
+            .entries()
+            .map(|tool| tool.runtime.tool_name())
+            .filter(|tool_name| {
+                !tool_name.is_default_namespace() && flat_tool_name(tool_name) == flattened_name
+            });
+        let tool_name = matches.next()?;
+        matches.next().is_none().then_some(tool_name)
     }
 
     #[instrument(level = "trace", skip_all, err)]
