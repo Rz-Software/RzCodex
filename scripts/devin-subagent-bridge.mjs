@@ -28,6 +28,7 @@ import {
 } from "./native-subagent-provider-router.mjs";
 import {
   NativeCliAgentError,
+  nativeCliAgentRunnerSelfTest,
   nativeCliAgentContext,
   runOpenCodeNativeAgent,
 } from "./native-cli-agent-runner.mjs";
@@ -1083,6 +1084,27 @@ function validateOllamaCompletion(completion, responseTools) {
   return { ...completion, output: completion.output.map((item) => restoreOllamaFunctionItem(item, responseTools)) };
 }
 
+function terminalAssistantFromRows(conversationRows) {
+  let lastToolNodeId = -1;
+  let terminalNodeId = -1;
+  let terminalText = null;
+  for (const row of conversationRows) {
+    const message = typeof row.chat_message === "string" ? JSON.parse(row.chat_message) : row.chat_message;
+    if (message.role === "tool") {
+      lastToolNodeId = Math.max(lastToolNodeId, Number(row.node_id));
+      continue;
+    }
+    const content = typeof message.content === "string" ? message.content.trim() : "";
+    const assistantToolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
+    if (content && assistantToolCalls.length === 0 && Number(row.node_id) > lastToolNodeId) {
+      terminalNodeId = Number(row.node_id);
+      terminalText = content;
+    }
+  }
+  if (terminalNodeId < lastToolNodeId) terminalText = null;
+  return { terminalText, terminalNodeId, lastToolNodeId };
+}
+
 function inspectSession(requestId) {
   const db = new DatabaseSync(DEVIN_DB, { readOnly: true });
   try {
@@ -1115,6 +1137,14 @@ function inspectSession(requestId) {
           OR ltrim(CAST(json_extract(chat_message, '$.content') AS TEXT)) LIKE 'Now summarize the conversation above%'
         )
     `).get(session.id);
+    const conversationRows = db.prepare(`
+      SELECT node_id, chat_message
+      FROM message_nodes
+      WHERE session_id = ?
+        AND json_extract(chat_message, '$.role') IN ('assistant', 'tool')
+      ORDER BY node_id
+    `).all(session.id);
+    const terminal = terminalAssistantFromRows(conversationRows);
     const toolCalls = uniqueToolCalls(toolRows);
     return {
       id: session.id,
@@ -1124,6 +1154,7 @@ function inspectSession(requestId) {
       toolCalls,
       lastActivityAt: Number(session.last_activity_at || 0) * 1000,
       compactionNodeId: Number(compaction?.node_id || 0),
+      ...terminal,
     };
   } finally {
     db.close();
@@ -1137,6 +1168,16 @@ async function waitForSession(requestId) {
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
   return null;
+}
+
+async function waitForTerminalSession(requestId, existingSession = null) {
+  let session = existingSession;
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    session = inspectSession(requestId) || session;
+    if (session?.terminalText) return session;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return session;
 }
 
 function removeSession(sessionId) {
@@ -1279,6 +1320,10 @@ function devinStreamContinuationPrompt(context) {
   return `[Native Devin stream recovery]\nContinue the same retained conversation and active task after the interrupted provider stream. Task hash: ${context.taskDiagnostics.taskHash}. Do not restart the investigation or repeat completed tool calls or file edits. Return the next required tool call or the concise final result.`;
 }
 
+function devinIncompleteTurnPrompt(context) {
+  return `[Native Devin terminal-message recovery]\nThe retained provider conversation ended after native tool execution without a terminal assistant message. Continue the same active task and return its actual completion report or concrete blocker now. Task hash: ${context.taskDiagnostics.taskHash}. Do not restart the investigation or repeat completed tool calls or file edits.`;
+}
+
 function devinCompactionCheckpointPrompt(context) {
   return `[Native Devin compaction checkpoint]\nYour provider context compacted during the bounded delegated task. Do not call tools, edit files, build, test, control the editor, or invoke RzMCP. Re-anchor on the complete active task below, then immediately return a concise checkpoint containing only: work actually completed, mutations actually made and their paths, the current concrete blocker or uncertainty, and the exact next step the parent should assign. Do not continue implementation in this turn.\n\n${activeTaskPromptSection(context.taskState)}`;
 }
@@ -1338,6 +1383,7 @@ async function runCliWithProviderRecovery(
 ) {
   const run = options.runCli || runCli;
   const findSession = options.waitForSession || waitForSession;
+  const findTerminalSession = options.waitForTerminalSession || waitForTerminalSession;
   const remove = options.removeSession || removeSession;
   const now = options.now || Date.now;
   const delay = options.delay || delayWithAbort;
@@ -1345,6 +1391,7 @@ async function runCliWithProviderRecovery(
   let recoveryDeadline = null;
   let resumeSession = null;
   let recoveryKind = null;
+  let providerContinuationUsed = false;
   while (true) {
     throwIfAborted(signal);
     const activeDeadline = recoveryDeadline || deadline;
@@ -1365,7 +1412,9 @@ async function runCliWithProviderRecovery(
                 ? devinCompactionCheckpointPrompt(context)
                 : recoveryKind === "permission"
                   ? devinPermissionCheckpointPrompt(context)
-                  : devinStreamContinuationPrompt(context),
+                  : recoveryKind === "incomplete"
+                    ? devinIncompleteTurnPrompt(context)
+                    : devinStreamContinuationPrompt(context),
               compactionBaseline: resumeSession.compactionNodeId,
             }
           : undefined,
@@ -1376,17 +1425,29 @@ async function runCliWithProviderRecovery(
       if (session) remove(session.id);
       throw preserved;
     }
-    const session = await findSession(context.requestId) || resumeSession;
+    let session = await findSession(context.requestId) || resumeSession;
+    if (cliResult.code === 0 && cliResult.stdout && session && !session.terminalText) {
+      session = await findTerminalSession(context.requestId, session) || session;
+    }
     const resourceFailure = isRetryableResourceFailure(cliResult);
     const streamFailure = isInterruptedStreamFailure(cliResult);
     const compactionFailure = isProviderCompactionFailure(cliResult);
     const permissionFailure = isPermissionRejection(cliResult);
-    if (!resourceFailure && !streamFailure && !compactionFailure && !permissionFailure) {
+    const incompleteTurn = cliResult.code === 0 && Boolean(cliResult.stdout) && session && !session.terminalText;
+    if (!resourceFailure && !streamFailure && !compactionFailure && !permissionFailure && !incompleteTurn) {
       return { cliResult, session };
     }
-    if ((streamFailure || compactionFailure || permissionFailure) && !session) {
+    if ((streamFailure || compactionFailure || permissionFailure || incompleteTurn) && !session) {
       const error = new BridgeError("Devin provider turn stopped but its conversation could not be recovered", 502);
       error.routeCommitted = true;
+      throw error;
+    }
+    if ((streamFailure || compactionFailure || permissionFailure || incompleteTurn) && providerContinuationUsed) {
+      const error = preserveProviderCommit(
+        new BridgeError("Devin provider conversation remained non-terminal after one same-session continuation", 502),
+        session,
+      );
+      if (session) remove(session.id);
       throw error;
     }
     if (recoveryDeadline === null) {
@@ -1411,6 +1472,9 @@ async function runCliWithProviderRecovery(
       runtime.lastStreamContinuationAt = new Date(now()).toISOString();
       runtime.lastStreamContinuationSessionHash = createHash("sha256").update(session.id).digest("hex");
     }
+    if (streamFailure || compactionFailure || permissionFailure || incompleteTurn) {
+      providerContinuationUsed = true;
+    }
     if (compactionFailure) runtime.compactionCheckpoints += 1;
     if (permissionFailure) runtime.permissionCheckpoints += 1;
     runtime.lastResourceModel = selectedModel.model_uid;
@@ -1424,7 +1488,13 @@ async function runCliWithProviderRecovery(
       runtime.activeResourceBackoffs = Math.max(0, runtime.activeResourceBackoffs - 1);
     }
     resumeSession = session;
-    recoveryKind = compactionFailure ? "compaction" : permissionFailure ? "permission" : "stream";
+    recoveryKind = compactionFailure
+      ? "compaction"
+      : permissionFailure
+        ? "permission"
+        : incompleteTurn
+          ? "incomplete"
+          : "stream";
   }
 }
 
@@ -1484,6 +1554,9 @@ function finalizeDevinResult(context, selected, routeResult, fallbackState) {
     if (session.model !== selected.model.model_uid) {
       throw new BridgeError(`Devin used unexpected model ${json(session.model)}`, 502);
     }
+    if (!session.terminalText) {
+      throw new BridgeError("Devin completed without a terminal assistant message after its native tools", 502);
+    }
     const metadata = session.metadata;
     const creditCost = Number(metadata.total_credit_cost || 0);
     const acuCost = Number(metadata.total_acu_cost || 0);
@@ -1504,7 +1577,7 @@ function finalizeDevinResult(context, selected, routeResult, fallbackState) {
       .filter((call) => call.name === "mcp_call_tool" && call.arguments?.tool_name === "call_rzmcp_tool")
       .map((call) => call.arguments?.arguments?.name).filter((name) => typeof name === "string");
     return {
-      text: cliResult.stdout, selected, providerMetadata: {},
+      text: session.terminalText, selected, providerMetadata: {},
       quotaFallback: fallbackState.quotaFallback,
       terminalFallback: fallbackState.terminalFallback,
       fallbackReason: fallbackState.fallbackReason,
@@ -2477,6 +2550,7 @@ function jsonResponse(response, status, value) {
 }
 
 async function selfTest() {
+  nativeCliAgentRunnerSelfTest();
   const fixedQuotaNow = new Date(2026, 7, 28, 12, 0, 0, 0).getTime();
   const selfTestQuotaState = new CalendarQuotaState(null, () => fixedQuotaNow);
   const selfTestTaskPins = new ActiveTaskRoutePins();
@@ -2651,6 +2725,29 @@ async function selfTest() {
   if (!isProviderCompactionFailure(compactedProviderFailure)) throw new Error("provider compaction classification failed");
   if (!isPermissionRejection(permissionFailure)) throw new Error("provider permission rejection classification failed");
   if (resourceBackoffMs(1) !== 5_000 || resourceBackoffMs(6) !== 10_000 || resourceBackoffMs(20) !== 10_000) throw new Error("resource backoff schedule failed");
+  const incompleteTopology = terminalAssistantFromRows([
+    {
+      node_id: 1,
+      chat_message: { role: "assistant", content: "I'll start by reading the files.", tool_calls: [{ name: "read" }] },
+    },
+    { node_id: 2, chat_message: { role: "tool", content: "file contents" } },
+  ]);
+  const completedTopology = terminalAssistantFromRows([
+    {
+      node_id: 1,
+      chat_message: { role: "assistant", content: "I'll start by reading the files.", tool_calls: [{ name: "read" }] },
+    },
+    { node_id: 2, chat_message: { role: "tool", content: "file contents" } },
+    { node_id: 3, chat_message: { role: "assistant", content: "Review complete.", tool_calls: [] } },
+  ]);
+  if (
+    incompleteTopology.terminalText !== null
+    || incompleteTopology.lastToolNodeId !== 2
+    || completedTopology.terminalText !== "Review complete."
+    || completedTopology.terminalNodeId !== 3
+  ) {
+    throw new Error("Devin terminal assistant topology detection failed");
+  }
   const recoveryContext = {
     requestId: "devin-recovery-fixture",
     taskDiagnostics: { taskHash: "devin-recovery-task-hash" },
@@ -2664,10 +2761,16 @@ async function selfTest() {
     },
   };
   const recoveryModel = { model_uid: "recovery-model" };
-  const recoverySession = { id: "devin-recovery-session", toolCalls: [{ name: "apply_patch" }], compactionNodeId: 0 };
+  const recoverySession = {
+    id: "devin-recovery-session",
+    toolCalls: [{ name: "apply_patch" }],
+    compactionNodeId: 0,
+    terminalText: null,
+  };
   const refreshedRecoverySession = {
     ...recoverySession,
     toolCalls: [...recoverySession.toolCalls, { name: "exec_command" }],
+    terminalText: "recovered",
   };
   const recoveryCalls = [];
   const recoveryDelays = [];
@@ -2690,6 +2793,7 @@ async function selfTest() {
         recoverySessionReads += 1;
         return recoverySessionReads === 1 ? recoverySession : refreshedRecoverySession;
       },
+      waitForTerminalSession: async (_requestId, session) => session,
       removeSession: () => { throw new Error("recovered Devin session was removed"); },
       runCli: async (_context, _model, _onSpawn, _onProgress, timeoutMs, options) => {
         recoveryCalls.push({ timeoutMs, options });
@@ -2714,6 +2818,7 @@ async function selfTest() {
     id: "devin-compaction-session",
     toolCalls: [{ name: "exec" }],
     compactionNodeId: 12,
+    terminalText: "checkpoint reported",
   };
   const compactionCalls = [];
   const compactionDelays = [];
@@ -2732,6 +2837,7 @@ async function selfTest() {
         compactionNow += milliseconds;
       },
       waitForSession: async () => compactionSession,
+      waitForTerminalSession: async (_requestId, session) => session,
       removeSession: () => { throw new Error("compaction checkpoint session was removed"); },
       runCli: async (_context, _model, _onSpawn, _onProgress, timeoutMs, options) => {
         compactionCalls.push({ timeoutMs, options });
@@ -2759,6 +2865,41 @@ async function selfTest() {
   ) {
     throw new Error("Devin permission checkpoint did not retain the active task");
   }
+  const incompleteCalls = [];
+  let incompleteSessionReads = 0;
+  let incompleteNow = 1_000;
+  const recoveredIncomplete = await runCliWithProviderRecovery(
+    recoveryContext,
+    recoveryModel,
+    () => {},
+    () => {},
+    undefined,
+    100_000,
+    {
+      now: () => incompleteNow,
+      delay: async (milliseconds) => { incompleteNow += milliseconds; },
+      waitForSession: async () => {
+        incompleteSessionReads += 1;
+        return incompleteSessionReads === 1 ? recoverySession : refreshedRecoverySession;
+      },
+      waitForTerminalSession: async (_requestId, session) => session,
+      removeSession: () => { throw new Error("incomplete Devin session was removed"); },
+      runCli: async (_context, _model, _onSpawn, _onProgress, _timeoutMs, options) => {
+        incompleteCalls.push(options);
+        return incompleteCalls.length === 1
+          ? { code: 0, stdout: "I'll start by inspecting the fixture.", stderr: "" }
+          : { code: 0, stdout: "recovered", stderr: "" };
+      },
+    },
+  );
+  if (
+    recoveredIncomplete.session !== refreshedRecoverySession
+    || incompleteCalls.length !== 2
+    || incompleteCalls[1]?.resumeSessionId !== recoverySession.id
+    || !incompleteCalls[1]?.prompt.includes("terminal-message recovery")
+  ) {
+    throw new Error("Devin structurally incomplete turn recovery failed");
+  }
   let exhaustedNow = 1_000;
   let exhaustedRemoved = 0;
   let exhaustedFailure;
@@ -2774,6 +2915,7 @@ async function selfTest() {
         now: () => exhaustedNow,
         delay: async (milliseconds) => { exhaustedNow += milliseconds; },
         waitForSession: async () => recoverySession,
+        waitForTerminalSession: async (_requestId, session) => session,
         removeSession: () => { exhaustedRemoved += 1; },
         runCli: async () => interruptedStreamFailure,
       },
@@ -2782,12 +2924,13 @@ async function selfTest() {
     exhaustedFailure = error;
   }
   if (
-    exhaustedFailure?.status !== 504
+    exhaustedFailure?.status !== 502
     || exhaustedFailure?.routeCommitted !== true
-    || exhaustedNow - 1_000 >= PROVIDER_RECOVERY_BUDGET_MS
+    || !exhaustedFailure?.message.includes("after one same-session continuation")
+    || exhaustedNow - 1_000 !== PROVIDER_RECOVERY_BACKOFF_MS
     || exhaustedRemoved !== 1
   ) {
-    throw new Error("Devin interrupted-stream recovery budget failed");
+    throw new Error("Devin interrupted-stream single-continuation bound failed");
   }
   const environmentWorkspace = promptFrom({
     stream: true,

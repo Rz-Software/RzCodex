@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, unlinkSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, statSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import {
@@ -15,6 +15,9 @@ const MAX_ACTIVE_TASK_CHARS = 40_000;
 const REQUEST_TIMEOUT_MS = 30 * 60 * 1000;
 const INACTIVITY_TIMEOUT_MS = 55 * 1000;
 const STDERR_LIMIT = 16 * 1024;
+const STATE_CLEANUP_RETRY_MS = 50;
+const STATE_CLEANUP_RELEASE_MS = 2 * 1000;
+const STALE_STATE_AGE_MS = REQUEST_TIMEOUT_MS + 5 * 60 * 1000;
 const OPENCODE_EXE = join(
   process.env.APPDATA || join(homedir(), "AppData", "Roaming"),
   "npm", "node_modules", "opencode-ai", "bin", "opencode.exe",
@@ -56,6 +59,54 @@ function sanitizedEnvironment(source = process.env) {
     "CODEBUDDY_API_KEY", "COMMAND_CODE_API_KEY", "OLLAMA_API_KEY",
   ]) delete env[key];
   return env;
+}
+
+function delay(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function nativeStatePaths(dbPath) {
+  return [dbPath, `${dbPath}-shm`, `${dbPath}-wal`];
+}
+
+function reportRetainedNativeState(path, error) {
+  const name = path.split(/[\\/]/).at(-1) || "unknown";
+  process.stderr.write(
+    `[RzCodex] Deferred cleanup of native CLI state ${name}: ${error?.code || error?.name || "unknown_error"}\n`,
+  );
+}
+
+async function cleanupNativeState(dbPath) {
+  const deadline = Date.now() + STATE_CLEANUP_RELEASE_MS;
+  const pending = new Set(nativeStatePaths(dbPath));
+  let lastError = null;
+  do {
+    for (const path of [...pending]) {
+      try {
+        unlinkSync(path);
+        pending.delete(path);
+      } catch (error) {
+        if (error?.code === "ENOENT") pending.delete(path);
+        else lastError = error;
+      }
+    }
+    if (pending.size === 0 || Date.now() >= deadline) break;
+    await delay(STATE_CLEANUP_RETRY_MS);
+  } while (true);
+  for (const path of pending) reportRetainedNativeState(path, lastError);
+}
+
+function sweepStaleNativeState(now = Date.now()) {
+  if (!existsSync(OPENCODE_STATE_DIRECTORY)) return;
+  for (const name of readdirSync(OPENCODE_STATE_DIRECTORY)) {
+    const path = join(OPENCODE_STATE_DIRECTORY, name);
+    try {
+      if (now - statSync(path).mtimeMs < STALE_STATE_AGE_MS) continue;
+      unlinkSync(path);
+    } catch (error) {
+      if (error?.code !== "ENOENT") reportRetainedNativeState(path, error);
+    }
+  }
 }
 
 function inputArray(body) {
@@ -238,7 +289,19 @@ function nativeProcess({ command, args, cwd, env, signal, onEvent, parseLine, la
 }
 
 function validateResult(context, result) {
-  if (!result.finalText?.trim()) throw new NativeCliAgentError(`${context.provider} CLI completed without a final report`);
+  const fail = (message) => {
+    const error = new NativeCliAgentError(message);
+    error.nativeToolNames = [...(result.toolNames || [])];
+    error.providerMutationCount = Number(result.mutationCount || 0);
+    throw error;
+  };
+  if (!result.finalText?.trim()) fail(`${context.provider} CLI completed without a final report`);
+  if (
+    Number(result.lastToolSequence || 0) > 0
+    && Number(result.lastTextSequence || 0) <= Number(result.lastToolSequence || 0)
+  ) {
+    fail(`${context.provider} CLI ended after native tool execution without a terminal assistant message`);
+  }
   return result;
 }
 
@@ -295,10 +358,15 @@ function openCodeParser(event, state) {
   state.inputTokens ||= 0;
   state.outputTokens ||= 0;
   state.peakTurnInputTokens ||= 0;
-  if (event.type === "text" && typeof event.part?.text === "string") state.finalText = event.part.text;
+  state.eventSequence = Number(state.eventSequence || 0) + 1;
+  if (event.type === "text" && typeof event.part?.text === "string") {
+    state.finalText = event.part.text;
+    state.lastTextSequence = state.eventSequence;
+  }
   if (event.type === "tool_use" && event.part?.state?.status === "completed") {
     const name = String(event.part.tool || "unknown_tool");
     state.toolNames.push(name);
+    state.lastToolSequence = state.eventSequence;
     if (MUTATION_TOOL.test(name)) state.mutationCount += 1;
   }
   if (event.type === "step_finish") {
@@ -313,6 +381,7 @@ export async function runOpenCodeNativeAgent(context, { providerKind, signal, on
   if (!existsSync(OPENCODE_EXE)) throw new NativeCliAgentError(`OpenCode CLI is missing at ${OPENCODE_EXE}`);
   if (!existsSync(LAZY_RZMCP_PROXY)) throw new NativeCliAgentError(`Lazy RzMCP proxy is missing at ${LAZY_RZMCP_PROXY}`);
   mkdirSync(OPENCODE_STATE_DIRECTORY, { recursive: true });
+  sweepStaleNativeState();
   const requestId = randomUUID();
   const dbPath = join(OPENCODE_STATE_DIRECTORY, `${requestId}.db`);
   const env = {
@@ -355,14 +424,15 @@ export async function runOpenCodeNativeAgent(context, { providerKind, signal, on
       inputTokens: state.inputTokens || 0,
       outputTokens: state.outputTokens || 0,
       peakTurnInputTokens: state.peakTurnInputTokens || 0,
+      lastTextSequence: state.lastTextSequence || 0,
+      lastToolSequence: state.lastToolSequence || 0,
       model,
     });
   } finally {
-    for (const suffix of ["", "-shm", "-wal"]) {
-      try { unlinkSync(`${dbPath}${suffix}`); } catch (error) {
-        if (error?.code !== "ENOENT") throw error;
-      }
-    }
+    // OpenCode can close before its SQLite handles are released on Windows. Cleanup is not part of
+    // provider task correctness: retry the release window, retain a named artifact if it remains
+    // locked, and let the age-based sweep remove it after no legitimate request can still own it.
+    await cleanupNativeState(dbPath);
   }
 }
 
@@ -374,10 +444,15 @@ function commandCodeParser(event, state) {
   state.inputTokens ||= 0;
   state.outputTokens ||= 0;
   state.peakTurnInputTokens ||= 0;
-  if (payload?.type === "text_delta" && typeof payload.delta === "string") state.finalText += payload.delta;
+  state.eventSequence = Number(state.eventSequence || 0) + 1;
+  if (payload?.type === "text_delta" && typeof payload.delta === "string") {
+    state.finalText += payload.delta;
+    state.lastTextSequence = state.eventSequence;
+  }
   if (payload?.type === "tool_completed") {
     const name = String(payload.toolName || "unknown_tool");
     state.toolNames.push(name);
+    state.lastToolSequence = state.eventSequence;
     if (MUTATION_TOOL.test(name)) state.mutationCount += 1;
   }
   if (payload?.type === "model_request_end") {
@@ -386,7 +461,10 @@ function commandCodeParser(event, state) {
     state.outputTokens += Number(payload.usage?.outputTokens || 0);
     state.peakTurnInputTokens = Math.max(state.peakTurnInputTokens, input);
   }
-  if (event?.type === "result" && typeof event.finalText === "string") state.finalText = event.finalText;
+  if (event?.type === "result" && typeof event.finalText === "string") {
+    state.finalText = event.finalText;
+    state.lastTextSequence = state.eventSequence;
+  }
 }
 
 export async function runCommandCodeNativeAgent(context, { signal, onEvent }) {
@@ -422,8 +500,40 @@ export async function runCommandCodeNativeAgent(context, { signal, onEvent }) {
     inputTokens: state.inputTokens || 0,
     outputTokens: state.outputTokens || 0,
     peakTurnInputTokens: state.peakTurnInputTokens || 0,
+    lastTextSequence: state.lastTextSequence || 0,
+    lastToolSequence: state.lastToolSequence || 0,
     model: context.model,
   });
+}
+
+export function nativeCliAgentRunnerSelfTest() {
+  const context = { provider: "fixture" };
+  let incompleteError = null;
+  try {
+    validateResult(context, {
+      finalText: "I'll start by reading the file.",
+      toolNames: ["read"],
+      mutationCount: 0,
+      lastTextSequence: 1,
+      lastToolSequence: 2,
+    });
+  } catch (error) {
+    incompleteError = error;
+  }
+  if (
+    !incompleteError?.message.includes("without a terminal assistant message")
+    || incompleteError?.providerMutationCount !== 0
+  ) {
+    throw new Error("native CLI incomplete tool turn detection failed");
+  }
+  const completed = validateResult(context, {
+    finalText: "Work complete.",
+    toolNames: ["read", "edit"],
+    mutationCount: 1,
+    lastTextSequence: 3,
+    lastToolSequence: 2,
+  });
+  if (completed.finalText !== "Work complete.") throw new Error("native CLI terminal tool turn detection failed");
 }
 
 export function nativeCliUsage(result) {
