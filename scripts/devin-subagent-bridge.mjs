@@ -35,7 +35,7 @@ const OLLAMA_REQUIRED_EFFORT = "max";
 const LEGACY_REQUEST_EFFORTS = new Set(["max"]);
 const DEFAULT_PORT = 54548;
 const MAX_REQUEST_BYTES = 32 * 1024 * 1024;
-const MAX_PROMPT_CHARS = 100_000;
+const MAX_PROMPT_CHARS = 40_000;
 const MAX_ACTIVE_TASK_CHARS = 40_000;
 const OUTPUT_LIMIT = 2 * 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 30 * 60 * 1000;
@@ -75,9 +75,11 @@ const DEVIN_DB = join(process.env.APPDATA || join(homedir(), "AppData", "Roaming
 const QUOTA_FAILURE = /(?:daily|weekly|included|usage)[\s\S]{0,100}quota[\s\S]{0,100}(?:exhaust|exceed|reach|limit)|quota[\s\S]{0,100}(?:exhaust|exceed|reach|limit)/i;
 const RESOURCE_EXHAUSTED = /cognition\.ai\/errorKind[\s\S]{0,100}resource_exhausted|resource_exhausted[\s\S]{0,100}cognition\.ai\/retryable[\s\S]{0,20}true/i;
 const INTERRUPTED_STREAM = /stream (?:was )?interrupted|stream disconnected|connection (?:closed|reset)|unexpected end of (?:file|stream)|please continue the task you were working on/i;
+const PROVIDER_COMPACTION = /provider context compacted/i;
+const PERMISSION_REJECTION = /rejected a tool call that requires confirmation|permission (?:was )?denied|requires (?:user )?confirmation/i;
 const EXPLICIT_READ_ONLY_TASK = /\bread[- ]only\b|\bno[- ]mutation\b|\bno\s+(?:edits?|modifications?|writes?|mutations?|file\s+changes|source\s+changes)\b|\b(?:do not|must not|never)\s+(?:edit|modify|write|mutate)(?:\s+(?:any|the|source|project|workspace|files?)){0,3}(?:[.;,]|$)/i;
-const VALIDATION_RESTRICTED_TASK = /\b(?:do not|must not|never)[^.\n]{0,160}\b(?:build|compile|run\s+(?:the\s+)?tests?|test|control\s+(?:the\s+)?editor|use\s+(?:the\s+)?editor|pie|sie)\b|\bno\s+(?:build|compile|tests?|editor|pie|sie)\b/i;
-const RZMCP_RESTRICTED_TASK = /\b(?:do not|must not|never)[^.\n]{0,160}\b(?:use|invoke|control|call)\s+(?:any\s+|the\s+)?(?:editor|rzmcp)\b|\bno\s+[^.\n]{0,120}\brzmcp\b/i;
+const VALIDATION_RESTRICTED_TASK = /\b(?:do not|must not|never)[^.\n]{0,160}\b(?:build|compile|run\s+(?:the\s+)?tests?|test|control\s+(?:the\s+)?editor|use\s+(?:the\s+)?editor|pie|sie)\b|\bno\s+(?:build|compile|tests?|editor|pie|sie)\b|\b(?:aucun(?:e)?|sans|interdiction\s+d['’](?:ex[eé]cuter|utiliser))[^.\n]{0,160}\b(?:build|compil(?:e|er|ation)|tests?|editor|[eé]diteur|pie|sie)\b/i;
+const RZMCP_RESTRICTED_TASK = /\b(?:do not|must not|never)[^.\n]{0,160}\b(?:use|invoke|control|call)\s+(?:any\s+|the\s+)?(?:editor|rzmcp)\b|\bno\s+[^.\n]{0,120}\b(?:editor|rzmcp|pie|sie)\b|\b(?:aucun(?:e)?|sans|interdiction\s+d['’](?:ex[eé]cuter|utiliser))[^.\n]{0,160}\b(?:editor|[eé]diteur|rzmcp|pie|sie)\b/i;
 const QUOTA_STATE_VERSION = 2;
 
 class BridgeError extends Error {
@@ -247,18 +249,16 @@ function sanitizedEnvironment(source = process.env) {
 
 function executionPolicyFromTaskState(taskState) {
   const taskText = taskState?.activeTask?.text || "";
-  const readOnly = EXPLICIT_READ_ONLY_TASK.test(taskText);
+  const readOnly = taskState?.activeTask?.intent === "analysis" || EXPLICIT_READ_ONLY_TASK.test(taskText);
   const validationRestricted = VALIDATION_RESTRICTED_TASK.test(taskText);
   const rzMcpRestricted = RZMCP_RESTRICTED_TASK.test(taskText);
   return {
-    permissionMode: readOnly ? "auto" : validationRestricted ? "accept-edits" : "dangerous",
+    permissionMode: readOnly ? "auto" : "accept-edits",
     rzMcpMode: rzMcpRestricted
       ? "disabled"
       : readOnly
         ? "read-only"
-        : validationRestricted
-          ? "no-validation"
-          : "full",
+        : "no-validation",
     readOnly,
     validationRestricted,
   };
@@ -428,7 +428,8 @@ const runtime = {
   activeFreeRequests: 0, queuedFreeRequests: 0,
   activeOllamaRequests: 0, queuedOllamaRequests: 0,
   supersededTurns: 0,
-  resourceRetries: 0, streamContinuations: 0, activeResourceBackoffs: 0,
+  resourceRetries: 0, streamContinuations: 0, compactionCheckpoints: 0,
+  permissionCheckpoints: 0, activeResourceBackoffs: 0,
   lastResourceModel: null, lastResourceRetryAttempt: 0,
   lastResourceBackoffMs: 0, lastResourceRetryAt: null,
   lastStreamContinuationAt: null, lastStreamContinuationSessionHash: null,
@@ -1107,6 +1108,16 @@ function inspectSession(requestId) {
       FROM message_nodes
       WHERE session_id = ? AND json_type(chat_message, '$.tool_calls') = 'array'
     `).all(session.id);
+    const compaction = db.prepare(`
+      SELECT COALESCE(MAX(node_id), 0) AS node_id
+      FROM message_nodes
+      WHERE session_id = ?
+        AND json_extract(chat_message, '$.role') = 'user'
+        AND (
+          ltrim(CAST(json_extract(chat_message, '$.content') AS TEXT)) LIKE 'Conversation to summarize:%'
+          OR ltrim(CAST(json_extract(chat_message, '$.content') AS TEXT)) LIKE 'Now summarize the conversation above%'
+        )
+    `).get(session.id);
     const toolCalls = uniqueToolCalls(toolRows);
     return {
       id: session.id,
@@ -1115,6 +1126,7 @@ function inspectSession(requestId) {
       metrics,
       toolCalls,
       lastActivityAt: Number(session.last_activity_at || 0) * 1000,
+      compactionNodeId: Number(compaction?.node_id || 0),
     };
   } finally {
     db.close();
@@ -1144,7 +1156,7 @@ function runCli(
   onSpawn,
   onProgress,
   timeoutMs = REQUEST_TIMEOUT_MS,
-  { resumeSessionId = null, prompt = context.prompt } = {},
+  { resumeSessionId = null, prompt = context.prompt, compactionBaseline = 0 } = {},
 ) {
   const promptPath = join(REQUEST_DIRECTORY, `${context.requestId}-${randomUUID()}.txt`);
   writeFileSync(promptPath, prompt, { encoding: "utf8", flag: "wx" });
@@ -1167,6 +1179,7 @@ function runCli(
     let stderr = "";
     let settled = false;
     let lastProviderActivityAt = Date.now();
+    let lastCompactionNodeId = Number(compactionBaseline || 0);
     const seenToolCalls = new Set();
     const reportProgress = () => {
       let session;
@@ -1177,6 +1190,16 @@ function runCli(
       }
       if (session?.lastActivityAt > lastProviderActivityAt) {
         lastProviderActivityAt = session.lastActivityAt;
+      }
+      if (session?.compactionNodeId > lastCompactionNodeId) {
+        lastCompactionNodeId = session.compactionNodeId;
+        child.kill();
+        finish(undefined, {
+          code: 1,
+          stdout: stdout.trim(),
+          stderr: `Devin provider context compacted at node ${lastCompactionNodeId}`,
+        });
+        return;
       }
       for (const [index, call] of (session?.toolCalls || []).entries()) {
         if (!call?.name) continue;
@@ -1247,8 +1270,24 @@ function isInterruptedStreamFailure(cliResult) {
   return cliFailed(cliResult) && INTERRUPTED_STREAM.test(`${cliResult.stdout}\n${cliResult.stderr}`);
 }
 
+function isProviderCompactionFailure(cliResult) {
+  return cliFailed(cliResult) && PROVIDER_COMPACTION.test(`${cliResult.stdout}\n${cliResult.stderr}`);
+}
+
+function isPermissionRejection(cliResult) {
+  return cliFailed(cliResult) && PERMISSION_REJECTION.test(`${cliResult.stdout}\n${cliResult.stderr}`);
+}
+
 function devinStreamContinuationPrompt(context) {
   return `[Native Devin stream recovery]\nContinue the same retained conversation and active task after the interrupted provider stream. Task hash: ${context.taskDiagnostics.taskHash}. Do not restart the investigation or repeat completed tool calls or file edits. Return the next required tool call or the concise final result.`;
+}
+
+function devinCompactionCheckpointPrompt(context) {
+  return `[Native Devin compaction checkpoint]\nYour provider context compacted during the bounded delegated task. Do not call tools, edit files, build, test, control the editor, or invoke RzMCP. Re-anchor on the complete active task below, then immediately return a concise checkpoint containing only: work actually completed, mutations actually made and their paths, the current concrete blocker or uncertainty, and the exact next step the parent should assign. Do not continue implementation in this turn.\n\n${activeTaskPromptSection(context.taskState)}`;
+}
+
+function devinPermissionCheckpointPrompt(context) {
+  return `[Native Devin permission checkpoint]\nA provider tool call was rejected by the enforced bounded-task permissions. Do not retry it, request broader permissions, or call another tool. Re-anchor on the complete active task below and immediately report the rejected capability as a concrete blocker, plus work already completed and the smallest safe next step for the parent.\n\n${activeTaskPromptSection(context.taskState)}`;
 }
 
 function sanitizedProviderFailure(error) {
@@ -1287,6 +1326,7 @@ async function runCliWithProviderRecovery(
   let attempt = 0;
   let recoveryDeadline = null;
   let resumeSession = null;
+  let recoveryKind = null;
   while (true) {
     throwIfAborted(signal);
     const activeDeadline = recoveryDeadline || deadline;
@@ -1301,7 +1341,15 @@ async function runCliWithProviderRecovery(
         onProgress,
         remainingMs,
         resumeSession
-          ? { resumeSessionId: resumeSession.id, prompt: devinStreamContinuationPrompt(context) }
+          ? {
+              resumeSessionId: resumeSession.id,
+              prompt: recoveryKind === "compaction"
+                ? devinCompactionCheckpointPrompt(context)
+                : recoveryKind === "permission"
+                  ? devinPermissionCheckpointPrompt(context)
+                  : devinStreamContinuationPrompt(context),
+              compactionBaseline: resumeSession.compactionNodeId,
+            }
           : undefined,
       );
     } catch (error) {
@@ -1313,9 +1361,13 @@ async function runCliWithProviderRecovery(
     const session = await findSession(context.requestId) || resumeSession;
     const resourceFailure = isRetryableResourceFailure(cliResult);
     const streamFailure = isInterruptedStreamFailure(cliResult);
-    if (!resourceFailure && !streamFailure) return { cliResult, session };
-    if (streamFailure && !session) {
-      const error = new BridgeError("Devin stream was interrupted but its conversation could not be recovered", 502);
+    const compactionFailure = isProviderCompactionFailure(cliResult);
+    const permissionFailure = isPermissionRejection(cliResult);
+    if (!resourceFailure && !streamFailure && !compactionFailure && !permissionFailure) {
+      return { cliResult, session };
+    }
+    if ((streamFailure || compactionFailure || permissionFailure) && !session) {
+      const error = new BridgeError("Devin provider turn stopped but its conversation could not be recovered", 502);
       error.routeCommitted = true;
       throw error;
     }
@@ -1323,7 +1375,7 @@ async function runCliWithProviderRecovery(
       recoveryDeadline = Math.min(deadline, now() + PROVIDER_RECOVERY_BUDGET_MS);
     }
     attempt += 1;
-    const backoffMs = resourceBackoffMs(attempt);
+    const backoffMs = resourceFailure ? resourceBackoffMs(attempt) : PROVIDER_RECOVERY_BACKOFF_MS;
     if (now() + backoffMs >= recoveryDeadline) {
       const error = preserveProviderCommit(
         new BridgeError(
@@ -1341,6 +1393,8 @@ async function runCliWithProviderRecovery(
       runtime.lastStreamContinuationAt = new Date(now()).toISOString();
       runtime.lastStreamContinuationSessionHash = createHash("sha256").update(session.id).digest("hex");
     }
+    if (compactionFailure) runtime.compactionCheckpoints += 1;
+    if (permissionFailure) runtime.permissionCheckpoints += 1;
     runtime.lastResourceModel = selectedModel.model_uid;
     runtime.lastResourceRetryAttempt = attempt;
     runtime.lastResourceBackoffMs = backoffMs;
@@ -1352,6 +1406,7 @@ async function runCliWithProviderRecovery(
       runtime.activeResourceBackoffs = Math.max(0, runtime.activeResourceBackoffs - 1);
     }
     resumeSession = session;
+    recoveryKind = compactionFailure ? "compaction" : permissionFailure ? "permission" : "stream";
   }
 }
 
@@ -2477,18 +2532,27 @@ async function selfTest() {
   const shorthandReadOnlyPolicy = executionPolicyFromTaskState({
     activeTask: { text: "Review the bounded diff. No edits/build/test/Editor/RzMCP." },
   });
+  const frenchBoundedReviewPolicy = executionPolicyFromTaskState({
+    activeTask: {
+      intent: "mutation",
+      text: "Audit statique borne, aucun edit sauf correction chirurgicale, aucun build/test/editor/PIE/stage/commit.",
+    },
+  });
   if (
     readOnlyPolicy.permissionMode !== "auto"
     || readOnlyPolicy.rzMcpMode !== "disabled"
     || boundedMutationPolicy.permissionMode !== "accept-edits"
     || boundedMutationPolicy.rzMcpMode !== "no-validation"
-    || unrestrictedMutationPolicy.permissionMode !== "dangerous"
-    || unrestrictedMutationPolicy.rzMcpMode !== "full"
-    || scopedMutationPolicy.permissionMode !== "dangerous"
+    || unrestrictedMutationPolicy.permissionMode !== "accept-edits"
+    || unrestrictedMutationPolicy.rzMcpMode !== "no-validation"
+    || scopedMutationPolicy.permissionMode !== "accept-edits"
+    || scopedMutationPolicy.rzMcpMode !== "no-validation"
     || shorthandMutationPolicy.permissionMode !== "accept-edits"
     || shorthandMutationPolicy.rzMcpMode !== "disabled"
     || shorthandReadOnlyPolicy.permissionMode !== "auto"
     || shorthandReadOnlyPolicy.rzMcpMode !== "disabled"
+    || frenchBoundedReviewPolicy.permissionMode !== "accept-edits"
+    || frenchBoundedReviewPolicy.rzMcpMode !== "disabled"
   ) {
     throw new Error("task execution permission policy failed");
   }
@@ -2520,13 +2584,29 @@ async function selfTest() {
     stderr: "The stream was interrupted. Please continue the task you were working on.",
   };
   if (!isInterruptedStreamFailure(interruptedStreamFailure)) throw new Error("interrupted Devin stream classification failed");
+  const compactedProviderFailure = { code: 1, stdout: "", stderr: "Devin provider context compacted at node 12" };
+  const permissionFailure = {
+    code: 1,
+    stdout: "",
+    stderr: "rejected a tool call that requires confirmation. Running in non-interactive mode.",
+  };
+  if (!isProviderCompactionFailure(compactedProviderFailure)) throw new Error("provider compaction classification failed");
+  if (!isPermissionRejection(permissionFailure)) throw new Error("provider permission rejection classification failed");
   if (resourceBackoffMs(1) !== 5_000 || resourceBackoffMs(6) !== 10_000 || resourceBackoffMs(20) !== 10_000) throw new Error("resource backoff schedule failed");
   const recoveryContext = {
     requestId: "devin-recovery-fixture",
     taskDiagnostics: { taskHash: "devin-recovery-task-hash" },
+    taskState: {
+      activeTask: {
+        id: "devin-recovery-task",
+        name: "/root/devin_recovery_fixture",
+        hash: "devin-recovery-task-hash",
+        text: "Message Type: NEW_TASK\nTask name: /root/devin_recovery_fixture\nPayload:\nInspect the bounded fixture.",
+      },
+    },
   };
   const recoveryModel = { model_uid: "recovery-model" };
-  const recoverySession = { id: "devin-recovery-session", toolCalls: [{ name: "apply_patch" }] };
+  const recoverySession = { id: "devin-recovery-session", toolCalls: [{ name: "apply_patch" }], compactionNodeId: 0 };
   const refreshedRecoverySession = {
     ...recoverySession,
     toolCalls: [...recoverySession.toolCalls, { name: "exec_command" }],
@@ -2567,10 +2647,59 @@ async function selfTest() {
     || recoveryCalls[0].options !== undefined
     || recoveryCalls[1].options?.resumeSessionId !== recoverySession.id
     || !recoveryCalls[1].options?.prompt.includes(recoveryContext.taskDiagnostics.taskHash)
-    || recoveryCalls.map(({ timeoutMs }) => timeoutMs).join(",") !== "99000,40000"
-    || recoveryDelays.join(",") !== "5000"
+    || recoveryCalls.map(({ timeoutMs }) => timeoutMs).join(",") !== "99000,44000"
+    || recoveryDelays.join(",") !== "1000"
   ) {
     throw new Error("same-session Devin stream recovery failed");
+  }
+  const compactionSession = {
+    id: "devin-compaction-session",
+    toolCalls: [{ name: "exec" }],
+    compactionNodeId: 12,
+  };
+  const compactionCalls = [];
+  const compactionDelays = [];
+  let compactionNow = 1_000;
+  const recoveredCompaction = await runCliWithProviderRecovery(
+    recoveryContext,
+    recoveryModel,
+    () => {},
+    () => {},
+    undefined,
+    100_000,
+    {
+      now: () => compactionNow,
+      delay: async (milliseconds) => {
+        compactionDelays.push(milliseconds);
+        compactionNow += milliseconds;
+      },
+      waitForSession: async () => compactionSession,
+      removeSession: () => { throw new Error("compaction checkpoint session was removed"); },
+      runCli: async (_context, _model, _onSpawn, _onProgress, timeoutMs, options) => {
+        compactionCalls.push({ timeoutMs, options });
+        return compactionCalls.length === 1
+          ? compactedProviderFailure
+          : { code: 0, stdout: "checkpoint reported", stderr: "" };
+      },
+    },
+  );
+  if (
+    recoveredCompaction.session !== compactionSession
+    || compactionCalls.length !== 2
+    || compactionCalls[1].options?.resumeSessionId !== compactionSession.id
+    || compactionCalls[1].options?.compactionBaseline !== 12
+    || !compactionCalls[1].options?.prompt.includes("Native Devin compaction checkpoint")
+    || !compactionCalls[1].options?.prompt.includes(recoveryContext.taskState.activeTask.text)
+    || compactionDelays.join(",") !== "1000"
+  ) {
+    throw new Error("Devin provider compaction checkpoint recovery failed");
+  }
+  const permissionPrompt = devinPermissionCheckpointPrompt(recoveryContext);
+  if (
+    !permissionPrompt.includes("Native Devin permission checkpoint")
+    || !permissionPrompt.includes(recoveryContext.taskState.activeTask.text)
+  ) {
+    throw new Error("Devin permission checkpoint did not retain the active task");
   }
   let exhaustedNow = 1_000;
   let exhaustedRemoved = 0;
