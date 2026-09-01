@@ -9,6 +9,7 @@ use crate::exec_policy::AllowPrefixRules;
 use crate::shell_snapshot::ShellSnapshotFile;
 use crate::tools::sandboxing::executor_windows_sandbox_level;
 use arc_swap::ArcSwap;
+use codex_config::ResolvedSubagentRoute;
 use codex_core_plugins::PluginCommandAttribution;
 use codex_core_plugins::ResolvedPluginMetricsOperation;
 use codex_core_plugins::TrustedPluginRoots;
@@ -551,6 +552,118 @@ impl TurnContext {
             ),
             cyber_access_program: self.cyber_access_program,
         }
+    }
+
+    pub(crate) async fn with_native_subagent_route(
+        &self,
+        resolved: &ResolvedSubagentRoute,
+        models_manager: &SharedModelsManager,
+    ) -> CodexResult<Self> {
+        if resolved.route.model_provider != codex_model_provider_info::OPENAI_PROVIDER_ID {
+            return Err(CodexErr::InvalidRequest(format!(
+                "Native subagent fallback route `{}` must use provider `{}`.",
+                resolved.id,
+                codex_model_provider_info::OPENAI_PROVIDER_ID
+            )));
+        }
+
+        let mut config = (*self.config).clone();
+        let provider_info = config
+            .model_providers
+            .get(&resolved.route.model_provider)
+            .cloned()
+            .ok_or_else(|| {
+                CodexErr::InvalidRequest(format!(
+                    "Native subagent fallback route `{}` references missing provider `{}`.",
+                    resolved.id, resolved.route.model_provider
+                ))
+            })?;
+        config
+            .model_provider_id
+            .clone_from(&resolved.route.model_provider);
+        config.model_provider = provider_info.clone();
+        config.model = Some(resolved.route.model.clone());
+        config.model_reasoning_effort = Some(resolved.route.reasoning_effort.clone());
+        config
+            .model_input_modalities
+            .clone_from(&resolved.route.input_modalities);
+
+        let model_info = models_manager
+            .get_model_info(
+                resolved.route.model.as_str(),
+                &config.to_models_manager_config(),
+            )
+            .await;
+        if model_info.used_fallback_model_metadata
+            || !model_info
+                .supported_reasoning_levels
+                .iter()
+                .any(|preset| preset.effort == resolved.route.reasoning_effort)
+        {
+            return Err(CodexErr::InvalidRequest(format!(
+                "Native subagent fallback route `{}` cannot verify reasoning effort `{}` for model `{}`.",
+                resolved.id, resolved.route.reasoning_effort, resolved.route.model
+            )));
+        }
+
+        let mut selected = self.initial_settings.selected().clone();
+        selected.collaboration_mode = selected.collaboration_mode.with_updates(
+            Some(resolved.route.model.clone()),
+            Some(Some(resolved.route.reasoning_effort.clone())),
+            /*developer_instructions*/ None,
+        );
+        let step_settings = Arc::new(ResolvedStepSettings::new(
+            Arc::new(selected),
+            Arc::new(model_info),
+            config.features.enabled(Feature::FastMode),
+        ));
+        config.service_tier = step_settings.service_tier.clone();
+        let session_telemetry = step_settings.telemetry(&self.session_telemetry);
+        let provider = create_model_provider(provider_info, self.auth_manager.clone());
+
+        Ok(Self {
+            sub_id: self.sub_id.clone(),
+            trace_id: self.trace_id.clone(),
+            realtime_active: self.realtime_active,
+            code_mode_available: self.code_mode_available,
+            config: Arc::new(config),
+            configured_token_budget: self.configured_token_budget.clone(),
+            use_model_token_budget_defaults: self.use_model_token_budget_defaults,
+            auth_manager: self.auth_manager.clone(),
+            initial_settings: Arc::clone(&step_settings),
+            current_settings: ArcSwap::from(step_settings),
+            session_telemetry,
+            provider,
+            session_source: self.session_source.clone(),
+            history_mode: self.history_mode,
+            parent_thread_id: self.parent_thread_id,
+            originator: self.originator.clone(),
+            environments: self.environments.clone(),
+            #[allow(deprecated)]
+            cwd: self.cwd.clone(),
+            current_date: self.current_date.clone(),
+            timezone: self.timezone.clone(),
+            app_server_client_name: self.app_server_client_name.clone(),
+            developer_instructions: self.developer_instructions.clone(),
+            multi_agent_version: self.multi_agent_version,
+            network: self.network.clone(),
+            windows_sandbox_level: self.windows_sandbox_level,
+            available_models: models_manager.try_list_models().unwrap_or_default(),
+            unified_exec_shell_mode: self.unified_exec_shell_mode.clone(),
+            final_output_json_schema: self.final_output_json_schema.clone(),
+            dynamic_tools: self.dynamic_tools.clone(),
+            turn_metadata_state: self.turn_metadata_state.clone(),
+            extension_data: Arc::clone(&self.extension_data),
+            turn_timing_state: Arc::clone(&self.turn_timing_state),
+            terminal_error: Arc::clone(&self.terminal_error),
+            server_model_warning_emitted: AtomicBool::new(
+                self.server_model_warning_emitted.load(Ordering::Relaxed),
+            ),
+            model_verification_emitted: AtomicBool::new(
+                self.model_verification_emitted.load(Ordering::Relaxed),
+            ),
+            cyber_access_program: self.cyber_access_program,
+        })
     }
 
     fn non_legacy_file_system_sandbox_policy(&self) -> Option<RawFileSystemSandboxPolicy> {

@@ -19,6 +19,8 @@ pub enum ApiError {
     QuotaExceeded,
     #[error("usage not included")]
     UsageNotIncluded,
+    #[error("native subagent fallback route requested: {route}")]
+    NativeSubagentFallback { route: String },
     #[error("retryable error: {message}")]
     Retryable {
         message: String,

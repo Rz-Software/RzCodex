@@ -68,6 +68,7 @@ use codex_analytics::InvocationType;
 use codex_analytics::TurnResolvedConfigFact;
 use codex_analytics::build_track_events_context;
 use codex_async_utils::OrCancelExt;
+use codex_config::resolve_subagent_route;
 use codex_connectors::AppToolPolicyEvaluator;
 use codex_core_plugins::RecommendedPluginCandidatesInput;
 use codex_extension_api::ExtensionData;
@@ -104,6 +105,7 @@ use codex_protocol::protocol::ReasoningContentDeltaEvent;
 use codex_protocol::protocol::ReasoningRawContentDeltaEvent;
 use codex_protocol::protocol::SafetyBufferingEvent;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::TurnDiffEvent;
 use codex_protocol::protocol::WarningEvent;
 use codex_protocol::user_input::UserInput;
@@ -164,6 +166,8 @@ pub(crate) async fn run_turn(
 
     let mut client_session =
         prewarmed_client_session.unwrap_or_else(|| sess.services.model_client.new_session());
+    let mut execution_turn_context = Arc::clone(&turn_context);
+    let mut native_fallback_active = false;
     // TODO(ccunningham): Pre-turn compaction runs before context updates and the
     // new user message are recorded. Estimate pending incoming items (context
     // diffs/full reinjection + user input) and trigger compaction preemptively
@@ -208,7 +212,7 @@ pub(crate) async fn run_turn(
     // run_turn owns the step used to seed context and make the first sampling request.
     let first_step_context = match sess
         .capture_step_context_with_required_mcp_servers(
-            Arc::clone(&turn_context),
+            Arc::clone(&execution_turn_context),
             &cancellation_token,
             &required_servers,
         )
@@ -272,9 +276,9 @@ pub(crate) async fn run_turn(
     sess.merge_connector_selection(explicitly_enabled_connectors.clone())
         .await;
     sess.set_previous_turn_settings(Some(PreviousTurnSettings {
-        model: turn_context.model_info().slug.clone(),
-        comp_hash: turn_context.model_info().comp_hash.clone(),
-        realtime_active: Some(turn_context.realtime_active),
+        model: execution_turn_context.model_info().slug.clone(),
+        comp_hash: execution_turn_context.model_info().comp_hash.clone(),
+        realtime_active: Some(execution_turn_context.realtime_active),
     }))
     .await;
     for response_item in injection_items {
@@ -336,20 +340,20 @@ pub(crate) async fn run_turn(
         let step_context = match next_step_context.take() {
             Some(step_context) => step_context,
             None if pending_input.is_empty() => {
-                sess.capture_step_context(Arc::clone(&turn_context), &cancellation_token)
+                sess.capture_step_context(Arc::clone(&execution_turn_context), &cancellation_token)
                     .await?
             }
             None => {
                 let pending_user_input = turn_user_input(&pending_input);
                 let (required_servers, _) = required_mcp_servers_for_input(
                     &sess,
-                    turn_context.as_ref(),
+                    execution_turn_context.as_ref(),
                     &pending_user_input,
                 )
                 .or_cancel(&cancellation_token)
                 .await?;
                 sess.capture_step_context_with_required_mcp_servers(
-                    Arc::clone(&turn_context),
+                    Arc::clone(&execution_turn_context),
                     &cancellation_token,
                     &required_servers,
                 )
@@ -359,7 +363,7 @@ pub(crate) async fn run_turn(
         let sampling_request_result: CodexResult<_> = async {
             super::time_reminder::maybe_record_current_time_reminder(
                 sess.as_ref(),
-                turn_context.as_ref(),
+                step_context.turn.as_ref(),
                 &window_id,
             )
             .await?;
@@ -378,12 +382,12 @@ pub(crate) async fn run_turn(
             .await;
 
             let responses_metadata = sess
-                .responses_metadata(turn_context.as_ref(), CodexResponsesRequestKind::Turn)
+                .responses_metadata(step_context.turn.as_ref(), CodexResponsesRequestKind::Turn)
                 .await;
             run_sampling_request(
                 Arc::clone(&sess),
                 Arc::clone(&step_context),
-                Arc::clone(&turn_context.extension_data),
+                Arc::clone(&step_context.turn.extension_data),
                 Arc::clone(&turn_diff_tracker),
                 &mut client_session,
                 &responses_metadata,
@@ -415,7 +419,7 @@ pub(crate) async fn run_turn(
                         sess.input_queue.has_pending_input(&sess.active_turn).await;
                     let token_status = super::context_window::context_window_token_status(
                         sess.as_ref(),
-                        turn_context.as_ref(),
+                        step_context.turn.as_ref(),
                     )
                     .await;
                     (has_pending_input, token_status)
@@ -430,7 +434,7 @@ pub(crate) async fn run_turn(
                     total_usage_tokens = token_status.active_context_tokens,
                     auto_compact_scope_tokens = token_status.auto_compact_scope_tokens,
                     auto_compact_scope_limit = ?token_status.auto_compact_scope_limit,
-                    auto_compact_limit_scope = ?turn_context.config.model_auto_compact_token_limit_scope,
+                    auto_compact_limit_scope = ?step_context.turn.config.model_auto_compact_token_limit_scope,
                     auto_compact_window_prefill_tokens = ?token_status.auto_compact_window_prefill_tokens,
                     full_context_window_limit = ?token_status.full_context_window_limit,
                     full_context_window_limit_reached = token_status.full_context_window_limit_reached,
@@ -447,8 +451,9 @@ pub(crate) async fn run_turn(
                     estimated_token_count,
                     message
                 ) {
-                    let estimated_token_count =
-                        sess.get_estimated_token_count(turn_context.as_ref()).await;
+                    let estimated_token_count = sess
+                        .get_estimated_token_count(step_context.turn.as_ref())
+                        .await;
                     trace!(
                         target: POST_SAMPLING_TOKEN_ESTIMATE_TARGET,
                         turn_id = %turn_context.sub_id,
@@ -462,7 +467,7 @@ pub(crate) async fn run_turn(
                 let allow_auto_compact_fallback = !should_roll_over && !token_limit_reached;
                 super::token_budget::maybe_record(
                     sess.as_ref(),
-                    turn_context.as_ref(),
+                    step_context.turn.as_ref(),
                     token_status.base_window_tokens_remaining,
                     allow_auto_compact_fallback,
                 )
@@ -564,6 +569,100 @@ pub(crate) async fn run_turn(
             }
             Err(err) if matches!(err.details(), CodexErrorDetails::TurnAborted) => {
                 return Err(err);
+            }
+            Err(codex_error)
+                if matches!(
+                    codex_error.details(),
+                    CodexErrorDetails::NativeSubagentFallback { .. }
+                ) =>
+            {
+                if native_fallback_active
+                    || !matches!(
+                        turn_context.session_source,
+                        SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. })
+                    )
+                {
+                    info!("Turn error: {codex_error:#}");
+                    let error = codex_error.to_codex_protocol_error();
+                    sess.emit_turn_error_lifecycle(turn_context.as_ref(), error.clone())
+                        .await;
+                    sess.track_turn_codex_error(turn_context.as_ref(), &codex_error);
+                    sess.send_event(
+                        &turn_context,
+                        EventMsg::Error(codex_error.to_error_event(/*message_prefix*/ None)),
+                    )
+                    .await;
+                    break;
+                }
+
+                let CodexErrorDetails::NativeSubagentFallback { route } = codex_error.details()
+                else {
+                    unreachable!("guarded native fallback error")
+                };
+                let resolved = match resolve_subagent_route(
+                    execution_turn_context.config.codex_home.as_ref(),
+                    route,
+                ) {
+                    Ok(resolved) => resolved,
+                    Err(err) => {
+                        let error = CodexErr::InvalidRequest(format!(
+                            "Native subagent fallback route `{route}` is invalid: {err:#}"
+                        ));
+                        let error_info = error.to_codex_protocol_error();
+                        sess.emit_turn_error_lifecycle(turn_context.as_ref(), error_info.clone())
+                            .await;
+                        sess.track_turn_codex_error(turn_context.as_ref(), &error);
+                        sess.send_event(
+                            &turn_context,
+                            EventMsg::Error(error.to_error_event(/*message_prefix*/ None)),
+                        )
+                        .await;
+                        break;
+                    }
+                };
+                let fallback_turn_context = match execution_turn_context
+                    .with_native_subagent_route(&resolved, &sess.services.models_manager)
+                    .await
+                {
+                    Ok(fallback_turn_context) => Arc::new(fallback_turn_context),
+                    Err(error) => {
+                        let error_info = error.to_codex_protocol_error();
+                        sess.emit_turn_error_lifecycle(turn_context.as_ref(), error_info.clone())
+                            .await;
+                        sess.track_turn_codex_error(turn_context.as_ref(), &error);
+                        sess.send_event(
+                            &turn_context,
+                            EventMsg::Error(error.to_error_event(/*message_prefix*/ None)),
+                        )
+                        .await;
+                        break;
+                    }
+                };
+                client_session = sess
+                    .services
+                    .model_client
+                    .new_session_for_provider(fallback_turn_context.provider.clone());
+                sess.set_previous_turn_settings(Some(PreviousTurnSettings {
+                    model: fallback_turn_context.model_info().slug.clone(),
+                    comp_hash: fallback_turn_context.model_info().comp_hash.clone(),
+                    realtime_active: Some(fallback_turn_context.realtime_active),
+                }))
+                .await;
+                sess.send_event(
+                    &turn_context,
+                    EventMsg::Warning(WarningEvent {
+                        message: format!(
+                            "External subagent providers were unavailable before committed work; continuing this turn with native route `{}`.",
+                            resolved.id
+                        ),
+                    }),
+                )
+                .await;
+                execution_turn_context = fallback_turn_context;
+                native_fallback_active = true;
+                next_step_context = None;
+                can_drain_pending_input = false;
+                continue;
             }
             Err(codex_error)
                 if matches!(

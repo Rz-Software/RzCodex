@@ -1,6 +1,7 @@
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
+use codex_model_provider_info::OPENAI_PROVIDER_ID;
 use codex_protocol::openai_models::InputModality;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_utils_path::write_atomically;
@@ -32,6 +33,8 @@ pub struct SubagentRoute {
     pub description: Option<String>,
     #[serde(default)]
     pub health_url: Option<String>,
+    #[serde(default)]
+    pub native_fallback_route: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -76,6 +79,24 @@ pub fn load_subagent_route_catalog(codex_home: &Path) -> Result<SubagentRouteCat
     }
     for (id, route) in &catalog.routes {
         validate_route(id, route)?;
+    }
+    for (id, route) in &catalog.routes {
+        let Some(fallback_id) = route.native_fallback_route.as_deref() else {
+            continue;
+        };
+        if fallback_id == id {
+            bail!("subagent route `{id}` cannot fall back to itself");
+        }
+        let fallback = catalog.routes.get(fallback_id).with_context(|| {
+            format!(
+                "subagent route `{id}` references missing native fallback route `{fallback_id}`"
+            )
+        })?;
+        if fallback.model_provider != OPENAI_PROVIDER_ID {
+            bail!(
+                "subagent route `{id}` native fallback `{fallback_id}` must use provider `{OPENAI_PROVIDER_ID}`"
+            );
+        }
     }
     Ok(catalog)
 }
@@ -369,6 +390,32 @@ mod tests {
         .unwrap();
     }
 
+    fn write_fallback_catalog(home: &Path, fallback_route: &str, fallback_provider: &str) {
+        std::fs::write(
+            home.join(SUBAGENT_ROUTE_CATALOG_FILE),
+            format!(
+                r#"{{
+                  "routes": {{
+                    "auto": {{
+                      "label": "Automatic route",
+                      "modelProvider": "bridge",
+                      "model": "bridge-model",
+                      "reasoningEffort": "high",
+                      "nativeFallbackRoute": "{fallback_route}"
+                    }},
+                    "native": {{
+                      "label": "Native route",
+                      "modelProvider": "{fallback_provider}",
+                      "model": "native-model",
+                      "reasoningEffort": "max"
+                    }}
+                  }}
+                }}"#
+            ),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn managed_route_is_opt_in_and_state_is_atomic() {
         let home = TempDir::new().unwrap();
@@ -404,5 +451,23 @@ mod tests {
             "/health"
         );
         assert!(HttpTarget::parse("http://example.com/health").is_err());
+    }
+
+    #[test]
+    fn validates_native_fallback_route() {
+        let home = TempDir::new().unwrap();
+        write_fallback_catalog(home.path(), "native", OPENAI_PROVIDER_ID);
+
+        let auto = resolve_subagent_route(home.path(), "auto").unwrap();
+        assert_eq!(auto.route.native_fallback_route.as_deref(), Some("native"));
+
+        write_fallback_catalog(home.path(), "missing", OPENAI_PROVIDER_ID);
+        assert!(load_subagent_route_catalog(home.path()).is_err());
+
+        write_fallback_catalog(home.path(), "auto", OPENAI_PROVIDER_ID);
+        assert!(load_subagent_route_catalog(home.path()).is_err());
+
+        write_fallback_catalog(home.path(), "native", "bridge");
+        assert!(load_subagent_route_catalog(home.path()).is_err());
     }
 }

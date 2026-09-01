@@ -151,6 +151,8 @@ pub enum CodexErrorDetails {
         "To use Codex with your ChatGPT plan, upgrade to Plus: https://chatgpt.com/explore/plus."
     )]
     UsageNotIncluded,
+    #[error("native subagent fallback route requested: {route}")]
+    NativeSubagentFallback { route: String },
     #[error("We're currently experiencing high demand, which may cause temporary errors.")]
     InternalServerError,
     /// Retry limit exceeded.
@@ -376,6 +378,7 @@ impl CodexErr {
             | CodexErrorDetails::EnvVar(_)
             | CodexErrorDetails::Fatal(_)
             | CodexErrorDetails::UsageNotIncluded
+            | CodexErrorDetails::NativeSubagentFallback { .. }
             | CodexErrorDetails::QuotaExceeded
             | CodexErrorDetails::InvalidImageRequest()
             | CodexErrorDetails::InvalidRequest(_)

@@ -45,6 +45,7 @@ const PROVIDER_RECOVERY_BACKOFF_MS = 1 * 1000;
 const NATIVE_PROGRESS_POLL_MS = 1 * 1000;
 const MAX_PROGRESS_EVENTS = 256;
 const FREE_ROUTE_CONCURRENCY = 2;
+const OLLAMA_CLOUD_CONCURRENCY = 3;
 const RESOURCE_BACKOFF_BASE_MS = 5 * 1000;
 const RESOURCE_BACKOFF_MAX_MS = 10 * 1000;
 const QUOTA_RECOVERY_PROBE_MS = 30 * 60 * 1000;
@@ -52,10 +53,13 @@ const ANTIGRAVITY_BRIDGE_ENDPOINT = "http://127.0.0.1:54549/v1/responses";
 const ANTIGRAVITY_REQUIRED_AUTH_SOURCE = "Antigravity cached OAuth session";
 const ANTIGRAVITY_REQUIRED_EFFORT = "high";
 const ANTIGRAVITY_CONTEXT_WINDOW = 131_072;
+const CODEBUDDY_BRIDGE_ENDPOINT = "http://127.0.0.1:54547/v1/responses";
+const CODEBUDDY_REQUIRED_AUTH_SOURCE = "www.codebuddy.ai";
+const CODEBUDDY_REQUIRED_EFFORT = "max";
 const OLLAMA_RESPONSES_ENDPOINT = "http://127.0.0.1:11434/v1/responses";
 const OLLAMA_AUTH_SOURCE = "Ollama local signed-in session";
 const OLLAMA_CONTEXT_WINDOW = 1_048_576;
-const REQUIRED_AUTO_PROVIDER_ORDER = ["antigravity", "devin", "ollama", "devin-free"];
+const REQUIRED_AUTO_PROVIDER_ORDER = ["antigravity", "devin", "ollama", "devin-free", "codebuddy"];
 const SCRIPT_DIRECTORY = dirname(fileURLToPath(import.meta.url));
 const CENTRAL_CONFIG = join(homedir(), ".codex", "subagent-models.json");
 const USER_DEVIN_CONFIG = join(process.env.APPDATA || join(homedir(), "AppData", "Roaming"), "devin", "config.json");
@@ -255,7 +259,9 @@ function centralRoute() {
   }
   const route = assertObject(parsed[PROVIDER_ID], `central route ${PROVIDER_ID}`);
   const antigravityRoute = assertObject(parsed.antigravity, "central route antigravity");
+  const codebuddyRoute = assertObject(parsed.codebuddy, "central route codebuddy");
   const ollamaRoute = assertObject(parsed.ollama, "central route ollama");
+  const autoRoute = assertObject(parsed.routes?.auto, "central managed route auto");
   const inputModalities = route.inputModalities;
   if (!Array.isArray(inputModalities) || inputModalities.length !== 1 || inputModalities[0] !== "text") {
     throw new BridgeError("Devin managed route must declare exactly the text modality", 500);
@@ -271,6 +277,21 @@ function centralRoute() {
   if (!Array.isArray(ollamaRoute.responseModels) || ollamaRoute.responseModels.length === 0) {
     throw new BridgeError("ollama.responseModels must contain at least one accepted response model", 500);
   }
+  if (ollamaRoute.maxConcurrency !== OLLAMA_CLOUD_CONCURRENCY) {
+    throw new BridgeError(
+      `ollama.maxConcurrency must match the Ollama Pro cloud limit ${OLLAMA_CLOUD_CONCURRENCY}`,
+      500,
+    );
+  }
+  const codebuddyInputModalities = codebuddyRoute.inputModalities;
+  if (!Array.isArray(codebuddyInputModalities) || codebuddyInputModalities.length !== 1 || codebuddyInputModalities[0] !== "text") {
+    throw new BridgeError("CodeBuddy managed route must declare exactly the text modality", 500);
+  }
+  const nativeFallbackRoute = requireString(autoRoute.nativeFallbackRoute, "routes.auto.nativeFallbackRoute");
+  const nativeRoute = assertObject(parsed.routes?.[nativeFallbackRoute], `central managed route ${nativeFallbackRoute}`);
+  if (nativeFallbackRoute === "auto" || nativeRoute.modelProvider !== "openai") {
+    throw new BridgeError("routes.auto.nativeFallbackRoute must reference a distinct native OpenAI route", 500);
+  }
   return {
     autoProviderOrder: [...configuredOrder],
     primaryModel: requireString(route.primaryModel, "primaryModel"),
@@ -279,12 +300,16 @@ function centralRoute() {
       requireString(antigravityRoute.primaryModel, "antigravity.primaryModel"),
       requireString(antigravityRoute.quotaFallbackModel, "antigravity.quotaFallbackModel"),
     ],
+    codebuddyModel: requireString(codebuddyRoute.model, "codebuddy.model"),
+    codebuddyInputModalities,
+    nativeFallbackRoute,
     ollamaModel: requireString(ollamaRoute.model, "ollama.model"),
     ollamaLabel: requireString(ollamaRoute.label, "ollama.label"),
     ollamaResponseModels: ollamaRoute.responseModels.map((model, index) =>
       requireString(model, `ollama.responseModels[${index}]`)),
     ollamaEffort,
     ollamaInputModalities,
+    ollamaMaxConcurrency: ollamaRoute.maxConcurrency,
     terminalFallbackModel: requireString(route.terminalFallbackModel, "terminalFallbackModel"),
     inputModalities,
   };
@@ -367,7 +392,9 @@ const models = {
 
 const runtime = {
   incomingRequests: 0, requests: 0, completed: 0, failed: 0, rejected: 0,
-  activeRequests: 0, activeFreeRequests: 0, queuedFreeRequests: 0,
+  activeRequests: 0,
+  activeFreeRequests: 0, queuedFreeRequests: 0,
+  activeOllamaRequests: 0, queuedOllamaRequests: 0,
   supersededTurns: 0,
   resourceRetries: 0, streamContinuations: 0, activeResourceBackoffs: 0,
   lastResourceModel: null, lastResourceRetryAttempt: 0,
@@ -377,8 +404,8 @@ const runtime = {
   lastActualProvider: null, lastModelLabel: null, lastQuotaFallback: false,
   lastTerminalFallback: false, lastFallbackReason: null,
   fallbackAttempts: 0, fallbackCompleted: 0, fallbackFailed: 0, terminalFallbacks: 0,
-  providerAttempts: { antigravity: 0, devin: 0, ollama: 0, devinFree: 0 },
-  providerFailures: { antigravity: 0, devin: 0, ollama: 0, "devin-free": 0 },
+  providerAttempts: { antigravity: 0, devin: 0, ollama: 0, devinFree: 0, codebuddy: 0 },
+  providerFailures: { antigravity: 0, devin: 0, ollama: 0, "devin-free": 0, codebuddy: 0 },
   lastProviderSequence: [],
   fallbackStreamCommits: 0, lastFallbackStreamCommitted: false,
   lastFallbackProviderOutputObserved: false,
@@ -399,12 +426,15 @@ const runtime = {
 };
 
 const terminalCapacity = { active: 0, waiters: [] };
+const ollamaCapacity = { active: 0, waiters: [] };
 const activeThreadTurns = new Map();
 const quotaTaskPins = new ActiveTaskRoutePins();
 
-function syncFreeCapacityRuntime() {
+function syncRouteCapacityRuntime() {
   runtime.activeFreeRequests = terminalCapacity.active;
   runtime.queuedFreeRequests = terminalCapacity.waiters.length;
+  runtime.activeOllamaRequests = ollamaCapacity.active;
+  runtime.queuedOllamaRequests = ollamaCapacity.waiters.length;
 }
 
 function registerThreadTurn(threadId, registration) {
@@ -445,47 +475,52 @@ function delayWithAbort(milliseconds, signal) {
   });
 }
 
-function acquireFreeCapacity(signal) {
+function acquireCapacity(capacity, limit, signal) {
   throwIfAborted(signal);
-  if (terminalCapacity.active < FREE_ROUTE_CONCURRENCY) {
-    terminalCapacity.active += 1;
-    syncFreeCapacityRuntime();
+  if (capacity.active < limit) {
+    capacity.active += 1;
+    syncRouteCapacityRuntime();
     return Promise.resolve();
   }
   return new Promise((resolve, reject) => {
     const waiter = { resolve, reject, signal, onAbort: null };
     waiter.onAbort = () => {
-      const index = terminalCapacity.waiters.indexOf(waiter);
-      if (index !== -1) terminalCapacity.waiters.splice(index, 1);
-      syncFreeCapacityRuntime();
+      const index = capacity.waiters.indexOf(waiter);
+      if (index !== -1) capacity.waiters.splice(index, 1);
+      syncRouteCapacityRuntime();
       reject(abortError());
     };
     signal?.addEventListener("abort", waiter.onAbort, { once: true });
-    terminalCapacity.waiters.push(waiter);
-    syncFreeCapacityRuntime();
+    capacity.waiters.push(waiter);
+    syncRouteCapacityRuntime();
   });
 }
 
-function releaseFreeCapacity() {
-  terminalCapacity.active = Math.max(0, terminalCapacity.active - 1);
-  while (terminalCapacity.waiters.length > 0) {
-    const waiter = terminalCapacity.waiters.shift();
+function releaseCapacity(capacity) {
+  capacity.active = Math.max(0, capacity.active - 1);
+  while (capacity.waiters.length > 0) {
+    const waiter = capacity.waiters.shift();
     waiter.signal?.removeEventListener("abort", waiter.onAbort);
     if (waiter.signal?.aborted) continue;
-    terminalCapacity.active += 1;
+    capacity.active += 1;
     waiter.resolve();
     break;
   }
-  syncFreeCapacityRuntime();
+  syncRouteCapacityRuntime();
 }
 
 async function withRouteCapacity(selected, signal, callback) {
-  if (selected.key !== "terminal") return callback();
-  await acquireFreeCapacity(signal);
+  const capacity = selected.key === "terminal"
+    ? { state: terminalCapacity, limit: FREE_ROUTE_CONCURRENCY }
+    : selected.key === "ollama"
+      ? { state: ollamaCapacity, limit: route.ollamaMaxConcurrency }
+      : null;
+  if (!capacity) return callback();
+  await acquireCapacity(capacity.state, capacity.limit, signal);
   try {
     return await callback();
   } finally {
-    releaseFreeCapacity();
+    releaseCapacity(capacity.state);
   }
 }
 
@@ -664,6 +699,15 @@ function ollamaSelection(reason) {
     key: "ollama",
     provider: "ollama",
     model: { model_uid: route.ollamaModel, label: route.ollamaLabel },
+    reason,
+  };
+}
+
+function codebuddySelection(reason) {
+  return {
+    key: "codebuddy",
+    provider: "codebuddy",
+    model: { model_uid: route.codebuddyModel, label: route.codebuddyModel },
     reason,
   };
 }
@@ -1424,46 +1468,98 @@ async function runOllamaResponsesWithRecovery(body, taskHash, signal, onEvent, o
 }
 
 async function runOllamaStage(context, requestBody, failures, onProgress, signal, streamRelay) {
-  runtime.providerAttempts.ollama += 1;
-  runtime.lastProviderSequence.push("ollama");
-  onProgress?.("Native route started the locally authenticated Ollama cloud model.\n");
-  const translated = ollamaRequest(requestBody, context);
+  const selected = ollamaSelection(
+    failures.length > 0 ? "auto_ollama_after_prior_provider_failure" : "explicit_ollama_route",
+  );
   try {
-    const streamResult = await runOllamaResponsesWithRecovery(
-      translated.body,
-      context.taskDiagnostics.taskHash,
+    return await withRouteCapacity(selected, signal, async () => {
+      runtime.providerAttempts.ollama += 1;
+      runtime.lastProviderSequence.push("ollama");
+      onProgress?.("Native route started the locally authenticated Ollama cloud model.\n");
+      const translated = ollamaRequest(requestBody, context);
+      const streamResult = await runOllamaResponsesWithRecovery(
+        translated.body,
+        context.taskDiagnostics.taskHash,
+        signal,
+        streamRelay.accept,
+        onProgress,
+      );
+      const rawCompletion = streamResult.completion;
+      const completion = validateOllamaCompletion(rawCompletion, translated.responseTools);
+      const lazyProxyTools = [...translated.responseTools.values()]
+        .filter((entry) => ["search_rzmcp_tools", "call_rzmcp_tool"].includes(entry.originalName))
+        .length;
+      const deferredToolSearchForwarded = [...translated.responseTools.values()]
+        .some((entry) => entry.kind === "tool_search");
+      completion.metadata = {
+        ...(completion.metadata || {}),
+        actual_provider: "ollama",
+        actual_model: route.ollamaModel,
+        actual_model_label: route.ollamaLabel,
+        actual_reasoning_effort: route.ollamaEffort,
+        auth_source: OLLAMA_AUTH_SOURCE,
+        codex_tool_schema_bytes_forwarded: translated.forwardedBytes,
+        codex_tool_schema_bytes_ignored: 0,
+        lazy_rzmcp_proxy_tools: lazyProxyTools,
+        deferred_tool_search_forwarded: deferredToolSearchForwarded,
+        hosted_web_search_replaced_by_deferred_tool_search: translated.hostedWebSearchReplaced,
+        interrupted_stream_recovered: streamResult.recovered,
+        interrupted_stream_recovered_completed_items: streamResult.recoveredCompletedItems === true,
+      };
+      return {
+        ...responsesResult(
+          completion,
+          selected,
+          fallbackState(context, failures),
+          { ignoredBytes: 0, forwardedBytes: translated.forwardedBytes },
+        ),
+        streamRelay,
+      };
+    });
+  } catch (error) {
+    if (streamRelay.committed) error.routeCommitted = true;
+    throw error;
+  }
+}
+
+function validateCodeBuddyCompletion(completion) {
+  if (!completion || completion.status !== "completed") {
+    throw new BridgeError(`CodeBuddy returned response status ${json(completion?.status)}`, 502);
+  }
+  const metadata = assertObject(completion.metadata, "CodeBuddy response metadata");
+  if (metadata.codebuddy_initialized_model !== route.codebuddyModel) {
+    throw new BridgeError(`CodeBuddy initialized unexpected model ${json(metadata.codebuddy_initialized_model)}`, 502);
+  }
+  if (metadata.codebuddy_auth_source !== CODEBUDDY_REQUIRED_AUTH_SOURCE) {
+    throw new BridgeError(`CodeBuddy used unexpected auth source ${json(metadata.codebuddy_auth_source)}`, 502);
+  }
+  if (Number(metadata.codebuddy_total_cost_usd) !== 0) {
+    throw new BridgeError(`CodeBuddy reported non-zero explicit cost ${json(metadata.codebuddy_total_cost_usd)}`, 502);
+  }
+  if (!Array.isArray(completion.output) || completion.output.length === 0) {
+    throw new BridgeError("CodeBuddy completed without output items", 502);
+  }
+  return completion;
+}
+
+async function runCodeBuddyStage(context, requestBody, failures, onProgress, signal, streamRelay) {
+  runtime.providerAttempts.codebuddy += 1;
+  runtime.lastProviderSequence.push("codebuddy");
+  onProgress?.("Automatic route started CodeBuddy Hy4 through its authenticated included access.\n");
+  try {
+    const completion = validateCodeBuddyCompletion(await runResponsesBridge({
+      endpoint: CODEBUDDY_BRIDGE_ENDPOINT,
+      body: fallbackForwardBody(requestBody, MODEL_ALIAS, CODEBUDDY_REQUIRED_EFFORT),
       signal,
-      streamRelay.accept,
-      onProgress,
-    );
-    const rawCompletion = streamResult.completion;
-    const completion = validateOllamaCompletion(rawCompletion, translated.responseTools);
-    const lazyProxyTools = [...translated.responseTools.values()]
-      .filter((entry) => ["search_rzmcp_tools", "call_rzmcp_tool"].includes(entry.originalName))
-      .length;
-    const deferredToolSearchForwarded = [...translated.responseTools.values()]
-      .some((entry) => entry.kind === "tool_search");
-    completion.metadata = {
-      ...(completion.metadata || {}),
-      actual_provider: "ollama",
-      actual_model: route.ollamaModel,
-      actual_model_label: route.ollamaLabel,
-      actual_reasoning_effort: route.ollamaEffort,
-      auth_source: OLLAMA_AUTH_SOURCE,
-      codex_tool_schema_bytes_forwarded: translated.forwardedBytes,
-      codex_tool_schema_bytes_ignored: 0,
-      lazy_rzmcp_proxy_tools: lazyProxyTools,
-      deferred_tool_search_forwarded: deferredToolSearchForwarded,
-      hosted_web_search_replaced_by_deferred_tool_search: translated.hostedWebSearchReplaced,
-      interrupted_stream_recovered: streamResult.recovered,
-      interrupted_stream_recovered_completed_items: streamResult.recoveredCompletedItems === true,
-    };
+      inactivityTimeoutMs: PROVIDER_STREAM_INACTIVITY_MS,
+      onEvent: streamRelay.accept,
+    }));
     return {
       ...responsesResult(
         completion,
-        ollamaSelection(failures.length > 0 ? "auto_ollama_after_prior_provider_failure" : "explicit_ollama_route"),
+        codebuddySelection("auto_codebuddy_after_prior_provider_failure"),
         fallbackState(context, failures),
-        { ignoredBytes: 0, forwardedBytes: translated.forwardedBytes },
+        { ignoredBytes: context.toolSchemaBytes, forwardedBytes: 0 },
       ),
       streamRelay,
     };
@@ -1519,9 +1615,11 @@ async function runDevinStage(context, selected, failures, onSpawn, onProgress, s
 
 async function executeAuto(context, requestBody, onSpawn, onProgress, signal, createStreamRelay) {
   runtime.lastProviderSequence = [];
-  const chain = await runOrderedProviderChain({
-    signal,
-    stages: [
+  let chain;
+  try {
+    chain = await runOrderedProviderChain({
+      signal,
+      stages: [
       {
         name: "antigravity",
         run: ({ failures }) => runAntigravityStage(
@@ -1564,14 +1662,31 @@ async function executeAuto(context, requestBody, onSpawn, onProgress, signal, cr
           return runDevinStage(context, selected, failures, onSpawn, onProgress, signal, true);
         },
       },
-    ],
-    onStageFailure: (stage, error) => {
-      runtime.providerFailures[stage] += 1;
-      runtime.fallbackFailed += 1;
-      runtime.lastFallbackError = `${stage}: ${sanitizedProviderFailure(error)}`;
-      if (!error.routeSkipped) onProgress?.(`${stage} was unavailable before committed work; trying the next configured provider.\n`);
-    },
-  });
+        {
+          name: "codebuddy",
+          run: ({ failures }) => runCodeBuddyStage(
+            context,
+            requestBody,
+            failures,
+            onProgress,
+            signal,
+            createStreamRelay(),
+          ),
+        },
+      ],
+      onStageFailure: (stage, error) => {
+        runtime.providerFailures[stage] += 1;
+        runtime.fallbackFailed += 1;
+        runtime.lastFallbackError = `${stage}: ${sanitizedProviderFailure(error)}`;
+        if (!error.routeSkipped) onProgress?.(`${stage} was unavailable before committed work; trying the next configured provider.\n`);
+      },
+    });
+  } catch (error) {
+    if (error?.routeCommitted !== true && !signal?.aborted) {
+      error.nativeFallbackRoute = route.nativeFallbackRoute;
+    }
+    throw error;
+  }
   if (chain.stage !== "antigravity") runtime.fallbackCompleted += 1;
   runtime.lastFallbackError = chain.failures.length > 0
     ? chain.failures.map((failure) => `${failure.stage}: ${sanitizedProviderFailure(failure.error)}`).join(" | ").slice(0, 2_000)
@@ -1669,6 +1784,7 @@ function writeSse(response, type, payload) {
 }
 
 function providerResponseErrorCode(error) {
+  if (typeof error?.nativeFallbackRoute === "string") return "native_subagent_fallback";
   return error?.routeCommitted === true ? "provider_state_changed" : "external_provider_error";
 }
 
@@ -1949,7 +2065,11 @@ async function handleResponses(request, response) {
   } catch (error) {
     runtime.failed += 1;
     progress.finish();
-    writeSse(response, "response.failed", { response: { id: responseId, object: "response", model: context.modelAlias, status: "failed", error: { code: providerResponseErrorCode(error), message: error.message } } });
+    const responseError = { code: providerResponseErrorCode(error), message: error.message };
+    if (typeof error?.nativeFallbackRoute === "string") {
+      responseError.fallback_route = error.nativeFallbackRoute;
+    }
+    writeSse(response, "response.failed", { response: { id: responseId, object: "response", model: context.modelAlias, status: "failed", error: responseError } });
     response.end();
   } finally {
     clearInterval(heartbeat);
@@ -2025,6 +2145,7 @@ function health(requestedRoute = "auto") {
       antigravity: ANTIGRAVITY_REQUIRED_AUTH_SOURCE,
       devin: auth.source,
       ollama: OLLAMA_AUTH_SOURCE,
+      codebuddy: CODEBUDDY_REQUIRED_AUTH_SOURCE,
     },
     inputModalities: route.inputModalities,
     routing: {
@@ -2050,6 +2171,7 @@ function health(requestedRoute = "auto") {
         effort: route.ollamaEffort,
         authSource: OLLAMA_AUTH_SOURCE,
         endpoint: OLLAMA_RESPONSES_ENDPOINT,
+        maxConcurrency: route.ollamaMaxConcurrency,
         toolServing: "Codex deferred tool_search with on-demand namespaced tool forwarding",
       },
       terminalFallback: {
@@ -2058,7 +2180,20 @@ function health(requestedRoute = "auto") {
         label: models.terminal.label,
         cost: models.terminal.cost_summary || models.terminal.cost_tier,
       },
-      orderedPolicy: "antigravity_primary_then_antigravity_quota_fallback_then_devin_primary_then_ollama_then_devin_free",
+      codebuddy: {
+        provider: "codebuddy",
+        uid: route.codebuddyModel,
+        effort: CODEBUDDY_REQUIRED_EFFORT,
+        authSource: CODEBUDDY_REQUIRED_AUTH_SOURCE,
+        endpoint: CODEBUDDY_BRIDGE_ENDPOINT,
+        explicitCostRequiredUsd: 0,
+        toolServing: "CodeBuddy ToolSearch and DeferExecuteTool lazy MCP adapter",
+      },
+      nativeFallback: {
+        route: route.nativeFallbackRoute,
+        activation: "Codex in-process provider switch after every external stage fails before committed work",
+      },
+      orderedPolicy: "antigravity_primary_then_antigravity_quota_fallback_then_devin_primary_then_ollama_then_devin_free_then_codebuddy_then_native_openai",
       configuredProviderOrder: route.autoProviderOrder,
       quotaDetection: "explicit_daily_or_weekly_quota_failure_with_single_bounded_recovery_probe_every_30_minutes",
     },
@@ -2135,7 +2270,10 @@ async function selfTest() {
     || route.antigravityModels.length !== 2
     || route.autoProviderOrder.join(",") !== REQUIRED_AUTO_PROVIDER_ORDER.join(",")
     || route.ollamaEffort !== OLLAMA_REQUIRED_EFFORT
+    || route.ollamaMaxConcurrency !== OLLAMA_CLOUD_CONCURRENCY
     || !route.ollamaResponseModels.includes(route.ollamaModel)
+    || route.codebuddyModel.length === 0
+    || route.nativeFallbackRoute !== "native"
     || !models.terminal.model_uid
   ) {
     throw new Error("ordered provider configuration failed");
@@ -2676,6 +2814,7 @@ async function selfTest() {
   }
   if (
     providerResponseErrorCode({ routeCommitted: true }) !== "provider_state_changed"
+    || providerResponseErrorCode({ nativeFallbackRoute: "native" }) !== "native_subagent_fallback"
     || providerResponseErrorCode(new Error("transient")) !== "external_provider_error"
   ) {
     throw new Error("committed fallback failure classification failed");
@@ -2690,6 +2829,18 @@ async function selfTest() {
   ) {
     throw new Error("Devin native-tool commitment classification failed");
   }
+  const codebuddyFixture = validateCodeBuddyCompletion({
+    status: "completed",
+    output: [{ type: "message", id: "msg-codebuddy", role: "assistant", content: [] }],
+    metadata: {
+      codebuddy_initialized_model: route.codebuddyModel,
+      codebuddy_auth_source: CODEBUDDY_REQUIRED_AUTH_SOURCE,
+      codebuddy_total_cost_usd: 0,
+    },
+  });
+  if (codebuddyFixture.metadata.codebuddy_total_cost_usd !== 0) {
+    throw new Error("CodeBuddy included-access validation failed");
+  }
   let concurrentFreeCalls = 0;
   let peakConcurrentFreeCalls = 0;
   const freeRoute = { key: "terminal" };
@@ -2703,8 +2854,28 @@ async function selfTest() {
     peakConcurrentFreeCalls !== FREE_ROUTE_CONCURRENCY
     || terminalCapacity.active !== 0
     || terminalCapacity.waiters.length !== 0
+    || runtime.activeFreeRequests !== 0
+    || runtime.queuedFreeRequests !== 0
   ) {
-    throw new Error("free route capacity failed");
+    throw new Error("Devin free route capacity failed");
+  }
+  let concurrentOllamaCalls = 0;
+  let peakConcurrentOllamaCalls = 0;
+  const ollamaRoute = { key: "ollama" };
+  await Promise.all(Array.from({ length: 6 }, () => withRouteCapacity(ollamaRoute, undefined, async () => {
+    concurrentOllamaCalls += 1;
+    peakConcurrentOllamaCalls = Math.max(peakConcurrentOllamaCalls, concurrentOllamaCalls);
+    await delayWithAbort(5);
+    concurrentOllamaCalls -= 1;
+  })));
+  if (
+    peakConcurrentOllamaCalls !== OLLAMA_CLOUD_CONCURRENCY
+    || ollamaCapacity.active !== 0
+    || ollamaCapacity.waiters.length !== 0
+    || runtime.activeOllamaRequests !== 0
+    || runtime.queuedOllamaRequests !== 0
+  ) {
+    throw new Error("Ollama cloud route capacity failed");
   }
   process.stdout.write("devin-subagent-bridge self-test: ok\n");
 }

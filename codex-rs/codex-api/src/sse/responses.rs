@@ -109,6 +109,7 @@ struct Error {
     message: Option<String>,
     plan_type: Option<String>,
     resets_at: Option<i64>,
+    fallback_route: Option<String>,
     #[serde(default)]
     misalignment: Option<Value>,
 }
@@ -422,6 +423,17 @@ pub fn process_responses_event(
                         response_error = ApiError::QuotaExceeded;
                     } else if is_usage_not_included(&error) {
                         response_error = ApiError::UsageNotIncluded;
+                    } else if error.code.as_deref() == Some("native_subagent_fallback") {
+                        response_error = match error
+                            .fallback_route
+                            .filter(|route| !route.trim().is_empty())
+                        {
+                            Some(route) => ApiError::NativeSubagentFallback { route },
+                            None => ApiError::InvalidRequest {
+                                message: "External provider requested a native fallback without a route identifier."
+                                    .to_string(),
+                            },
+                        };
                     } else if is_cyber_policy_error(&error) {
                         let message = cyber_policy_message(error.message);
                         response_error = ApiError::CyberPolicy { message };
@@ -1166,6 +1178,48 @@ mod tests {
             }
             other => panic!("unexpected provider-state event: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn native_subagent_fallback_preserves_route() {
+        let event = json!({
+            "type": "response.failed",
+            "response": {
+                "error": {
+                    "code": "native_subagent_fallback",
+                    "message": "External providers are unavailable.",
+                    "fallback_route": "native"
+                }
+            },
+        });
+        let sse = format!("event: response.failed\ndata: {event}\n\n");
+        let events = collect_events(&[sse.as_bytes()]).await;
+
+        assert_matches!(
+            events.as_slice(),
+            [Err(ApiError::NativeSubagentFallback { route })] if route == "native"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_subagent_fallback_without_route_fails_explicitly() {
+        let event = json!({
+            "type": "response.failed",
+            "response": {
+                "error": {
+                    "code": "native_subagent_fallback",
+                    "message": "External providers are unavailable."
+                }
+            },
+        });
+        let sse = format!("event: response.failed\ndata: {event}\n\n");
+        let events = collect_events(&[sse.as_bytes()]).await;
+
+        assert_matches!(
+            events.as_slice(),
+            [Err(ApiError::InvalidRequest { message })]
+                if message.contains("without a route identifier")
+        );
     }
 
     #[tokio::test]
@@ -2036,6 +2090,7 @@ mod tests {
             code: Some("rate_limit_exceeded".to_string()),
             plan_type: None,
             resets_at: None,
+            fallback_route: None,
             misalignment: None,
         };
 
@@ -2051,6 +2106,7 @@ mod tests {
             code: Some("rate_limit_exceeded".to_string()),
             plan_type: None,
             resets_at: None,
+            fallback_route: None,
             misalignment: None,
         };
         let delay = try_parse_retry_after(&err);
@@ -2065,6 +2121,7 @@ mod tests {
             code: Some("rate_limit_exceeded".to_string()),
             plan_type: None,
             resets_at: None,
+            fallback_route: None,
             misalignment: None,
         };
         let delay = try_parse_retry_after(&err);
