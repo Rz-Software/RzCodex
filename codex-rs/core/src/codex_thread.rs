@@ -607,6 +607,21 @@ impl CodexThread {
         self.io.agent_status().await
     }
 
+    pub(crate) async fn agent_progress(&self) -> Option<AgentProgressSnapshot> {
+        let turn_state = {
+            let active = self.session.active_turn.lock().await;
+            Arc::clone(&active.as_ref()?.turn_state)
+        };
+        let state = turn_state.lock().await;
+        Some(AgentProgressSnapshot {
+            tool_calls: state.tool_calls,
+            last_activity_at_ms: state.last_activity_at_ms,
+            last_completed_tool: state.last_completed_tool.clone(),
+            successful_mutations: state.successful_mutations,
+            changed_paths: state.changed_paths.iter().take(32).cloned().collect(),
+        })
+    }
+
     pub async fn list_background_terminals(&self) -> Vec<BackgroundTerminalInfo> {
         self.session.list_background_terminals().await
     }
@@ -984,4 +999,12 @@ impl CodexThread {
         }
         Ok(elicitations.count)
     }
+}
+#[derive(Clone, Debug, serde::Serialize, PartialEq, Eq)]
+pub(crate) struct AgentProgressSnapshot {
+    pub(crate) tool_calls: u64,
+    pub(crate) last_activity_at_ms: Option<i64>,
+    pub(crate) last_completed_tool: Option<String>,
+    pub(crate) successful_mutations: u64,
+    pub(crate) changed_paths: Vec<String>,
 }

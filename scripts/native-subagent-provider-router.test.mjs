@@ -219,7 +219,7 @@ test("consumer callback failures are explicit protocol errors, not resumable str
   });
 });
 
-test("a silent stream times out while periodic provider activity may run longer", async () => {
+test("transport heartbeats do not hide provider silence while explicit provider activity extends it", async () => {
   await withServer((_request, response) => {
     response.writeHead(200, { "content-type": "text/event-stream" });
     response.write(sse("response.created", { response: { id: "resp-silent", status: "in_progress" } }));
@@ -242,10 +242,31 @@ test("a silent stream times out while periodic provider activity may run longer"
       }
     }, 20);
   }, async (endpoint) => {
-    assert.deepEqual(
-      await runResponsesBridge({ endpoint, body: {}, inactivityTimeoutMs: 100 }),
-      completion(),
+    await assert.rejects(
+      runResponsesBridge({ endpoint, body: {}, inactivityTimeoutMs: 60 }),
+      (error) => error.recoverableStreamFailure === true && /silent for 60ms/.test(error.message),
     );
+  });
+
+  await withServer((_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    let activities = 0;
+    const timer = setInterval(() => {
+      activities += 1;
+      response.write(sse("response.in_progress", {
+        response: { status: "in_progress", metadata: { provider_activity: `tool-${activities}` } },
+      }));
+      if (activities === 4) {
+        clearInterval(timer);
+        response.end(sse("response.completed", { response: completion() }));
+      }
+    }, 20);
+  }, async (endpoint) => {
+    assert.deepEqual(await runResponsesBridge({
+      endpoint,
+      body: {},
+      inactivityTimeoutMs: 50,
+    }), completion());
   });
 });
 

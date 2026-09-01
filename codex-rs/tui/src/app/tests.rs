@@ -4133,6 +4133,14 @@ async fn inactive_thread_started_notification_initializes_replay_session() -> Re
     );
     assert_eq!(session.rollout_path, Some(rollout_path));
     assert_eq!(
+        app.thread_event_channels
+            .get(&agent_thread_id)
+            .expect("agent thread channel")
+            .attachment(),
+        ThreadEventAttachment::ReplayOnly,
+        "a notification-created child channel must resume its real event stream when selected"
+    );
+    assert_eq!(
         app.agent_navigation.get(&agent_thread_id),
         Some(&AgentPickerThreadEntry {
             agent_nickname: Some("Robie".to_string()),

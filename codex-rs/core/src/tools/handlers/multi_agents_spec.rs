@@ -463,9 +463,22 @@ fn list_agents_output_schema() -> Value {
                         "agent_status": {
                             "description": "Last known status of the agent.",
                             "allOf": [agent_status_output_schema()]
+                        },
+                        "agent_progress": {
+                            "description": "Authoritative progress for the currently active turn, or null when idle.",
+                            "type": ["object", "null"],
+                            "properties": {
+                                "tool_calls": { "type": "integer", "minimum": 0 },
+                                "last_activity_at_ms": { "type": ["integer", "null"] },
+                                "last_completed_tool": { "type": ["string", "null"] },
+                                "successful_mutations": { "type": "integer", "minimum": 0 },
+                                "changed_paths": { "type": "array", "items": { "type": "string" } }
+                            },
+                            "required": ["tool_calls", "last_activity_at_ms", "last_completed_tool", "successful_mutations", "changed_paths"],
+                            "additionalProperties": false
                         }
                     },
-                    "required": ["agent_name", "agent_status"],
+                    "required": ["agent_name", "agent_status", "agent_progress"],
                     "additionalProperties": false
                 },
                 "description": "Live agents visible in the current root thread tree."

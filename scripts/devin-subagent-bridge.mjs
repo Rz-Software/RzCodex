@@ -15,6 +15,7 @@ import {
   normalizeAgentMessageContent,
   taskDeliveryDiagnostics,
   taskStateFromInput,
+  validateTerminalCompletion,
 } from "./codebuddy-subagent-task-state.mjs";
 import {
   ActiveTaskProviderPins,
@@ -40,7 +41,7 @@ const MAX_ACTIVE_TASK_CHARS = 40_000;
 const OUTPUT_LIMIT = 2 * 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 30 * 60 * 1000;
 const SSE_HEARTBEAT_MS = 15 * 1000;
-const PROVIDER_STREAM_INACTIVITY_MS = 20 * 1000;
+const PROVIDER_STREAM_INACTIVITY_MS = 55 * 1000;
 const PROVIDER_RECOVERY_BUDGET_MS = 45 * 1000;
 const PROVIDER_RECOVERY_BACKOFF_MS = 1 * 1000;
 const ROUTE_CAPACITY_WAIT_MS = PROVIDER_RECOVERY_BUDGET_MS;
@@ -1297,14 +1298,35 @@ function sanitizedProviderFailure(error) {
     .slice(0, 2_000);
 }
 
+function providerMutationToolCalls(session) {
+  const toolCalls = Array.isArray(session?.toolCalls)
+    ? session.toolCalls.filter((call) => call?.name)
+    : [];
+  return toolCalls.filter((call) => {
+    const name = String(call.name || "").toLowerCase();
+    return [
+      "apply_patch",
+      "edit",
+      "edit_file",
+      "write_file",
+      "create_file",
+      "delete_file",
+      "move_file",
+      "mcp_call_tool",
+    ].includes(name);
+  });
+}
+
 function preserveProviderCommit(error, session) {
   const toolCalls = Array.isArray(session?.toolCalls)
     ? session.toolCalls.filter((call) => call?.name)
     : [];
-  if (toolCalls.length > 0) {
+  const mutationToolCalls = providerMutationToolCalls(session);
+  if (mutationToolCalls.length > 0) {
     error.routeCommitted = true;
     error.toolCalls = toolCalls.length;
     error.toolNames = [...new Set(toolCalls.map((call) => call.name))];
+    error.mutationToolCalls = mutationToolCalls.length;
   }
   return error;
 }
@@ -1451,7 +1473,7 @@ function responsesResult(completion, selected, fallbackState, transport) {
   };
 }
 
-function finalizeDevinResult(selected, routeResult, fallbackState) {
+function finalizeDevinResult(context, selected, routeResult, fallbackState) {
   const { cliResult, session } = routeResult;
   if (!session) {
     if (cliResult.code !== 0 || !cliResult.stdout) {
@@ -1482,6 +1504,15 @@ function finalizeDevinResult(selected, routeResult, fallbackState) {
     const measuredOutputTokens = session.metrics.reduce((sum, metric) => sum + Number(metric.output_tokens || 0), 0);
     const outputTokensPerSecond = generationSeconds > 0 ? measuredOutputTokens / generationSeconds : null;
     const toolCalls = session.toolCalls.filter((call) => call?.name);
+    const mutationToolCalls = providerMutationToolCalls(session);
+    try {
+      validateTerminalCompletion(context.taskState, cliResult.stdout, [], {
+        providerMutationCount: mutationToolCalls.length,
+      });
+    } catch (error) {
+      if (error instanceof TaskStateError) throw new BridgeError(error.message, 502);
+      throw error;
+    }
     const rzMcpTools = toolCalls
       .filter((call) => call.name === "mcp_call_tool" && call.arguments?.tool_name === "call_rzmcp_tool")
       .map((call) => call.arguments?.arguments?.name).filter((name) => typeof name === "string");
@@ -1530,6 +1561,7 @@ async function runAntigravityStage(context, requestBody, failures, onProgress, s
       endpoint: ANTIGRAVITY_BRIDGE_ENDPOINT,
       body: forwardedBody,
       signal,
+      inactivityTimeoutMs: PROVIDER_STREAM_INACTIVITY_MS,
       onEvent: streamRelay.accept,
     });
     validateOAuthFallbackCompletion(completion, {
@@ -1763,7 +1795,7 @@ async function runDevinStage(
     );
   }, capacityOptions);
   if (!freeModel && isQuotaFailure(routeResult.cliResult)) {
-    if (routeResult.session?.toolCalls?.some((call) => call?.name)) {
+    if (providerMutationToolCalls(routeResult.session).length > 0) {
       const error = preserveProviderCommit(
         new BridgeError("Devin quota ended after executing native tools; the turn was not replayed", 502),
         routeResult.session,
@@ -1785,6 +1817,7 @@ async function runDevinStage(
     runtime.calendarQuotaClears += 1;
   }
   return finalizeDevinResult(
+    context,
     selected,
     routeResult,
     fallbackState(context, failures, terminalFallback),

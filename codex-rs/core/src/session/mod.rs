@@ -130,6 +130,7 @@ use codex_protocol::protocol::ItemCompletedEvent;
 use codex_protocol::protocol::ItemStartedEvent;
 use codex_protocol::protocol::MULTI_AGENT_MODE_OPEN_TAG;
 use codex_protocol::protocol::MultiAgentVersion;
+use codex_protocol::protocol::PatchApplyStatus;
 use codex_protocol::protocol::RawResponseItemEvent;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentActivityKind;
@@ -2407,6 +2408,8 @@ impl Session {
             .turn_timing_state
             .record_item_started(item.id(), now_unix_timestamp_ms())
             .await;
+        self.record_agent_progress(turn_context, item, started_at_ms, false)
+            .await;
         self.send_event(
             turn_context,
             EventMsg::ItemStarted(ItemStartedEvent {
@@ -2427,6 +2430,8 @@ impl Session {
         record_turn_ttfm_metric(turn_context, &item).await;
         let completed_at_ms = now_unix_timestamp_ms();
         let item_id = item.id();
+        self.record_agent_progress(turn_context, &item, completed_at_ms, true)
+            .await;
         let started_at_ms = turn_context
             .turn_timing_state
             .take_item_started(&item_id)
@@ -2451,6 +2456,56 @@ impl Session {
             }),
         )
         .await;
+    }
+
+    async fn record_agent_progress(
+        &self,
+        turn_context: &TurnContext,
+        item: &TurnItem,
+        activity_at_ms: i64,
+        completed: bool,
+    ) {
+        let turn_state = {
+            let active = self.active_turn.lock().await;
+            active.as_ref().and_then(|active| {
+                active
+                    .task
+                    .as_ref()
+                    .filter(|task| task.turn_context.sub_id == turn_context.sub_id)
+                    .map(|_| Arc::clone(&active.turn_state))
+            })
+        };
+        let Some(turn_state) = turn_state else {
+            return;
+        };
+        let mut state = turn_state.lock().await;
+        state.last_activity_at_ms = Some(activity_at_ms);
+        if !completed {
+            return;
+        }
+        let completed_tool = match item {
+            TurnItem::CommandExecution(_) => Some("exec_command".to_string()),
+            TurnItem::DynamicToolCall(item) => Some(item.tool.clone()),
+            TurnItem::McpToolCall(item) => Some(format!("{}.{}", item.server, item.tool)),
+            TurnItem::FileChange(_) => Some("apply_patch".to_string()),
+            TurnItem::WebSearch(_) => Some("web_search".to_string()),
+            TurnItem::ImageView(_) => Some("view_image".to_string()),
+            TurnItem::ImageGeneration(_) => Some("image_generation".to_string()),
+            _ => None,
+        };
+        if let Some(completed_tool) = completed_tool {
+            state.last_completed_tool = Some(completed_tool);
+        }
+        if let TurnItem::FileChange(item) = item
+            && item.status == Some(PatchApplyStatus::Completed)
+        {
+            state.successful_mutations = state.successful_mutations.saturating_add(1);
+            state.changed_paths.extend(
+                item.changes
+                    .keys()
+                    .map(|path| path.to_string_lossy().into_owned()),
+            );
+        }
     }
 
     /// Adds an execpolicy amendment to both the in-memory and on-disk policies so future

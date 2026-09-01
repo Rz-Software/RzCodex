@@ -1039,8 +1039,17 @@ impl App {
         let is_turn_started = matches!(notification, ServerNotification::TurnStarted(_));
         let is_thread_closed = matches!(notification, ServerNotification::ThreadClosed(_));
         let notification_status_change = SideParentStatusChange::for_notification(&notification);
+        let channel_already_existed = self.thread_event_channels.contains_key(&thread_id);
+        let is_primary_thread = self.primary_thread_id == Some(thread_id);
         let (sender, store) = {
             let channel = self.ensure_thread_channel(thread_id);
+            if !channel_already_existed && !is_primary_thread {
+                // A notification proves that the thread exists, but it does not prove that this
+                // TUI connection subscribed to the child event stream. Keep the placeholder
+                // replay-only so selecting it performs a real thread/resume instead of opening a
+                // permanently blank transcript.
+                channel.mark_replay_only();
+            }
             (channel.sender.clone(), Arc::clone(&channel.store))
         };
         let (notification, previous_pending_status, pending_status, turn_stopped) = {

@@ -168,6 +168,7 @@ mod tests {
             input_modalities: None,
             description: Some("Devin, then CodeBuddy, then free Devin".to_string()),
             health_url: None,
+            native_fallback_route: None,
         };
         insta::assert_snapshot!(
             format_route_description(

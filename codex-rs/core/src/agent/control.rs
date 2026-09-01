@@ -106,6 +106,7 @@ pub(crate) struct LiveAgent {
 pub(crate) struct ListedAgent {
     pub(crate) agent_name: String,
     pub(crate) agent_status: AgentStatus,
+    pub(crate) agent_progress: Option<crate::codex_thread::AgentProgressSnapshot>,
 }
 
 /// Control-plane handle for multi-agent operations.
@@ -537,6 +538,7 @@ impl AgentControl {
             agents.push(ListedAgent {
                 agent_name: root_path.to_string(),
                 agent_status: root_thread.agent_status().await,
+                agent_progress: root_thread.agent_progress().await,
             });
         }
 
@@ -562,6 +564,7 @@ impl AgentControl {
             agents.push(ListedAgent {
                 agent_name,
                 agent_status: thread.agent_status().await,
+                agent_progress: thread.agent_progress().await,
             });
         }
 

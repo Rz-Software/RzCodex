@@ -447,9 +447,21 @@ fn list_agents_tool_includes_path_prefix_and_agent_fields() {
             .and_then(|schema| schema.description.as_deref()),
         Some("Task-path prefix filter without a trailing slash. Omit to list all live agents.")
     );
+    let output_schema = output_schema.expect("list_agents output schema");
     assert_eq!(
-        output_schema.expect("list_agents output schema")["properties"]["agents"]["items"]["required"],
-        json!(["agent_name", "agent_status"])
+        output_schema["properties"]["agents"]["items"]["required"],
+        json!(["agent_name", "agent_status", "agent_progress"])
+    );
+    let progress = &output_schema["properties"]["agents"]["items"]["properties"]["agent_progress"];
+    assert_eq!(
+        progress["required"],
+        json!([
+            "tool_calls",
+            "last_activity_at_ms",
+            "last_completed_tool",
+            "successful_mutations",
+            "changed_paths"
+        ])
     );
 }
 

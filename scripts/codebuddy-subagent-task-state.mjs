@@ -10,6 +10,7 @@ const CHECKPOINT_REQUEST = /\b(?:checkpoint(?:\/report)?|status report|progress 
 const IMMEDIATE_RETURN = /\b(?:return|report|respond)\b[\s\S]{0,80}\b(?:immediately|now|current|where)\b/i;
 const NO_MUTATION_REASON = /(?:^|\n)NO_MUTATION_REASON:\s*(\{[^\r\n]+\})\s*(?:\r?\n|$)/;
 const NO_MUTATION_CATEGORIES = new Set(["policy", "permission", "tool", "missing_input", "semantic"]);
+const NON_TERMINAL_COMPLETION = /^(?:i(?:\s+need\s+to|\s+will|(?:'|’)ll|\s+am\s+going\s+to)|let\s+me|continuing\b|investigation\s+deferred\b|awaiting\b)/i;
 
 export class TaskStateError extends Error {
   constructor(message) {
@@ -352,6 +353,26 @@ export function validateNoMutationCompletion(taskState, finalText, pendingCalls)
     detailHash: sha256(reason.detail),
     detailLength: reason.detail.length,
   };
+}
+
+export function validateTerminalCompletion(
+  taskState,
+  finalText,
+  pendingCalls = [],
+  { providerMutationCount = 0 } = {},
+) {
+  const text = typeof finalText === "string" ? finalText.trim() : "";
+  if (pendingCalls.length > 0) return null;
+  if (!text) {
+    throw new TaskStateError("provider completed without a terminal report");
+  }
+  if (NON_TERMINAL_COMPLETION.test(text)) {
+    throw new TaskStateError(
+      "provider returned an intention or deferred-work preamble instead of a terminal result or concrete blocker",
+    );
+  }
+  if (providerMutationCount > 0) return null;
+  return validateNoMutationCompletion(taskState, text, pendingCalls);
 }
 
 export function authoritativeProgressReport(taskState, noMutationReason) {

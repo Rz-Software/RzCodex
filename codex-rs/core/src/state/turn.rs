@@ -1,5 +1,6 @@
 //! Turn-scoped state and active turn metadata scaffolding.
 
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -110,6 +111,10 @@ pub(crate) struct TurnState {
     granted_permissions_by_environment_id: HashMap<String, AdditionalPermissionProfile>,
     strict_auto_review_enabled: bool,
     pub(crate) tool_calls: u64,
+    pub(crate) last_activity_at_ms: Option<i64>,
+    pub(crate) last_completed_tool: Option<String>,
+    pub(crate) successful_mutations: u64,
+    pub(crate) changed_paths: BTreeSet<String>,
     pub(crate) has_memory_citation: bool,
     pub(crate) token_usage_at_turn_start: TokenUsage,
     /// The last step captured for execution or selected from a speculative fallback.

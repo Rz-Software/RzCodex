@@ -28,7 +28,7 @@ import {
   progressPromptSection,
   taskDeliveryDiagnostics,
   taskStateFromInput,
-  validateNoMutationCompletion,
+  validateTerminalCompletion,
 } from "./codebuddy-subagent-task-state.mjs";
 
 const PROVIDER_ID = "codebuddy";
@@ -1412,7 +1412,7 @@ async function handleResponses(request, response) {
     }
     let noMutationReason;
     try {
-      noMutationReason = validateNoMutationCompletion(
+      noMutationReason = validateTerminalCompletion(
         context.taskState,
         providerFinalText,
         result.calls,
@@ -1994,12 +1994,12 @@ function selfTest() {
   }
   const zeroMutation = normalizeSelfTestRequest([mutationTaskItem]);
   try {
-    validateNoMutationCompletion(zeroMutation.taskState, "I stopped without editing.", []);
+    validateTerminalCompletion(zeroMutation.taskState, "I stopped without editing.", []);
     throw new Error("self-test failed: zero-mutation completion requires a structured reason");
   } catch (error) {
     if (!String(error.message).includes("no structured no_mutation_reason")) throw error;
   }
-  const recordedReason = validateNoMutationCompletion(
+  const recordedReason = validateTerminalCompletion(
     zeroMutation.taskState,
     "Blocked.\nNO_MUTATION_REASON: {\"category\":\"missing_input\",\"detail\":\"parent must choose the target\",\"resolvable_tool\":null}",
     [],
@@ -2007,6 +2007,23 @@ function selfTest() {
   if (!recordedReason || recordedReason.category !== "missing_input" || "detail" in recordedReason) {
     throw new Error("self-test failed: no-mutation diagnostics must be structured and sanitized");
   }
+  for (const preamble of [
+    "I need to find the actual log before I can continue.",
+    "I'll continue the investigation and make the edit next.",
+    "Investigation deferred to the client runtime; awaiting the real command result before proceeding.",
+  ]) {
+    try {
+      validateTerminalCompletion(readOnlyTask.taskState, preamble, []);
+      throw new Error("self-test failed: non-terminal provider narration was accepted");
+    } catch (error) {
+      if (!String(error.message).includes("intention or deferred-work preamble")) throw error;
+    }
+  }
+  validateTerminalCompletion(
+    readOnlyTask.taskState,
+    "Confirmed: the requested symbol is defined once in the bounded source file.",
+    [],
+  );
   if (
     context.toolInfo.definitions.length !== 6 ||
     !context.toolInfo.byWire.has("apply_patch") ||

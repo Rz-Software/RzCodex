@@ -79,6 +79,13 @@ function incompleteStreamError(observation, detail = "Fallback bridge ended with
   return attachStreamObservation(error, observation, true);
 }
 
+function isMeaningfulStreamEvent(event) {
+  if (event.type === "response.in_progress") {
+    return typeof event.payload?.response?.metadata?.provider_activity === "string";
+  }
+  return event.type !== "response.created";
+}
+
 export function completedResponseFromRecoverableStream(error) {
   if (error?.recoverableStreamFailure !== true || !Array.isArray(error.completedOutputItems)) return null;
   const output = error.completedOutputItems.filter((item) => item?.type !== "reasoning");
@@ -340,7 +347,6 @@ export async function runResponsesBridge({
       body: JSON.stringify(body),
       signal: controller.signal,
     });
-    resetInactivityTimer();
   } catch (error) {
     clearTimeout(inactivityTimer);
     clearTimeout(requestTimer);
@@ -365,7 +371,6 @@ export async function runResponsesBridge({
     let totalBytes = 0;
     const accept = async (event) => {
       observeStreamEvent(observation, event);
-      resetInactivityTimer();
       if (event.type === "response.failed") {
         const error = event.payload?.response?.error;
         throw providerFailure(error);
@@ -388,16 +393,21 @@ export async function runResponsesBridge({
       }
     };
     for await (const chunk of response.body) {
-      resetInactivityTimer();
       const bytes = Buffer.from(chunk);
       totalBytes += bytes.length;
       if (totalBytes > maxResponseBytes) {
         await response.body.cancel().catch(() => {});
         throw new ProviderRouteError(`Fallback bridge response exceeded ${maxResponseBytes} bytes`);
       }
-      for (const event of decoder.push(bytes)) await accept(event);
+      for (const event of decoder.push(bytes)) {
+        if (isMeaningfulStreamEvent(event)) resetInactivityTimer();
+        await accept(event);
+      }
     }
-    for (const event of decoder.finish()) await accept(event);
+    for (const event of decoder.finish()) {
+      if (isMeaningfulStreamEvent(event)) resetInactivityTimer();
+      await accept(event);
+    }
     if (!completed) throw incompleteStreamError(observation);
     return completed;
   } catch (error) {

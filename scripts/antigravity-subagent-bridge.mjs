@@ -13,6 +13,7 @@ import {
   normalizeAgentMessageContent,
   taskDeliveryDiagnostics,
   taskStateFromInput,
+  validateTerminalCompletion,
 } from "./codebuddy-subagent-task-state.mjs";
 
 const PROVIDER_ID = "antigravity";
@@ -186,7 +187,12 @@ function attachTurnProgress(error, turn) {
   error.peakContextTokens = Number(turn.peakContextTokens || 0);
   error.generatedTokens = Number(turn.generatedTokens || 0);
   error.generationSeconds = Number(turn.generationSeconds || 0);
-  if (error.toolCalls > 0 || error.rzMcpTools.length > 0 || error.subagentActivity) {
+  if (
+    error.mutationToolCalls > 0
+    || error.rzMcpTools.length > 0
+    || error.subagentActivity
+    || error.forbiddenToolName
+  ) {
     error.routeCommitted = true;
   }
   return error;
@@ -661,10 +667,6 @@ function applyInterruptedProgress(target, progress) {
   target.generatedTokens = progress.generatedTokens + Number(target.generatedTokens || 0);
   target.generationSeconds = progress.generationSeconds + Number(target.generationSeconds || 0);
   target.durationSeconds = progress.durationSeconds + Number(target.durationSeconds || 0);
-  if (progress.streamContinuations > 0) {
-    target.routeCommitted = true;
-    target.safeToRetry = false;
-  }
   return target;
 }
 
@@ -706,8 +708,8 @@ async function runWithInterruptedStreamRecovery(
       session.close?.();
       throw error;
     }
-    const hasCommittedMutation = progress.mutationToolCalls > 0 || progress.rzMcpTools.size > 0;
-    const remainingUncommittedMs = uncommittedRouteDeadline && !hasCommittedMutation
+    const hasProviderActivity = progress.toolCalls > 0;
+    const remainingUncommittedMs = uncommittedRouteDeadline && !hasProviderActivity
       ? uncommittedRouteDeadline - now()
       : null;
     if (remainingUncommittedMs !== null && remainingUncommittedMs <= 0) {
@@ -907,6 +909,7 @@ class AntigravitySession {
         this.turn.toolStepKeys.add(stepKey);
         if (typeof name === "string") this.turn.toolNames.add(name);
         if (firstObservation) {
+          clearUncommittedRouteTimer(this.turn);
           this.turn.onProgress?.({
             kind: "tool",
             index: this.turn.toolStepKeys.size,
@@ -1019,7 +1022,7 @@ class AntigravitySession {
         && error.rzMcpTools.length === 0
         && !error.subagentActivity
         && !error.forbiddenToolName;
-      error.routeCommitted = interruptedStream || !error.safeToRetry;
+      error.routeCommitted = !error.safeToRetry;
       turn.reject(error);
       if (!interruptedStream) this.close();
       return;
@@ -1411,6 +1414,14 @@ async function handleResponses(request, response) {
       diagnostics = diagnosticsFor(prompt, false);
       result = await runSession(session, prompt);
     }
+    try {
+      validateTerminalCompletion(context.taskState, result.text, [], {
+        providerMutationCount: result.mutationToolCalls + result.rzMcpTools.length,
+      });
+    } catch (error) {
+      if (error instanceof TaskStateError) throw new BridgeError(error.message, 502);
+      throw error;
+    }
     for (const key of context.messageKeys) session.seenMessageKeys.add(key);
     runtime.completed += 1;
     runtime.lastActualModel = session.model;
@@ -1747,16 +1758,23 @@ async function selfTest() {
       tool_info: { name: "grep_search", parameters: {} },
     },
   });
-  const uncommittedTimeoutFailure = await uncommittedTimeoutPromise.catch((error) => error);
+  await new Promise((resolve) => setTimeout(resolve, 15));
+  uncommittedTimeoutSession.finishTurn({
+    status: "SUCCESS",
+    response: "read-only result",
+    conversation_id: "uncommitted-timeout-fixture",
+    duration_seconds: 0.01,
+    usage: {},
+  });
+  const uncommittedTimeoutResult = await uncommittedTimeoutPromise;
   if (
-    uncommittedTimeoutFailure?.uncommittedRouteTimeout !== true
-    || uncommittedTimeoutFailure.safeToRetry !== true
-    || uncommittedTimeoutFailure.routeCommitted !== false
-    || uncommittedTimeoutFailure.toolCalls !== 1
-    || uncommittedTimeoutFailure.mutationToolCalls !== 0
+    uncommittedTimeoutResult.text !== "read-only result"
+    || uncommittedTimeoutResult.toolCalls !== 1
+    || uncommittedTimeoutResult.mutationToolCalls !== 0
   ) {
-    throw new Error("read-only Antigravity mutation-route timeout did not remain safe to reroute");
+    throw new Error("read-only Antigravity activity did not clear the pre-work route deadline");
   }
+  uncommittedTimeoutSession.close();
   const committedTimeoutSession = new AntigravitySession(
     "committed-timeout-fixture",
     process.cwd(),
@@ -1971,10 +1989,10 @@ async function selfTest() {
   if (
     terminalRecoveryRun !== 2
     || terminalRecoveryFailure?.streamContinuations !== 1
-    || terminalRecoveryFailure?.routeCommitted !== true
-    || terminalRecoveryFailure?.safeToRetry !== false
+    || terminalRecoveryFailure?.routeCommitted !== false
+    || terminalRecoveryFailure?.safeToRetry !== true
   ) {
-    throw new Error("post-interruption terminal failure was eligible for unsafe replay");
+    throw new Error("read-only post-interruption terminal failure was not eligible for rerouting");
   }
   const abortedRecoveryController = new AbortController();
   abortedRecoveryController.abort();
