@@ -7,6 +7,14 @@ const RZMCP_BRIDGE = "G:/QANGA/Plugins/RzDirectMCP/Source/RzMCP/rzmcp-bridge.mjs
 const MAX_SEARCH_RESULTS = 5;
 const MAX_SEARCH_OUTPUT_BYTES = 96 * 1024;
 const STDERR_LIMIT = 8 * 1024;
+const RZMCP_MODE = process.env.RZCODEX_SUBAGENT_RZMCP_MODE || "full";
+const VALID_RZMCP_MODES = new Set(["full", "no-validation", "read-only", "disabled"]);
+const READ_ONLY_TOOL_NAME = /^(?:analyze|check|count|describe|discover|does|enumerate|find|get|has|inspect|is|list|locate|query|read|resolve|search|validate)_/i;
+const VALIDATION_TOOL_NAME = /(?:^|_)(?:automation|build|close_editor|compile|cook|launch|open_level|package|pie|play|restart|shutdown|sie|test)(?:_|$)/i;
+
+if (!VALID_RZMCP_MODES.has(RZMCP_MODE)) {
+  throw new Error(`Invalid RzMCP subagent mode ${json(RZMCP_MODE)}`);
+}
 
 class ProxyError extends Error {}
 
@@ -71,6 +79,18 @@ export function searchCatalog(tools, query, requestedLimit = 3) {
       description: typeof tool.description === "string" ? tool.description : "",
       inputSchema: tool.inputSchema ?? { type: "object", additionalProperties: true },
     }));
+}
+
+export function catalogForMode(tools, mode) {
+  if (mode === "full") return tools;
+  if (mode === "disabled") return [];
+  if (mode === "no-validation") {
+    return tools.filter((tool) => !VALIDATION_TOOL_NAME.test(tool.name));
+  }
+  if (mode === "read-only") {
+    return tools.filter((tool) => READ_ONLY_TOOL_NAME.test(tool.name));
+  }
+  throw new ProxyError(`Unknown RzMCP mode ${json(mode)}`);
 }
 
 class RzMcpClient {
@@ -218,6 +238,24 @@ function selfTest() {
   if (exact.length !== 1 || exact[0].name !== "get_project_info") throw new Error("exact search failed");
   const focused = searchCatalog(tools, "project index", 1);
   if (focused.length !== 1 || focused[0].name !== "search_project_index") throw new Error("focused search failed");
+  const permissionTools = [
+    ...tools,
+    { name: "compile_project", description: "Compile", inputSchema: { type: "object" } },
+    { name: "save_asset", description: "Save", inputSchema: { type: "object" } },
+    { name: "inspect_graph_by_path", description: "Inspect", inputSchema: { type: "object" } },
+  ];
+  const readOnlyNames = catalogForMode(permissionTools, "read-only").map((tool) => tool.name);
+  const noValidationNames = catalogForMode(permissionTools, "no-validation").map((tool) => tool.name);
+  if (
+    readOnlyNames.includes("compile_project")
+    || readOnlyNames.includes("save_asset")
+    || !readOnlyNames.includes("inspect_graph_by_path")
+    || noValidationNames.includes("compile_project")
+    || !noValidationNames.includes("save_asset")
+    || catalogForMode(permissionTools, "disabled").length !== 0
+  ) {
+    throw new Error("RzMCP execution mode filtering failed");
+  }
   if (Buffer.byteLength(json(PROXY_TOOLS)) > 4 * 1024) throw new Error("proxy tool surface is unexpectedly large");
   process.stdout.write("devin-rzmcp-lazy-proxy self-test: ok\n");
 }
@@ -245,7 +283,7 @@ async function handle(message) {
     return;
   }
   if (message.method === "tools/list") {
-    result(message.id, { tools: PROXY_TOOLS });
+    result(message.id, { tools: RZMCP_MODE === "disabled" ? [] : PROXY_TOOLS });
     return;
   }
   if (message.method !== "tools/call") {
@@ -256,7 +294,11 @@ async function handle(message) {
     const name = message.params?.name;
     const args = message.params?.arguments;
     if (name === "search_rzmcp_tools") {
-      const matches = searchCatalog(await client.catalog(), args?.query, args?.limit);
+      const matches = searchCatalog(
+        catalogForMode(await client.catalog(), RZMCP_MODE),
+        args?.query,
+        args?.limit,
+      );
       const text = json({ matches });
       if (Buffer.byteLength(text) > MAX_SEARCH_OUTPUT_BYTES) {
         throw new ProxyError(`focused search output is ${Buffer.byteLength(text)} bytes; narrow the query or lower the limit`);

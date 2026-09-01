@@ -73,6 +73,9 @@ const DEVIN_DB = join(process.env.APPDATA || join(homedir(), "AppData", "Roaming
 const QUOTA_FAILURE = /(?:daily|weekly|included|usage)[\s\S]{0,100}quota[\s\S]{0,100}(?:exhaust|exceed|reach|limit)|quota[\s\S]{0,100}(?:exhaust|exceed|reach|limit)/i;
 const RESOURCE_EXHAUSTED = /cognition\.ai\/errorKind[\s\S]{0,100}resource_exhausted|resource_exhausted[\s\S]{0,100}cognition\.ai\/retryable[\s\S]{0,20}true/i;
 const INTERRUPTED_STREAM = /stream (?:was )?interrupted|stream disconnected|connection (?:closed|reset)|unexpected end of (?:file|stream)|please continue the task you were working on/i;
+const EXPLICIT_READ_ONLY_TASK = /\bread[- ]only\b|\bno[- ]mutation\b|\b(?:do not|must not|never)\s+(?:edit|modify|write|mutate)(?:\s+(?:any|the|source|project|workspace|files?)){0,3}(?:[.;,]|$)/i;
+const VALIDATION_RESTRICTED_TASK = /\b(?:do not|must not|never)[^.\n]{0,160}\b(?:build|compile|run\s+(?:the\s+)?tests?|test|control\s+(?:the\s+)?editor|use\s+(?:the\s+)?editor|pie|sie)\b/i;
+const RZMCP_RESTRICTED_TASK = /\b(?:do not|must not|never)[^.\n]{0,160}\b(?:use|invoke|control|call)\s+(?:any\s+|the\s+)?(?:editor|rzmcp)\b/i;
 const QUOTA_STATE_VERSION = 2;
 
 class BridgeError extends Error {
@@ -238,6 +241,32 @@ function sanitizedEnvironment(source = process.env) {
     "OLLAMA_API_KEY",
   ]) delete env[key];
   return env;
+}
+
+function executionPolicyFromTaskState(taskState) {
+  const taskText = taskState?.activeTask?.text || "";
+  const readOnly = EXPLICIT_READ_ONLY_TASK.test(taskText);
+  const validationRestricted = VALIDATION_RESTRICTED_TASK.test(taskText);
+  const rzMcpRestricted = RZMCP_RESTRICTED_TASK.test(taskText);
+  return {
+    permissionMode: readOnly ? "auto" : validationRestricted ? "accept-edits" : "dangerous",
+    rzMcpMode: rzMcpRestricted
+      ? "disabled"
+      : readOnly
+        ? "read-only"
+        : validationRestricted
+          ? "no-validation"
+          : "full",
+    readOnly,
+    validationRestricted,
+  };
+}
+
+function providerEnvironment(executionPolicy) {
+  return {
+    ...sanitizedEnvironment(),
+    RZCODEX_SUBAGENT_RZMCP_MODE: executionPolicy.rzMcpMode,
+  };
 }
 
 function centralRoute() {
@@ -423,6 +452,7 @@ const runtime = {
   lastWorkingDirectory: null, lastTaskId: null, lastTaskName: null, lastTaskHash: null,
   lastTaskIntent: null, lastTaskDeliveryMode: null, lastTaskPartTypes: [],
   lastTaskPartLengths: [], lastCompleteTaskDelivered: false,
+  lastPermissionMode: null, lastRzMcpMode: null,
   actualByConfiguredRoute: { auto: null, ollama: null, "devin-free": null },
 };
 
@@ -636,11 +666,13 @@ function promptFrom(body) {
   }
   const requestId = randomUUID();
   const workingDirectory = workingDirectoryFrom(body, input);
+  const executionPolicy = executionPolicyFromTaskState(taskState);
   const threadId = typeof body.client_metadata?.thread_id === "string"
     ? body.client_metadata.thread_id
     : null;
   const sections = [
     `[Native delegated coding contract]\nRzCodex request ID: ${requestId}\nWork directly in the supplied workspace as the bounded native sub-agent. Use the file and command tools available in this turn. Do not spawn provider-side subagents. Honor project AGENTS.md ownership boundaries exactly; when builds, tests, editor control, PIE, runtime validation, or RzMCP execution are reserved to the parent, do not invoke them and instead report the exact checks the parent should run. For Unreal/RzMCP work that is within your assigned ownership, use only the lazy RzMCP proxy surface: search with an exact or focused query, then call only a discovered tool. Never use or request the full RzMCP catalog. On Windows, use PowerShell-native commands, single-quote ripgrep patterns containing |, and never assume Unix-only commands such as head are installed. Return concise evidence as soon as the bounded task is complete or genuinely blocked.\nAuthoritative workspace: ${workingDirectory}`,
+    `[Enforced provider permissions]\nFile and command permission mode: ${executionPolicy.permissionMode}. RzMCP mode: ${executionPolicy.rzMcpMode}. These are hard task boundaries, not suggestions.`,
   ];
   const roleInstructions = roleInstructionsFrom(body.instructions);
   if (roleInstructions) sections.push(`[Role instructions]\n${roleInstructions}`);
@@ -718,6 +750,7 @@ function promptFrom(body) {
     threadId,
     taskState,
     taskDiagnostics,
+    executionPolicy,
     toolSchemaBytes,
     modelAlias,
     requestedRoute,
@@ -1105,12 +1138,15 @@ function runCli(
   writeFileSync(promptPath, prompt, { encoding: "utf8", flag: "wx" });
   const args = [
     "--config", ISOLATED_CONFIG, "--model", selectedModel.model_uid,
-    "--permission-mode", "dangerous", "--respect-workspace-trust", "false",
+    "--permission-mode", context.executionPolicy.permissionMode,
+    "--respect-workspace-trust", "false",
     ...(resumeSessionId ? ["--resume", resumeSessionId] : []),
     "-p", "--prompt-file", promptPath,
   ];
   const child = spawn(DEVIN_EXE, args, {
-    cwd: context.workingDirectory, env: sanitizedEnvironment(), windowsHide: true,
+    cwd: context.workingDirectory,
+    env: providerEnvironment(context.executionPolicy),
+    windowsHide: true,
     stdio: ["ignore", "pipe", "pipe"],
   });
   onSpawn(child);
@@ -2030,6 +2066,8 @@ async function handleResponses(request, response) {
   runtime.lastTaskPartTypes = context.taskDiagnostics.taskPartTypes;
   runtime.lastTaskPartLengths = context.taskDiagnostics.taskPartLengths;
   runtime.lastCompleteTaskDelivered = context.taskDiagnostics.completeTaskDelivered;
+  runtime.lastPermissionMode = context.executionPolicy.permissionMode;
+  runtime.lastRzMcpMode = context.executionPolicy.rzMcpMode;
   const selected = initialSelection(context);
   runtime.lastConfiguredRoute = context.requestedRoute;
   runtime.lastFallbackStreamCommitted = false;
@@ -2363,6 +2401,36 @@ async function selfTest() {
     throw new Error("provider credential isolation failed");
   }
   if (isolatedEnvironment.RETAINED_TEST_VALUE !== "retained") throw new Error("environment isolation removed unrelated values");
+  const readOnlyPolicy = executionPolicyFromTaskState({
+    activeTask: { text: "Independent read-only review. Do not edit, build, test, or use Editor/PIE." },
+  });
+  const boundedMutationPolicy = executionPolicyFromTaskState({
+    activeTask: { text: "Implement the bounded source fix. Do not build or run tests." },
+  });
+  const unrestrictedMutationPolicy = executionPolicyFromTaskState({
+    activeTask: { text: "Implement and verify the bounded source fix." },
+  });
+  const scopedMutationPolicy = executionPolicyFromTaskState({
+    activeTask: { text: "Implement the fix. Do not edit unrelated files." },
+  });
+  if (
+    readOnlyPolicy.permissionMode !== "auto"
+    || readOnlyPolicy.rzMcpMode !== "disabled"
+    || boundedMutationPolicy.permissionMode !== "accept-edits"
+    || boundedMutationPolicy.rzMcpMode !== "no-validation"
+    || unrestrictedMutationPolicy.permissionMode !== "dangerous"
+    || unrestrictedMutationPolicy.rzMcpMode !== "full"
+    || scopedMutationPolicy.permissionMode !== "dangerous"
+  ) {
+    throw new Error("task execution permission policy failed");
+  }
+  const readOnlyEnvironment = providerEnvironment(readOnlyPolicy);
+  if (
+    readOnlyEnvironment.RZCODEX_SUBAGENT_RZMCP_MODE !== "disabled"
+    || "OPENAI_API_KEY" in readOnlyEnvironment
+  ) {
+    throw new Error("task execution environment isolation failed");
+  }
   if (!QUOTA_FAILURE.test("Daily usage quota reached")) throw new Error("quota detection failed");
   if (!RESOURCE_EXHAUSTED.test('{"cognition.ai/errorKind":"resource_exhausted","cognition.ai/retryable":true}')) throw new Error("resource exhaustion detection failed");
   const wrappedQuotaFailure = {
