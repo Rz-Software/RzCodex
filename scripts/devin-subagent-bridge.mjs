@@ -42,6 +42,7 @@ const SSE_HEARTBEAT_MS = 15 * 1000;
 const PROVIDER_STREAM_INACTIVITY_MS = 20 * 1000;
 const PROVIDER_RECOVERY_BUDGET_MS = 45 * 1000;
 const PROVIDER_RECOVERY_BACKOFF_MS = 1 * 1000;
+const ROUTE_CAPACITY_WAIT_MS = PROVIDER_RECOVERY_BUDGET_MS;
 const NATIVE_PROGRESS_POLL_MS = 1 * 1000;
 const MAX_PROGRESS_EVENTS = 256;
 const FREE_ROUTE_CONCURRENCY = 2;
@@ -475,21 +476,37 @@ function delayWithAbort(milliseconds, signal) {
   });
 }
 
-function acquireCapacity(capacity, limit, signal) {
+function capacityUnavailableError(routeKey, waitedMs = 0) {
+  const detail = waitedMs > 0 ? ` after waiting ${waitedMs}ms` : "";
+  return new BridgeError(`Managed ${routeKey} capacity is unavailable${detail}`, 503);
+}
+
+function rejectCapacityWaiter(capacity, waiter, error) {
+  if (waiter.settled) return;
+  waiter.settled = true;
+  const index = capacity.waiters.indexOf(waiter);
+  if (index !== -1) capacity.waiters.splice(index, 1);
+  clearTimeout(waiter.timer);
+  waiter.signal?.removeEventListener("abort", waiter.onAbort);
+  syncRouteCapacityRuntime();
+  waiter.reject(error);
+}
+
+function acquireCapacity(capacity, limit, signal, routeKey, maxWaitMs) {
   throwIfAborted(signal);
   if (capacity.active < limit) {
     capacity.active += 1;
     syncRouteCapacityRuntime();
     return Promise.resolve();
   }
+  if (maxWaitMs <= 0) return Promise.reject(capacityUnavailableError(routeKey));
   return new Promise((resolve, reject) => {
-    const waiter = { resolve, reject, signal, onAbort: null };
-    waiter.onAbort = () => {
-      const index = capacity.waiters.indexOf(waiter);
-      if (index !== -1) capacity.waiters.splice(index, 1);
-      syncRouteCapacityRuntime();
-      reject(abortError());
-    };
+    const waiter = { resolve, reject, signal, onAbort: null, timer: null, settled: false };
+    waiter.onAbort = () => rejectCapacityWaiter(capacity, waiter, abortError());
+    waiter.timer = setTimeout(
+      () => rejectCapacityWaiter(capacity, waiter, capacityUnavailableError(routeKey, maxWaitMs)),
+      maxWaitMs,
+    );
     signal?.addEventListener("abort", waiter.onAbort, { once: true });
     capacity.waiters.push(waiter);
     syncRouteCapacityRuntime();
@@ -500,8 +517,14 @@ function releaseCapacity(capacity) {
   capacity.active = Math.max(0, capacity.active - 1);
   while (capacity.waiters.length > 0) {
     const waiter = capacity.waiters.shift();
+    if (waiter.settled) continue;
+    waiter.settled = true;
+    clearTimeout(waiter.timer);
     waiter.signal?.removeEventListener("abort", waiter.onAbort);
-    if (waiter.signal?.aborted) continue;
+    if (waiter.signal?.aborted) {
+      waiter.reject(abortError());
+      continue;
+    }
     capacity.active += 1;
     waiter.resolve();
     break;
@@ -509,14 +532,30 @@ function releaseCapacity(capacity) {
   syncRouteCapacityRuntime();
 }
 
-async function withRouteCapacity(selected, signal, callback) {
+async function withRouteCapacity(
+  selected,
+  signal,
+  callback,
+  { skipIfBusy = false, maxWaitMs = ROUTE_CAPACITY_WAIT_MS } = {},
+) {
   const capacity = selected.key === "terminal"
     ? { state: terminalCapacity, limit: FREE_ROUTE_CONCURRENCY }
     : selected.key === "ollama"
       ? { state: ollamaCapacity, limit: route.ollamaMaxConcurrency }
       : null;
   if (!capacity) return callback();
-  await acquireCapacity(capacity.state, capacity.limit, signal);
+  try {
+    await acquireCapacity(
+      capacity.state,
+      capacity.limit,
+      signal,
+      selected.key,
+      skipIfBusy ? 0 : maxWaitMs,
+    );
+  } catch (error) {
+    if (skipIfBusy && error?.status === 503) error.routeSkipped = true;
+    throw error;
+  }
   try {
     return await callback();
   } finally {
@@ -1467,7 +1506,15 @@ async function runOllamaResponsesWithRecovery(body, taskHash, signal, onEvent, o
   }
 }
 
-async function runOllamaStage(context, requestBody, failures, onProgress, signal, streamRelay) {
+async function runOllamaStage(
+  context,
+  requestBody,
+  failures,
+  onProgress,
+  signal,
+  streamRelay,
+  capacityOptions,
+) {
   const selected = ollamaSelection(
     failures.length > 0 ? "auto_ollama_after_prior_provider_failure" : "explicit_ollama_route",
   );
@@ -1515,7 +1562,7 @@ async function runOllamaStage(context, requestBody, failures, onProgress, signal
         ),
         streamRelay,
       };
-    });
+    }, capacityOptions);
   } catch (error) {
     if (streamRelay.committed) error.routeCommitted = true;
     throw error;
@@ -1569,21 +1616,31 @@ async function runCodeBuddyStage(context, requestBody, failures, onProgress, sig
   }
 }
 
-async function runDevinStage(context, selected, failures, onSpawn, onProgress, signal, terminalFallback) {
+async function runDevinStage(
+  context,
+  selected,
+  failures,
+  onSpawn,
+  onProgress,
+  signal,
+  terminalFallback,
+  capacityOptions,
+) {
   const freeModel = selected.key === "terminal";
   const providerKey = freeModel ? "devinFree" : "devin";
   runtime.providerAttempts[providerKey] += 1;
   runtime.lastProviderSequence.push(terminalFallback ? "devin-free" : "devin");
-  onProgress?.(`Devin native worker started with ${selected.model.label}.\n`);
-  const routeResult = await withRouteCapacity(selected, signal, () =>
-    runCliWithProviderRecovery(
+  const routeResult = await withRouteCapacity(selected, signal, () => {
+    onProgress?.(`Devin native worker started with ${selected.model.label}.\n`);
+    return runCliWithProviderRecovery(
       context,
       selected.model,
       onSpawn,
       ({ index, name }) => onProgress?.(`Devin native tool ${index}: ${progressToolName(name)}.\n`),
       signal,
       Date.now() + REQUEST_TIMEOUT_MS,
-    ));
+    );
+  }, capacityOptions);
   if (!freeModel && isQuotaFailure(routeResult.cliResult)) {
     if (routeResult.session?.toolCalls?.some((call) => call?.name)) {
       const error = preserveProviderCommit(
@@ -1652,6 +1709,7 @@ async function executeAuto(context, requestBody, onSpawn, onProgress, signal, cr
           onProgress,
           signal,
           createStreamRelay({ forwardReasoningSummaries: true, providerLabel: "Ollama" }),
+          { skipIfBusy: true },
         ),
       },
       {
@@ -1659,7 +1717,16 @@ async function executeAuto(context, requestBody, onSpawn, onProgress, signal, cr
         run: ({ failures }) => {
           runtime.terminalFallbacks += 1;
           const selected = terminalSelection("auto_terminal_devin_free");
-          return runDevinStage(context, selected, failures, onSpawn, onProgress, signal, true);
+          return runDevinStage(
+            context,
+            selected,
+            failures,
+            onSpawn,
+            onProgress,
+            signal,
+            true,
+            { skipIfBusy: true },
+          );
         },
       },
         {
@@ -2858,6 +2925,66 @@ async function selfTest() {
     || runtime.queuedFreeRequests !== 0
   ) {
     throw new Error("Devin free route capacity failed");
+  }
+  let releaseFreeCapacityHolders;
+  const freeCapacityGate = new Promise((resolve) => { releaseFreeCapacityHolders = resolve; });
+  const freeCapacityHolders = Array.from({ length: FREE_ROUTE_CONCURRENCY }, () =>
+    withRouteCapacity(freeRoute, undefined, () => freeCapacityGate));
+  await delayWithAbort(1);
+  let saturatedAutoError;
+  try {
+    await withRouteCapacity(
+      freeRoute,
+      undefined,
+      async () => { throw new Error("saturated auto route unexpectedly acquired capacity"); },
+      { skipIfBusy: true },
+    );
+  } catch (error) {
+    saturatedAutoError = error;
+  }
+  if (saturatedAutoError?.status !== 503 || saturatedAutoError?.routeSkipped !== true) {
+    throw new Error("saturated auto route did not skip to the next provider");
+  }
+  const saturatedAutoChain = await runOrderedProviderChain({
+    stages: [
+      {
+        name: "devin-free",
+        run: () => withRouteCapacity(
+          freeRoute,
+          undefined,
+          async () => { throw new Error("saturated auto chain unexpectedly acquired capacity"); },
+          { skipIfBusy: true },
+        ),
+      },
+      { name: "codebuddy", run: async () => "next-provider" },
+    ],
+  });
+  if (saturatedAutoChain.stage !== "codebuddy" || saturatedAutoChain.value !== "next-provider") {
+    throw new Error("saturated auto chain did not continue to the next provider");
+  }
+  let boundedCapacityError;
+  try {
+    await withRouteCapacity(
+      freeRoute,
+      undefined,
+      async () => { throw new Error("bounded route unexpectedly acquired capacity"); },
+      { maxWaitMs: 5 },
+    );
+  } catch (error) {
+    boundedCapacityError = error;
+  }
+  if (boundedCapacityError?.status !== 503 || boundedCapacityError?.routeSkipped === true) {
+    throw new Error("explicit route capacity wait was not bounded");
+  }
+  releaseFreeCapacityHolders();
+  await Promise.all(freeCapacityHolders);
+  if (
+    terminalCapacity.active !== 0
+    || terminalCapacity.waiters.length !== 0
+    || runtime.activeFreeRequests !== 0
+    || runtime.queuedFreeRequests !== 0
+  ) {
+    throw new Error("bounded route capacity cleanup failed");
   }
   let concurrentOllamaCalls = 0;
   let peakConcurrentOllamaCalls = 0;
