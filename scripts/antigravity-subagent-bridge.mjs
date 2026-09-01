@@ -70,16 +70,17 @@ inheritCustomizations: false
 
 # RzCodex native worker
 
-You are already a bounded native sub-agent owned by a separate Codex main agent. Work directly on the assigned task. Never delegate, invoke another agent, define an agent, or create background work. Honor project AGENTS.md ownership boundaries exactly; when builds, tests, editor control, PIE, runtime validation, or RzMCP execution are reserved to the parent, do not invoke them and instead report the exact checks the parent should run. Use run_command for read-only inspection only; never edit, create, move, delete, build, test, or invoke a side-effecting script through it. On Windows, use PowerShell-native commands, single-quote ripgrep patterns containing |, and never assume Unix-only commands such as head are installed. A long run_command may be moved to the background by the client runtime; manage only that command with manage_task and do not poll it repeatedly. Use the dedicated file tools for file mutations. Keep each reasoning/tool cycle focused, return promptly when the task is complete, and return a concise concrete blocker or question when the main agent must decide something.
+You are already a bounded native sub-agent owned by a separate Codex main agent. Work directly on the assigned task. Never delegate, invoke another agent, define an agent, or create background work. Honor project AGENTS.md ownership boundaries exactly; when builds, tests, editor control, PIE, runtime validation, or RzMCP execution are reserved to the parent, do not invoke them and instead report the exact checks the parent should run. Use run_command for read-only inspection only; never edit, create, move, delete, build, test, or invoke a side-effecting script through it. On Windows, use PowerShell-native commands, single-quote ripgrep patterns containing |, and never assume Unix-only commands such as head are installed. A long run_command may be moved to the background by the client runtime; manage only that command with manage_task and do not poll it repeatedly. If manage_task reports that exact command is still running and there is no other useful work, schedule at most one wait of 10 seconds or less with Prompt "Wait for task-N to finish" and TimerCondition set to that exact task; never use schedule for future work, recurring work, delegation, or a new prompt. Use the dedicated file tools for file mutations. Keep each reasoning/tool cycle focused, return promptly when the task is complete, and return a concise concrete blocker or question when the main agent must decide something.
 `;
 const MUTATION_TOOLS = new Set(["multi_replace_file_content", "replace_file_content", "sed_file", "write_to_file"]);
+const BOUNDED_WAIT_TOOL = "schedule";
+const MAX_BOUNDED_WAIT_SECONDS = 10;
 const FORBIDDEN_AGENT_TOOLS = new Set([
   "browser_subagent",
   "define_subagent",
   "invoke_subagent",
   "manage_inbox",
   "manage_subagents",
-  "schedule",
   "send_message",
 ]);
 const REQUIRED_AGENT_TOOLS = new Set(["call_mcp_tool", "grep_search", "manage_task", "replace_file_content", "run_command", "view_file", "write_to_file"]);
@@ -99,6 +100,19 @@ function json(value) {
 
 function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
+}
+
+function isBoundedTaskWait(parameters, conversationId) {
+  if (!parameters || typeof parameters !== "object" || typeof conversationId !== "string" || !conversationId) return false;
+  const durationSeconds = Number(parameters.DurationSeconds ?? parameters.duration_seconds);
+  const prompt = String(parameters.Prompt ?? parameters.prompt ?? "").trim();
+  const timerCondition = String(parameters.TimerCondition ?? parameters.timer_condition ?? "").trim();
+  const prefix = `${conversationId}/task-`;
+  if (!Number.isInteger(durationSeconds) || durationSeconds < 1 || durationSeconds > MAX_BOUNDED_WAIT_SECONDS) return false;
+  if (!timerCondition.startsWith(prefix)) return false;
+  const taskNumber = timerCondition.slice(prefix.length);
+  if (!/^\d+$/.test(taskNumber)) return false;
+  return new RegExp(`^wait (?:briefly )?for task-${taskNumber} to (?:finish|complete)[.!]?$`, "i").test(prompt);
 }
 
 function assertObject(value, label) {
@@ -841,8 +855,10 @@ class AntigravitySession {
       }
       if (step.step_type === "tool") {
         const name = step.tool_name || step.tool_info?.name;
+        const parameters = step.tool_info?.parameters || {};
         const stepIndex = Number.isInteger(step.step_index) ? step.step_index : `unknown-${this.turn.unknownToolSteps++}`;
         const stepKey = `${step.conversation_id || this.init?.conversationId || "unknown"}:${stepIndex}`;
+        const conversationId = step.conversation_id || this.init?.conversationId || null;
         const firstObservation = !this.turn.toolStepKeys.has(stepKey);
         this.turn.toolStepKeys.add(stepKey);
         if (typeof name === "string") this.turn.toolNames.add(name);
@@ -854,7 +870,8 @@ class AntigravitySession {
           });
         }
         if (firstObservation && MUTATION_TOOLS.has(name)) this.turn.mutationToolStepKeys.add(stepKey);
-        if (firstObservation && FORBIDDEN_AGENT_TOOLS.has(name)) {
+        const invalidBoundedWait = name === BOUNDED_WAIT_TOOL && !isBoundedTaskWait(parameters, conversationId);
+        if (firstObservation && (FORBIDDEN_AGENT_TOOLS.has(name) || invalidBoundedWait)) {
           this.turn.forbiddenToolName = name;
           const error = attachTurnProgress(
             new BridgeError(`Antigravity attempted forbidden orchestration tool ${json(name)}`, 502, "provider_state_changed"),
@@ -864,7 +881,6 @@ class AntigravitySession {
           return;
         }
         if (name === "call_mcp_tool") {
-          const parameters = step.tool_info?.parameters || {};
           const server = parameters.ServerName || parameters.server_name || parameters.server || parameters.mcp_server;
           const tool = parameters.ToolName || parameters.tool_name || parameters.name;
           if (server === LAZY_MCP_SERVER && typeof tool === "string") this.turn.rzMcpTools.add(tool);
@@ -1465,6 +1481,7 @@ function health() {
       forceDisableFundamentalComponents: true,
       forbiddenToolPolicy: "terminate_committed_turn",
       forbiddenTools: [...FORBIDDEN_AGENT_TOOLS],
+      boundedWaitToolPolicy: `${BOUNDED_WAIT_TOOL} may only wait up to ${MAX_BOUNDED_WAIT_SECONDS}s for an existing command task`,
       initReportsProviderBaseToolSurface: true,
     },
     routing: {
@@ -1859,6 +1876,51 @@ async function selfTest() {
   });
   if (!initResolved || initRejected || runtime.lastInitializedForbiddenTools.length !== FORBIDDEN_AGENT_TOOLS.size) {
     throw new Error("provider base-tool init surface was mistaken for the effective agent allowlist");
+  }
+  const boundedWaitSession = new AntigravitySession("bounded-wait-fixture", process.cwd(), "task", models.primary, () => {});
+  boundedWaitSession.close = () => {};
+  boundedWaitSession.init = { conversationId: "bounded-wait-fixture" };
+  boundedWaitSession.initSettled = true;
+  let boundedWaitFailure;
+  boundedWaitSession.turn = {
+    cleanup: () => {},
+    reject: (error) => { boundedWaitFailure = error; },
+    generatedTokens: 0,
+    toolNames: new Set(),
+    toolStepKeys: new Set(),
+    mutationToolStepKeys: new Set(),
+    rzMcpTools: new Set(),
+    subagentActivity: false,
+    forbiddenToolName: null,
+    unknownToolSteps: 0,
+  };
+  boundedWaitSession.consumeEvent({
+    event: "step_update",
+    step_update: {
+      conversation_id: "bounded-wait-fixture",
+      step_index: 0,
+      state: "DONE",
+      step_type: "tool",
+      tool_name: BOUNDED_WAIT_TOOL,
+      tool_info: {
+        name: BOUNDED_WAIT_TOOL,
+        parameters: {
+          DurationSeconds: 2,
+          Prompt: "Wait for task-30 to finish",
+          TimerCondition: "bounded-wait-fixture/task-30",
+        },
+      },
+    },
+  });
+  if (boundedWaitFailure || boundedWaitSession.turn?.forbiddenToolName || !boundedWaitSession.turn?.toolNames.has(BOUNDED_WAIT_TOOL)) {
+    throw new Error("bounded Antigravity command wait was rejected as orchestration");
+  }
+  if (isBoundedTaskWait({
+    DurationSeconds: MAX_BOUNDED_WAIT_SECONDS + 1,
+    Prompt: "Wait for task-30 to finish",
+    TimerCondition: "bounded-wait-fixture/task-30",
+  }, "bounded-wait-fixture")) {
+    throw new Error("unbounded Antigravity command wait was accepted");
   }
   const forbiddenSession = new AntigravitySession("forbidden-fixture", process.cwd(), "task", models.primary, () => {});
   forbiddenSession.close = () => {};
