@@ -2246,6 +2246,7 @@ function health(requestedRoute = "auto") {
         uid: models.terminal.model_uid,
         label: models.terminal.label,
         cost: models.terminal.cost_summary || models.terminal.cost_tier,
+        maxConcurrency: FREE_ROUTE_CONCURRENCY,
       },
       codebuddy: {
         provider: "codebuddy",
@@ -2262,6 +2263,10 @@ function health(requestedRoute = "auto") {
       },
       orderedPolicy: "antigravity_primary_then_antigravity_quota_fallback_then_devin_primary_then_ollama_then_devin_free_then_codebuddy_then_native_openai",
       configuredProviderOrder: route.autoProviderOrder,
+      capacityPolicy: {
+        autoWhenSaturated: "continue_to_next_provider",
+        explicitRouteMaxWaitMs: ROUTE_CAPACITY_WAIT_MS,
+      },
       quotaDetection: "explicit_daily_or_weekly_quota_failure_with_single_bounded_recovery_probe_every_30_minutes",
     },
     apiKeysStripped: true, ollamaApiKeyRequired: false,
