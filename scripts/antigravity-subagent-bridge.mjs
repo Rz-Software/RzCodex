@@ -27,6 +27,7 @@ const MAX_HISTORY_ENTRY_CHARS = 8_000;
 const MAX_ROLE_INSTRUCTIONS_CHARS = 8_000;
 const OUTPUT_LIMIT = 2 * 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 30 * 60 * 1000;
+const UNCOMMITTED_MUTATION_ROUTE_TIMEOUT_MS = 55 * 1000;
 const INIT_TIMEOUT_MS = 30 * 1000;
 const SESSION_IDLE_MS = 30 * 60 * 1000;
 const SSE_HEARTBEAT_MS = 15 * 1000;
@@ -186,6 +187,34 @@ function attachTurnProgress(error, turn) {
     error.routeCommitted = true;
   }
   return error;
+}
+
+function uncommittedMutationRouteTimeoutError() {
+  const error = new BridgeError(
+    `Antigravity did not commit mutation-authorized work within ${UNCOMMITTED_MUTATION_ROUTE_TIMEOUT_MS}ms`,
+    504,
+  );
+  error.uncommittedRouteTimeout = true;
+  error.safeToRetry = true;
+  error.routeCommitted = false;
+  return error;
+}
+
+function classifyUncommittedRouteTimeout(error, turn) {
+  const classified = attachTurnProgress(error, turn);
+  if (classified.uncommittedRouteTimeout !== true) return classified;
+  classified.safeToRetry = classified.mutationToolCalls === 0
+    && classified.rzMcpTools.length === 0
+    && !classified.subagentActivity
+    && !classified.forbiddenToolName;
+  classified.routeCommitted = !classified.safeToRetry;
+  return classified;
+}
+
+function clearUncommittedRouteTimer(turn) {
+  if (!turn?.uncommittedRouteTimer) return;
+  clearTimeout(turn.uncommittedRouteTimer);
+  turn.uncommittedRouteTimer = null;
 }
 
 function centralRoute() {
@@ -651,6 +680,7 @@ async function runWithInterruptedStreamRecovery(
   const now = options.now || Date.now;
   const delay = options.delay || delayWithAbort;
   const requestDeadline = options.deadline || now() + REQUEST_TIMEOUT_MS;
+  const uncommittedRouteDeadline = options.uncommittedRouteDeadline || null;
   const recoveryBudgetMs = options.recoveryBudgetMs || STREAM_CONTINUATION_RECOVERY_BUDGET_MS;
   const conversationId = session.init?.conversationId || null;
   const progress = emptyInterruptedProgress();
@@ -673,12 +703,24 @@ async function runWithInterruptedStreamRecovery(
       session.close?.();
       throw error;
     }
+    const hasCommittedMutation = progress.mutationToolCalls > 0 || progress.rzMcpTools.size > 0;
+    const remainingUncommittedMs = uncommittedRouteDeadline && !hasCommittedMutation
+      ? uncommittedRouteDeadline - now()
+      : null;
+    if (remainingUncommittedMs !== null && remainingUncommittedMs <= 0) {
+      const error = applyInterruptedProgress(uncommittedMutationRouteTimeoutError(), progress);
+      error.safeToRetry = error.mutationToolCalls === 0 && error.rzMcpTools.length === 0;
+      error.routeCommitted = !error.safeToRetry;
+      session.close?.();
+      throw error;
+    }
     try {
       const result = await session.run(
         currentPrompt,
         signal,
         (event) => onProgress({ ...event, index: progress.toolCalls + event.index }),
         remainingMs,
+        remainingUncommittedMs,
       );
       if ((result.conversationId || null) !== conversationId) {
         session.close?.();
@@ -869,7 +911,10 @@ class AntigravitySession {
             name: typeof name === "string" ? name : "unknown_tool",
           });
         }
-        if (firstObservation && MUTATION_TOOLS.has(name)) this.turn.mutationToolStepKeys.add(stepKey);
+        if (firstObservation && MUTATION_TOOLS.has(name)) {
+          this.turn.mutationToolStepKeys.add(stepKey);
+          clearUncommittedRouteTimer(this.turn);
+        }
         const invalidBoundedWait = name === BOUNDED_WAIT_TOOL && !isBoundedTaskWait(parameters, conversationId);
         if (firstObservation && (FORBIDDEN_AGENT_TOOLS.has(name) || invalidBoundedWait)) {
           this.turn.forbiddenToolName = name;
@@ -883,7 +928,10 @@ class AntigravitySession {
         if (name === "call_mcp_tool") {
           const server = parameters.ServerName || parameters.server_name || parameters.server || parameters.mcp_server;
           const tool = parameters.ToolName || parameters.tool_name || parameters.name;
-          if (server === LAZY_MCP_SERVER && typeof tool === "string") this.turn.rzMcpTools.add(tool);
+          if (server === LAZY_MCP_SERVER && typeof tool === "string") {
+            this.turn.rzMcpTools.add(tool);
+            clearUncommittedRouteTimer(this.turn);
+          }
         }
       }
       if (step.subagent_info) {
@@ -899,7 +947,7 @@ class AntigravitySession {
     if (event?.event === "result" && this.turn) this.finishTurn(event.result);
   }
 
-  run(prompt, signal, onProgress = () => {}, timeoutMs = REQUEST_TIMEOUT_MS) {
+  run(prompt, signal, onProgress = () => {}, timeoutMs = REQUEST_TIMEOUT_MS, uncommittedTimeoutMs = null) {
     if (!this.init) throw new BridgeError("Antigravity session is not initialized", 500);
     if (this.turn) throw new BridgeError("Antigravity session already has an active turn", 409);
     if (signal?.aborted) throw new BridgeError("Client disconnected before Antigravity started", 499);
@@ -907,14 +955,10 @@ class AntigravitySession {
     return new Promise((resolve, reject) => {
       const onAbort = () => this.close(new BridgeError("Client disconnected while Antigravity was active", 499));
       signal?.addEventListener("abort", onAbort, { once: true });
-      const timeout = setTimeout(() => this.close(new BridgeError(`Antigravity exceeded ${timeoutMs}ms`, 504)), timeoutMs);
-      this.turn = {
+      const turn = {
         resolve,
         reject,
-        cleanup: () => {
-          clearTimeout(timeout);
-          signal?.removeEventListener("abort", onAbort);
-        },
+        cleanup: null,
         peakContextTokens: 0,
         generatedTokens: 0,
         generationSeconds: 0,
@@ -925,8 +969,22 @@ class AntigravitySession {
         subagentActivity: false,
         forbiddenToolName: null,
         unknownToolSteps: 0,
+        uncommittedRouteTimer: null,
         onProgress,
       };
+      const timeout = setTimeout(() => this.close(new BridgeError(`Antigravity exceeded ${timeoutMs}ms`, 504)), timeoutMs);
+      if (Number.isFinite(uncommittedTimeoutMs) && uncommittedTimeoutMs > 0) {
+        turn.uncommittedRouteTimer = setTimeout(
+          () => this.close(uncommittedMutationRouteTimeoutError()),
+          uncommittedTimeoutMs,
+        );
+      }
+      turn.cleanup = () => {
+        clearTimeout(timeout);
+        clearUncommittedRouteTimer(turn);
+        signal?.removeEventListener("abort", onAbort);
+      };
+      this.turn = turn;
       this.child.stdin.write(`${json({ event: "user", message: { content: prompt } })}\n`, (error) => {
         if (error) this.fail(new BridgeError(`Cannot deliver the task to Antigravity: ${error.message}`, 502));
       });
@@ -996,7 +1054,7 @@ class AntigravitySession {
       const turn = this.turn;
       this.turn = null;
       turn.cleanup();
-      turn.reject(attachTurnProgress(error, turn));
+      turn.reject(classifyUncommittedRouteTimeout(error, turn));
     }
     this.close();
   }
@@ -1009,7 +1067,7 @@ class AntigravitySession {
       const turn = this.turn;
       this.turn = null;
       turn.cleanup();
-      turn.reject(attachTurnProgress(error, turn));
+      turn.reject(classifyUncommittedRouteTimeout(error, turn));
     }
     if (this.child && !this.child.killed) this.child.kill();
     this.onClose(this);
@@ -1271,6 +1329,9 @@ async function sessionFor(context) {
 async function handleResponses(request, response) {
   const body = await readRequestBody(request);
   const context = requestContext(body);
+  const uncommittedRouteDeadline = context.taskState.activeTask?.intent === "mutation"
+    ? Date.now() + UNCOMMITTED_MUTATION_ROUTE_TIMEOUT_MS
+    : null;
   runtime.lastWorkingDirectory = context.workingDirectory;
   runtime.lastCodexToolSchemaBytesIgnored = context.toolSchemaBytes;
   runtime.lastTaskId = context.taskState.activeTask?.id || null;
@@ -1327,7 +1388,7 @@ async function handleResponses(request, response) {
         runtime.lastStreamContinuationConversationId = conversationId;
         progress.emit(`Antigravity upstream stream interrupted; continuing the same conversation after ${backoffMs}ms.\n`);
       },
-      { deadline },
+      { deadline, uncommittedRouteDeadline },
     );
     try {
       result = await runSession(session, prompt);
@@ -1514,6 +1575,7 @@ function health() {
       idleMilliseconds: SESSION_IDLE_MS,
       maximumSessions: MAX_SESSIONS,
       maximumConcurrentTurns: MAX_SESSIONS,
+      uncommittedMutationRouteTimeoutMs: UNCOMMITTED_MUTATION_ROUTE_TIMEOUT_MS,
     },
     activeSessions: sessions.size,
     activeTurns: [...sessions.values()].filter((session) => session.busy).length,
@@ -1654,6 +1716,78 @@ async function selfTest() {
   }
   const capacityQuotaFailure = quotaFailureFor([], 0, "You have exhausted your capacity on this model.");
   if (!capacityQuotaFailure?.modelQuotaFailure) throw new Error("capacity quota classification failed");
+  const fakeChild = () => ({
+    killed: false,
+    stdin: { write: (_payload, callback) => callback?.() },
+    kill() { this.killed = true; },
+  });
+  const uncommittedTimeoutSession = new AntigravitySession(
+    "uncommitted-timeout-fixture",
+    process.cwd(),
+    "mutation-task",
+    models.fallback,
+    () => {},
+  );
+  uncommittedTimeoutSession.init = { conversationId: "uncommitted-timeout-fixture" };
+  uncommittedTimeoutSession.initSettled = true;
+  uncommittedTimeoutSession.child = fakeChild();
+  const uncommittedTimeoutPromise = uncommittedTimeoutSession.run("task", null, () => {}, 1_000, 5);
+  uncommittedTimeoutSession.consumeEvent({
+    event: "step_update",
+    step_update: {
+      conversation_id: "uncommitted-timeout-fixture",
+      step_index: 0,
+      state: "DONE",
+      step_type: "tool",
+      tool_name: "grep_search",
+      tool_info: { name: "grep_search", parameters: {} },
+    },
+  });
+  const uncommittedTimeoutFailure = await uncommittedTimeoutPromise.catch((error) => error);
+  if (
+    uncommittedTimeoutFailure?.uncommittedRouteTimeout !== true
+    || uncommittedTimeoutFailure.safeToRetry !== true
+    || uncommittedTimeoutFailure.routeCommitted !== false
+    || uncommittedTimeoutFailure.toolCalls !== 1
+    || uncommittedTimeoutFailure.mutationToolCalls !== 0
+  ) {
+    throw new Error("read-only Antigravity mutation-route timeout did not remain safe to reroute");
+  }
+  const committedTimeoutSession = new AntigravitySession(
+    "committed-timeout-fixture",
+    process.cwd(),
+    "mutation-task",
+    models.fallback,
+    () => {},
+  );
+  committedTimeoutSession.init = { conversationId: "committed-timeout-fixture" };
+  committedTimeoutSession.initSettled = true;
+  committedTimeoutSession.child = fakeChild();
+  const committedTimeoutPromise = committedTimeoutSession.run("task", null, () => {}, 1_000, 5);
+  committedTimeoutSession.consumeEvent({
+    event: "step_update",
+    step_update: {
+      conversation_id: "committed-timeout-fixture",
+      step_index: 0,
+      state: "DONE",
+      step_type: "tool",
+      tool_name: "replace_file_content",
+      tool_info: { name: "replace_file_content", parameters: {} },
+    },
+  });
+  await new Promise((resolve) => setTimeout(resolve, 15));
+  committedTimeoutSession.finishTurn({
+    status: "SUCCESS",
+    response: "done",
+    conversation_id: "committed-timeout-fixture",
+    duration_seconds: 0.01,
+    usage: {},
+  });
+  const committedTimeoutResult = await committedTimeoutPromise;
+  if (committedTimeoutResult.text !== "done" || committedTimeoutResult.mutationToolCalls !== 1) {
+    throw new Error("Antigravity mutation did not cancel the uncommitted route deadline");
+  }
+  committedTimeoutSession.close();
   const interruptionSession = new AntigravitySession(
     "interruption-fixture",
     process.cwd(),
