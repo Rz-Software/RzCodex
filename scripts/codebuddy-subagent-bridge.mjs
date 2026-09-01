@@ -78,8 +78,11 @@ const runtime = {
   lastOutputTokens: null,
   lastDurationApiMs: null,
   lastMaxTurnInputTokens: null,
+  lastIncomingCodexToolCount: null,
   lastCodexToolCount: null,
   lastCodexToolSchemaBytes: null,
+  lastRetainedToolSurfaceUsed: false,
+  retainedToolSurfaceUses: 0,
   maxObservedTurnInputTokens: 0,
   maxObservedCodexToolCount: 0,
   maxObservedCodexToolSchemaBytes: 0,
@@ -403,6 +406,7 @@ class ProviderConversationRegistry {
         countedCalls: new Set(),
         countedOutputs: new Set(),
         seenInputKeys: new Set(),
+        toolInfo: null,
       };
       this.#states.set(threadId, state);
     }
@@ -680,6 +684,50 @@ function validateManagedToolSurface(toolInfo, inputModalities) {
   }
 }
 
+function mergeRetainedToolInfo(retained, incoming) {
+  const definitions = retained.definitions.map((definition) => ({ ...definition }));
+  const definitionsByName = new Map(definitions.map((definition) => [definition.name, definition]));
+  const byWire = new Map(retained.byWire);
+  const byOriginal = new Map(retained.byOriginal);
+  const hosted = new Set([...retained.hosted, ...incoming.hosted]);
+  for (const [wireName, entry] of incoming.byWire) {
+    const existing = byWire.get(wireName);
+    if (existing) {
+      const existingIdentity = jsonString({
+        namespace: existing.namespace,
+        originalName: existing.originalName,
+        custom: existing.custom,
+        toolSearch: existing.toolSearch,
+        inputSchema: existing.inputSchema,
+      });
+      const incomingIdentity = jsonString({
+        namespace: entry.namespace,
+        originalName: entry.originalName,
+        custom: entry.custom,
+        toolSearch: entry.toolSearch,
+        inputSchema: entry.inputSchema,
+      });
+      if (existingIdentity !== incomingIdentity) {
+        throw new BridgeError(`Retained Codex tool ${JSON.stringify(wireName)} changed incompatibly`, 500);
+      }
+      continue;
+    }
+    const definition = incoming.definitions.find((candidate) => candidate.name === wireName);
+    if (!definition) {
+      throw new BridgeError(`Codex tool ${JSON.stringify(wireName)} has no provider definition`, 500);
+    }
+    if (definitionsByName.has(wireName)) {
+      throw new BridgeError(`Codex tool ${JSON.stringify(wireName)} collided with a retained definition`, 500);
+    }
+    const retainedDefinition = { ...definition };
+    definitions.push(retainedDefinition);
+    definitionsByName.set(wireName, retainedDefinition);
+    byWire.set(wireName, entry);
+    byOriginal.set(toolLookupKey(entry.namespace, entry.originalName), entry);
+  }
+  return { definitions, byWire, byOriginal, hosted };
+}
+
 function promptFrom(body, registry = providerConversations) {
   assertObject(body, "request body");
   if (body.stream !== true) throw new BridgeError("The CodeBuddy bridge requires stream=true");
@@ -700,8 +748,17 @@ function promptFrom(body, registry = providerConversations) {
   const threadId = requireString(body.client_metadata?.thread_id, "client_metadata.thread_id");
   const conversation = registry.prepare(threadId, input, incomingTaskState);
   const taskState = conversation.taskState;
-  const toolInfo = codexToolsFrom(body, route.inputModalities);
+  const incomingToolInfo = codexToolsFrom(body, route.inputModalities);
+  const incomingManagedSurface = Array.isArray(body.tools) && body.tools.length > 0;
+  const retainedToolSurfaceUsed = !incomingManagedSurface && conversation.state.toolInfo !== null;
+  const toolInfo = retainedToolSurfaceUsed
+    ? mergeRetainedToolInfo(conversation.state.toolInfo, incomingToolInfo)
+    : incomingToolInfo;
+  runtime.lastIncomingCodexToolCount = incomingToolInfo.definitions.length;
+  runtime.lastRetainedToolSurfaceUsed = retainedToolSurfaceUsed;
   validateManagedToolSurface(toolInfo, route.inputModalities);
+  conversation.state.toolInfo = toolInfo;
+  if (retainedToolSurfaceUsed) runtime.retainedToolSurfaceUses += 1;
   const sections = [
     conversation.providerSessionStarted
       ? "[Native delegation continuation]\nContinue the same delegated task in this retained CodeBuddy conversation. The full active task and project AGENTS.md ownership boundaries remain authoritative; do not ask the parent to resend them. New Codex client results and control messages follow below. Use ToolSearch with the exact mcp__codex__ tool name before DeferExecuteTool. When its proxy reports DEFERRED_TO_CODEX_CLIENT, end this turn immediately; the parent will execute that call and resume this same conversation with the real result."
@@ -850,6 +907,8 @@ function promptFrom(body, registry = providerConversations) {
     threadId,
     providerSessionId: conversation.providerSessionId,
     providerSessionStarted: conversation.providerSessionStarted,
+    incomingCodexToolCount: incomingToolInfo.definitions.length,
+    retainedToolSurfaceUsed,
   };
 }
 
@@ -1346,6 +1405,8 @@ async function handleResponses(request, response) {
           codebuddy_auth_source: result.initEvent.apiKeySource,
           codebuddy_total_cost_usd: result.resultEvent.total_cost_usd,
           codex_client_tool_count: context.toolInfo.definitions.length,
+          codex_client_tool_count_incoming: context.incomingCodexToolCount,
+          codex_client_tool_surface_retained: context.retainedToolSurfaceUsed,
           codex_client_tool_schema_bytes: Buffer.byteLength(jsonString(context.toolInfo.definitions)),
           codebuddy_max_turn_input_tokens: result.maxTurnInputTokens,
           active_task_id: context.taskDiagnostics.taskId,
@@ -1434,18 +1495,21 @@ function selfTest() {
   ];
   const selfTestRegistry = new ProviderConversationRegistry();
   let selfTestThread = 0;
-  const normalizeSelfTestRequest = (input, options = {}) => promptFrom({
-    model: MODEL_ALIAS,
-    stream: true,
-    reasoning: { effort: "max" },
-    client_metadata: {
-      cwd: process.cwd(),
-      thread_id: options.threadId ?? `self-test-thread-${selfTestThread += 1}`,
-    },
-    instructions: "<external_cli_route_instructions>bounded role</external_cli_route_instructions>",
-    tools: selfTestTools,
-    input,
-  }, options.registry ?? selfTestRegistry);
+  const normalizeSelfTestRequest = (input, options = {}) => {
+    const request = {
+      model: MODEL_ALIAS,
+      stream: true,
+      reasoning: { effort: "max" },
+      client_metadata: {
+        cwd: process.cwd(),
+        thread_id: options.threadId ?? `self-test-thread-${selfTestThread += 1}`,
+      },
+      instructions: "<external_cli_route_instructions>bounded role</external_cli_route_instructions>",
+      input,
+    };
+    if (!options.omitTools) request.tools = options.tools ?? selfTestTools;
+    return promptFrom(request, options.registry ?? selfTestRegistry);
+  };
   const readOnlyTask = normalizeSelfTestRequest([{
     type: "agent_message",
     id: "self-test-read-only",
@@ -1578,7 +1642,7 @@ function selfTest() {
     plaintextTaskItem,
     { type: "function_call", name: "exec_command", call_id: "resume-read", arguments: "{}" },
     { type: "function_call_output", call_id: "resume-read", output: firstToolResultText },
-  ], { registry: resumeRegistry, threadId: resumeThread });
+  ], { registry: resumeRegistry, threadId: resumeThread, tools: [] });
   const resumedSessionArgs = codeBuddyArguments(resumed, "mcp-config.json");
   if (
     !resumed.providerSessionStarted
@@ -1590,8 +1654,11 @@ function selfTest() {
     || resumed.taskDiagnostics.completeTaskOccurrences !== 0
     || !resumed.taskDiagnostics.retainedInProviderSession
     || resumed.conversation.deltaItemCount !== 1
+    || !resumed.retainedToolSurfaceUsed
+    || resumed.incomingCodexToolCount !== 0
+    || jsonString(resumed.toolInfo.definitions) !== jsonString(resumeFirst.toolInfo.definitions)
   ) {
-    throw new Error("self-test failed: resumed provider turn did not preserve session with delta-only input");
+    throw new Error("self-test failed: resumed provider turn did not preserve its validated lazy tool surface");
   }
   resumeRegistry.commit(resumed);
   const postCompactionResult = "Exit code: 0\nOutput:\npost-compaction proof";
@@ -1599,7 +1666,7 @@ function selfTest() {
     { type: "compaction", encrypted_content: "provider-opaque" },
     { type: "function_call", name: "exec_command", call_id: "post-compact-read", arguments: "{}" },
     { type: "function_call_output", call_id: "post-compact-read", output: postCompactionResult },
-  ], { registry: resumeRegistry, threadId: resumeThread });
+  ], { registry: resumeRegistry, threadId: resumeThread, omitTools: true });
   if (
     postCompaction.taskState.activeTask.hash !== plaintextTask.taskState.activeTask.hash
     || !postCompaction.taskDiagnostics.completeTaskDelivered
@@ -1607,6 +1674,7 @@ function selfTest() {
     || postCompaction.prompt.includes(plaintextTaskText)
     || !postCompaction.prompt.includes(postCompactionResult)
     || postCompaction.taskState.progress.toolCallsSinceTask !== 2
+    || !postCompaction.retainedToolSurfaceUsed
   ) {
     throw new Error("self-test failed: compaction removed retained task or cumulative progress");
   }
@@ -1637,6 +1705,36 @@ function selfTest() {
     throw new Error("self-test failed: orphan continuation must fail loudly");
   } catch (error) {
     if (!String(error.message).includes("without an active NEW_TASK")) throw error;
+  }
+  try {
+    normalizeSelfTestRequest(
+      [plaintextTaskItem],
+      { registry: new ProviderConversationRegistry(), threadId: "self-test-tool-less-first-turn", tools: [] },
+    );
+    throw new Error("self-test failed: a first provider turn without native capabilities must fail loudly");
+  } catch (error) {
+    if (!String(error.message).includes("required native capabilities")) throw error;
+  }
+  const taskChangeRegistry = new ProviderConversationRegistry();
+  const taskChangeThread = "self-test-task-change-tools";
+  const beforeTaskChange = normalizeSelfTestRequest(
+    [plaintextTaskItem],
+    { registry: taskChangeRegistry, threadId: taskChangeThread },
+  );
+  taskChangeRegistry.commit(beforeTaskChange);
+  const taskChange = normalizeSelfTestRequest([{
+    id: "amsg-task-change-without-tools",
+    type: "agent_message",
+    author: "/root",
+    recipient: "/root/test",
+    content: [{ type: "input_text", text: `${taskHeader}replace the task without repeating unchanged tools` }],
+  }], { registry: taskChangeRegistry, threadId: taskChangeThread, omitTools: true });
+  if (
+    !taskChange.retainedToolSurfaceUsed
+    || taskChange.taskState.activeTask.id !== "amsg-task-change-without-tools"
+    || jsonString(taskChange.toolInfo.definitions) !== jsonString(beforeTaskChange.toolInfo.definitions)
+  ) {
+    throw new Error("self-test failed: a follow-up task lost the retained provider tool surface");
   }
   const inheritedHistory = "h".repeat(MAX_PROMPT_CHARS + 10_000);
   const longFork = normalizeSelfTestRequest([
