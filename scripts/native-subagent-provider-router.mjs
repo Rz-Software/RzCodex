@@ -131,6 +131,45 @@ export class ActiveTaskRoutePins {
   }
 }
 
+export class ActiveTaskProviderPins {
+  #pinsByThread = new Map();
+
+  get(threadId, taskHash) {
+    if (typeof threadId !== "string" || threadId.length === 0) return null;
+    if (typeof taskHash !== "string" || taskHash.length === 0) return null;
+    const pin = this.#pinsByThread.get(threadId);
+    if (!pin) return null;
+    if (pin.taskHash === taskHash) return pin.provider;
+    this.#pinsByThread.delete(threadId);
+    return null;
+  }
+
+  pin(threadId, taskHash, provider) {
+    if (typeof threadId !== "string" || threadId.length === 0) return false;
+    if (typeof taskHash !== "string" || taskHash.length === 0) return false;
+    if (typeof provider !== "string" || provider.length === 0) return false;
+    const current = this.#pinsByThread.get(threadId);
+    if (current?.taskHash === taskHash && current.provider === provider) return false;
+    this.#pinsByThread.set(threadId, { taskHash, provider });
+    return true;
+  }
+
+  release(threadId, taskHash) {
+    if (this.get(threadId, taskHash) === null) return false;
+    this.#pinsByThread.delete(threadId);
+    return true;
+  }
+
+  releaseAfterFinalResponse(threadId, taskHash, pendingToolCallCount) {
+    if (pendingToolCallCount !== 0) return false;
+    return this.release(threadId, taskHash);
+  }
+
+  get size() {
+    return this.#pinsByThread.size;
+  }
+}
+
 function requireObject(value, label) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new ProviderRouteError(`${label} must be an object`);

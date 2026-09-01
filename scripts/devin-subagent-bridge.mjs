@@ -17,6 +17,7 @@ import {
   taskStateFromInput,
 } from "./codebuddy-subagent-task-state.mjs";
 import {
+  ActiveTaskProviderPins,
   ActiveTaskRoutePins,
   completedResponseFromRecoverableStream,
   fallbackForwardBody,
@@ -443,6 +444,8 @@ const runtime = {
   quotaProbeSkips: 0, quotaRecoveryProbes: 0, quotaPinsReleased: 0,
   calendarQuotaSkips: 0, calendarQuotaActivations: 0, calendarQuotaClears: 0,
   lastQuotaProbeSkipped: false, lastQuotaSkipScope: null, lastQuotaPinCreated: false,
+  providerTaskPinsCreated: 0, providerTaskPinsReleased: 0,
+  providerTaskPinsReleasedOnFailure: 0, lastPinnedProviderStage: null,
   lastFallbackError: null, lastFallbackAuthSource: null,
   lastCreditCost: null, lastAcuCost: null,
   lastInputTokens: null, lastCachedInputTokens: null, lastOutputTokens: null,
@@ -460,6 +463,7 @@ const terminalCapacity = { active: 0, waiters: [] };
 const ollamaCapacity = { active: 0, waiters: [] };
 const activeThreadTurns = new Map();
 const quotaTaskPins = new ActiveTaskRoutePins();
+const providerTaskPins = new ActiveTaskProviderPins();
 
 function syncRouteCapacityRuntime() {
   runtime.activeFreeRequests = terminalCapacity.active;
@@ -1708,76 +1712,88 @@ async function runDevinStage(
 
 async function executeAuto(context, requestBody, onSpawn, onProgress, signal, createStreamRelay) {
   runtime.lastProviderSequence = [];
+  const pinnedStage = providerTaskPins.get(
+    context.threadId,
+    context.taskDiagnostics.taskHash,
+  );
+  runtime.lastPinnedProviderStage = pinnedStage;
+  const stages = [
+    {
+      name: "antigravity",
+      run: ({ failures }) => runAntigravityStage(
+        context,
+        requestBody,
+        failures,
+        onProgress,
+        signal,
+        createStreamRelay(),
+      ),
+    },
+    {
+      name: "devin",
+      run: async ({ failures }) => {
+        const selected = chooseDevinStage(context);
+        if (selected.key !== "primary") {
+          const error = new BridgeError(`Devin paid route skipped: ${selected.reason}`, 503);
+          error.routeSkipped = true;
+          throw error;
+        }
+        return runDevinStage(context, selected, failures, onSpawn, onProgress, signal, false);
+      },
+    },
+    {
+      name: "ollama",
+      run: ({ failures }) => runOllamaStage(
+        context,
+        requestBody,
+        failures,
+        onProgress,
+        signal,
+        createStreamRelay({ forwardReasoningSummaries: true, providerLabel: "Ollama" }),
+        { skipIfBusy: true },
+      ),
+    },
+    {
+      name: "devin-free",
+      run: ({ failures }) => {
+        runtime.terminalFallbacks += 1;
+        const selected = terminalSelection("auto_terminal_devin_free");
+        return runDevinStage(
+          context,
+          selected,
+          failures,
+          onSpawn,
+          onProgress,
+          signal,
+          true,
+          { skipIfBusy: true },
+        );
+      },
+    },
+    {
+      name: "codebuddy",
+      run: ({ failures }) => runCodeBuddyStage(
+        context,
+        requestBody,
+        failures,
+        onProgress,
+        signal,
+        createStreamRelay(),
+      ),
+    },
+  ];
+  const pinnedIndex = stages.findIndex((stage) => stage.name === pinnedStage);
+  if (pinnedIndex > 0) stages.unshift(stages.splice(pinnedIndex, 1)[0]);
   let chain;
   try {
     chain = await runOrderedProviderChain({
       signal,
-      stages: [
-      {
-        name: "antigravity",
-        run: ({ failures }) => runAntigravityStage(
-          context,
-          requestBody,
-          failures,
-          onProgress,
-          signal,
-          createStreamRelay(),
-        ),
-      },
-      {
-        name: "devin",
-        run: async ({ failures }) => {
-          const selected = chooseDevinStage(context);
-          if (selected.key !== "primary") {
-            const error = new BridgeError(`Devin paid route skipped: ${selected.reason}`, 503);
-            error.routeSkipped = true;
-            throw error;
-          }
-          return runDevinStage(context, selected, failures, onSpawn, onProgress, signal, false);
-        },
-      },
-      {
-        name: "ollama",
-        run: ({ failures }) => runOllamaStage(
-          context,
-          requestBody,
-          failures,
-          onProgress,
-          signal,
-          createStreamRelay({ forwardReasoningSummaries: true, providerLabel: "Ollama" }),
-          { skipIfBusy: true },
-        ),
-      },
-      {
-        name: "devin-free",
-        run: ({ failures }) => {
-          runtime.terminalFallbacks += 1;
-          const selected = terminalSelection("auto_terminal_devin_free");
-          return runDevinStage(
-            context,
-            selected,
-            failures,
-            onSpawn,
-            onProgress,
-            signal,
-            true,
-            { skipIfBusy: true },
-          );
-        },
-      },
-        {
-          name: "codebuddy",
-          run: ({ failures }) => runCodeBuddyStage(
-            context,
-            requestBody,
-            failures,
-            onProgress,
-            signal,
-            createStreamRelay(),
-          ),
-        },
-      ],
+      stages,
       onStageFailure: (stage, error) => {
+        if (
+          stage === pinnedStage
+          && providerTaskPins.release(context.threadId, context.taskDiagnostics.taskHash)
+        ) runtime.providerTaskPinsReleasedOnFailure += 1;
         runtime.providerFailures[stage] += 1;
         runtime.fallbackFailed += 1;
         runtime.lastFallbackError = `${stage}: ${sanitizedProviderFailure(error)}`;
@@ -1794,7 +1810,7 @@ async function executeAuto(context, requestBody, onSpawn, onProgress, signal, cr
   runtime.lastFallbackError = chain.failures.length > 0
     ? chain.failures.map((failure) => `${failure.stage}: ${sanitizedProviderFailure(failure.error)}`).join(" | ").slice(0, 2_000)
     : null;
-  return chain.value;
+  return { ...chain.value, autoStage: chain.stage };
 }
 
 async function execute(context, requestBody, initialRoute, onSpawn, onProgress, signal, createStreamRelay) {
@@ -2106,6 +2122,21 @@ async function handleResponses(request, response) {
       context.taskDiagnostics.taskHash,
       result.toolCalls.length,
     )) runtime.quotaPinsReleased += 1;
+    if (context.requestedRoute === "auto" && result.toolCalls.length > 0 && result.autoStage) {
+      if (providerTaskPins.pin(
+        context.threadId,
+        context.taskDiagnostics.taskHash,
+        result.autoStage,
+      )) runtime.providerTaskPinsCreated += 1;
+      runtime.lastPinnedProviderStage = result.autoStage;
+    } else if (providerTaskPins.releaseAfterFinalResponse(
+      context.threadId,
+      context.taskDiagnostics.taskHash,
+      result.toolCalls.length,
+    )) {
+      runtime.providerTaskPinsReleased += 1;
+      runtime.lastPinnedProviderStage = null;
+    }
     const streamRelay = result.streamRelay || { committed: false, streamedMessageIds: new Set() };
     runtime.lastFallbackStreamCommitted = streamRelay.committed;
     runtime.lastFallbackProviderOutputObserved = streamRelay.providerOutputObserved === true;
@@ -2311,6 +2342,7 @@ function health(requestedRoute = "auto") {
     isolatedConfigImports: ["agents_standard"], lazyRzMcpProxyTools: 2,
     rawPromptFilesRetained: false, ephemeralSessionsRemoved: true,
     activeThreadTurns: activeThreadTurns.size, pinnedQuotaTasks: quotaTaskPins.size,
+    pinnedProviderTasks: providerTaskPins.size,
     calendarQuotaState: calendarQuotaState.snapshot(), runtime,
   };
 }

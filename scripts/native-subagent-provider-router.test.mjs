@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import test from "node:test";
 import {
+  ActiveTaskProviderPins,
   ActiveTaskRoutePins,
   completedResponseFromRecoverableStream,
   fallbackForwardBody,
@@ -91,6 +92,22 @@ test("quota routing stays pinned only for the same active task and releases on i
   assert.equal(pins.has("thread-a", "task-a"), true);
   assert.equal(pins.releaseAfterFinalResponse("thread-a", "task-a", 0), true);
   assert.equal(pins.size, 0);
+});
+
+test("provider routing stays on the tool-owning provider until the active task reaches a final response", () => {
+  const pins = new ActiveTaskProviderPins();
+  assert.equal(pins.pin(null, "task-a", "codebuddy"), false);
+  assert.equal(pins.pin("thread-a", "task-a", null), false);
+  assert.equal(pins.pin("thread-a", "task-a", "codebuddy"), true);
+  assert.equal(pins.pin("thread-a", "task-a", "codebuddy"), false);
+  assert.equal(pins.get("thread-a", "task-a"), "codebuddy");
+  assert.equal(pins.releaseAfterFinalResponse("thread-a", "task-a", 1), false);
+  assert.equal(pins.get("thread-a", "task-a"), "codebuddy");
+  assert.equal(pins.get("thread-a", "task-b"), null);
+  assert.equal(pins.size, 0);
+  assert.equal(pins.pin("thread-a", "task-b", "devin-free"), true);
+  assert.equal(pins.release("thread-a", "task-b"), true);
+  assert.equal(pins.release("thread-a", "task-b"), false);
 });
 
 test("SSE parsing preserves completed tool-call output after heartbeats", () => {
