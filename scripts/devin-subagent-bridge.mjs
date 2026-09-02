@@ -1723,6 +1723,15 @@ async function runCliWithProviderRecovery(
       }
     }
     let session = sessionFromRunError || await findSession(context.requestId) || resumeSession;
+    if (signal?.aborted) {
+      const error = preserveProviderSession(
+        new BridgeError("Devin turn was superseded by parent control", 499),
+        session,
+        context.executionPolicy,
+      );
+      if (session && !error.retainedProviderSession) remove(session.id);
+      throw error;
+    }
     if (runError && session?.terminalText) {
       cliResult = { code: 0, stdout: session.terminalText, stderr: "" };
       runError = null;
@@ -2670,7 +2679,12 @@ async function handleResponses(request, response) {
     abort,
     done: new Promise((resolve) => { resolveThreadTurnDone = resolve; }),
   };
-  await registerThreadTurn(context.threadId, threadTurn);
+  try {
+    await registerThreadTurn(context.threadId, threadTurn);
+  } catch (error) {
+    runtime.activeRequests = Math.max(0, runtime.activeRequests - 1);
+    throw error;
+  }
   request.once("aborted", abort);
   response.once("close", () => { if (!response.writableEnded) abort(); });
   response.writeHead(200, { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache", connection: "keep-alive" });
@@ -3487,6 +3501,37 @@ async function selfTest() {
     || incompleteDelays.join(",") !== "1000"
   ) {
     throw new Error("Devin structurally incomplete post-tool continuation failed");
+  }
+  const parentAbortController = new AbortController();
+  let parentAbortRemoved = 0;
+  let parentAbortError;
+  try {
+    await runCliWithProviderRecovery(
+      recoveryContext,
+      recoveryModel,
+      () => {},
+      () => {},
+      parentAbortController.signal,
+      Date.now() + 100_000,
+      {
+        waitForSession: async () => committedSession,
+        removeSession: () => { parentAbortRemoved += 1; },
+        runCli: async () => {
+          parentAbortController.abort();
+          return { code: 1, stdout: "", stderr: "terminated by parent control" };
+        },
+      },
+    );
+  } catch (error) {
+    parentAbortError = error;
+  }
+  if (
+    parentAbortError?.status !== 499
+    || parentAbortError?.retainedProviderSession !== committedSession
+    || parentAbortError?.routeCommitted !== true
+    || parentAbortRemoved !== 0
+  ) {
+    throw new Error("parent control did not retain the active Devin provider session");
   }
   const emptyRecoverySession = {
     id: "devin-empty-recovery-session",
