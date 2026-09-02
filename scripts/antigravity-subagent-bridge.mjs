@@ -762,26 +762,14 @@ async function runWithInterruptedStreamRecovery(
       }
       accumulateInterruptedProgress(progress, error);
       progress.streamContinuations += 1;
-      if (progress.toolCalls > 0) {
-        const committedError = applyInterruptedProgress(
-          new BridgeError(
-            "Antigravity stream ended after provider tool work; the turn was not replayed",
-            502,
-          ),
-          progress,
-        );
-        committedError.safeToRetry = false;
-        committedError.routeCommitted = true;
-        session.close?.();
-        throw committedError;
-      }
       if (attempt >= 1) {
         const exhaustedError = applyInterruptedProgress(
-          new BridgeError("Antigravity remained stream-interrupted after one pre-work continuation", 502),
+          new BridgeError("Antigravity remained stream-interrupted after one same-session continuation", 502),
           progress,
         );
-        exhaustedError.safeToRetry = true;
-        exhaustedError.routeCommitted = false;
+        const committed = exhaustedError.toolCalls > 0 || exhaustedError.rzMcpTools.length > 0;
+        exhaustedError.safeToRetry = !committed;
+        exhaustedError.routeCommitted = committed;
         session.close?.();
         throw exhaustedError;
       }
@@ -1917,45 +1905,92 @@ async function selfTest() {
     run: async (currentPrompt, _signal, onProgress, timeoutMs) => {
       recoveryCalls.push({ prompt: currentPrompt, timeoutMs });
       recoveryRun += 1;
-      onProgress({ kind: "tool", index: 1, name: "replace_file_content" });
-      throw interruptedError("replace_file_content", 1, 10);
+      if (recoveryRun === 1) {
+        onProgress({ kind: "tool", index: 1, name: "replace_file_content" });
+        throw interruptedError("replace_file_content", 1, 10);
+      }
+      onProgress({ kind: "tool", index: 1, name: "read_file" });
+      return {
+        text: "recovered completion",
+        toolCalls: 1,
+        toolNames: ["read_file"],
+        mutationToolCalls: 0,
+        rzMcpTools: [],
+        peakContextTokens: 150,
+        generatedTokens: 5,
+        generationSeconds: 0.05,
+        durationSeconds: 0.1,
+        conversationId: "recovery-conversation",
+      };
     },
   };
-  let committedRecoveryFailure;
-  try {
-    await runWithInterruptedStreamRecovery(
-      recoverySession,
-      "original task payload",
-      undefined,
-      (event) => recoveryToolEvents.push(event),
-      (event) => recoveryEvents.push(event),
-      {
-        now: () => fakeNow,
-        deadline: 100_000,
-        delay: async (milliseconds) => {
-          recoveryDelays.push(milliseconds);
-          fakeNow += milliseconds;
-        },
+  const committedRecovery = await runWithInterruptedStreamRecovery(
+    recoverySession,
+    "original task payload",
+    undefined,
+    (event) => recoveryToolEvents.push(event),
+    (event) => recoveryEvents.push(event),
+    {
+      now: () => fakeNow,
+      deadline: 100_000,
+      delay: async (milliseconds) => {
+        recoveryDelays.push(milliseconds);
+        fakeNow += milliseconds;
       },
-    );
-  } catch (error) {
-    committedRecoveryFailure = error;
-  }
+    },
+  );
   if (
-    recoveryCalls.length !== 1
+    recoveryCalls.length !== 2
     || recoveryCalls[0].prompt !== "original task payload"
     || recoveryCalls[0].timeoutMs !== 99000
-    || recoveryDelays.length !== 0
-    || recoveryEvents.length !== 0
-    || recoveryToolEvents.map(({ index }) => index).join(",") !== "1"
-    || committedRecoveryFailure?.streamContinuations !== 1
-    || committedRecoveryFailure?.toolCalls !== 1
-    || committedRecoveryFailure?.mutationToolCalls !== 1
-    || committedRecoveryFailure?.toolNames.join(",") !== "replace_file_content"
-    || committedRecoveryFailure?.routeCommitted !== true
-    || committedRecoveryFailure?.safeToRetry !== false
+    || !recoveryCalls[1].prompt.includes("[Native Antigravity stream recovery]")
+    || !recoveryCalls[1].prompt.includes("recovery-task-hash")
+    || recoveryCalls[1].timeoutMs !== 44000
+    || recoveryDelays.join(",") !== "1000"
+    || recoveryEvents.length !== 1
+    || recoveryToolEvents.map(({ index }) => index).join(",") !== "1,2"
+    || committedRecovery.text !== "recovered completion"
+    || committedRecovery.streamContinuations !== 1
+    || committedRecovery.toolCalls !== 2
+    || committedRecovery.mutationToolCalls !== 1
+    || committedRecovery.toolNames.join(",") !== "replace_file_content,read_file"
+    || committedRecovery.generatedTokens !== 15
+    || committedRecovery.conversationId !== "recovery-conversation"
   ) {
-    throw new Error("post-tool Antigravity stream interruption was replayed");
+    throw new Error("post-tool Antigravity stream interruption did not resume the retained session once");
+  }
+  let exhaustedCommittedRuns = 0;
+  let exhaustedCommittedFailure;
+  try {
+    await runWithInterruptedStreamRecovery(
+      {
+        activeTaskHash: "exhausted-committed-task",
+        init: { conversationId: "exhausted-committed-conversation" },
+        closed: false,
+        close: () => {},
+        run: async () => {
+          exhaustedCommittedRuns += 1;
+          throw interruptedError("replace_file_content", 1, 3);
+        },
+      },
+      "exhausted committed task",
+      undefined,
+      undefined,
+      undefined,
+      { now: () => 1_000, deadline: 100_000, delay: async () => {} },
+    );
+  } catch (error) {
+    exhaustedCommittedFailure = error;
+  }
+  if (
+    exhaustedCommittedRuns !== 2
+    || exhaustedCommittedFailure?.streamContinuations !== 2
+    || exhaustedCommittedFailure?.toolCalls !== 2
+    || exhaustedCommittedFailure?.mutationToolCalls !== 2
+    || exhaustedCommittedFailure?.routeCommitted !== true
+    || exhaustedCommittedFailure?.safeToRetry !== false
+  ) {
+    throw new Error("exhausted post-tool Antigravity recovery lost committed provider ownership");
   }
   let terminalRecoveryRun = 0;
   let terminalRecoveryFailure;
