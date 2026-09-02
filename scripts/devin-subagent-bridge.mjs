@@ -82,6 +82,7 @@ const DEVIN_HOME = join(process.env.LOCALAPPDATA || join(homedir(), "AppData", "
 const ISOLATED_CONFIG = join(DEVIN_HOME, "config.json");
 const REQUEST_DIRECTORY = join(DEVIN_HOME, "requests");
 const QUOTA_STATE_FILE = join(DEVIN_HOME, "quota-state.json");
+const OLLAMA_QUOTA_STATE_FILE = join(DEVIN_HOME, "ollama-quota-state.json");
 const DEVIN_EXE = join(process.env.LOCALAPPDATA || join(homedir(), "AppData", "Local"), "devin", "cli", "bin", "devin.exe");
 const DEVIN_DB = join(process.env.APPDATA || join(homedir(), "AppData", "Roaming"), "devin", "cli", "sessions.db");
 const QUOTA_FAILURE = /(?:daily|weekly|included|usage)[\s\S]{0,100}quota[\s\S]{0,100}(?:exhaust|exceed|reach|limit)|quota[\s\S]{0,100}(?:exhaust|exceed|reach|limit)/i;
@@ -92,6 +93,7 @@ const READ_ONLY_RZMCP_TOOL_NAME = /^(?:analyze|check|count|describe|discover|doe
 const PERMISSION_REJECTION = /rejected a tool call that requires confirmation|permission (?:was )?denied|requires (?:user )?confirmation/i;
 const VALIDATION_RESTRICTED_TASK = /\b(?:do not|must not|never)[^.\n]{0,160}\b(?:build|compile|run\s+(?:the\s+)?tests?|test|control\s+(?:the\s+)?editor|use\s+(?:the\s+)?editor|pie|sie)\b|\bno\s+(?:build|compile|tests?|editor|pie|sie)\b|\b(?:aucun(?:e)?|sans|interdiction\s+d['’](?:ex[eé]cuter|utiliser))[^.\n]{0,160}\b(?:build|compil(?:e|er|ation)|tests?|editor|[eé]diteur|pie|sie)\b/i;
 const QUOTA_STATE_VERSION = 2;
+const RECOVERY_PROBE_STATE_VERSION = 1;
 
 class BridgeError extends Error {
   constructor(message, status = 400) {
@@ -243,6 +245,100 @@ class CalendarQuotaState {
         nextProbeAt: this.state.nextProbeAt,
       }
       : { active, kind: null, confirmedAt: null, retryAt: null, nextProbeAt: null };
+  }
+}
+
+class RecoveryProbeState {
+  constructor(statePath, now = () => Date.now()) {
+    this.statePath = statePath;
+    this.now = now;
+    this.state = null;
+    this.load();
+  }
+
+  load() {
+    if (!this.statePath || !existsSync(this.statePath)) return;
+    try {
+      const parsed = JSON.parse(readFileSync(this.statePath, "utf8"));
+      if (
+        parsed.version !== RECOVERY_PROBE_STATE_VERSION
+        || typeof parsed.reason !== "string"
+        || parsed.reason.length === 0
+        || !Number.isFinite(parsed.confirmedAt)
+        || !Number.isFinite(parsed.nextProbeAt)
+        || parsed.nextProbeAt <= parsed.confirmedAt
+      ) {
+        throw new Error("invalid schema");
+      }
+      this.state = {
+        reason: parsed.reason,
+        confirmedAt: parsed.confirmedAt,
+        nextProbeAt: parsed.nextProbeAt,
+      };
+    } catch (error) {
+      throw new BridgeError(`Cannot read persisted provider recovery state: ${error.message}`, 500);
+    }
+  }
+
+  isActive() {
+    return this.state !== null;
+  }
+
+  record(reason, nowMs = this.now()) {
+    this.state = {
+      reason,
+      confirmedAt: nowMs,
+      nextProbeAt: nowMs + QUOTA_RECOVERY_PROBE_MS,
+    };
+    this.persist();
+    return true;
+  }
+
+  claimRecoveryProbe(nowMs = this.now()) {
+    if (!this.state || this.state.nextProbeAt > nowMs) return false;
+    this.state.nextProbeAt = nowMs + QUOTA_RECOVERY_PROBE_MS;
+    this.persist();
+    return true;
+  }
+
+  clear() {
+    const changed = this.state !== null || Boolean(this.statePath && existsSync(this.statePath));
+    this.state = null;
+    if (!this.statePath) return changed;
+    try {
+      unlinkSync(this.statePath);
+    } catch (error) {
+      if (error?.code !== "ENOENT") {
+        throw new BridgeError(`Cannot clear persisted provider recovery state: ${error.message}`, 500);
+      }
+    }
+    return changed;
+  }
+
+  persist() {
+    if (!this.statePath) return;
+    const temporaryPath = `${this.statePath}.${process.pid}.tmp`;
+    try {
+      writeFileSync(
+        temporaryPath,
+        `${json({ version: RECOVERY_PROBE_STATE_VERSION, ...this.state })}\n`,
+        "utf8",
+      );
+      renameSync(temporaryPath, this.statePath);
+    } catch (error) {
+      try { unlinkSync(temporaryPath); } catch (cleanupError) {
+        if (cleanupError?.code !== "ENOENT") {
+          throw new BridgeError(`Cannot persist provider recovery state and clean its temporary file: ${cleanupError.message}`, 500);
+        }
+      }
+      throw new BridgeError(`Cannot persist provider recovery state: ${error.message}`, 500);
+    }
+  }
+
+  snapshot() {
+    return this.state
+      ? { active: true, ...this.state }
+      : { active: false, reason: null, confirmedAt: null, nextProbeAt: null };
   }
 }
 
@@ -416,6 +512,7 @@ if (!existsSync(DEVIN_EXE)) throw new BridgeError(`Devin CLI is missing at ${DEV
 if (!existsSync(DEVIN_DB)) throw new BridgeError(`Devin session database is missing at ${DEVIN_DB}`, 500);
 ensureRuntimeConfig();
 const calendarQuotaState = new CalendarQuotaState(QUOTA_STATE_FILE);
+const ollamaQuotaState = new RecoveryProbeState(OLLAMA_QUOTA_STATE_FILE);
 const route = centralRoute();
 const catalog = modelCatalog();
 const auth = authStatus();
@@ -463,6 +560,8 @@ const runtime = {
   lastFallbackStreamedMessageCount: 0,
   quotaProbeSkips: 0, quotaRecoveryProbes: 0, quotaPinsReleased: 0,
   calendarQuotaSkips: 0, calendarQuotaActivations: 0, calendarQuotaClears: 0,
+  ollamaQuotaSkips: 0, ollamaQuotaRecoveryProbes: 0,
+  ollamaQuotaActivations: 0, ollamaQuotaClears: 0,
   lastQuotaProbeSkipped: false, lastQuotaSkipScope: null, lastQuotaPinCreated: false,
   providerTaskPinsCreated: 0, providerTaskPinsReleased: 0,
   providerTaskPinsReleasedOnFailure: 0, lastPinnedProviderStage: null,
@@ -2068,6 +2167,16 @@ async function runOllamaStage(
   const selected = ollamaSelection(
     failures.length > 0 ? "auto_ollama_after_prior_provider_failure" : "explicit_ollama_route",
   );
+  if (ollamaQuotaState.isActive()) {
+    if (!ollamaQuotaState.claimRecoveryProbe()) {
+      runtime.ollamaQuotaSkips += 1;
+      onProgress?.("Ollama cloud usage limit is cached; skipping this provider until its bounded recovery probe.\n");
+      const error = new BridgeError("Ollama cloud usage limit is currently exhausted", 503);
+      error.routeSkipped = true;
+      throw error;
+    }
+    runtime.ollamaQuotaRecoveryProbes += 1;
+  }
   try {
     return await withRouteCapacity(selected, signal, async () => {
       runtime.providerAttempts.ollama += 1;
@@ -2119,6 +2228,7 @@ async function runOllamaStage(
           onProgress?.("Ollama native CLI resumed the same retained session after a missing terminal response.\n");
         },
       });
+      if (ollamaQuotaState.clear()) runtime.ollamaQuotaClears += 1;
       const providerMetadata = {
         actual_provider: "ollama",
         actual_model: route.ollamaModel,
@@ -2156,6 +2266,10 @@ async function runOllamaStage(
       };
     }, capacityOptions);
   } catch (error) {
+    if (error?.quotaFailure === true) {
+      ollamaQuotaState.record("session_usage_limit");
+      runtime.ollamaQuotaActivations += 1;
+    }
     if (
       streamRelay.providerWorkCommitted
       || (Array.isArray(error?.nativeToolNames) && error.nativeToolNames.length > 0)
@@ -2930,14 +3044,16 @@ function health(requestedRoute = "auto") {
         autoWhenSaturated: "continue_to_next_provider",
         explicitRouteMaxWaitMs: ROUTE_CAPACITY_WAIT_MS,
       },
-      quotaDetection: "explicit_daily_or_weekly_quota_failure_with_single_bounded_recovery_probe_every_30_minutes",
+      quotaDetection: "provider_quota_failures_with_one_bounded_recovery_probe_every_30_minutes",
     },
     apiKeysStripped: true, ollamaApiKeyRequired: false,
     isolatedConfigImports: ["agents_standard"], lazyRzMcpProxyTools: 2,
     rawPromptFilesRetained: false, ephemeralSessionsRemoved: true,
     activeThreadTurns: activeThreadTurns.size, pinnedQuotaTasks: quotaTaskPins.size,
     pinnedProviderTasks: providerTaskPins.size,
-    calendarQuotaState: calendarQuotaState.snapshot(), runtime,
+    calendarQuotaState: calendarQuotaState.snapshot(),
+    ollamaQuotaState: ollamaQuotaState.snapshot(),
+    runtime,
   };
 }
 
@@ -3001,6 +3117,41 @@ async function selfTest() {
   } finally {
     try { unlinkSync(quotaFixturePath); } catch (error) { if (error?.code !== "ENOENT") throw error; }
     try { unlinkSync(`${quotaFixturePath}.${process.pid}.tmp`); } catch (error) { if (error?.code !== "ENOENT") throw error; }
+  }
+  let ollamaProbeNow = fixedQuotaNow;
+  const ollamaQuotaFixturePath = join(
+    REQUEST_DIRECTORY,
+    `ollama-quota-state-self-test-${process.pid}.json`,
+  );
+  try {
+    const persistentOllamaQuota = new RecoveryProbeState(
+      ollamaQuotaFixturePath,
+      () => ollamaProbeNow,
+    );
+    persistentOllamaQuota.record("session_usage_limit");
+    const reloadedOllamaQuota = new RecoveryProbeState(
+      ollamaQuotaFixturePath,
+      () => ollamaProbeNow,
+    );
+    if (
+      !reloadedOllamaQuota.isActive()
+      || reloadedOllamaQuota.claimRecoveryProbe()
+      || reloadedOllamaQuota.snapshot().reason !== "session_usage_limit"
+    ) {
+      throw new Error("Ollama quota state did not suppress premature recovery probes");
+    }
+    ollamaProbeNow += QUOTA_RECOVERY_PROBE_MS;
+    if (
+      !reloadedOllamaQuota.claimRecoveryProbe()
+      || reloadedOllamaQuota.claimRecoveryProbe()
+      || !reloadedOllamaQuota.clear()
+      || reloadedOllamaQuota.isActive()
+    ) {
+      throw new Error("Ollama quota state did not provide one bounded recovery probe");
+    }
+  } finally {
+    try { unlinkSync(ollamaQuotaFixturePath); } catch (error) { if (error?.code !== "ENOENT") throw error; }
+    try { unlinkSync(`${ollamaQuotaFixturePath}.${process.pid}.tmp`); } catch (error) { if (error?.code !== "ENOENT") throw error; }
   }
   if (
     route.antigravityProvider !== "antigravity"

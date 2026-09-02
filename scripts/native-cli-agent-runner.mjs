@@ -44,6 +44,7 @@ const VALIDATION_RESTRICTED_TASK = /\b(?:do not|must not|never)[^.\n]{0,160}\b(?
 const MUTATION_TOOL = /^(?:apply_patch|edit|edit_file|write|write_file|create_file|delete_file|move_file)$/i;
 const LAZY_RZMCP_CALL_TOOL = /(?:^|[_:.-])call_rzmcp_tool$/i;
 const READ_ONLY_RZMCP_TOOL_NAME = /^(?:analyze|check|count|describe|discover|does|enumerate|find|get|has|inspect|is|list|locate|query|read|resolve|search|validate)_/i;
+const OLLAMA_USAGE_LIMIT = /providerID=ollama[\s\S]{0,2000}(?:reached|exceeded)[\s\S]{0,120}(?:session\s+)?usage limit|providerID=ollama[\s\S]{0,2000}\b429\b[\s\S]{0,120}(?:quota|usage|limit)/i;
 const retainedOpenCodeStates = new Set();
 const retainedCommandCodeSessions = new Set();
 const nativeStateTails = new Map();
@@ -298,6 +299,7 @@ function nativeProcess({
   signal,
   onEvent,
   parseLine,
+  inspectStderr,
   label,
   requestTimeoutMs = REQUEST_TIMEOUT_MS,
   routeOwnershipTimeoutMs = ROUTE_OWNERSHIP_TIMEOUT_MS,
@@ -378,6 +380,12 @@ function nativeProcess({
     child.stderr.setEncoding("utf8");
     child.stderr.on("data", (chunk) => {
       stderr = `${stderr}${chunk}`.slice(-STDERR_LIMIT);
+      try {
+        inspectStderr?.(stderr, state);
+      } catch (error) {
+        child.kill();
+        finish(error);
+      }
     });
     child.once("error", (error) => finish(new NativeCliAgentError(`${label} failed to start: ${error.message}`)));
     child.once("close", (code, closeSignal) => {
@@ -611,6 +619,10 @@ function openCodeParser(event, state, executionPolicy) {
   state.outputTokens ||= 0;
   state.peakTurnInputTokens ||= 0;
   state.eventSequence = Number(state.eventSequence || 0) + 1;
+  if (event.type === "error") {
+    const errorName = typeof event.error?.name === "string" ? event.error.name : "provider error";
+    throw new NativeCliAgentError(`OpenCode reported ${errorName}`, 502);
+  }
   if (
     ["step_start", "step-start"].includes(event.type)
     || (event.type === "reasoning" && typeof event.part?.text === "string" && event.part.text.length > 0)
@@ -641,6 +653,7 @@ function openCodeParser(event, state, executionPolicy) {
 
 function openCodeRunArgs(context, providerKind, prompt, continueSession = false) {
   const args = ["run", "--pure", "--auto", "--format", "json"];
+  if (providerKind === "ollama") args.push("--print-logs", "--log-level", "ERROR");
   if (continueSession) args.push("--continue");
   else args.push("--title", "RzCodex native subagent");
   args.push(
@@ -650,6 +663,16 @@ function openCodeRunArgs(context, providerKind, prompt, continueSession = false)
     prompt,
   );
   return args;
+}
+
+function inspectOpenCodeStderr(providerKind, stderr) {
+  if (providerKind !== "ollama" || !OLLAMA_USAGE_LIMIT.test(stderr)) return;
+  const error = new NativeCliAgentError(
+    "Ollama cloud usage limit is currently exhausted",
+    503,
+  );
+  error.quotaFailure = true;
+  throw error;
 }
 
 function routeOwnershipTimeout(continueSession, requestTimeoutMs) {
@@ -698,6 +721,7 @@ export async function runOpenCodeNativeAgent(context, {
       signal,
       onEvent,
       parseLine: (event, state) => openCodeParser(event, state, context.executionPolicy),
+      inspectStderr: (stderr) => inspectOpenCodeStderr(providerKind, stderr),
       label: `${context.provider} native OpenCode agent`,
       requestTimeoutMs: timeoutMs,
       routeOwnershipTimeoutMs: routeOwnershipTimeout(continueSession, timeoutMs),
@@ -1164,11 +1188,15 @@ export async function nativeCliAgentRunnerSelfTest() {
   }
   const initialArgs = openCodeRunArgs(resumedMutationContext, "ollama", resumedMutationContext.prompt);
   const recoveryArgs = openCodeRunArgs(resumedMutationContext, "ollama", recoveryPrompt, true);
+  const nonOllamaArgs = openCodeRunArgs(resumedMutationContext, "opencode", resumedMutationContext.prompt);
   if (
     initialArgs.includes("--continue")
     || !initialArgs.includes("--title")
+    || !initialArgs.includes("--print-logs")
+    || !initialArgs.includes("ERROR")
     || !recoveryArgs.includes("--continue")
     || recoveryArgs.includes("--title")
+    || nonOllamaArgs.includes("--print-logs")
     || routeOwnershipTimeout(false, 120_000) !== ROUTE_OWNERSHIP_TIMEOUT_MS
     || routeOwnershipTimeout(true, 120_000) !== 120_000
   ) {
@@ -1248,6 +1276,63 @@ export async function nativeCliAgentRunnerSelfTest() {
   });
   if (activeReasoning.state.finalText !== "complete") {
     throw new Error("native CLI active reasoning incorrectly triggered provider rerouting");
+  }
+
+  const quotaStartedAt = Date.now();
+  let ollamaQuotaError = null;
+  try {
+    await nativeProcess({
+      command: process.execPath,
+      args: [
+        "-e",
+        "console.error('level=ERROR providerID=ollama modelID=fixture error.error=\"AI_APICallError: reached your session usage limit\"'); setTimeout(() => {}, 1000);",
+      ],
+      cwd: process.cwd(),
+      env: sanitizedEnvironment(),
+      parseLine: fixtureParser,
+      inspectStderr: (stderr) => inspectOpenCodeStderr("ollama", stderr),
+      label: "Ollama quota fixture",
+      requestTimeoutMs: 2_000,
+      routeOwnershipTimeoutMs: 1_500,
+    });
+  } catch (error) {
+    ollamaQuotaError = error;
+  }
+  if (
+    ollamaQuotaError?.status !== 503
+    || ollamaQuotaError?.quotaFailure !== true
+    || !ollamaQuotaError.message.includes("usage limit")
+    || Date.now() - quotaStartedAt >= 1_000
+  ) {
+    throw new Error("native Ollama quota error was not surfaced immediately");
+  }
+
+  const benignStderr = await nativeProcess({
+    command: process.execPath,
+    args: [
+      "-e",
+      "console.error('level=ERROR providerID=ollama message=temporary-note'); console.log(JSON.stringify({type:'done',text:'complete'}));",
+    ],
+    cwd: process.cwd(),
+    env: sanitizedEnvironment(),
+    parseLine: fixtureParser,
+    inspectStderr: (stderr) => inspectOpenCodeStderr("ollama", stderr),
+    label: "Ollama benign stderr fixture",
+    requestTimeoutMs: 2_000,
+    routeOwnershipTimeoutMs: 1_500,
+  });
+  if (benignStderr.state.finalText !== "complete") {
+    throw new Error("native Ollama stderr inspection rejected a non-quota message");
+  }
+
+  let providerEventError = null;
+  try {
+    openCodeParser({ type: "error", error: { name: "UnknownError" } }, {}, { rzMcpMode: "disabled" });
+  } catch (error) {
+    providerEventError = error;
+  }
+  if (providerEventError?.message !== "OpenCode reported UnknownError") {
+    throw new Error("native OpenCode terminal error event was silently ignored");
   }
 
   let preToolTimeout = null;
