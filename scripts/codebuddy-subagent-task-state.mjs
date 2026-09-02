@@ -4,7 +4,7 @@ const NEW_TASK_HEADER = /^Message Type:\s*NEW_TASK\s*$/m;
 const MESSAGE_HEADER = /^Message Type:\s*MESSAGE\s*$/m;
 const TASK_NAME_HEADER = /^Task name:\s*(.+?)\s*$/m;
 const PAYLOAD_HEADER = /(?:^|\n)Payload:\s*\n/;
-const MUTATION_INTENT = /\b(?:implement|fix|patch|edit|modify|create|write|replace|delete|repair|refactor|apply_patch)\b/gi;
+const MUTATION_INTENT = /\b(?:implement|fix|patch|edit|modify|create|write|replace|delete|remove|repair|refactor|instrument|apply_patch)\b/gi;
 const NEGATED_MUTATION_PREFIX = /\b(?:do not|don't|must not|never|cannot|can't|not allowed to)\s+(?:[a-z][a-z0-9_-]*\s+){0,4}$/i;
 const EXPLICIT_READ_ONLY_TASK = /\bread[- ]only\b|\bno[- ]mutation\b|\bno\s+(?:edits?|modifications?|writes?|mutations?|file\s+changes|source\s+changes)\s*(?:[.;,/]|$)|\b(?:do not|must not|never)\s+(?:edit|modify|write|mutate)(?:\s+(?:any|the|source|project|workspace|files?)){0,3}(?:[.;,]|$)/i;
 const CHECKPOINT_REQUEST = /\b(?:checkpoint(?:\/report)?|status report|progress report)\b/i;
@@ -173,9 +173,10 @@ function resumedTaskIntent(text, priorIntent, currentIntent) {
   const resumeIndex = payload.search(/\b(?:resume|continue|proceed|carry on|pick up|reprends?|reprendre|continue[rz]?|poursuis|poursuivre)\b/i);
   if (resumeIndex < 0) return currentIntent;
   const resumedScope = payload.slice(resumeIndex);
-  const mutationIndex = resumedScope.search(/\b(?:implementation|implementing|patch(?:ing)?|edit(?:ing)?|mutation|fix(?:ing)?|repair(?:ing)?|code changes?|impl[eé]mentation|correction)\b/i);
+  const mutationIndex = resumedScope.search(/\b(?:apply|implementation|implementing|patch(?:ing)?|edit(?:ing)?|modify(?:ing)?|mutation|fix(?:ing)?|repair(?:ing)?|refactor(?:ing)?|remove|instrument|code changes?|impl[eé]mentation|corrections?)\b|\b(?:finish|complete|minimi[sz]e|clean up)\b[\s\S]{0,80}\b(?:diff|patch|implementation|diagnostics?|instrumentation|code|changes?)\b/i);
   const analysisIndex = resumedScope.search(/\b(?:statically\s+)?(?:audit|review|inspect|analy[sz]e|assess|confirm|revue|analyse[rz]?|inspecte[rz]?)\b/i);
-  if (analysisIndex >= 0 && (mutationIndex < 0 || analysisIndex < mutationIndex)) return currentIntent;
+  if (mutationIndex >= 0) return "mutation";
+  if (analysisIndex >= 0) return currentIntent;
   return "mutation";
 }
 

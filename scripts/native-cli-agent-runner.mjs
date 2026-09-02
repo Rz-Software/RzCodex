@@ -627,6 +627,29 @@ export async function nativeCliAgentRunnerSelfTest() {
   ) {
     throw new Error("native CLI resumed task lost its explicitly referenced prior assignment");
   }
+  const mutationOriginText = "Message Type: NEW_TASK\nTask name: /root/resumed_mutation_fixture\nPayload:\nImplement the bounded diagnostic and remove obsolete code. Do not build or run tests.";
+  const mutationResumeText = "Message Type: NEW_TASK\nTask name: /root/resumed_mutation_fixture\nPayload:\nBridge repaired. Resume the same task. Apply the integration-review corrections, minimize the current diff, and finish; no build/editor/tests.";
+  const resumedMutationContext = nativeCliAgentContext({
+    model: "@preset/codex-subagents",
+    reasoning: { effort: "max" },
+    stream: true,
+    client_metadata: { cwd: authoritativeWorkspace },
+    input: [
+      { type: "agent_message", id: "mutation-origin-fixture", author: "Codex", recipient: "/root/resumed_mutation_fixture", content: [{ type: "input_text", text: mutationOriginText }] },
+      { type: "agent_message", id: "mutation-resume-fixture", author: "Codex", recipient: "/root/resumed_mutation_fixture", content: [{ type: "input_text", text: mutationResumeText }] },
+    ],
+  }, {
+    provider: "fixture",
+    model: "fixture-model",
+    requiredEffort: "max",
+  });
+  if (
+    resumedMutationContext.taskDiagnostics.taskIntent !== "mutation"
+    || !resumedMutationContext.prompt.includes("[Mutation convergence contract]")
+    || resumedMutationContext.prompt.includes("[Analysis convergence contract]")
+  ) {
+    throw new Error("native CLI resumed implementation was misclassified as analysis");
+  }
   let missingCwdError = null;
   try {
     nativeCliAgentContext({
