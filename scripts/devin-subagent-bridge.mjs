@@ -14,6 +14,7 @@ import {
   isExplicitReadOnlyTask,
   isBridgeProgressReasoning,
   normalizeAgentMessageContent,
+  rzMcpModeForTask,
   taskControlPromptSections,
   taskDeliveryDiagnostics,
   taskStateFromInput,
@@ -86,7 +87,6 @@ const INTERRUPTED_STREAM = /stream (?:was )?interrupted|stream disconnected|conn
 const PROVIDER_COMPACTION = /provider context compacted/i;
 const PERMISSION_REJECTION = /rejected a tool call that requires confirmation|permission (?:was )?denied|requires (?:user )?confirmation/i;
 const VALIDATION_RESTRICTED_TASK = /\b(?:do not|must not|never)[^.\n]{0,160}\b(?:build|compile|run\s+(?:the\s+)?tests?|test|control\s+(?:the\s+)?editor|use\s+(?:the\s+)?editor|pie|sie)\b|\bno\s+(?:build|compile|tests?|editor|pie|sie)\b|\b(?:aucun(?:e)?|sans|interdiction\s+d['’](?:ex[eé]cuter|utiliser))[^.\n]{0,160}\b(?:build|compil(?:e|er|ation)|tests?|editor|[eé]diteur|pie|sie)\b/i;
-const RZMCP_RESTRICTED_TASK = /\b(?:do not|must not|never)[^.\n]{0,160}\b(?:use|invoke|control|call)\s+(?:any\s+|the\s+)?(?:editor|rzmcp)\b|\bno\s+[^.\n]{0,120}\b(?:editor|rzmcp|pie|sie)\b|\b(?:aucun(?:e)?|sans|interdiction\s+d['’](?:ex[eé]cuter|utiliser))[^.\n]{0,160}\b(?:editor|[eé]diteur|rzmcp|pie|sie)\b/i;
 const QUOTA_STATE_VERSION = 2;
 
 class BridgeError extends Error {
@@ -258,17 +258,12 @@ function executionPolicyFromTaskState(taskState) {
   const taskText = taskState?.activeTask?.text || "";
   const readOnly = taskState?.activeTask?.intent === "analysis" || isExplicitReadOnlyTask(taskText);
   const validationRestricted = VALIDATION_RESTRICTED_TASK.test(taskText);
-  const rzMcpRestricted = RZMCP_RESTRICTED_TASK.test(taskText);
   return {
     // Devin's non-interactive auto and accept-edits modes still reject ordinary shell commands.
     // Native subagents need the same file/shell surface as the other managed providers; task scope
     // and RzMCP access remain constrained independently below and in the pinned task prompt.
     permissionMode: "dangerous",
-    rzMcpMode: rzMcpRestricted
-      ? "disabled"
-      : readOnly
-        ? "read-only"
-        : "no-validation",
+    rzMcpMode: rzMcpModeForTask(taskText, readOnly),
     readOnly,
     validationRestricted,
   };
@@ -2817,6 +2812,14 @@ async function selfTest() {
       text: "Audit statique borne, aucun edit sauf correction chirurgicale, aucun build/test/editor/PIE/stage/commit.",
     },
   });
+  const explicitReadOnlyRzMcpPolicy = executionPolicyFromTaskState({
+    activeTask: {
+      text: "Read-only inspection. No edits/build/tests/editor control/assets saves/staging. Use RzDirectMCP semantic/read-only APIs only (never binary grep).",
+    },
+  });
+  const explicitRzMcpBanPolicy = executionPolicyFromTaskState({
+    activeTask: { text: "Read-only inspection. Use repository text tools, but do not use or invoke RzDirectMCP." },
+  });
   if (
     readOnlyPolicy.permissionMode !== "dangerous"
     || readOnlyPolicy.rzMcpMode !== "disabled"
@@ -2832,6 +2835,10 @@ async function selfTest() {
     || shorthandReadOnlyPolicy.rzMcpMode !== "disabled"
     || frenchBoundedReviewPolicy.permissionMode !== "dangerous"
     || frenchBoundedReviewPolicy.rzMcpMode !== "disabled"
+    || explicitReadOnlyRzMcpPolicy.permissionMode !== "dangerous"
+    || explicitReadOnlyRzMcpPolicy.rzMcpMode !== "read-only"
+    || explicitRzMcpBanPolicy.permissionMode !== "dangerous"
+    || explicitRzMcpBanPolicy.rzMcpMode !== "disabled"
   ) {
     throw new Error("task execution permission policy failed");
   }

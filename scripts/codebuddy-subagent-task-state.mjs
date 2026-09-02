@@ -12,6 +12,19 @@ const IMMEDIATE_RETURN = [
   /\b(?:return|report|respond)\b[\s\S]{0,120}\b(?:immediately|right now|now)\b/i,
   /\b(?:immediately|right now|now)\b[\s\S]{0,120}\b(?:return|report|respond)\b/i,
 ];
+const RZMCP_NAME = String.raw`rz(?:direct)?mcp`;
+const RZMCP_EXPLICIT_PROHIBITION = [
+  new RegExp(String.raw`\b(?:do not|don't|must not|never|cannot|can't)\b[^\n.;]{0,160}\b${RZMCP_NAME}\b`, "i"),
+  new RegExp(String.raw`\bno\s+[^\n.;]{0,160}\b${RZMCP_NAME}\b`, "i"),
+  new RegExp(String.raw`\b(?:ne\s+(?:pas|jamais)|sans|aucun(?:e)?|interdiction\s+d['’](?:utiliser|invoquer|appeler))\b[^\n.;]{0,160}\b${RZMCP_NAME}\b`, "i"),
+];
+const RZMCP_EXPLICIT_REQUIREMENT = [
+  new RegExp(String.raw`\b(?:use|invoke|call|access|query)\b[^\n.;]{0,120}\b${RZMCP_NAME}\b`, "i"),
+  new RegExp(String.raw`\b(?:using|via|through|with)\s+(?:the\s+)?${RZMCP_NAME}\b`, "i"),
+  new RegExp(String.raw`\b(?:utiliser|utilisez|utilise|invoquer|invoquez|appeler|appelez|acc[eé]der)\b[^\n.;]{0,120}\b${RZMCP_NAME}\b`, "i"),
+  /\bmcp__rzmcp__[a-z0-9_]+\b/i,
+];
+const GENERIC_EDITOR_RESTRICTION = /\b(?:do not|must not|never)[^.\n]{0,160}\b(?:use|invoke|control|call)\s+(?:any\s+|the\s+)?editor\b|\bno\s+[^.\n]{0,120}\b(?:editor|pie|sie)\b|\b(?:aucun(?:e)?|sans|interdiction\s+d['’](?:ex[eé]cuter|utiliser))[^.\n]{0,160}\b(?:editor|[eé]diteur|pie|sie)\b/i;
 
 export class TaskStateError extends Error {
   constructor(message) {
@@ -40,6 +53,15 @@ function requireNonEmptyString(value, label) {
 function payloadFrom(text) {
   const match = PAYLOAD_HEADER.exec(text);
   return match ? text.slice(match.index + match[0].length) : text;
+}
+
+export function rzMcpModeForTask(text, readOnly) {
+  const payload = payloadFrom(text);
+  const explicitlyProhibited = RZMCP_EXPLICIT_PROHIBITION.some((pattern) => pattern.test(payload));
+  if (explicitlyProhibited) return "disabled";
+  const explicitlyRequired = RZMCP_EXPLICIT_REQUIREMENT.some((pattern) => pattern.test(payload));
+  if (!explicitlyRequired && GENERIC_EDITOR_RESTRICTION.test(payload)) return "disabled";
+  return readOnly ? "read-only" : "no-validation";
 }
 
 function isCheckpointRequest(text) {

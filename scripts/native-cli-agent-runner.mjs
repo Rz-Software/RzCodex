@@ -7,6 +7,7 @@ import {
   TaskStateError,
   activeTaskPromptSection,
   isExplicitReadOnlyTask,
+  rzMcpModeForTask,
   taskControlPromptSections,
   taskDeliveryDiagnostics,
   taskStateFromInput,
@@ -35,7 +36,6 @@ const OPENCODE_STATE_DIRECTORY = join(
 const LAZY_RZMCP_PROXY = join(import.meta.dirname, "devin-rzmcp-lazy-proxy.mjs");
 const ROLE_TAG = /<(?:external_cli|codebuddy|cursor)_route_instructions>([\s\S]*?)<\/(?:external_cli|codebuddy|cursor)_route_instructions>/gi;
 const VALIDATION_RESTRICTED_TASK = /\b(?:do not|must not|never)[^.\n]{0,160}\b(?:build|compile|run\s+(?:the\s+)?tests?|test|control\s+(?:the\s+)?editor|use\s+(?:the\s+)?editor|pie|sie)\b|\bno\s+(?:build|compile|tests?|editor|pie|sie)\b/i;
-const RZMCP_RESTRICTED_TASK = /\b(?:do not|must not|never)[^.\n]{0,160}\b(?:use|invoke|control|call)\s+(?:any\s+|the\s+)?(?:editor|rzmcp)\b|\bno\s+[^.\n]{0,120}\b(?:editor|rzmcp|pie|sie)\b/i;
 const MUTATION_TOOL = /^(?:apply_patch|edit|edit_file|write|write_file|create_file|delete_file|move_file|mcp__rzmcp__call_rzmcp_tool)$/i;
 
 export class NativeCliAgentError extends Error {
@@ -163,11 +163,7 @@ function executionPolicy(taskState) {
   return {
     readOnly,
     validationRestricted: VALIDATION_RESTRICTED_TASK.test(task),
-    rzMcpMode: RZMCP_RESTRICTED_TASK.test(task)
-      ? "disabled"
-      : readOnly
-        ? "read-only"
-        : "no-validation",
+    rzMcpMode: rzMcpModeForTask(task, readOnly),
   };
 }
 
@@ -563,6 +559,42 @@ export async function nativeCliAgentRunnerSelfTest() {
   });
   if (cwdContext.workingDirectory !== authoritativeWorkspace) {
     throw new Error("native CLI ignored the authoritative request working directory");
+  }
+  const policyContext = (payload) => nativeCliAgentContext({
+    model: "@preset/codex-subagents",
+    reasoning: { effort: "max" },
+    stream: true,
+    client_metadata: { cwd: authoritativeWorkspace },
+    input: [{
+      type: "agent_message",
+      id: `policy-fixture-${randomUUID()}`,
+      author: "Codex",
+      recipient: "/root/policy_fixture",
+      content: [{
+        type: "input_text",
+        text: `Message Type: NEW_TASK\nTask name: /root/policy_fixture\nPayload:\n${payload}`,
+      }],
+    }],
+  }, {
+    provider: "fixture",
+    model: "fixture-model",
+    requiredEffort: "max",
+  }).executionPolicy;
+  const explicitReadOnlyRzMcp = policyContext(
+    "Read-only inspection. No edits/build/tests/editor control/assets saves/staging. Use RzDirectMCP semantic/read-only APIs only (never binary grep).",
+  );
+  const explicitRzMcpBan = policyContext(
+    "Read-only inspection. Use repository text tools, but do not use or invoke RzDirectMCP.",
+  );
+  const genericEditorBan = policyContext(
+    "Read-only inspection. No edits/build/tests/editor/PIE/staging.",
+  );
+  if (
+    explicitReadOnlyRzMcp.rzMcpMode !== "read-only"
+    || explicitRzMcpBan.rzMcpMode !== "disabled"
+    || genericEditorBan.rzMcpMode !== "disabled"
+  ) {
+    throw new Error("native CLI RzMCP task capability classification failed");
   }
   let missingCwdError = null;
   try {

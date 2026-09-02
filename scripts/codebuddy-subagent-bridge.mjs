@@ -24,6 +24,7 @@ import {
   isBridgeProgressReasoning,
   isExplicitReadOnlyTask,
   normalizeAgentMessageContent,
+  rzMcpModeForTask,
   taskControlPromptSections,
   taskDeliveryDiagnostics,
   taskStateFromInput,
@@ -50,7 +51,6 @@ const CODEBUDDY_HOME = join(homedir(), ".codebuddy");
 const MANAGED_SESSION_PREFIX = "rzcodex-";
 const SCRIPT_DIRECTORY = dirname(fileURLToPath(import.meta.url));
 const MCP_SERVER_SCRIPT = join(SCRIPT_DIRECTORY, "devin-rzmcp-lazy-proxy.mjs");
-const RZMCP_RESTRICTED_TASK = /\b(?:do not|must not|never)[^.\n]{0,160}\b(?:use|invoke|control|call)\s+(?:any\s+|the\s+)?(?:editor|rzmcp)\b|\bno\s+[^.\n]{0,120}\b(?:editor|rzmcp|pie|sie)\b/i;
 const PROVIDER_MUTATION_TOOL = /^(?:Edit|Write|NotebookEdit|mcp__rzmcp__call_rzmcp_tool)$/i;
 const CODEBUDDY_SCRIPT = join(
   process.env.APPDATA || join(homedir(), "AppData", "Roaming"),
@@ -70,11 +70,7 @@ function executionPolicy(taskState) {
   const readOnly = taskState.activeTask?.intent === "analysis" || isExplicitReadOnlyTask(task);
   return {
     readOnly,
-    rzMcpMode: RZMCP_RESTRICTED_TASK.test(task)
-      ? "disabled"
-      : readOnly
-        ? "read-only"
-        : "no-validation",
+    rzMcpMode: rzMcpModeForTask(task, readOnly),
   };
 }
 
@@ -1715,6 +1711,30 @@ function selfTest() {
   }], { cwd: homedir() });
   if (readOnlyTask.workingDirectory !== homedir()) {
     throw new Error("self-test failed: CodeBuddy ignored the authoritative request working directory");
+  }
+  const rzMcpPolicyTask = (id, payload) => normalizeSelfTestRequest([{
+    type: "agent_message",
+    id,
+    author: "Codex",
+    recipient: "/root/rzmcp_policy",
+    content: [{
+      type: "input_text",
+      text: `Message Type: NEW_TASK\nTask name: /root/rzmcp_policy\nPayload:\n${payload}`,
+    }],
+  }]);
+  const explicitReadOnlyRzMcp = rzMcpPolicyTask(
+    "self-test-rzmcp-required",
+    "Read-only inspection. No edits/build/tests/editor control/assets saves/staging. Use RzDirectMCP semantic/read-only APIs only (never binary grep).",
+  );
+  const explicitRzMcpBan = rzMcpPolicyTask(
+    "self-test-rzmcp-forbidden",
+    "Read-only inspection. Use repository text tools, but do not use or invoke RzDirectMCP.",
+  );
+  if (
+    explicitReadOnlyRzMcp.executionPolicy.rzMcpMode !== "read-only"
+    || explicitRzMcpBan.executionPolicy.rzMcpMode !== "disabled"
+  ) {
+    throw new Error("self-test failed: CodeBuddy RzMCP task capability classification");
   }
   const boundedMutationTask = normalizeSelfTestRequest([{
     type: "agent_message",
