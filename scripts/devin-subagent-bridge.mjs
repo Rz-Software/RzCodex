@@ -490,6 +490,24 @@ function ownershipTaskHash(context) {
   return taskOwnershipHash(context.taskState) ?? context.taskDiagnostics?.taskHash ?? null;
 }
 
+function pinProviderTask(context, stage) {
+  if (context.requestedRoute !== "auto") return false;
+  const changed = providerTaskPins.pin(context.threadId, ownershipTaskHash(context), stage);
+  if (changed) runtime.providerTaskPinsCreated += 1;
+  runtime.lastPinnedProviderStage = stage;
+  return changed;
+}
+
+function preserveProviderPinForAbortedTurn(context, error, signal) {
+  if (!signal?.aborted) return null;
+  const stage = providerTaskPins.get(context.threadId, ownershipTaskHash(context));
+  if (stage === null) return null;
+  runtime.lastPinnedProviderStage = stage;
+  error.providerTaskPinPreserved = true;
+  error.routeCommitted = true;
+  return stage;
+}
+
 function retainedDevinSessionKey(context, selectedModel) {
   const taskHash = ownershipTaskHash(context);
   if (!context.threadId || !taskHash || !selectedModel?.model_uid) return null;
@@ -1938,9 +1956,7 @@ function fallbackState(context, failures, terminalFallback = false) {
 async function runAntigravityStage(context, requestBody, failures, onProgress, signal, streamRelay) {
   runtime.providerAttempts.antigravity += 1;
   runtime.lastProviderSequence.push("antigravity");
-  if (context.requestedRoute === "auto") {
-    providerTaskPins.pin(context.threadId, ownershipTaskHash(context), "antigravity");
-  }
+  pinProviderTask(context, "antigravity");
   onProgress?.("Automatic route started Antigravity Claude/Gemini pool selection.\n");
   try {
     const forwardedBody = fallbackForwardBody(
@@ -1986,9 +2002,7 @@ async function runAntigravityStage(context, requestBody, failures, onProgress, s
 async function runCodeBuddyStage(context, requestBody, failures, onProgress, signal, streamRelay) {
   runtime.providerAttempts.codebuddy += 1;
   runtime.lastProviderSequence.push("codebuddy");
-  if (context.requestedRoute === "auto") {
-    providerTaskPins.pin(context.threadId, ownershipTaskHash(context), "codebuddy");
-  }
+  pinProviderTask(context, "codebuddy");
   onProgress?.("Automatic route started one self-contained CodeBuddy native CLI execution.\n");
   try {
     const forwardedBody = fallbackForwardBody(
@@ -2049,9 +2063,7 @@ async function runOllamaStage(
     return await withRouteCapacity(selected, signal, async () => {
       runtime.providerAttempts.ollama += 1;
       runtime.lastProviderSequence.push("ollama");
-      if (context.requestedRoute === "auto") {
-        providerTaskPins.pin(context.threadId, ownershipTaskHash(context), "ollama");
-      }
+      pinProviderTask(context, "ollama");
       onProgress?.("Ollama native CLI agent started one self-contained execution.\n");
       let nativeContext;
       try {
@@ -2156,9 +2168,7 @@ async function runDevinStage(
   const freeModel = selected.key === "terminal";
   const providerKey = freeModel ? "devinFree" : "devin";
   const stage = terminalFallback ? "devin-free" : "devin";
-  if (context.requestedRoute === "auto") {
-    providerTaskPins.pin(context.threadId, ownershipTaskHash(context), stage);
-  }
+  pinProviderTask(context, stage);
   const retainedSessionKey = retainedDevinSessionKey(context, selected.model);
   const retainedSession = retainedSessionKey
     ? retainedDevinSessions.get(retainedSessionKey) || null
@@ -2189,10 +2199,7 @@ async function runDevinStage(
   } catch (error) {
     if (retainedSessionKey && error?.retainedProviderSession) {
       retainedDevinSessions.set(retainedSessionKey, error.retainedProviderSession);
-      if (providerTaskPins.pin(context.threadId, ownershipTaskHash(context), stage)) {
-        runtime.providerTaskPinsCreated += 1;
-      }
-      runtime.lastPinnedProviderStage = stage;
+      pinProviderTask(context, stage);
     }
     error.failedStage ||= terminalFallback ? "devin-free" : "devin";
     throw error;
@@ -2312,10 +2319,7 @@ async function executeAuto(context, requestBody, onSpawn, onProgress, signal, cr
       pinnedStage,
       onStageFailure: (stage, error) => {
         if (error?.providerTaskPinPreserved === true) {
-          if (providerTaskPins.pin(context.threadId, ownershipTaskHash(context), stage)) {
-            runtime.providerTaskPinsCreated += 1;
-          }
-          runtime.lastPinnedProviderStage = stage;
+          pinProviderTask(context, stage);
         } else if (
           error?.routeCommitted !== true
           && providerTaskPins.release(context.threadId, ownershipTaskHash(context))
@@ -2342,11 +2346,12 @@ async function executeAuto(context, requestBody, onSpawn, onProgress, signal, cr
       },
     });
   } catch (error) {
+    const abortedStage = preserveProviderPinForAbortedTurn(context, error, signal);
+    if (abortedStage !== null) {
+      throw error;
+    }
     if (pinnedStage !== null) {
-      if (providerTaskPins.pin(context.threadId, ownershipTaskHash(context), pinnedStage)) {
-        runtime.providerTaskPinsCreated += 1;
-      }
-      runtime.lastPinnedProviderStage = pinnedStage;
+      pinProviderTask(context, pinnedStage);
       error.providerTaskPinPreserved = true;
       error.routeCommitted = true;
     } else if (
@@ -2703,12 +2708,7 @@ async function handleResponses(request, response) {
       && result.autoStage
       && (routeRetentionCount > 0 || result.preserveProviderPin === true)
     ) {
-      if (providerTaskPins.pin(
-        context.threadId,
-        taskHash,
-        result.autoStage,
-      )) runtime.providerTaskPinsCreated += 1;
-      runtime.lastPinnedProviderStage = result.autoStage;
+      pinProviderTask(context, result.autoStage);
     } else if (providerTaskPins.releaseAfterFinalResponse(
       context.threadId,
       taskHash,
@@ -4127,6 +4127,36 @@ async function selfTest() {
   ) {
     throw new Error("active provider continuation checkpoint lost its provider pin");
   }
+  const abortedProviderContext = {
+    requestedRoute: "auto",
+    threadId: "thread-aborted-provider-owner",
+    taskState: { activeTask: { hash: "task-aborted-provider-owner" } },
+    taskDiagnostics: { taskHash: "task-aborted-provider-owner" },
+  };
+  pinProviderTask(abortedProviderContext, "devin-free");
+  const abortedProviderController = new AbortController();
+  abortedProviderController.abort();
+  const abortedProviderError = new Error("superseded by parent checkpoint");
+  const abortedProviderStage = preserveProviderPinForAbortedTurn(
+    abortedProviderContext,
+    abortedProviderError,
+    abortedProviderController.signal,
+  );
+  if (
+    abortedProviderStage !== "devin-free"
+    || abortedProviderError.providerTaskPinPreserved !== true
+    || abortedProviderError.routeCommitted !== true
+    || providerTaskPins.get(
+      abortedProviderContext.threadId,
+      ownershipTaskHash(abortedProviderContext),
+    ) !== "devin-free"
+  ) {
+    throw new Error("parent checkpoint abort released the active provider owner");
+  }
+  providerTaskPins.release(
+    abortedProviderContext.threadId,
+    ownershipTaskHash(abortedProviderContext),
+  );
   let concurrentFreeCalls = 0;
   let peakConcurrentFreeCalls = 0;
   const freeRoute = { key: "terminal" };
