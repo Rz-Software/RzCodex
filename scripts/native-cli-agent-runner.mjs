@@ -821,6 +821,8 @@ export async function nativeCliAgentRunnerSelfTest() {
   });
   if (
     resumedMutationContext.taskDiagnostics.taskIntent !== "mutation"
+    || !resumedMutationContext.prompt.includes("[Parent-directed turn scope]")
+    || !resumedMutationContext.prompt.includes("the parent can answer and resume this same Codex subagent")
     || !resumedMutationContext.prompt.includes("[Mutation convergence contract]")
     || resumedMutationContext.prompt.includes("[Analysis convergence contract]")
   ) {
