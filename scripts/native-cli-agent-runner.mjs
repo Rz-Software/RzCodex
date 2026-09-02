@@ -614,6 +614,12 @@ function openCodeRunArgs(context, providerKind, prompt, continueSession = false)
   return args;
 }
 
+function routeOwnershipTimeout(continueSession, requestTimeoutMs) {
+  return continueSession
+    ? requestTimeoutMs
+    : Math.min(ROUTE_OWNERSHIP_TIMEOUT_MS, requestTimeoutMs);
+}
+
 export async function runOpenCodeNativeAgent(context, {
   providerKind,
   signal,
@@ -656,7 +662,7 @@ export async function runOpenCodeNativeAgent(context, {
       parseLine: openCodeParser,
       label: `${context.provider} native OpenCode agent`,
       requestTimeoutMs: timeoutMs,
-      routeOwnershipTimeoutMs: Math.min(ROUTE_OWNERSHIP_TIMEOUT_MS, timeoutMs),
+      routeOwnershipTimeoutMs: routeOwnershipTimeout(continueSession, timeoutMs),
     });
     return state;
   };
@@ -678,8 +684,9 @@ export async function runOpenCodeNativeAgent(context, {
       resumedProviderSession: resumeRetainedSession,
     };
   } catch (error) {
-    preserveRetainedSession = error?.status === 499
-      && (resumeRetainedSession || (error.nativeToolNames || []).length > 0);
+    if (resumeRetainedSession) error.routeCommitted = true;
+    preserveRetainedSession = resumeRetainedSession
+      || (error?.status === 499 && (error.nativeToolNames || []).length > 0);
     if (preserveRetainedSession) retainedOpenCodeStates.add(dbPath);
     throw error;
   } finally {
@@ -1115,6 +1122,8 @@ export async function nativeCliAgentRunnerSelfTest() {
     || !initialArgs.includes("--title")
     || !recoveryArgs.includes("--continue")
     || recoveryArgs.includes("--title")
+    || routeOwnershipTimeout(false, 120_000) !== ROUTE_OWNERSHIP_TIMEOUT_MS
+    || routeOwnershipTimeout(true, 120_000) !== 120_000
   ) {
     throw new Error("native OpenCode continuation did not retain the isolated provider session");
   }

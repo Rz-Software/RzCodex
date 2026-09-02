@@ -880,6 +880,7 @@ function committedProviderResult(context, error) {
     Number(error?.providerMutationCount || 0),
     Number(error?.mutationToolCalls || 0),
   );
+  const pinnedContinuationFailure = error?.providerTaskPinPreserved === true;
   const text = [
     "[Authoritative native-provider checkpoint]",
     `Task hash: ${context.taskDiagnostics.taskHash}`,
@@ -888,8 +889,12 @@ function committedProviderResult(context, error) {
     `Provider mutation calls observed: ${mutationCount}`,
     `Tool names: ${toolNames.join(", ") || "not reported"}`,
     `Last completed tool: ${toolNames.at(-1) || "not reported"}`,
-    "Concrete blocker: the provider stopped after beginning tool work and did not return a terminal response.",
-    "The provider turn was not replayed and no later provider was started. The delegated task may be incomplete; the parent should inspect the preserved work and decide whether to resume or reassign it.",
+    pinnedContinuationFailure
+      ? "Concrete blocker: the provider continuation stopped before completing the already-owned active task."
+      : "Concrete blocker: the provider stopped after beginning tool work and did not return a terminal response.",
+    pinnedContinuationFailure
+      ? "The active task remains pinned to the same provider. No later provider was started and no committed context was replayed across providers; the parent can resume this same subagent."
+      : "The provider turn was not replayed and no later provider was started. The delegated task may be incomplete; the parent should inspect the preserved work and decide whether to resume or reassign it.",
   ].join("\n");
   return {
     text,
@@ -911,6 +916,8 @@ function committedProviderResult(context, error) {
     rzMcpTools: Array.isArray(error?.rzMcpTools) ? error.rzMcpTools : [],
     toolSchemaBytesIgnored: context.toolSchemaBytes,
     toolSchemaBytesForwarded: 0,
+    autoStage: error?.failedStage || null,
+    preserveProviderPin: pinnedContinuationFailure,
   };
 }
 
@@ -1920,9 +1927,6 @@ async function runAntigravityStage(context, requestBody, failures, onProgress, s
     };
   } catch (error) {
     if (streamRelay.providerWorkCommitted) error.routeCommitted = true;
-    if (context.requestedRoute === "auto" && error?.routeCommitted !== true) {
-      providerTaskPins.release(context.threadId, ownershipTaskHash(context));
-    }
     throw error;
   }
 }
@@ -1973,9 +1977,6 @@ async function runCodeBuddyStage(context, requestBody, failures, onProgress, sig
     };
   } catch (error) {
     if (streamRelay.providerWorkCommitted) error.routeCommitted = true;
-    if (context.requestedRoute === "auto" && error?.routeCommitted !== true) {
-      providerTaskPins.release(context.threadId, ownershipTaskHash(context));
-    }
     throw error;
   }
 }
@@ -2075,9 +2076,6 @@ async function runOllamaStage(
       streamRelay.providerWorkCommitted
       || (Array.isArray(error?.nativeToolNames) && error.nativeToolNames.length > 0)
     ) error.routeCommitted = true;
-    if (context.requestedRoute === "auto" && error?.routeCommitted !== true) {
-      providerTaskPins.release(context.threadId, ownershipTaskHash(context));
-    }
     throw error;
   }
 }
@@ -2132,9 +2130,6 @@ async function runDevinStage(
         runtime.providerTaskPinsCreated += 1;
       }
       runtime.lastPinnedProviderStage = stage;
-    }
-    if (context.requestedRoute === "auto" && error?.routeCommitted !== true) {
-      providerTaskPins.release(context.threadId, ownershipTaskHash(context));
     }
     error.failedStage ||= terminalFallback ? "devin-free" : "devin";
     throw error;
@@ -2245,19 +2240,24 @@ async function executeAuto(context, requestBody, onSpawn, onProgress, signal, cr
       ),
     },
   ];
-  const pinnedIndex = stages.findIndex((stage) => stage.name === pinnedStage);
-  if (pinnedIndex > 0) stages.unshift(stages.splice(pinnedIndex, 1)[0]);
   let chain;
   try {
     chain = await runOrderedProviderChain({
       signal,
       stages,
+      pinnedStage,
       onStageFailure: (stage, error) => {
-        if (
-          stage === pinnedStage
-          && error?.routeCommitted !== true
+        if (error?.providerTaskPinPreserved === true) {
+          if (providerTaskPins.pin(context.threadId, ownershipTaskHash(context), stage)) {
+            runtime.providerTaskPinsCreated += 1;
+          }
+          runtime.lastPinnedProviderStage = stage;
+        } else if (
+          error?.routeCommitted !== true
           && providerTaskPins.release(context.threadId, ownershipTaskHash(context))
-        ) runtime.providerTaskPinsReleasedOnFailure += 1;
+        ) {
+          runtime.providerTaskPinsReleasedOnFailure += 1;
+        }
         runtime.providerFailures[stage] += 1;
         runtime.fallbackFailed += 1;
         runtime.lastFallbackError = `${stage}: ${sanitizedProviderFailure(error)}`;
@@ -2268,7 +2268,9 @@ async function executeAuto(context, requestBody, onSpawn, onProgress, signal, cr
           error: sanitizedProviderFailure(error),
         });
         runtime.recentProviderFailures = runtime.recentProviderFailures.slice(-20);
-        if (!error.routeSkipped && error?.routeCommitted !== true) {
+        if (error?.providerTaskPinPreserved === true) {
+          onProgress?.(`${stage} continuation failed; preserving the active task on that provider without rerouting.\n`);
+        } else if (!error.routeSkipped && error?.routeCommitted !== true) {
           onProgress?.(`${stage} was unavailable before provider tool work; trying the next configured provider.\n`);
         } else if (error?.routeCommitted === true) {
           onProgress?.(`${stage} stopped after provider tool work; preserving that work without replay or rerouting.\n`);
@@ -2276,6 +2278,19 @@ async function executeAuto(context, requestBody, onSpawn, onProgress, signal, cr
       },
     });
   } catch (error) {
+    if (pinnedStage !== null) {
+      if (providerTaskPins.pin(context.threadId, ownershipTaskHash(context), pinnedStage)) {
+        runtime.providerTaskPinsCreated += 1;
+      }
+      runtime.lastPinnedProviderStage = pinnedStage;
+      error.providerTaskPinPreserved = true;
+      error.routeCommitted = true;
+    } else if (
+      error?.routeCommitted !== true
+      && providerTaskPins.release(context.threadId, ownershipTaskHash(context))
+    ) {
+      runtime.providerTaskPinsReleasedOnFailure += 1;
+    }
     if (error?.routeCommitted !== true && !signal?.aborted) {
       error.nativeFallbackRoute = route.nativeFallbackRoute;
     }
@@ -2619,7 +2634,11 @@ async function handleResponses(request, response) {
       taskHash,
       routeRetentionCount,
     )) runtime.quotaPinsReleased += 1;
-    if (context.requestedRoute === "auto" && routeRetentionCount > 0 && result.autoStage) {
+    if (
+      context.requestedRoute === "auto"
+      && result.autoStage
+      && (routeRetentionCount > 0 || result.preserveProviderPin === true)
+    ) {
       if (providerTaskPins.pin(
         context.threadId,
         taskHash,
@@ -3975,6 +3994,20 @@ async function selfTest() {
     || committedCheckpointResult.toolSchemaBytesIgnored !== 123
   ) {
     throw new Error("read-only provider checkpoint classification failed");
+  }
+  const pinnedContinuationResult = committedProviderResult(
+    { taskDiagnostics: recoveryContext.taskDiagnostics, toolSchemaBytes: 123 },
+    Object.assign(new Error("fixture"), {
+      failedStage: "ollama",
+      providerTaskPinPreserved: true,
+    }),
+  );
+  if (
+    pinnedContinuationResult.autoStage !== "ollama"
+    || pinnedContinuationResult.preserveProviderPin !== true
+    || !pinnedContinuationResult.text.includes("remains pinned to the same provider")
+  ) {
+    throw new Error("active provider continuation checkpoint lost its provider pin");
   }
   let concurrentFreeCalls = 0;
   let peakConcurrentFreeCalls = 0;

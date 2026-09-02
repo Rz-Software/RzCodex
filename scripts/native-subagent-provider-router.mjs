@@ -474,14 +474,29 @@ export function validateOAuthFallbackCompletion(completion, expected) {
 export async function runOrderedProviderChain({
   signal,
   stages,
+  pinnedStage = null,
   onStageFailure = () => {},
 }) {
   if (!Array.isArray(stages) || stages.length === 0) {
     throw new ProviderRouteError("Ordered provider chain must contain at least one stage", 500);
   }
+  let runnableStages = stages;
+  if (pinnedStage !== null) {
+    if (typeof pinnedStage !== "string" || pinnedStage.length === 0) {
+      throw new ProviderRouteError("Pinned provider stage must be a non-empty string", 500);
+    }
+    const pinned = stages.filter((stage) => stage?.name === pinnedStage);
+    if (pinned.length !== 1) {
+      throw new ProviderRouteError(
+        `Pinned provider stage ${JSON.stringify(pinnedStage)} is not present exactly once in the configured chain`,
+        500,
+      );
+    }
+    runnableStages = pinned;
+  }
   const failures = [];
-  for (let index = 0; index < stages.length; index += 1) {
-    const stage = requireObject(stages[index], `provider chain stage[${index}]`);
+  for (let index = 0; index < runnableStages.length; index += 1) {
+    const stage = requireObject(runnableStages[index], `provider chain stage[${index}]`);
     if (typeof stage.name !== "string" || stage.name.length === 0) {
       throw new ProviderRouteError(`provider chain stage[${index}].name must be a non-empty string`, 500);
     }
@@ -492,10 +507,14 @@ export async function runOrderedProviderChain({
       const value = await stage.run({ failures: [...failures], index });
       return { stage: stage.name, value, failures };
     } catch (error) {
-      if (signal?.aborted || error?.name === "AbortError" || error?.status === 499) throw error;
       error.failedStage ||= stage.name;
+      if (pinnedStage !== null) {
+        error.routeCommitted = true;
+        error.providerTaskPinPreserved = true;
+      }
+      if (signal?.aborted || error?.name === "AbortError" || error?.status === 499) throw error;
       onStageFailure(stage.name, error, index);
-      if (error?.routeCommitted === true || index === stages.length - 1) throw error;
+      if (error?.routeCommitted === true || index === runnableStages.length - 1) throw error;
       failures.push({ stage: stage.name, error });
     }
   }

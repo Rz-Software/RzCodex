@@ -392,6 +392,37 @@ test("ordered routing reaches each later provider exactly once after uncommitted
   ]);
 });
 
+test("a pinned active task cannot cross providers after a continuation failure", async () => {
+  const calls = [];
+  const failure = new Error("retained Ollama continuation failed");
+  await assert.rejects(runOrderedProviderChain({
+    pinnedStage: "ollama",
+    stages: [
+      { name: "antigravity", run: async () => { calls.push("antigravity"); } },
+      { name: "ollama", run: async () => { calls.push("ollama"); throw failure; } },
+      { name: "devin-free", run: async () => { calls.push("devin-free"); } },
+    ],
+  }), (error) => (
+    error === failure
+    && error.routeCommitted === true
+    && error.providerTaskPinPreserved === true
+    && error.failedStage === "ollama"
+  ));
+  assert.deepEqual(calls, ["ollama"]);
+});
+
+test("a missing pinned provider fails explicitly without starting another route", async () => {
+  let calls = 0;
+  await assert.rejects(runOrderedProviderChain({
+    pinnedStage: "removed-provider",
+    stages: [
+      { name: "ollama", run: async () => { calls += 1; } },
+      { name: "devin-free", run: async () => { calls += 1; } },
+    ],
+  }), /is not present exactly once/);
+  assert.equal(calls, 0);
+});
+
 test("client abort never starts the next ordered provider", async () => {
   const controller = new AbortController();
   let laterCalls = 0;
@@ -406,6 +437,24 @@ test("client abort never starts the next ordered provider", async () => {
     ],
   }), /aborted/);
   assert.equal(laterCalls, 0);
+});
+
+test("a parent interruption preserves an existing provider pin", async () => {
+  const controller = new AbortController();
+  const failure = new DOMException("aborted", "AbortError");
+  await assert.rejects(runOrderedProviderChain({
+    signal: controller.signal,
+    pinnedStage: "ollama",
+    stages: [
+      { name: "ollama", run: async () => { controller.abort(); throw failure; } },
+      { name: "devin-free", run: async () => { throw new Error("must not run"); } },
+    ],
+  }), (error) => (
+    error === failure
+    && error.failedStage === "ollama"
+    && error.routeCommitted === true
+    && error.providerTaskPinPreserved === true
+  ));
 });
 
 test("a committed provider stream fails explicitly instead of mixing later output", async () => {
