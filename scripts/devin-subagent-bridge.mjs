@@ -2059,10 +2059,21 @@ async function runOllamaStage(
         throw error;
       }
       const announcedTools = new Set();
+      let announcedProviderActivity = false;
       const nativeResult = await runOpenCodeNativeAgent(nativeContext, {
         providerKind: "ollama",
         signal,
         onEvent: (event) => {
+          if (
+            !announcedProviderActivity
+            && (
+              ["step_start", "step-start"].includes(event?.type)
+              || (event?.type === "reasoning" && typeof event.part?.text === "string" && event.part.text.length > 0)
+            )
+          ) {
+            announcedProviderActivity = true;
+            onProgress?.("Ollama native model started reasoning in its retained execution.\n");
+          }
           if (event?.type !== "tool_use" || event.part?.state?.status !== "completed") return;
           const key = event.part.callID || event.part.id;
           if (key && announcedTools.has(key)) return;

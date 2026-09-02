@@ -53,7 +53,8 @@ const CODEBUDDY_HOME = join(homedir(), ".codebuddy");
 const MANAGED_SESSION_PREFIX = "rzcodex-";
 const SCRIPT_DIRECTORY = dirname(fileURLToPath(import.meta.url));
 const MCP_SERVER_SCRIPT = join(SCRIPT_DIRECTORY, "devin-rzmcp-lazy-proxy.mjs");
-const PROVIDER_MUTATION_TOOL = /^(?:Edit|Write|NotebookEdit|mcp__rzmcp__call_rzmcp_tool)$/i;
+const PROVIDER_MUTATION_TOOL = /^(?:Edit|Write|NotebookEdit)$/i;
+const READ_ONLY_RZMCP_TOOL_NAME = /^(?:analyze|check|count|describe|discover|does|enumerate|find|get|has|inspect|is|list|locate|query|read|resolve|search|validate)_/i;
 const CODEBUDDY_SCRIPT = join(
   process.env.APPDATA || join(homedir(), "AppData", "Roaming"),
   "npm", "node_modules", "@tencent-ai", "codebuddy-code", "bin", "codebuddy",
@@ -74,6 +75,14 @@ function executionPolicy(taskState) {
     readOnly,
     rzMcpMode: rzMcpModeForTask(task, readOnly),
   };
+}
+
+function providerToolIsMutation(name, input, policy) {
+  if (PROVIDER_MUTATION_TOOL.test(String(name || ""))) return true;
+  if (String(name || "").toLowerCase() !== "mcp__rzmcp__call_rzmcp_tool") return false;
+  if (policy?.rzMcpMode === "read-only") return false;
+  const rzMcpToolName = typeof input?.name === "string" ? input.name : null;
+  return rzMcpToolName === null || !READ_ONLY_RZMCP_TOOL_NAME.test(rzMcpToolName);
 }
 
 const runtime = {
@@ -1164,6 +1173,8 @@ function runCodeBuddy(context, onSpawn, onProviderEvent = () => {}) {
     const nativeToolNames = [];
     const nativeChangedPaths = [];
     const nativeToolIds = new Set();
+    let nativeMutationCount = 0;
+    let providerActivityObserved = false;
     const finish = (error, value) => {
       if (settled) return;
       settled = true;
@@ -1172,7 +1183,7 @@ function runCodeBuddy(context, onSpawn, onProviderEvent = () => {}) {
       artifacts.cleanup();
       if (error) {
         error.nativeToolNames = [...nativeToolNames];
-        error.providerMutationCount = nativeToolNames.filter((name) => PROVIDER_MUTATION_TOOL.test(name)).length;
+        error.providerMutationCount = nativeMutationCount;
       }
       error ? reject(error) : resolve(value);
     };
@@ -1192,6 +1203,9 @@ function runCodeBuddy(context, onSpawn, onProviderEvent = () => {}) {
         finish(new BridgeError("CodeBuddy emitted model output before authenticated initialization", 502));
         return;
       }
+      if (event.type === "stream_event" || event.type === "assistant") {
+        providerActivityObserved = true;
+      }
       try { onProviderEvent(event); } catch (error) { child.kill(); finish(error); return; }
       if (event.type === "assistant" && Array.isArray(event.message?.content)) {
         const turnInput = event.message?.usage?.input_tokens;
@@ -1207,7 +1221,8 @@ function runCodeBuddy(context, onSpawn, onProviderEvent = () => {}) {
           if (typeof part.name === "string" && !nativeToolIds.has(nativeToolId)) {
             nativeToolIds.add(nativeToolId);
             nativeToolNames.push(part.name);
-            if (PROVIDER_MUTATION_TOOL.test(part.name)) {
+            if (providerToolIsMutation(part.name, part.input, context.executionPolicy)) {
+              nativeMutationCount += 1;
               const changedPath = part.input?.file_path ?? part.input?.filePath ?? part.input?.path;
               if (typeof changedPath === "string" && changedPath) nativeChangedPaths.push(changedPath);
             }
@@ -1226,7 +1241,7 @@ function runCodeBuddy(context, onSpawn, onProviderEvent = () => {}) {
       finish(new BridgeError(`CodeBuddy exceeded ${REQUEST_TIMEOUT_MS}ms`, 504));
     }, REQUEST_TIMEOUT_MS);
     silenceTimer = setInterval(() => {
-      if (providerToolWorkStarted(nativeToolNames)) {
+      if (providerActivityObserved || providerToolWorkStarted(nativeToolNames)) {
         clearInterval(silenceTimer);
         return;
       }
@@ -1279,7 +1294,7 @@ function runCodeBuddy(context, onSpawn, onProviderEvent = () => {}) {
         maxTurnInputTokens,
         nativeToolNames,
         nativeChangedPaths: [...new Set(nativeChangedPaths)],
-        mutationCount: nativeToolNames.filter((name) => PROVIDER_MUTATION_TOOL.test(name)).length,
+        mutationCount: nativeMutationCount,
       });
     });
     child.stdin.end(codeBuddyInput(context.prompt, context.images));
@@ -1725,6 +1740,14 @@ async function handleResponses(request, response) {
 }
 
 function selfTest() {
+  if (
+    providerToolIsMutation("mcp__rzmcp__call_rzmcp_tool", { name: "inspect_graph_by_path" }, { rzMcpMode: "full" })
+    || providerToolIsMutation("mcp__rzmcp__call_rzmcp_tool", { name: "connect_pins_with_details" }, { rzMcpMode: "read-only" })
+    || !providerToolIsMutation("mcp__rzmcp__call_rzmcp_tool", { name: "connect_pins_with_details" }, { rzMcpMode: "full" })
+    || !providerToolIsMutation("Edit", { file_path: "fixture.cpp" }, { rzMcpMode: "read-only" })
+  ) {
+    throw new Error("self-test failed: CodeBuddy lazy RzMCP mutation accounting");
+  }
   const toolServingMetadata = codexToolServingMetadata(2);
   if (
     toolServingMetadata.codex_tool_schema_bytes_forwarded !== 0

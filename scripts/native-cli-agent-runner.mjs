@@ -41,7 +41,9 @@ const OPENCODE_STATE_DIRECTORY = join(
 const LAZY_RZMCP_PROXY = join(import.meta.dirname, "devin-rzmcp-lazy-proxy.mjs");
 const ROLE_TAG = /<(?:external_cli|codebuddy|cursor)_route_instructions>([\s\S]*?)<\/(?:external_cli|codebuddy|cursor)_route_instructions>/gi;
 const VALIDATION_RESTRICTED_TASK = /\b(?:do not|must not|never)[^.\n]{0,160}\b(?:build|compile|run\s+(?:the\s+)?tests?|test|control\s+(?:the\s+)?editor|use\s+(?:the\s+)?editor|pie|sie)\b|\bno\s+(?:build|compile|tests?|editor|pie|sie)\b/i;
-const MUTATION_TOOL = /^(?:apply_patch|edit|edit_file|write|write_file|create_file|delete_file|move_file|mcp__rzmcp__call_rzmcp_tool)$/i;
+const MUTATION_TOOL = /^(?:apply_patch|edit|edit_file|write|write_file|create_file|delete_file|move_file)$/i;
+const LAZY_RZMCP_CALL_TOOL = /(?:^|[_:.-])call_rzmcp_tool$/i;
+const READ_ONLY_RZMCP_TOOL_NAME = /^(?:analyze|check|count|describe|discover|does|enumerate|find|get|has|inspect|is|list|locate|query|read|resolve|search|validate)_/i;
 const retainedOpenCodeStates = new Set();
 const retainedCommandCodeSessions = new Set();
 const nativeStateTails = new Map();
@@ -68,6 +70,29 @@ export class NativeCliAgentError extends Error {
 
 function json(value) {
   return JSON.stringify(value);
+}
+
+function parsedToolInput(value) {
+  if (value && typeof value === "object" && !Array.isArray(value)) return value;
+  if (typeof value !== "string") return null;
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function nativeToolIsMutation(name, input, executionPolicy) {
+  if (MUTATION_TOOL.test(String(name || ""))) return true;
+  if (!LAZY_RZMCP_CALL_TOOL.test(String(name || ""))) return false;
+  if (executionPolicy?.rzMcpMode === "read-only") return false;
+  const outer = parsedToolInput(input);
+  const nested = outer?.tool_name === "call_rzmcp_tool"
+    ? parsedToolInput(outer.arguments)
+    : outer;
+  const rzMcpToolName = typeof nested?.name === "string" ? nested.name : null;
+  return rzMcpToolName === null || !READ_ONLY_RZMCP_TOOL_NAME.test(rzMcpToolName);
 }
 
 function sanitizedEnvironment(source = process.env) {
@@ -294,7 +319,11 @@ function nativeProcess({
       finish(new NativeCliAgentError(`${label} exceeded ${requestTimeoutMs}ms`, 504));
     }, requestTimeoutMs);
     const routeOwnershipTimer = setInterval(() => {
-      if (state.providerToolStarted || (state.toolNames || []).length > 0) {
+      if (
+        state.providerActivityObserved
+        || state.providerToolStarted
+        || (state.toolNames || []).length > 0
+      ) {
         clearInterval(routeOwnershipTimer);
         return;
       }
@@ -574,7 +603,7 @@ function openCodeConfig(context, providerKind) {
   return json(config);
 }
 
-function openCodeParser(event, state) {
+function openCodeParser(event, state, executionPolicy) {
   state.finalText ||= "";
   state.toolNames ||= [];
   state.mutationCount ||= 0;
@@ -582,6 +611,13 @@ function openCodeParser(event, state) {
   state.outputTokens ||= 0;
   state.peakTurnInputTokens ||= 0;
   state.eventSequence = Number(state.eventSequence || 0) + 1;
+  if (
+    ["step_start", "step-start"].includes(event.type)
+    || (event.type === "reasoning" && typeof event.part?.text === "string" && event.part.text.length > 0)
+    || (event.type === "text" && typeof event.part?.text === "string" && event.part.text.length > 0)
+  ) {
+    state.providerActivityObserved = true;
+  }
   if (event.type === "text" && typeof event.part?.text === "string") {
     state.finalText = event.part.text;
     state.lastTextSequence = state.eventSequence;
@@ -591,7 +627,9 @@ function openCodeParser(event, state) {
     const name = String(event.part.tool || "unknown_tool");
     state.toolNames.push(name);
     state.lastToolSequence = state.eventSequence;
-    if (MUTATION_TOOL.test(name)) state.mutationCount += 1;
+    if (nativeToolIsMutation(name, event.part?.state?.input, executionPolicy)) {
+      state.mutationCount += 1;
+    }
   }
   if (event.type === "step_finish") {
     const input = Number(event.part?.tokens?.input || 0);
@@ -659,7 +697,7 @@ export async function runOpenCodeNativeAgent(context, {
       env,
       signal,
       onEvent,
-      parseLine: openCodeParser,
+      parseLine: (event, state) => openCodeParser(event, state, context.executionPolicy),
       label: `${context.provider} native OpenCode agent`,
       requestTimeoutMs: timeoutMs,
       routeOwnershipTimeoutMs: routeOwnershipTimeout(continueSession, timeoutMs),
@@ -701,7 +739,7 @@ export async function runOpenCodeNativeAgent(context, {
   }
 }
 
-function commandCodeParser(event, state) {
+function commandCodeParser(event, state, executionPolicy) {
   const payload = event?.type === "event" ? event.event : event;
   state.finalText ||= "";
   state.toolNames ||= [];
@@ -721,7 +759,8 @@ function commandCodeParser(event, state) {
     const name = String(payload.toolName || "unknown_tool");
     state.toolNames.push(name);
     state.lastToolSequence = state.eventSequence;
-    if (MUTATION_TOOL.test(name)) state.mutationCount += 1;
+    const input = payload.toolInput ?? payload.input ?? payload.arguments;
+    if (nativeToolIsMutation(name, input, executionPolicy)) state.mutationCount += 1;
   }
   if (payload?.type === "model_request_end") {
     const input = Number(payload.usage?.inputTokens || 0);
@@ -765,7 +804,7 @@ export async function runCommandCodeNativeAgent(context, { signal, onEvent }) {
       },
       signal,
       onEvent,
-      parseLine: commandCodeParser,
+      parseLine: (event, state) => commandCodeParser(event, state, context.executionPolicy),
       label: `${context.provider} native CommandCode agent`,
     });
     if (sessionName) {
@@ -1068,6 +1107,14 @@ export async function nativeCliAgentRunnerSelfTest() {
     lastToolSequence: 2,
   });
   if (completed.finalText !== "Work complete.") throw new Error("native CLI terminal tool turn detection failed");
+  if (
+    nativeToolIsMutation("mcp__rzmcp__call_rzmcp_tool", { name: "inspect_graph_by_path" }, { rzMcpMode: "full" })
+    || nativeToolIsMutation("mcp__rzmcp__call_rzmcp_tool", { name: "connect_pins_with_details" }, { rzMcpMode: "read-only" })
+    || !nativeToolIsMutation("mcp__rzmcp__call_rzmcp_tool", { name: "connect_pins_with_details" }, { rzMcpMode: "full" })
+    || !nativeToolIsMutation("edit", {}, { rzMcpMode: "read-only" })
+  ) {
+    throw new Error("native CLI lazy RzMCP mutation accounting failed");
+  }
 
   let recoveryPrompt = "";
   let recoveryNotices = 0;
@@ -1167,6 +1214,7 @@ export async function nativeCliAgentRunnerSelfTest() {
   const fixtureParser = (event, state) => {
     state.toolNames ||= [];
     if (event.type === "tool") state.toolNames.push(event.name);
+    if (event.type === "reasoning") state.providerActivityObserved = true;
     if (event.type === "done") state.finalText = event.text;
   };
   const postToolSilence = await nativeProcess({
@@ -1184,6 +1232,22 @@ export async function nativeCliAgentRunnerSelfTest() {
   });
   if (postToolSilence.state.finalText !== "complete") {
     throw new Error("native CLI post-tool silence incorrectly triggered provider rerouting");
+  }
+  const activeReasoning = await nativeProcess({
+    command: process.execPath,
+    args: [
+      "-e",
+      "console.log(JSON.stringify({type:'reasoning'})); setTimeout(() => { console.log(JSON.stringify({type:'done',text:'complete'})); }, 350);",
+    ],
+    cwd: process.cwd(),
+    env: sanitizedEnvironment(),
+    parseLine: fixtureParser,
+    label: "active provider reasoning fixture",
+    requestTimeoutMs: 2_000,
+    routeOwnershipTimeoutMs: 200,
+  });
+  if (activeReasoning.state.finalText !== "complete") {
+    throw new Error("native CLI active reasoning incorrectly triggered provider rerouting");
   }
 
   let preToolTimeout = null;
