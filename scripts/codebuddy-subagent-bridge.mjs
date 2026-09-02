@@ -1898,6 +1898,22 @@ function selfTest() {
     throw new Error("self-test failed: request normalization");
   }
   const taskHeader = "Message Type: NEW_TASK\nTask name: /root/test\nSender: /root\nPayload:\n";
+  const conditionalCheckpointTask = taskStateFromInput([{
+    id: "amsg-conditional-checkpoint",
+    type: "agent_message",
+    author: "/root",
+    recipient: "/root/test",
+    content: [{
+      type: "input_text",
+      text: `${taskHeader}Read-only RzCodex checkpoint smoke test. Do not edit files. Inspect the bounded files in order. Return concise evidence when complete or immediately if the parent requests a checkpoint.`,
+    }],
+  }], MAX_ACTIVE_TASK_CHARS);
+  if (
+    conditionalCheckpointTask.checkpointRequested
+    || conditionalCheckpointTask.immediateReturnRequested
+  ) {
+    throw new Error("self-test failed: a conditional checkpoint mention became a terminal control request");
+  }
   const encryptedPayload = "implement encrypted delivery fixture";
   const encryptedTask = normalizeSelfTestRequest([{
     id: "amsg-encrypted",
@@ -2181,6 +2197,7 @@ function selfTest() {
     firstPatch.taskState.progress.successfulMutationCount !== 1
     || firstPatch.taskState.progress.changedPaths.join(",") !== "C:/fixture/proof.txt"
     || !firstPatch.taskState.checkpointRequested
+    || !firstPatch.taskState.immediateReturnRequested
     || !firstPatch.prompt.includes("Do not start another tool call")
     || !authoritativeProgressReport(firstPatch.taskState).includes("Successful apply_patch mutations: 1")
   ) {

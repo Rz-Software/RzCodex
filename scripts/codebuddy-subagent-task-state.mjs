@@ -7,11 +7,18 @@ const PAYLOAD_HEADER = /(?:^|\n)Payload:\s*\n/;
 const MUTATION_INTENT = /\b(?:implement|fix|patch|edit|modify|create|write|replace|delete|remove|repair|refactor|instrument|apply_patch)\b/gi;
 const NEGATED_MUTATION_PREFIX = /\b(?:do not|don't|must not|never|cannot|can't|not allowed to)\s+(?:[a-z][a-z0-9_-]*\s+){0,4}$/i;
 const EXPLICIT_READ_ONLY_TASK = /\bread[- ]only\b|\bno[- ]mutation\b|\bno\s+(?:edits?|modifications?|writes?|mutations?|file\s+changes|source\s+changes)\s*(?:[.;,/]|$)|\b(?:do not|must not|never)\s+(?:edit|modify|write|mutate)(?:\s+(?:any|the|source|project|workspace|files?)){0,3}(?:[.;,/]|$)/i;
-const CHECKPOINT_REQUEST = /\b(?:checkpoint(?:\/report)?|status report|progress report)\b/i;
-const IMMEDIATE_RETURN = [
-  /\b(?:return|report|respond)\b[\s\S]{0,120}\b(?:immediately|right now|now)\b/i,
-  /\b(?:immediately|right now|now)\b[\s\S]{0,120}\b(?:return|report|respond)\b/i,
+const CHECKPOINT_DIRECTIVE = [
+  /^\s*(?:please\s+)?(?:return|send|provide|give|report)\s+(?:(?:an?|the|your|current|immediate|brief|concise|requested)\s+){0,6}(?:checkpoint(?:\/report)?|status report|progress report)\b/i,
+  /^\s*(?:please\s+)?(?:immediate\s+)?checkpoint(?:\/report)?\s*(?::|-|\bnow\b|\bimmediately\b)/i,
+  /^\s*(?:please\s+)?(?:current|immediate|brief|concise)\s+(?:status report|progress report)\s*(?::|-|\bnow\b|\bimmediately\b)/i,
+  /^\s*(?:please\s+)?(?:finish|complete)\b[^\n.!?]{0,120}\b(?:then|and)\s+(?:return|send|provide|give|report)\s+(?:(?:an?|the|your|current|immediate|brief|concise|requested)\s+){0,6}(?:checkpoint(?:\/report)?|status report|progress report)\b/i,
 ];
+const IMMEDIATE_RETURN_DIRECTIVE = [
+  /^\s*(?:please\s+)?(?:return|report|respond|send|provide|give)\b[^\n.!?]{0,180}\b(?:immediately|right now|now)\b/i,
+  /^\s*(?:immediately|right now|now)\s+(?:return|report|respond|send|provide|give)\b/i,
+  /^\s*(?:please\s+)?(?:stop|pause)\b[^\n.!?]{0,120}\b(?:and|then)\s+(?:immediately\s+)?(?:return|report|respond|send|provide|give)\b/i,
+];
+const CONDITIONAL_TIMING = /\b(?:if|when|once|unless|until|after)\b/i;
 const RZMCP_NAME = String.raw`rz(?:direct)?mcp`;
 const RZMCP_EXPLICIT_PROHIBITION = [
   new RegExp(String.raw`\b(?:do not|don't|must not|never|cannot|can't)\b[^\n.;]{0,160}\b${RZMCP_NAME}\b`, "i"),
@@ -69,17 +76,23 @@ export function rzMcpModeForTask(text, readOnly) {
   return readOnly ? "read-only" : "no-validation";
 }
 
+function leadingDirectiveFrom(text) {
+  const payload = payloadFrom(text).trimStart();
+  const paragraphEnd = payload.search(/\r?\n\s*\r?\n/);
+  const firstParagraph = paragraphEnd >= 0 ? payload.slice(0, paragraphEnd) : payload;
+  return firstParagraph.slice(0, 320).trim();
+}
+
 function isCheckpointRequest(text) {
-  const payload = payloadFrom(text);
-  return CHECKPOINT_REQUEST.test(payload) && (
-    isImmediateReturnRequest(text)
-    || /\b(?:return|send|provide|give|request(?:ing)?|need)\b[\s\S]{0,100}\b(?:checkpoint(?:\/report)?|status report|progress report)\b/i.test(payload)
-  );
+  const directive = leadingDirectiveFrom(text);
+  return CHECKPOINT_DIRECTIVE.some((pattern) => pattern.test(directive));
 }
 
 function isImmediateReturnRequest(text) {
-  const payload = payloadFrom(text);
-  return IMMEDIATE_RETURN.some((pattern) => pattern.test(payload));
+  const directive = leadingDirectiveFrom(text);
+  const matched = IMMEDIATE_RETURN_DIRECTIVE.some((pattern) => pattern.test(directive))
+    || /^\s*immediate\s+checkpoint(?:\/report)?\b/i.test(directive);
+  return matched && !CONDITIONAL_TIMING.test(directive);
 }
 
 export function normalizeAgentMessageContent(content, label) {
