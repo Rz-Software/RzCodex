@@ -11,6 +11,7 @@ import {
   activeTaskPromptSection,
   isBridgeProgressReasoning,
   normalizeAgentMessageContent,
+  referencedPriorTaskPromptSection,
   taskControlPromptSections,
   taskDeliveryDiagnostics,
   taskStateFromInput,
@@ -470,6 +471,7 @@ function historyEntries(input, taskState) {
         checkpoint: false,
       };
       if (message.newTask) continue;
+      if (message.index === taskState.referencedPriorControl?.index) continue;
       checkpoint = message.checkpoint;
       text = `[Inter-agent message ${message.author} -> ${message.recipient}]\n${message.text}`;
     } else if (["function_call", "custom_tool_call", "tool_search_call"].includes(item.type)) {
@@ -552,13 +554,18 @@ function requestContext(body) {
 function fullPrompt(context) {
   const sections = [delegationContract(context.requestId, context.workingDirectory)];
   if (context.roleInstructions) sections.push(`[Role instructions]\n${context.roleInstructions}`);
+  const referencedPriorTask = referencedPriorTaskPromptSection(context.taskState);
   const activeTask = activeTaskPromptSection(context.taskState);
   const taskControlSections = taskControlPromptSections(context.taskState);
-  const mandatorySectionCount = sections.length + (activeTask ? 1 : 0) + taskControlSections.length;
+  const mandatorySectionCount = sections.length + (referencedPriorTask ? 1 : 0) + (activeTask ? 1 : 0) + taskControlSections.length;
   const mandatoryChars = sections.reduce((sum, section) => sum + section.length, 0)
+    + referencedPriorTask.length
     + activeTask.length
     + taskControlSections.reduce((sum, section) => sum + section.length, 0)
     + Math.max(0, mandatorySectionCount - 1) * 2;
+  if (mandatoryChars > MAX_PROMPT_CHARS) {
+    throw new BridgeError("Antigravity mandatory task context exceeded its hard prompt limit", 400);
+  }
   const retained = boundedEntries(
     context.entries,
     MAX_PROMPT_CHARS - mandatoryChars,
@@ -568,6 +575,7 @@ function fullPrompt(context) {
   if (activeTask) {
     const activeIndex = context.taskState.activeTask.index;
     sections.push(...retained.filter((entry) => entry.index < activeIndex && !entry.checkpoint).map((entry) => entry.text));
+    if (referencedPriorTask) sections.push(referencedPriorTask);
     sections.push(activeTask);
     sections.push(...retained.filter((entry) => entry.index > activeIndex && !entry.checkpoint).map((entry) => entry.text));
     sections.push(...retained.filter((entry) => entry.checkpoint).map((entry) => entry.text));
@@ -2236,6 +2244,26 @@ async function selfTest() {
     || analysisFirst.includes("[Immediate terminal report required]")
   ) {
     throw new Error("Antigravity analysis convergence control failed");
+  }
+  const priorResumeTaskText = "Message Type: NEW_TASK\nTask name: /root/agy_resume\nPayload:\nInspect the original bounded fixture under its exact ownership constraints.";
+  const activeResumeTaskText = "Message Type: NEW_TASK\nTask name: /root/agy_resume\nPayload:\nBridge repaired. Resume the same bounded audit from your preserved state; keep the original scope and finish.";
+  const afterBridgeRestartResume = requestContext({
+    stream: true,
+    model: MODEL_ALIAS,
+    reasoning: { effort: REQUIRED_EFFORT },
+    client_metadata: { cwd: homedir(), thread_id: "thread-agy-after-restart" },
+    input: [
+      { type: "agent_message", id: "agy-prior-resume", author: "Codex", recipient: "/root/agy_resume", content: [{ type: "input_text", text: priorResumeTaskText }] },
+      { type: "agent_message", id: "agy-active-resume", author: "Codex", recipient: "/root/agy_resume", content: [{ type: "input_text", text: activeResumeTaskText }] },
+    ],
+  });
+  const afterBridgeRestartPrompt = fullPrompt(afterBridgeRestartResume);
+  if (
+    afterBridgeRestartPrompt.split(priorResumeTaskText).length - 1 !== 1
+    || afterBridgeRestartPrompt.split(activeResumeTaskText).length - 1 !== 1
+    || !afterBridgeRestartPrompt.includes("[Referenced prior delegated context]")
+  ) {
+    throw new Error("Antigravity bridge restart lost referenced prior task context");
   }
   const immediateContext = requestContext({
     stream: true,

@@ -24,6 +24,7 @@ import {
   isBridgeProgressReasoning,
   isExplicitReadOnlyTask,
   normalizeAgentMessageContent,
+  referencedPriorTaskPromptSection,
   rzMcpModeForTask,
   taskControlPromptSections,
   taskDeliveryDiagnostics,
@@ -512,6 +513,9 @@ class ProviderConversationRegistry {
       deltaItemCount: inputIndexes.length,
       taskState: {
         activeTask: state.activeTask,
+        referencedPriorTask: incomingTaskState.referencedPriorTask,
+        referencedPriorTasks: incomingTaskState.referencedPriorTasks,
+        referencedPriorControl: incomingTaskState.referencedPriorControl,
         checkpointRequested: state.checkpointRequested,
         immediateReturnRequested: state.immediateReturnRequested,
         messages: incomingTaskState.messages,
@@ -787,6 +791,10 @@ function promptFrom(body, registry = providerConversations) {
   const activeTaskSection = conversation.activeTaskIncludedThisTurn
     ? activeTaskPromptSection(taskState)
     : "";
+  const referencedPriorTaskSection = !conversation.providerSessionStarted
+    ? referencedPriorTaskPromptSection(taskState)
+    : "";
+  if (referencedPriorTaskSection) sections.push(referencedPriorTaskSection);
   if (activeTaskSection) sections.push(activeTaskSection);
   sections.push(...taskControlPromptSections(taskState));
   if (toolInfo.definitions.length > 0) {
@@ -823,6 +831,7 @@ function promptFrom(body, registry = providerConversations) {
         checkpoint: false,
       };
       if (message.newTask) continue;
+      if (referencedPriorTaskSection && message.index === taskState.referencedPriorControl?.index) continue;
       pushHistory(`[Inter-agent message ${message.author} -> ${message.recipient}]\n${message.text}`);
     } else if (item.type === "reasoning") {
       if (isBridgeProgressReasoning(item)) continue;
@@ -867,18 +876,32 @@ function promptFrom(body, registry = providerConversations) {
       throw new BridgeError(`${label} has unsupported input type ${JSON.stringify(item.type)}`);
     }
   }
-  let retainedChars = 0;
+  const mandatoryChars = sections.reduce((sum, section) => sum + section.length, 0)
+    + Math.max(0, sections.length - 1) * 2;
+  if (mandatoryChars > MAX_PROMPT_CHARS) {
+    throw new BridgeError("CodeBuddy mandatory task context exceeded its hard prompt limit", 400);
+  }
+  let remainingChars = MAX_PROMPT_CHARS - mandatoryChars;
   const retained = [];
   const images = [];
   for (let index = history.length - 1; index >= 0; index -= 1) {
     const section = history[index];
-    if (retainedChars + section.text.length > MAX_PROMPT_CHARS && retained.length > 0) break;
-    retained.unshift(section.text.slice(-MAX_PROMPT_CHARS));
+    const separatorChars = sections.length > 0 || retained.length > 0 ? 2 : 0;
+    const textBudget = remainingChars - separatorChars;
+    if (textBudget <= 0) break;
+    const retainedText = section.text.length > textBudget
+      ? section.text.slice(-textBudget)
+      : section.text;
+    retained.unshift(retainedText);
     images.unshift(...section.images);
-    retainedChars += section.text.length;
+    remainingChars -= retainedText.length + separatorChars;
+    if (retainedText.length < section.text.length) break;
   }
   sections.push(...retained);
   const prompt = sections.join("\n\n");
+  if (prompt.length > MAX_PROMPT_CHARS) {
+    throw new BridgeError("CodeBuddy normalized prompt exceeded its hard limit", 500);
+  }
   if (
     conversation.providerSessionStarted
     && !conversation.activeTaskIncludedThisTurn
@@ -1842,6 +1865,19 @@ function selfTest() {
     || plaintextTask.prompt.split(plaintextPayload).length - 1 !== 1
   ) {
     throw new Error("self-test failed: plaintext V2 task delivery regressed");
+  }
+  const priorResumeTaskText = `${taskHeader}inspect the original bounded fixture and retain its exact scope`;
+  const activeResumeTaskText = `${taskHeader}Bridge repaired. Resume the same bounded task from the preserved state and finish.`;
+  const afterBridgeRestartResume = normalizeSelfTestRequest([
+    { ...plaintextTaskItem, id: "amsg-prior-resume", content: [{ type: "input_text", text: priorResumeTaskText }] },
+    { ...plaintextTaskItem, id: "amsg-active-resume", content: [{ type: "input_text", text: activeResumeTaskText }] },
+  ], { registry: new ProviderConversationRegistry(), threadId: "self-test-after-bridge-restart" });
+  if (
+    afterBridgeRestartResume.prompt.split(priorResumeTaskText).length - 1 !== 1
+    || afterBridgeRestartResume.prompt.split(activeResumeTaskText).length - 1 !== 1
+    || !afterBridgeRestartResume.prompt.includes("[Referenced prior delegated context]")
+  ) {
+    throw new Error("self-test failed: CodeBuddy bridge restart lost referenced prior task context");
   }
   const reasoningBoundary = normalizeSelfTestRequest([
     plaintextTaskItem,

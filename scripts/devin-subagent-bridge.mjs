@@ -14,6 +14,7 @@ import {
   isExplicitReadOnlyTask,
   isBridgeProgressReasoning,
   normalizeAgentMessageContent,
+  referencedPriorTaskPromptSection,
   rzMcpModeForTask,
   taskControlPromptSections,
   taskDeliveryDiagnostics,
@@ -696,6 +697,7 @@ function promptFrom(body) {
         author: item.author || "Codex", recipient: item.recipient || "managed worker", newTask: false, checkpoint: false,
       };
       if (message.newTask) continue;
+      if (message.index === taskState.referencedPriorControl?.index) continue;
       history.push({ index, checkpoint: message.checkpoint, text: `[Inter-agent message ${message.author} -> ${message.recipient}]\n${message.text}` });
     } else if (["function_call", "custom_tool_call", "tool_search_call"].includes(item.type)) {
       const requestInput = item.arguments ?? item.input ?? item.query ?? null;
@@ -722,28 +724,51 @@ function promptFrom(body) {
       throw new BridgeError(`input[${index}] has unsupported type ${json(item.type)}`);
     }
   }
+  const activeTask = activeTaskPromptSection(taskState);
+  const referencedPriorTask = referencedPriorTaskPromptSection(taskState);
+  const taskControlSections = taskControlPromptSections(taskState);
+  const mandatorySections = [
+    ...sections,
+    referencedPriorTask,
+    activeTask,
+    ...taskControlSections,
+  ].filter(Boolean);
+  const mandatoryChars = mandatorySections.reduce((sum, section) => sum + section.length, 0)
+    + Math.max(0, mandatorySections.length - 1) * 2;
+  if (mandatoryChars > MAX_PROMPT_CHARS) {
+    throw new BridgeError("Managed subagent mandatory task context exceeded its hard prompt limit", 400);
+  }
+  const historyBudget = MAX_PROMPT_CHARS - mandatoryChars;
   let retainedChars = 0;
   const retained = [];
   for (let index = history.length - 1; index >= 0; index -= 1) {
     const { text } = history[index];
-    if (retainedChars + text.length > MAX_PROMPT_CHARS && retained.length > 0) break;
-    retained.unshift({ ...history[index], text: text.slice(-MAX_PROMPT_CHARS) });
+    if (retainedChars + text.length > historyBudget) {
+      if (retained.length === 0 && historyBudget > 0) {
+        retained.unshift({ ...history[index], text: text.slice(-historyBudget) });
+      }
+      break;
+    }
+    retained.unshift(history[index]);
     retainedChars += text.length;
   }
-  const activeTask = activeTaskPromptSection(taskState);
   if (activeTask) {
     const activeTaskIndex = taskState.activeTask.index;
     const checkpoints = retained.filter((item) => item.checkpoint);
     const ordinaryHistory = retained.filter((item) => !item.checkpoint);
     sections.push(...ordinaryHistory.filter((item) => item.index < activeTaskIndex).map((item) => item.text));
+    if (referencedPriorTask) sections.push(referencedPriorTask);
     sections.push(activeTask);
     sections.push(...ordinaryHistory.filter((item) => item.index > activeTaskIndex).map((item) => item.text));
     sections.push(...checkpoints.map((item) => item.text));
   } else {
     sections.push(...retained.map((item) => item.text));
   }
-  sections.push(...taskControlPromptSections(taskState));
+  sections.push(...taskControlSections);
   const prompt = sections.join("\n\n");
+  if (prompt.length > MAX_PROMPT_CHARS) {
+    throw new BridgeError("Managed subagent normalized prompt exceeded its hard limit", 500);
+  }
   let taskDiagnostics;
   try {
     taskDiagnostics = taskDeliveryDiagnostics(taskState, prompt);
@@ -3352,6 +3377,27 @@ async function selfTest() {
     || explicitReadOnlyAudit.prompt.includes("[Mutation convergence contract]")
   ) {
     throw new Error("explicit read-only audit was misclassified as mutation");
+  }
+  const priorResumeTaskText = "Message Type: NEW_TASK\nTask name: /root/resume_fixture\nPayload:\nImplement the original bounded diagnostic with the exact supplied ownership constraints.";
+  const activeResumeTaskText = "Message Type: NEW_TASK\nTask name: /root/resume_fixture\nPayload:\nBridge repaired. Resume the same bounded implementation from your preserved state; keep the original scope and finish.";
+  const afterBridgeRestartResume = promptFrom({
+    stream: true,
+    model: OLLAMA_MODEL_ALIAS,
+    reasoning: { effort: OLLAMA_REQUIRED_EFFORT },
+    client_metadata: { cwd: process.cwd() },
+    input: [
+      { type: "agent_message", id: "prior-resume-task", author: "Codex", recipient: "/root/resume_fixture", content: [{ type: "input_text", text: priorResumeTaskText }] },
+      { type: "agent_message", id: "active-resume-task", author: "Codex", recipient: "/root/resume_fixture", content: [{ type: "input_text", text: activeResumeTaskText }] },
+    ],
+  });
+  if (
+    afterBridgeRestartResume.prompt.split(priorResumeTaskText).length - 1 !== 1
+    || afterBridgeRestartResume.prompt.split(activeResumeTaskText).length - 1 !== 1
+    || !afterBridgeRestartResume.prompt.includes("[Referenced prior delegated context]")
+    || afterBridgeRestartResume.taskDiagnostics.taskIntent !== "mutation"
+    || !afterBridgeRestartResume.prompt.includes("[Mutation convergence contract]")
+  ) {
+    throw new Error("managed bridge restart lost referenced prior task context");
   }
   const mutationReturnWhenDone = promptFrom({
     stream: true,

@@ -7,6 +7,7 @@ import {
   TaskStateError,
   activeTaskPromptSection,
   isExplicitReadOnlyTask,
+  referencedPriorTaskPromptSection,
   rzMcpModeForTask,
   taskControlPromptSections,
   taskDeliveryDiagnostics,
@@ -192,6 +193,7 @@ export function nativeCliAgentContext(body, { provider, model, requiredEffort })
   ];
   const role = roleInstructionsFrom(body.instructions);
   if (role) sections.push(`[Role instructions]\n${role}`);
+  sections.push(referencedPriorTaskPromptSection(taskState));
   sections.push(activeTaskPromptSection(taskState));
   sections.push(...taskControlPromptSections(taskState));
   const control = latestControlMessage(taskState);
@@ -595,6 +597,35 @@ export async function nativeCliAgentRunnerSelfTest() {
     || genericEditorBan.rzMcpMode !== "disabled"
   ) {
     throw new Error("native CLI RzMCP task capability classification failed");
+  }
+  const priorTaskText = "Message Type: NEW_TASK\nTask name: /root/resume_fixture\nPayload:\nInspect the exact bounded source and report the original evidence.";
+  const intermediateResumeTaskText = "Message Type: NEW_TASK\nTask name: /root/resume_fixture\nPayload:\nBridge repaired. Resume the same bounded task from its original scope and preserve the focused ownership.";
+  const resumeTaskText = "Message Type: NEW_TASK\nTask name: /root/resume_fixture\nPayload:\nBridge repaired. Resume the same bounded task from your preserved state; keep the original scope and finish.";
+  const priorControlText = "Message Type: MESSAGE\nTask name: /root/resume_fixture\nPayload:\nReturn only after the bounded evidence is complete.";
+  const resumedTaskContext = nativeCliAgentContext({
+    model: "@preset/codex-subagents",
+    reasoning: { effort: "max" },
+    stream: true,
+    client_metadata: { cwd: authoritativeWorkspace },
+    input: [
+      { type: "agent_message", id: "prior-task-fixture", author: "Codex", recipient: "/root/resume_fixture", content: [{ type: "input_text", text: priorTaskText }] },
+      { type: "agent_message", id: "intermediate-resume-task-fixture", author: "Codex", recipient: "/root/resume_fixture", content: [{ type: "input_text", text: intermediateResumeTaskText }] },
+      { type: "agent_message", id: "prior-control-fixture", author: "Codex", recipient: "/root/resume_fixture", content: [{ type: "input_text", text: priorControlText }] },
+      { type: "agent_message", id: "resume-task-fixture", author: "Codex", recipient: "/root/resume_fixture", content: [{ type: "input_text", text: resumeTaskText }] },
+    ],
+  }, {
+    provider: "fixture",
+    model: "fixture-model",
+    requiredEffort: "max",
+  });
+  if (
+    resumedTaskContext.prompt.split(priorTaskText).length - 1 !== 1
+    || resumedTaskContext.prompt.split(intermediateResumeTaskText).length - 1 !== 1
+    || resumedTaskContext.prompt.split(priorControlText).length - 1 !== 1
+    || resumedTaskContext.prompt.split(resumeTaskText).length - 1 !== 1
+    || !resumedTaskContext.prompt.includes("Do not search Codex session or rollout files merely to reconstruct the assignment")
+  ) {
+    throw new Error("native CLI resumed task lost its explicitly referenced prior assignment");
   }
   let missingCwdError = null;
   try {

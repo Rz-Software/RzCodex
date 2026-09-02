@@ -25,6 +25,11 @@ const RZMCP_EXPLICIT_REQUIREMENT = [
   /\bmcp__rzmcp__[a-z0-9_]+\b/i,
 ];
 const GENERIC_EDITOR_RESTRICTION = /\b(?:do not|must not|never)[^.\n]{0,160}\b(?:use|invoke|control|call)\s+(?:any\s+|the\s+)?editor\b|\bno\s+[^.\n]{0,120}\b(?:editor|pie|sie)\b|\b(?:aucun(?:e)?|sans|interdiction\s+d['’](?:ex[eé]cuter|utiliser))[^.\n]{0,160}\b(?:editor|[eé]diteur|pie|sie)\b/i;
+const PRIOR_TASK_REFERENCE = [
+  /^\s*(?:resume|continue|proceed|carry on|pick up)(?:\s+(?:the|this|that|same|previous|prior|original|interrupted|preserved)\s+(?:task|work|scope|ownership|implementation|review|audit))?\s*[.!]?\s*$/i,
+  /\b(?:resume|continue|proceed|carry on|pick up)\b[\s\S]{0,240}\b(?:same|previous|prior|original|interrupted|preserved|where you (?:left off|were))\b/i,
+  /\b(?:reprends?|reprendre|continue[rz]?|poursuis|poursuivre)\b[\s\S]{0,240}\b(?:m[eê]me|pr[eé]c[eé]dent|initial|original|interrompu|conserv[eé]|l[aà]\s+o[uù]\s+tu)\b/i,
+];
 
 export class TaskStateError extends Error {
   constructor(message) {
@@ -146,6 +151,34 @@ function taskName(text, fallback) {
   return TASK_NAME_HEADER.exec(text)?.[1]?.trim() || fallback;
 }
 
+function enrichedTask(message) {
+  return {
+    ...message,
+    hash: sha256(message.text),
+    name: taskName(message.text, message.recipient),
+    intent: taskIntent(message.text),
+  };
+}
+
+function referencesPriorTask(text) {
+  const payload = payloadFrom(text);
+  return PRIOR_TASK_REFERENCE.some((pattern) => pattern.test(payload));
+}
+
+function resumedTaskIntent(text, priorIntent, currentIntent) {
+  if (priorIntent !== "mutation" || currentIntent === "mutation" || isExplicitReadOnlyTask(text)) {
+    return currentIntent;
+  }
+  const payload = payloadFrom(text);
+  const resumeIndex = payload.search(/\b(?:resume|continue|proceed|carry on|pick up|reprends?|reprendre|continue[rz]?|poursuis|poursuivre)\b/i);
+  if (resumeIndex < 0) return currentIntent;
+  const resumedScope = payload.slice(resumeIndex);
+  const mutationIndex = resumedScope.search(/\b(?:implementation|implementing|patch(?:ing)?|edit(?:ing)?|mutation|fix(?:ing)?|repair(?:ing)?|code changes?|impl[eé]mentation|correction)\b/i);
+  const analysisIndex = resumedScope.search(/\b(?:statically\s+)?(?:audit|review|inspect|analy[sz]e|assess|confirm|revue|analyse[rz]?|inspecte[rz]?)\b/i);
+  if (analysisIndex >= 0 && (mutationIndex < 0 || analysisIndex < mutationIndex)) return currentIntent;
+  return "mutation";
+}
+
 function messageState(item, index) {
   const normalized = normalizeAgentMessageContent(item.content, `input[${index}].content`);
   const newTask = NEW_TASK_HEADER.test(normalized.text);
@@ -242,6 +275,9 @@ export function taskStateFromInput(input, maxActiveTaskChars) {
   if (!activeTask) {
     return {
       activeTask: null,
+      referencedPriorTask: null,
+      referencedPriorTasks: [],
+      referencedPriorControl: null,
       checkpointRequested: false,
       immediateReturnRequested: false,
       messages,
@@ -258,12 +294,54 @@ export function taskStateFromInput(input, maxActiveTaskChars) {
       `active task ${activeTask.id} is ${activeTask.text.length} characters; maximum is ${maxActiveTaskChars}`,
     );
   }
-  activeTask = {
-    ...activeTask,
-    hash: sha256(activeTask.text),
-    name: taskName(activeTask.text, activeTask.recipient),
-    intent: taskIntent(activeTask.text),
-  };
+  activeTask = enrichedTask(activeTask);
+  const priorTaskMessages = messages.filter((message) => message.newTask && message.index < activeTask.index);
+  let referencedPriorTask = null;
+  let referencedPriorTasks = [];
+  let referencedPriorControl = null;
+  if (referencesPriorTask(activeTask.text)) {
+    let priorTaskIndex = priorTaskMessages.length - 1;
+    if (priorTaskIndex < 0) {
+      throw new TaskStateError(
+        `active task ${activeTask.id} references a prior assignment, but no prior NEW_TASK payload is available`,
+      );
+    }
+    while (priorTaskIndex >= 0) {
+      const priorTaskMessage = priorTaskMessages[priorTaskIndex];
+      if (priorTaskMessage.text.length > maxActiveTaskChars) {
+        throw new TaskStateError(
+          `referenced prior task ${priorTaskMessage.id} is ${priorTaskMessage.text.length} characters; maximum is ${maxActiveTaskChars}`,
+        );
+      }
+      referencedPriorTasks.unshift(enrichedTask(priorTaskMessage));
+      if (!referencesPriorTask(priorTaskMessage.text)) break;
+      priorTaskIndex -= 1;
+    }
+    if (priorTaskIndex < 0 && referencesPriorTask(referencedPriorTasks[0].text)) {
+      throw new TaskStateError(
+        `referenced task chain for ${activeTask.id} has no complete originating NEW_TASK payload`,
+      );
+    }
+    let inheritedIntent = referencedPriorTasks[0].intent;
+    referencedPriorTasks = referencedPriorTasks.map((task, index) => {
+      if (index === 0) return task;
+      const intent = resumedTaskIntent(task.text, inheritedIntent, task.intent);
+      inheritedIntent = intent;
+      return { ...task, intent };
+    });
+    referencedPriorTask = referencedPriorTasks[0];
+    activeTask = {
+      ...activeTask,
+      intent: resumedTaskIntent(activeTask.text, inheritedIntent, activeTask.intent),
+    };
+    referencedPriorControl = messages
+      .filter((message) => (
+        !message.newTask
+        && message.index > referencedPriorTask.index
+        && message.index < activeTask.index
+      ))
+      .at(-1) || null;
+  }
   const latestControlMessage = messages
     .filter((message) => message.index > activeTask.index)
     .at(-1);
@@ -286,6 +364,9 @@ export function taskStateFromInput(input, maxActiveTaskChars) {
   );
   return {
     activeTask,
+    referencedPriorTask,
+    referencedPriorTasks,
+    referencedPriorControl,
     checkpointRequested,
     immediateReturnRequested,
     messages,
@@ -356,6 +437,25 @@ export function activeTaskPromptSection(taskState) {
   const task = taskState.activeTask;
   if (!task) return "";
   return `[Active delegated task - authoritative]\nTask ID: ${task.id}\nTask name: ${task.name}\nTask hash: ${task.hash}\nIntent: ${task.intent}\nDelivery mode: ${task.deliveryMode}\nComplete task follows exactly:\n${task.text}`;
+}
+
+export function referencedPriorTaskPromptSection(taskState) {
+  const priorTasks = taskState.referencedPriorTasks?.length > 0
+    ? taskState.referencedPriorTasks
+    : taskState.referencedPriorTask ? [taskState.referencedPriorTask] : [];
+  if (priorTasks.length === 0) return "";
+  const sections = [
+    "[Referenced prior delegated context]\nThe active task explicitly asks to resume or continue its prior assignment chain. Read the retained tasks below in chronological order; each later task overrides earlier text where they differ, and the current active task remains authoritative over all of them. Provider-private progress from an interrupted execution is not assumed to survive unless represented in retained conversation. Do not search Codex session or rollout files merely to reconstruct the assignment; its complete task chain is supplied here.",
+  ];
+  for (let index = 0; index < priorTasks.length; index += 1) {
+    const priorTask = priorTasks[index];
+    const label = index === 0 ? "Originating delegated task" : `Prior continuation ${index}`;
+    sections.push(`[${label}]\nTask ID: ${priorTask.id}\nTask name: ${priorTask.name}\nTask hash: ${priorTask.hash}\nIntent: ${priorTask.intent}\n${priorTask.text}`);
+  }
+  if (taskState.referencedPriorControl) {
+    sections.push(`[Latest parent control before the resume]\n${taskState.referencedPriorControl.text}`);
+  }
+  return sections.join("\n\n");
 }
 
 export function progressPromptSection(taskState) {
