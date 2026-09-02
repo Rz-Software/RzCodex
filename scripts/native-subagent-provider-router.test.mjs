@@ -16,7 +16,7 @@ import {
 const MODEL_ALIAS = "@preset/codex-subagents";
 const EXPECTED = {
   provider: "antigravity",
-  models: ["claude-opus-4-6-thinking", "gemini-3.7-flash-high"],
+  models: ["claude-opus-4-6-thinking", "gemini-3.8-flash-high"],
   authSource: "Antigravity cached OAuth session",
 };
 

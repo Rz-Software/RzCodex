@@ -430,7 +430,7 @@ const runtime = {
   activeFreeRequests: 0, queuedFreeRequests: 0,
   activeOllamaRequests: 0, queuedOllamaRequests: 0,
   supersededTurns: 0,
-  resourceRetries: 0, streamContinuations: 0, compactionCheckpoints: 0,
+  resourceRetries: 0, providerContinuations: 0, streamContinuations: 0, compactionCheckpoints: 0,
   providerCheckpoints: 0,
   permissionCheckpoints: 0, activeResourceBackoffs: 0,
   lastResourceModel: null, lastResourceRetryAttempt: 0,
@@ -917,6 +917,24 @@ function uniqueToolCalls(toolRows) {
   return toolCalls;
 }
 
+function providerToolCallKey(call, index) {
+  return typeof call?.id === "string" && call.id
+    ? call.id
+    : `${String(call?.name || "unknown")}:${index}`;
+}
+
+function unseenProviderToolProgress(toolCalls, seenToolCalls) {
+  const progress = [];
+  for (const [index, call] of (toolCalls || []).entries()) {
+    if (!call?.name) continue;
+    const key = providerToolCallKey(call, index);
+    if (seenToolCalls.has(key)) continue;
+    seenToolCalls.add(key);
+    progress.push({ kind: "tool", index: index + 1, name: call.name });
+  }
+  return progress;
+}
+
 function ollamaWireToolName(namespace, name) {
   const fullName = namespace
     ? (namespace.endsWith("_") || name.startsWith("_") ? `${namespace}${name}` : `${namespace}__${name}`)
@@ -1256,7 +1274,12 @@ function runCli(
   onSpawn,
   onProgress,
   timeoutMs = REQUEST_TIMEOUT_MS,
-  { resumeSessionId = null, prompt = context.prompt, compactionBaseline = 0 } = {},
+  {
+    resumeSessionId = null,
+    prompt = context.prompt,
+    compactionBaseline = 0,
+    toolCallBaseline = [],
+  } = {},
 ) {
   const promptPath = join(REQUEST_DIRECTORY, `${context.requestId}-${randomUUID()}.txt`);
   writeFileSync(promptPath, prompt, { encoding: "utf8", flag: "wx" });
@@ -1280,7 +1303,11 @@ function runCli(
     let settled = false;
     const routeOwnershipDeadline = Date.now() + NATIVE_PROVIDER_INACTIVITY_MS;
     let lastCompactionNodeId = Number(compactionBaseline || 0);
-    const seenToolCalls = new Set();
+    const seenToolCalls = new Set(
+      toolCallBaseline
+        .map((call, index) => call?.name ? providerToolCallKey(call, index) : null)
+        .filter(Boolean),
+    );
     const reportProgress = () => {
       let session;
       try {
@@ -1298,12 +1325,8 @@ function runCli(
         });
         return;
       }
-      for (const [index, call] of (session?.toolCalls || []).entries()) {
-        if (!call?.name) continue;
-        const key = typeof call.id === "string" && call.id ? call.id : `${call.name}:${index}`;
-        if (seenToolCalls.has(key)) continue;
-        seenToolCalls.add(key);
-        onProgress?.({ kind: "tool", index: seenToolCalls.size, name: call.name });
+      for (const progress of unseenProviderToolProgress(session?.toolCalls, seenToolCalls)) {
+        onProgress?.(progress);
       }
       if (seenToolCalls.size > 0) return;
       if (Date.now() < routeOwnershipDeadline) return;
@@ -1451,7 +1474,9 @@ function completedProviderCheckpoint(context, session, failureState) {
     `Tool names: ${toolNames.join(", ") || "none"}`,
     `Last completed tool: ${toolNames.at(-1) || "none"}`,
     `Concrete blocker: ${providerCheckpointReason(failureState)}.`,
-    "The provider turn was not replayed and no later provider was started. The delegated task may be incomplete; the parent should inspect the preserved work and decide whether to resume or reassign it.",
+    failureState.continuationAttempted
+      ? "One bounded same-session continuation was attempted without replaying the task, and no later provider was started. The delegated task may be incomplete; the parent should inspect the preserved work and decide whether to resume or reassign it."
+      : "No later provider was started after committed work. The delegated task may be incomplete; the parent should inspect the preserved work and decide whether to resume or reassign it.",
   ].join("\n");
   runtime.providerCheckpoints += 1;
   return {
@@ -1486,6 +1511,8 @@ async function runCliWithProviderRecovery(
     const remainingMs = activeDeadline - now();
     if (remainingMs <= 0) throw new BridgeError("Devin provider recovery deadline exceeded", 504);
     let cliResult;
+    let sessionFromRunError = null;
+    let runError = null;
     try {
       cliResult = await run(
         context,
@@ -1504,41 +1531,39 @@ async function runCliWithProviderRecovery(
                     ? devinIncompleteTurnPrompt(context)
                     : devinStreamContinuationPrompt(context),
               compactionBaseline: resumeSession.compactionNodeId,
+              toolCallBaseline: providerToolCalls(resumeSession),
             }
           : undefined,
       );
     } catch (error) {
       const session = await findSession(context.requestId) || resumeSession;
-      if (!signal?.aborted && error?.status !== 499 && providerToolCalls(session).length > 0) {
-        return completedProviderCheckpoint(context, session, { streamFailure: true });
+      if (!signal?.aborted && error?.status !== 499 && session) {
+        runError = error;
+        sessionFromRunError = session;
+        cliResult = {
+          code: 1,
+          stdout: "",
+          stderr: sanitizedProviderFailure(error),
+        };
+      } else {
+        const preserved = preserveProviderCommit(error, session);
+        if (session) remove(session.id);
+        throw preserved;
       }
-      const preserved = preserveProviderCommit(error, session);
-      if (session) remove(session.id);
-      throw preserved;
     }
-    let session = await findSession(context.requestId) || resumeSession;
+    let session = sessionFromRunError || await findSession(context.requestId) || resumeSession;
+    if (runError && session?.terminalText) {
+      cliResult = { code: 0, stdout: session.terminalText, stderr: "" };
+      runError = null;
+    }
     if (cliResult.code === 0 && cliResult.stdout && session && !session.terminalText) {
       session = await findTerminalSession(context.requestId, session) || session;
     }
     const resourceFailure = isRetryableResourceFailure(cliResult);
-    const streamFailure = isInterruptedStreamFailure(cliResult);
+    const streamFailure = Boolean(runError) || isInterruptedStreamFailure(cliResult);
     const compactionFailure = isProviderCompactionFailure(cliResult);
     const permissionFailure = isPermissionRejection(cliResult);
-    const incompleteTurn = cliResult.code === 0 && Boolean(cliResult.stdout) && session && !session.terminalText;
-    const recoverableProviderFailure = resourceFailure
-      || streamFailure
-      || compactionFailure
-      || permissionFailure
-      || incompleteTurn;
-    if (recoverableProviderFailure && providerToolCalls(session).length > 0) {
-      return completedProviderCheckpoint(context, session, {
-        resourceFailure,
-        streamFailure,
-        compactionFailure,
-        permissionFailure,
-        incompleteTurn,
-      });
-    }
+    const incompleteTurn = cliResult.code === 0 && Boolean(session) && !session.terminalText;
     if (!resourceFailure && !streamFailure && !compactionFailure && !permissionFailure && !incompleteTurn) {
       return { cliResult, session };
     }
@@ -1547,7 +1572,20 @@ async function runCliWithProviderRecovery(
       error.routeCommitted = true;
       throw error;
     }
-    if ((streamFailure || compactionFailure || permissionFailure || incompleteTurn) && providerContinuationUsed) {
+    const failureState = {
+      resourceFailure,
+      streamFailure,
+      compactionFailure,
+      permissionFailure,
+      incompleteTurn,
+    };
+    if (providerContinuationUsed && session) {
+      if (providerToolCalls(session).length > 0) {
+        return completedProviderCheckpoint(context, session, {
+          ...failureState,
+          continuationAttempted: true,
+        });
+      }
       const error = preserveProviderCommit(
         new BridgeError("Devin provider conversation remained non-terminal after one same-session continuation", 502),
         session,
@@ -1561,6 +1599,12 @@ async function runCliWithProviderRecovery(
     attempt += 1;
     const backoffMs = resourceFailure ? resourceBackoffMs(attempt) : PROVIDER_RECOVERY_BACKOFF_MS;
     if (now() + backoffMs >= recoveryDeadline) {
+      if (providerToolCalls(session).length > 0) {
+        return completedProviderCheckpoint(context, session, {
+          ...failureState,
+          continuationAttempted: providerContinuationUsed,
+        });
+      }
       const error = preserveProviderCommit(
         new BridgeError(
           `Devin provider recovery exceeded its ${PROVIDER_RECOVERY_BUDGET_MS / 1000}-second budget`,
@@ -1577,8 +1621,19 @@ async function runCliWithProviderRecovery(
       runtime.lastStreamContinuationAt = new Date(now()).toISOString();
       runtime.lastStreamContinuationSessionHash = createHash("sha256").update(session.id).digest("hex");
     }
-    if (streamFailure || compactionFailure || permissionFailure || incompleteTurn) {
+    const hasCommittedProviderWork = providerToolCalls(session).length > 0;
+    if (
+      session
+      && (
+        streamFailure
+        || compactionFailure
+        || permissionFailure
+        || incompleteTurn
+        || (resourceFailure && hasCommittedProviderWork)
+      )
+    ) {
       providerContinuationUsed = true;
+      runtime.providerContinuations += 1;
     }
     if (compactionFailure) runtime.compactionCheckpoints += 1;
     if (permissionFailure) runtime.permissionCheckpoints += 1;
@@ -1586,6 +1641,12 @@ async function runCliWithProviderRecovery(
     runtime.lastResourceRetryAttempt = attempt;
     runtime.lastResourceBackoffMs = backoffMs;
     runtime.lastResourceRetryAt = now() + backoffMs;
+    if (providerContinuationUsed) {
+      onProgress?.({
+        kind: "recovery",
+        reason: providerCheckpointReason(failureState),
+      });
+    }
     runtime.activeResourceBackoffs += 1;
     try {
       await delay(backoffMs, signal);
@@ -1919,7 +1980,13 @@ async function runDevinStage(
         context,
         selected.model,
         onSpawn,
-        ({ index, name }) => onProgress?.(`Devin native tool ${index}: ${progressToolName(name)}.\n`),
+        (progress) => {
+          if (progress?.kind === "recovery") {
+            onProgress?.(`Devin native same-session recovery: ${progress.reason}.\n`);
+            return;
+          }
+          onProgress?.(`Devin native tool ${progress.index}: ${progressToolName(progress.name)}.\n`);
+        },
         signal,
         Date.now() + REQUEST_TIMEOUT_MS,
       );
@@ -2825,6 +2892,24 @@ async function selfTest() {
   ) {
     throw new Error("Devin terminal assistant topology detection failed");
   }
+  const priorProgressCalls = [
+    { id: "tool-1", name: "read" },
+    { id: "tool-2", name: "grep" },
+  ];
+  const seenProgressCalls = new Set(
+    priorProgressCalls.map((call, index) => providerToolCallKey(call, index)),
+  );
+  const resumedProgress = unseenProviderToolProgress(
+    [...priorProgressCalls, { id: "tool-3", name: "edit" }],
+    seenProgressCalls,
+  );
+  if (
+    resumedProgress.length !== 1
+    || resumedProgress[0].index !== 3
+    || resumedProgress[0].name !== "edit"
+  ) {
+    throw new Error("Devin resumed tool progress repeated completed calls");
+  }
   const recoveryContext = {
     requestId: "devin-recovery-fixture",
     taskDiagnostics: { taskHash: "devin-recovery-task-hash" },
@@ -2892,11 +2977,63 @@ async function selfTest() {
   }
   const committedSession = {
     id: "devin-committed-session",
-    toolCalls: [{ name: "read" }, { name: "edit" }],
+    model: recoveryModel.model_uid,
+    toolCalls: [{ id: "committed-read", name: "read" }, { id: "committed-edit", name: "edit" }],
     compactionNodeId: 0,
     terminalText: null,
   };
+  const recoveredCommittedSession = {
+    ...committedSession,
+    terminalText: "Committed work recovered.",
+  };
   const committedCalls = [];
+  const committedDelays = [];
+  const committedProgress = [];
+  let committedSessionReads = 0;
+  let committedNow = 1_000;
+  const recoveredCommitted = await runCliWithProviderRecovery(
+    recoveryContext,
+    recoveryModel,
+    () => {},
+    (progress) => committedProgress.push(progress),
+    undefined,
+    100_000,
+    {
+      now: () => committedNow,
+      delay: async (milliseconds) => {
+        committedDelays.push(milliseconds);
+        committedNow += milliseconds;
+      },
+      waitForSession: async () => {
+        committedSessionReads += 1;
+        return committedSessionReads === 1 ? committedSession : recoveredCommittedSession;
+      },
+      waitForTerminalSession: async (_requestId, session) => session,
+      removeSession: () => { throw new Error("recovered committed session was removed"); },
+      runCli: async (_context, _model, _onSpawn, _onProgress, timeoutMs, options) => {
+        committedCalls.push({ timeoutMs, options });
+        return committedCalls.length === 1
+          ? interruptedStreamFailure
+          : { code: 0, stdout: "Committed work recovered.", stderr: "" };
+      },
+    },
+  );
+  if (
+    recoveredCommitted.session !== recoveredCommittedSession
+    || committedCalls.length !== 2
+    || committedCalls[0].options !== undefined
+    || committedCalls[1].options?.resumeSessionId !== committedSession.id
+    || committedCalls[1].options?.toolCallBaseline?.length !== 2
+    || !committedCalls[1].options?.prompt.includes("Native Devin stream recovery")
+    || committedDelays.join(",") !== "1000"
+    || committedProgress.length !== 1
+    || committedProgress[0]?.kind !== "recovery"
+  ) {
+    throw new Error("Devin post-tool stream continuation failed");
+  }
+  const terminalFailureCalls = [];
+  const terminalFailureDelays = [];
+  let terminalFailureNow = 1_000;
   const committedCheckpoint = await runCliWithProviderRecovery(
     recoveryContext,
     recoveryModel,
@@ -2905,34 +3042,44 @@ async function selfTest() {
     undefined,
     100_000,
     {
-      now: () => 1_000,
-      delay: async () => { throw new Error("committed Devin work entered recovery backoff"); },
+      now: () => terminalFailureNow,
+      delay: async (milliseconds) => {
+        terminalFailureDelays.push(milliseconds);
+        terminalFailureNow += milliseconds;
+      },
       waitForSession: async () => committedSession,
       waitForTerminalSession: async (_requestId, session) => session,
       removeSession: () => { throw new Error("committed checkpoint session was removed before finalization"); },
-      runCli: async () => {
-        committedCalls.push(true);
+      runCli: async (_context, _model, _onSpawn, _onProgress, timeoutMs, options) => {
+        terminalFailureCalls.push({ timeoutMs, options });
         return interruptedStreamFailure;
       },
     },
   );
   if (
-    committedCalls.length !== 1
+    terminalFailureCalls.length !== 2
+    || terminalFailureDelays.join(",") !== "1000"
     || !committedCheckpoint.session.terminalText.includes("Authoritative native-provider checkpoint")
     || !committedCheckpoint.session.terminalText.includes("Provider tool calls completed: 2")
     || !committedCheckpoint.session.terminalText.includes("Provider mutation calls observed: 1")
-    || !committedCheckpoint.session.terminalText.includes("was not replayed")
+    || !committedCheckpoint.session.terminalText.includes("One bounded same-session continuation")
   ) {
-    throw new Error("Devin post-tool stream failure was replayed");
+    throw new Error("Devin post-tool continuation bound failed");
   }
   const compactionSession = {
     id: "devin-compaction-session",
-    toolCalls: [{ name: "exec" }],
+    model: recoveryModel.model_uid,
+    toolCalls: [{ id: "compaction-exec", name: "exec" }],
     compactionNodeId: 12,
     terminalText: null,
   };
+  const completedCompactionSession = {
+    ...compactionSession,
+    terminalText: "Compaction checkpoint returned.",
+  };
   const compactionCalls = [];
   const compactionDelays = [];
+  let compactionSessionReads = 0;
   let compactionNow = 1_000;
   const recoveredCompaction = await runCliWithProviderRecovery(
     recoveryContext,
@@ -2947,23 +3094,31 @@ async function selfTest() {
         compactionDelays.push(milliseconds);
         compactionNow += milliseconds;
       },
-      waitForSession: async () => compactionSession,
+      waitForSession: async () => {
+        compactionSessionReads += 1;
+        return compactionSessionReads === 1 ? compactionSession : completedCompactionSession;
+      },
       waitForTerminalSession: async (_requestId, session) => session,
       removeSession: () => { throw new Error("compaction checkpoint session was removed"); },
       runCli: async (_context, _model, _onSpawn, _onProgress, timeoutMs, options) => {
         compactionCalls.push({ timeoutMs, options });
-        return compactedProviderFailure;
+        return compactionCalls.length === 1
+          ? compactedProviderFailure
+          : { code: 0, stdout: "Compaction checkpoint returned.", stderr: "" };
       },
     },
   );
   if (
-    compactionCalls.length !== 1
+    recoveredCompaction.session !== completedCompactionSession
+    || compactionCalls.length !== 2
     || compactionCalls[0].options !== undefined
-    || compactionDelays.length !== 0
-    || !recoveredCompaction.session.terminalText.includes("compacted its context")
-    || !recoveredCompaction.session.terminalText.includes("was not replayed")
+    || compactionCalls[1].options?.resumeSessionId !== compactionSession.id
+    || compactionCalls[1].options?.toolCallBaseline?.length !== 1
+    || !compactionCalls[1].options?.prompt.includes("Native Devin compaction checkpoint")
+    || !compactionCalls[1].options?.prompt.includes(recoveryContext.taskState.activeTask.text)
+    || compactionDelays.join(",") !== "1000"
   ) {
-    throw new Error("Devin provider compaction was not checkpointed without replay");
+    throw new Error("Devin provider compaction continuation failed");
   }
   const permissionPrompt = devinPermissionCheckpointPrompt(recoveryContext);
   if (
@@ -2973,6 +3128,13 @@ async function selfTest() {
     throw new Error("Devin permission checkpoint did not retain the active task");
   }
   const incompleteCalls = [];
+  const incompleteDelays = [];
+  const completedIncompleteSession = {
+    ...committedSession,
+    terminalText: "Incomplete turn recovered.",
+  };
+  let incompleteSessionReads = 0;
+  let incompleteNow = 1_000;
   const recoveredIncomplete = await runCliWithProviderRecovery(
     recoveryContext,
     recoveryModel,
@@ -2981,24 +3143,35 @@ async function selfTest() {
     undefined,
     100_000,
     {
-      now: () => 1_000,
-      delay: async () => { throw new Error("incomplete committed Devin turn entered recovery backoff"); },
-      waitForSession: async () => committedSession,
+      now: () => incompleteNow,
+      delay: async (milliseconds) => {
+        incompleteDelays.push(milliseconds);
+        incompleteNow += milliseconds;
+      },
+      waitForSession: async () => {
+        incompleteSessionReads += 1;
+        return incompleteSessionReads === 1 ? committedSession : completedIncompleteSession;
+      },
       waitForTerminalSession: async (_requestId, session) => session,
       removeSession: () => { throw new Error("incomplete Devin session was removed"); },
       runCli: async (_context, _model, _onSpawn, _onProgress, _timeoutMs, options) => {
         incompleteCalls.push(options);
-        return { code: 0, stdout: "I'll start by inspecting the fixture.", stderr: "" };
+        return incompleteCalls.length === 1
+          ? { code: 0, stdout: "I'll start by inspecting the fixture.", stderr: "" }
+          : { code: 0, stdout: "Incomplete turn recovered.", stderr: "" };
       },
     },
   );
   if (
-    incompleteCalls.length !== 1
+    recoveredIncomplete.session !== completedIncompleteSession
+    || incompleteCalls.length !== 2
     || incompleteCalls[0] !== undefined
-    || !recoveredIncomplete.session.terminalText.includes("without a terminal assistant response")
-    || !recoveredIncomplete.session.terminalText.includes("was not replayed")
+    || incompleteCalls[1]?.resumeSessionId !== committedSession.id
+    || incompleteCalls[1]?.toolCallBaseline?.length !== 2
+    || !incompleteCalls[1]?.prompt.includes("Native Devin terminal-message recovery")
+    || incompleteDelays.join(",") !== "1000"
   ) {
-    throw new Error("Devin structurally incomplete post-tool turn was replayed");
+    throw new Error("Devin structurally incomplete post-tool continuation failed");
   }
   const emptyRecoverySession = {
     id: "devin-empty-recovery-session",
