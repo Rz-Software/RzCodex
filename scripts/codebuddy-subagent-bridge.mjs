@@ -428,6 +428,10 @@ class ProviderConversationRegistry {
       this.#states.set(threadId, state);
     }
 
+    const continuesRetainedTask = Boolean(
+      state.activeTask
+      && incomingTaskState.referencedPriorTasks?.some((task) => task.hash === state.activeTask.hash),
+    );
     const taskChanged = Boolean(
       incomingTask && incomingTask.hash !== state.activeTask?.hash,
     );
@@ -442,7 +446,12 @@ class ProviderConversationRegistry {
       };
       state.checkpointRequested = incomingTaskState.checkpointRequested;
       state.immediateReturnRequested = incomingTaskState.immediateReturnRequested;
-      state.progress = emptyProgress();
+      state.progress = continuesRetainedTask
+        ? {
+            ...incomingTaskState.progress,
+            changedPaths: [...incomingTaskState.progress.changedPaths],
+          }
+        : emptyProgress();
       state.callNames.clear();
       state.countedCalls.clear();
       state.countedOutputs.clear();
@@ -2180,6 +2189,26 @@ function selfTest() {
       text: "Message Type: MESSAGE\nTask name: /root/test\nSender: /root\nPayload:\nReturn a checkpoint/report immediately with current progress.",
     }],
   };
+  const checkpointNewTask = {
+    id: "amsg-checkpoint-control",
+    type: "agent_message",
+    author: "/root",
+    recipient: "/root/test",
+    content: [{
+      type: "input_text",
+      text: "Message Type: NEW_TASK\nTask name: /root/test\nSender: /root\nPayload:\nImmediate checkpoint: finish the current tool call, do not start another tool, and report authoritative progress.",
+    }],
+  };
+  const checkpointResumeNewTask = {
+    id: "amsg-checkpoint-resume",
+    type: "agent_message",
+    author: "/root",
+    recipient: "/root/test",
+    content: [{
+      type: "input_text",
+      text: "Message Type: NEW_TASK\nTask name: /root/test\nSender: /root\nPayload:\nContinue the original bounded task from the checkpoint.",
+    }],
+  };
   const firstPatchHistory = [
     mutationTaskItem,
     { type: "function_call", name: "exec_command", call_id: "inspect", arguments: "{}" },
@@ -2192,6 +2221,33 @@ function selfTest() {
     },
     checkpointMessage,
   ];
+  const checkpointDeliveredAsNewTask = taskStateFromInput([
+    ...firstPatchHistory.slice(0, -1),
+    checkpointNewTask,
+  ], MAX_ACTIVE_TASK_CHARS);
+  if (
+    checkpointDeliveredAsNewTask.activeTask.id !== mutationTaskItem.id
+    || checkpointDeliveredAsNewTask.progress.successfulMutationCount !== 1
+    || checkpointDeliveredAsNewTask.progress.lastCompletedTool !== "apply_patch"
+    || !checkpointDeliveredAsNewTask.checkpointRequested
+    || !checkpointDeliveredAsNewTask.immediateReturnRequested
+  ) {
+    throw new Error("self-test failed: NEW_TASK checkpoint control replaced the active task or erased progress");
+  }
+  const continuationAfterCheckpoint = taskStateFromInput([
+    ...firstPatchHistory.slice(0, -1),
+    checkpointNewTask,
+    checkpointResumeNewTask,
+  ], MAX_ACTIVE_TASK_CHARS);
+  if (
+    continuationAfterCheckpoint.activeTask.id !== "amsg-checkpoint-resume"
+    || continuationAfterCheckpoint.referencedPriorTask?.id !== mutationTaskItem.id
+    || continuationAfterCheckpoint.progress.successfulMutationCount !== 1
+    || continuationAfterCheckpoint.checkpointRequested
+    || continuationAfterCheckpoint.immediateReturnRequested
+  ) {
+    throw new Error("self-test failed: checkpoint continuation replaced the active task or lost cumulative progress");
+  }
   const firstPatch = normalizeSelfTestRequest(firstPatchHistory);
   if (
     firstPatch.taskState.progress.successfulMutationCount !== 1
@@ -2243,6 +2299,39 @@ function selfTest() {
     throw new Error("self-test failed: retained provider session lost its first patch");
   }
   mutationRegistry.commit(mutationAfterFirstPatch);
+  const checkpointControlRegistry = new ProviderConversationRegistry();
+  const checkpointControlThread = "self-test-new-task-checkpoint-resume";
+  const checkpointControlFirstTurn = normalizeSelfTestRequest(
+    [mutationTaskItem],
+    { registry: checkpointControlRegistry, threadId: checkpointControlThread },
+  );
+  checkpointControlRegistry.commit(checkpointControlFirstTurn);
+  const checkpointControlTurn = normalizeSelfTestRequest([
+    ...firstPatchHistory.slice(0, -1),
+    checkpointNewTask,
+  ], { registry: checkpointControlRegistry, threadId: checkpointControlThread });
+  if (
+    checkpointControlTurn.taskState.activeTask.id !== mutationTaskItem.id
+    || checkpointControlTurn.taskState.progress.successfulMutationCount !== 1
+    || !checkpointControlTurn.taskState.checkpointRequested
+    || !checkpointControlTurn.taskDiagnostics.retainedInProviderSession
+  ) {
+    throw new Error("self-test failed: retained provider checkpoint replaced active ownership or progress");
+  }
+  checkpointControlRegistry.commit(checkpointControlTurn);
+  const checkpointResumeTurn = normalizeSelfTestRequest([
+    ...firstPatchHistory.slice(0, -1),
+    checkpointNewTask,
+    checkpointResumeNewTask,
+  ], { registry: checkpointControlRegistry, threadId: checkpointControlThread });
+  if (
+    checkpointResumeTurn.taskState.activeTask.id !== checkpointResumeNewTask.id
+    || checkpointResumeTurn.taskState.progress.successfulMutationCount !== 1
+    || checkpointResumeTurn.taskState.checkpointRequested
+    || checkpointResumeTurn.taskDiagnostics.retainedInProviderSession
+  ) {
+    throw new Error("self-test failed: retained provider resume lost cumulative checkpoint progress");
+  }
   const mutationAfterCompaction = normalizeSelfTestRequest([
     { type: "context_compaction", encrypted_content: "opaque" },
     { type: "custom_tool_call", name: "apply_patch", call_id: "patch-two", input: "patch two" },

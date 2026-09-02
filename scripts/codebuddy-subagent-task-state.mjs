@@ -199,6 +199,7 @@ function messageState(item, index) {
   const checkpoint = isCheckpointRequest(normalized.text);
   const immediateReturn = isImmediateReturnRequest(normalized.text);
   const intent = taskIntent(normalized.text);
+  const terminalControl = intent === "analysis" && (checkpoint || immediateReturn);
   return {
     ...normalized,
     index,
@@ -211,6 +212,7 @@ function messageState(item, index) {
     checkpoint,
     immediateReturn,
     intent,
+    terminalControl,
   };
 }
 
@@ -296,7 +298,12 @@ export function taskStateFromInput(input, maxActiveTaskChars) {
     if (!item || typeof item !== "object" || item.type !== "agent_message") continue;
     const message = messageState(item, index);
     messages.push(message);
-    if (message.newTask) activeTask = message;
+    if (
+      message.newTask
+      && (!activeTask || !message.terminalControl)
+    ) {
+      activeTask = message;
+    }
   }
   if (!activeTask) {
     return {
@@ -321,7 +328,11 @@ export function taskStateFromInput(input, maxActiveTaskChars) {
     );
   }
   activeTask = enrichedTask(activeTask);
-  const priorTaskMessages = messages.filter((message) => message.newTask && message.index < activeTask.index);
+  const priorTaskMessages = messages.filter((message) => (
+    message.newTask
+    && !message.terminalControl
+    && message.index < activeTask.index
+  ));
   let referencedPriorTask = null;
   let referencedPriorTasks = [];
   let referencedPriorControl = null;
@@ -362,7 +373,7 @@ export function taskStateFromInput(input, maxActiveTaskChars) {
     };
     referencedPriorControl = messages
       .filter((message) => (
-        !message.newTask
+        (!message.newTask || message.terminalControl)
         && message.index > referencedPriorTask.index
         && message.index < activeTask.index
       ))
@@ -396,7 +407,7 @@ export function taskStateFromInput(input, maxActiveTaskChars) {
     checkpointRequested,
     immediateReturnRequested,
     messages,
-    progress: progressFrom(input, activeTask.index),
+    progress: progressFrom(input, referencedPriorTask?.index ?? activeTask.index),
   };
 }
 
