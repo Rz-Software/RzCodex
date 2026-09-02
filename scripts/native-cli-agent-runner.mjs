@@ -15,6 +15,7 @@ import {
 } from "./codebuddy-subagent-task-state.mjs";
 
 const MAX_ACTIVE_TASK_CHARS = 40_000;
+const OLLAMA_CLOUD_CONTEXT_WINDOW = 1_048_576;
 const REQUEST_TIMEOUT_MS = 30 * 60 * 1000;
 const ROUTE_OWNERSHIP_TIMEOUT_MS = 55 * 1000;
 const STDERR_LIMIT = 16 * 1024;
@@ -375,7 +376,7 @@ function openCodeConfig(context, providerKind) {
             name: context.model,
             tool_call: true,
             reasoning: true,
-            limit: { context: 65_536, output: 32_768 },
+            limit: { context: OLLAMA_CLOUD_CONTEXT_WINDOW, output: 32_768 },
           },
         },
       },
@@ -541,6 +542,16 @@ export async function runCommandCodeNativeAgent(context, { signal, onEvent }) {
 
 export async function nativeCliAgentRunnerSelfTest() {
   const authoritativeWorkspace = homedir();
+  const ollamaConfigFixture = JSON.parse(openCodeConfig({
+    model: "glm-5.3-flash:cloud",
+    executionPolicy: { rzMcpMode: "disabled" },
+  }, "ollama"));
+  if (
+    ollamaConfigFixture.provider?.ollama?.models?.["glm-5.3-flash:cloud"]?.limit?.context
+      !== OLLAMA_CLOUD_CONTEXT_WINDOW
+  ) {
+    throw new Error("Ollama cloud model context window was truncated by the OpenCode adapter");
+  }
   const cwdTask = "Message Type: NEW_TASK\nTask name: /root/cwd_fixture\nPayload:\nInspect the bounded fixture and report.";
   const cwdContext = nativeCliAgentContext({
     model: "@preset/codex-subagents",
