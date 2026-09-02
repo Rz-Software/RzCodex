@@ -260,7 +260,10 @@ function executionPolicyFromTaskState(taskState) {
   const validationRestricted = VALIDATION_RESTRICTED_TASK.test(taskText);
   const rzMcpRestricted = RZMCP_RESTRICTED_TASK.test(taskText);
   return {
-    permissionMode: readOnly ? "auto" : "accept-edits",
+    // Devin's non-interactive auto and accept-edits modes still reject ordinary shell commands.
+    // Native subagents need the same file/shell surface as the other managed providers; task scope
+    // and RzMCP access remain constrained independently below and in the pinned task prompt.
+    permissionMode: "dangerous",
     rzMcpMode: rzMcpRestricted
       ? "disabled"
       : readOnly
@@ -682,7 +685,7 @@ function promptFrom(body) {
     : null;
   const sections = [
     `[Native delegated coding contract]\nRzCodex request ID: ${requestId}\nWork directly in the supplied workspace as the bounded native sub-agent. Use the file and command tools available in this turn. Do not spawn provider-side subagents. Honor project AGENTS.md ownership boundaries exactly; when builds, tests, editor control, PIE, runtime validation, or RzMCP execution are reserved to the parent, do not invoke them and instead report the exact checks the parent should run. For Unreal/RzMCP work that is within your assigned ownership, use only the lazy RzMCP proxy surface: search with an exact or focused query, then call only a discovered tool. Never use or request the full RzMCP catalog. On Windows, use PowerShell-native commands, single-quote ripgrep patterns containing |, and never assume Unix-only commands such as head are installed. Return concise evidence as soon as the bounded task is complete or genuinely blocked.\nAuthoritative workspace: ${workingDirectory}`,
-    `[Enforced provider permissions]\nFile and command permission mode: ${executionPolicy.permissionMode}. RzMCP mode: ${executionPolicy.rzMcpMode}. These are hard task boundaries, not suggestions.`,
+    `[Enforced provider permissions]\nNon-interactive native file and shell tools are enabled with Devin permission mode ${executionPolicy.permissionMode}. This permission mode does not expand the active task. RzMCP mode: ${executionPolicy.rzMcpMode}. The active task's scope and restrictions remain hard boundaries, not suggestions.`,
   ];
   const roleInstructions = roleInstructionsFrom(body.instructions);
   if (roleInstructions) sections.push(`[Role instructions]\n${roleInstructions}`);
@@ -2815,19 +2818,19 @@ async function selfTest() {
     },
   });
   if (
-    readOnlyPolicy.permissionMode !== "auto"
+    readOnlyPolicy.permissionMode !== "dangerous"
     || readOnlyPolicy.rzMcpMode !== "disabled"
-    || boundedMutationPolicy.permissionMode !== "accept-edits"
+    || boundedMutationPolicy.permissionMode !== "dangerous"
     || boundedMutationPolicy.rzMcpMode !== "no-validation"
-    || unrestrictedMutationPolicy.permissionMode !== "accept-edits"
+    || unrestrictedMutationPolicy.permissionMode !== "dangerous"
     || unrestrictedMutationPolicy.rzMcpMode !== "no-validation"
-    || scopedMutationPolicy.permissionMode !== "accept-edits"
+    || scopedMutationPolicy.permissionMode !== "dangerous"
     || scopedMutationPolicy.rzMcpMode !== "no-validation"
-    || shorthandMutationPolicy.permissionMode !== "accept-edits"
+    || shorthandMutationPolicy.permissionMode !== "dangerous"
     || shorthandMutationPolicy.rzMcpMode !== "disabled"
-    || shorthandReadOnlyPolicy.permissionMode !== "auto"
+    || shorthandReadOnlyPolicy.permissionMode !== "dangerous"
     || shorthandReadOnlyPolicy.rzMcpMode !== "disabled"
-    || frenchBoundedReviewPolicy.permissionMode !== "accept-edits"
+    || frenchBoundedReviewPolicy.permissionMode !== "dangerous"
     || frenchBoundedReviewPolicy.rzMcpMode !== "disabled"
   ) {
     throw new Error("task execution permission policy failed");
@@ -3337,7 +3340,7 @@ async function selfTest() {
   });
   if (
     explicitReadOnlyAudit.taskDiagnostics.taskIntent !== "analysis"
-    || explicitReadOnlyAudit.executionPolicy.permissionMode !== "auto"
+    || explicitReadOnlyAudit.executionPolicy.permissionMode !== "dangerous"
     || !explicitReadOnlyAudit.prompt.includes("[Analysis convergence contract]")
     || explicitReadOnlyAudit.prompt.includes("[Mutation convergence contract]")
   ) {
