@@ -6,7 +6,7 @@ const TASK_NAME_HEADER = /^Task name:\s*(.+?)\s*$/m;
 const PAYLOAD_HEADER = /(?:^|\n)Payload:\s*\n/;
 const MUTATION_INTENT = /\b(?:implement|fix|patch|edit|modify|create|write|replace|delete|remove|repair|refactor|instrument|apply_patch)\b/gi;
 const NEGATED_MUTATION_PREFIX = /\b(?:do not|don't|must not|never|cannot|can't|not allowed to)\s+(?:[a-z][a-z0-9_-]*\s+){0,4}$/i;
-const EXPLICIT_READ_ONLY_TASK = /\bread[- ]only\b|\bno[- ]mutation\b|\bno\s+(?:edits?|modifications?|writes?|mutations?|file\s+changes|source\s+changes)\s*(?:[.;,/]|$)|\b(?:do not|must not|never)\s+(?:edit|modify|write|mutate)(?:\s+(?:any|the|source|project|workspace|files?)){0,3}(?:[.;,]|$)/i;
+const EXPLICIT_READ_ONLY_TASK = /\bread[- ]only\b|\bno[- ]mutation\b|\bno\s+(?:edits?|modifications?|writes?|mutations?|file\s+changes|source\s+changes)\s*(?:[.;,/]|$)|\b(?:do not|must not|never)\s+(?:edit|modify|write|mutate)(?:\s+(?:any|the|source|project|workspace|files?)){0,3}(?:[.;,/]|$)/i;
 const CHECKPOINT_REQUEST = /\b(?:checkpoint(?:\/report)?|status report|progress report)\b/i;
 const IMMEDIATE_RETURN = [
   /\b(?:return|report|respond)\b[\s\S]{0,120}\b(?:immediately|right now|now)\b/i,

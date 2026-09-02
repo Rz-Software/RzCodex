@@ -650,6 +650,27 @@ export async function nativeCliAgentRunnerSelfTest() {
   ) {
     throw new Error("native CLI resumed implementation was misclassified as analysis");
   }
+  const slashDelimitedReadOnlyTask = "Message Type: NEW_TASK\nTask name: /root/slash_read_only_fixture\nPayload:\nIndependent architecture audit. Review the implementation and builder patch. Do not edit/build/test/editor. Return evidence only.";
+  const slashDelimitedReadOnlyContext = nativeCliAgentContext({
+    model: "@preset/codex-subagents",
+    reasoning: { effort: "max" },
+    stream: true,
+    client_metadata: { cwd: authoritativeWorkspace },
+    input: [
+      { type: "agent_message", id: "slash-read-only-fixture", author: "Codex", recipient: "/root/slash_read_only_fixture", content: [{ type: "input_text", text: slashDelimitedReadOnlyTask }] },
+    ],
+  }, {
+    provider: "fixture",
+    model: "fixture-model",
+    requiredEffort: "max",
+  });
+  if (
+    slashDelimitedReadOnlyContext.taskDiagnostics.taskIntent !== "analysis"
+    || !slashDelimitedReadOnlyContext.prompt.includes("[Analysis convergence contract]")
+    || slashDelimitedReadOnlyContext.prompt.includes("[Mutation convergence contract]")
+  ) {
+    throw new Error("slash-delimited read-only task was misclassified as mutation");
+  }
   let missingCwdError = null;
   try {
     nativeCliAgentContext({
