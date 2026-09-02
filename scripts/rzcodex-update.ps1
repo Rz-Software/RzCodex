@@ -396,8 +396,6 @@ try {
         Invoke-NativeCommand -FilePath "git" -ArgumentList @("merge", "--no-commit", "--no-ff", $releaseTag) -WorkingDirectory $RepoRoot
     }
 
-    $env:RZCODEX_BASE_VERSION = $baseVersion
-    $env:RZCODEX_REPO_ROOT = $RepoRoot
     Invoke-NativeCommand -FilePath "just" -ArgumentList @("fmt-check") -WorkingDirectory $CodexRustRoot
     if ($RunTests) {
         Invoke-NativeCommand -FilePath "just" -ArgumentList @("test", "-p", "codex-core", "agent::role::tests") -WorkingDirectory $CodexRustRoot
@@ -411,6 +409,11 @@ try {
         Invoke-NativeCommand -FilePath "just" -ArgumentList @("test", "-p", "codex-tui", "history_cell::tests::coalesces_reads_across_multiple_calls") -WorkingDirectory $CodexRustRoot
     }
     Initialize-RustyV8Artifacts
+    # These values are compile-time metadata for the installed release binary. Setting them
+    # before the debug test suite changes Cargo's build fingerprint and recompiles the entire
+    # workspace once per update even when the ordinary test artifacts are already current.
+    $env:RZCODEX_BASE_VERSION = $baseVersion
+    $env:RZCODEX_REPO_ROOT = $RepoRoot
     Invoke-NativeCommand -FilePath "cargo" -ArgumentList @(
         "build",
         "--release",
