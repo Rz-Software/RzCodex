@@ -67,6 +67,7 @@ const OPENCODE_RESPONSES_MODELS = new Set([
   "grok-build-0.1",
   "muse-spark-1.2",
   "muse-spark-1.2-contributor-free",
+  "muse-spark-1.3-contributor-free",
 ]);
 const OPENCODE_CHAT_COMPLETIONS_MODELS = new Set([
   "big-pickle",
@@ -3195,7 +3196,7 @@ function selfTest() {
     throw new Error("self-test failed: Cursor continuation changed the retained chat identity");
   }
   const openCodeAnalysis = normalizeOpenCodeRequest({
-    model: "opencode/muse-spark-1.2-contributor-free",
+    model: "opencode/muse-spark-1.3-contributor-free",
     input: [taskItem(analysisTaskText)],
     stream: true,
     client_metadata: { cwd: process.cwd() },
@@ -3887,7 +3888,7 @@ function selfTest() {
     "gpt-5", "gpt-5-codex", "gpt-5-nano", "gpt-5.1", "gpt-5.1-codex", "gpt-5.1-codex-max", "gpt-5.1-codex-mini",
     "gpt-5.2", "gpt-5.2-codex", "gpt-5.3-codex", "gpt-5.3-codex-spark", "gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano",
     "gpt-5.4-pro", "gpt-5.5", "gpt-5.5-pro", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "grok-4.5", "grok-4.6",
-    "grok-build-0.1", "muse-spark-1.2", "muse-spark-1.2-contributor-free",
+    "grok-build-0.1", "muse-spark-1.2", "muse-spark-1.2-contributor-free", "muse-spark-1.3-contributor-free",
   ];
   const expectedChat = [
     "big-pickle", "hy3-free", "mimo-v2.5-free", "nemotron-3-ultra-free", "nemotron-3.5-lightning-free", "x-preview-f-free",
