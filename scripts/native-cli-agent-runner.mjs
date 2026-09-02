@@ -13,7 +13,7 @@ import {
 
 const MAX_ACTIVE_TASK_CHARS = 40_000;
 const REQUEST_TIMEOUT_MS = 30 * 60 * 1000;
-const INACTIVITY_TIMEOUT_MS = 55 * 1000;
+const ROUTE_OWNERSHIP_TIMEOUT_MS = 55 * 1000;
 const STDERR_LIMIT = 16 * 1024;
 const STATE_CLEANUP_RETRY_MS = 50;
 const STATE_CLEANUP_RELEASE_MS = 2 * 1000;
@@ -203,7 +203,18 @@ export function nativeCliAgentContext(body, { provider, model, requiredEffort })
   };
 }
 
-function nativeProcess({ command, args, cwd, env, signal, onEvent, parseLine, label }) {
+function nativeProcess({
+  command,
+  args,
+  cwd,
+  env,
+  signal,
+  onEvent,
+  parseLine,
+  label,
+  requestTimeoutMs = REQUEST_TIMEOUT_MS,
+  routeOwnershipTimeoutMs = ROUTE_OWNERSHIP_TIMEOUT_MS,
+}) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
       cwd,
@@ -214,18 +225,25 @@ function nativeProcess({ command, args, cwd, env, signal, onEvent, parseLine, la
     let settled = false;
     let stdoutBuffer = "";
     let stderr = "";
-    let lastActivityAt = Date.now();
+    const routeOwnershipDeadline = Date.now() + routeOwnershipTimeoutMs;
     const state = {};
     const requestTimer = setTimeout(() => {
       child.kill();
-      finish(new NativeCliAgentError(`${label} exceeded ${REQUEST_TIMEOUT_MS}ms`, 504));
-    }, REQUEST_TIMEOUT_MS);
-    const inactivityTimer = setInterval(() => {
-      if (Date.now() - lastActivityAt < INACTIVITY_TIMEOUT_MS) return;
+      finish(new NativeCliAgentError(`${label} exceeded ${requestTimeoutMs}ms`, 504));
+    }, requestTimeoutMs);
+    const routeOwnershipTimer = setInterval(() => {
+      if ((state.toolNames || []).length > 0) {
+        clearInterval(routeOwnershipTimer);
+        return;
+      }
+      if (Date.now() < routeOwnershipDeadline) return;
       child.kill();
-      finish(new NativeCliAgentError(`${label} produced no process or provider activity for ${INACTIVITY_TIMEOUT_MS}ms`, 504));
-    }, 1_000);
-    inactivityTimer.unref?.();
+      finish(new NativeCliAgentError(
+        `${label} did not begin provider tool work within ${routeOwnershipTimeoutMs}ms`,
+        504,
+      ));
+    }, Math.min(1_000, Math.max(10, Math.floor(routeOwnershipTimeoutMs / 4))));
+    routeOwnershipTimer.unref?.();
     const abort = () => {
       child.kill();
       finish(new NativeCliAgentError(`${label} was aborted`, 499));
@@ -234,7 +252,7 @@ function nativeProcess({ command, args, cwd, env, signal, onEvent, parseLine, la
       if (settled) return;
       settled = true;
       clearTimeout(requestTimer);
-      clearInterval(inactivityTimer);
+      clearInterval(routeOwnershipTimer);
       signal?.removeEventListener("abort", abort);
       if (error) {
         error.nativeToolNames = [...(state.toolNames || [])];
@@ -246,7 +264,6 @@ function nativeProcess({ command, args, cwd, env, signal, onEvent, parseLine, la
       if (!line.trim()) return;
       try {
         const event = JSON.parse(line);
-        lastActivityAt = Date.now();
         parseLine(event, state);
         onEvent?.(event, state);
       } catch (error) {
@@ -506,7 +523,7 @@ export async function runCommandCodeNativeAgent(context, { signal, onEvent }) {
   });
 }
 
-export function nativeCliAgentRunnerSelfTest() {
+export async function nativeCliAgentRunnerSelfTest() {
   const context = { provider: "fixture" };
   let incompleteError = null;
   try {
@@ -534,6 +551,47 @@ export function nativeCliAgentRunnerSelfTest() {
     lastToolSequence: 2,
   });
   if (completed.finalText !== "Work complete.") throw new Error("native CLI terminal tool turn detection failed");
+
+  const fixtureParser = (event, state) => {
+    state.toolNames ||= [];
+    if (event.type === "tool") state.toolNames.push(event.name);
+    if (event.type === "done") state.finalText = event.text;
+  };
+  const postToolSilence = await nativeProcess({
+    command: process.execPath,
+    args: [
+      "-e",
+      "console.log(JSON.stringify({type:'tool',name:'read'})); setTimeout(() => { console.log(JSON.stringify({type:'done',text:'complete'})); }, 350);",
+    ],
+    cwd: process.cwd(),
+    env: sanitizedEnvironment(),
+    parseLine: fixtureParser,
+    label: "post-tool silence fixture",
+    requestTimeoutMs: 2_000,
+    routeOwnershipTimeoutMs: 200,
+  });
+  if (postToolSilence.state.finalText !== "complete") {
+    throw new Error("native CLI post-tool silence incorrectly triggered provider rerouting");
+  }
+
+  let preToolTimeout = null;
+  try {
+    await nativeProcess({
+      command: process.execPath,
+      args: ["-e", "setTimeout(() => {}, 1000);"],
+      cwd: process.cwd(),
+      env: sanitizedEnvironment(),
+      parseLine: fixtureParser,
+      label: "pre-tool silence fixture",
+      requestTimeoutMs: 2_000,
+      routeOwnershipTimeoutMs: 200,
+    });
+  } catch (error) {
+    preToolTimeout = error;
+  }
+  if (!preToolTimeout?.message.includes("did not begin provider tool work within 200ms")) {
+    throw new Error("native CLI pre-tool route deadline failed");
+  }
 }
 
 export function nativeCliUsage(result) {

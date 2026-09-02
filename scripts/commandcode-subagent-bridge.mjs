@@ -1208,7 +1208,7 @@ function cursorContentText(value, label) {
 
 function preserveCursorCommit(error, nativeToolNames) {
   const names = [...new Set(nativeToolNames.filter((name) => typeof name === "string" && name))];
-  if (names.some((name) => /^(?:apply_patch|edit|write_file|create_file|delete_file|move_file|mcp_call_tool)$/i.test(name))) {
+  if (names.length > 0) {
     error.routeCommitted = true;
     error.nativeToolNames = names;
   }
@@ -1217,6 +1217,12 @@ function preserveCursorCommit(error, nativeToolNames) {
 
 function cursorResponseErrorCode(error) {
   return error?.routeCommitted === true ? "provider_state_changed" : "external_provider_error";
+}
+
+function nativeCliResponseErrorCode(error) {
+  return Array.isArray(error?.nativeToolNames) && error.nativeToolNames.length > 0
+    ? "provider_state_changed"
+    : "external_provider_error";
 }
 
 function cursorPromptFrom(body) {
@@ -2927,7 +2933,11 @@ async function handleNativeCliResponses(request, response, provider) {
         object: "response",
         model: body.model,
         status: "failed",
-        error: { type: "bridge_error", message },
+        error: {
+          code: nativeCliResponseErrorCode(error),
+          type: "bridge_error",
+          message,
+        },
       },
     });
     response.end();
@@ -2946,6 +2956,14 @@ async function handleOpenCodeResponses(request, response) {
 
 function selfTest() {
   readCommandCodeInstallation();
+  if (
+    nativeCliResponseErrorCode({ nativeToolNames: ["read"] }) !== "provider_state_changed"
+    || nativeCliResponseErrorCode({ nativeToolNames: [] }) !== "external_provider_error"
+    || cursorResponseErrorCode(preserveCursorCommit(new BridgeError("fixture"), ["read_file"]))
+      !== "provider_state_changed"
+  ) {
+    throw new Error("self-test failed: native CLI read-only provider work was eligible for replay");
+  }
   const cursorTaskPayload = "Message Type: NEW_TASK\nTask name: /root/worker\nPayload:\nInspect the bounded active Cursor task.";
   const cursorTask = cursorPromptFrom({
     model: "cursor/test-model",

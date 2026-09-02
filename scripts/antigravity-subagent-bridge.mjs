@@ -28,7 +28,7 @@ const MAX_HISTORY_ENTRY_CHARS = 8_000;
 const MAX_ROLE_INSTRUCTIONS_CHARS = 8_000;
 const OUTPUT_LIMIT = 2 * 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 30 * 60 * 1000;
-const UNCOMMITTED_MUTATION_ROUTE_TIMEOUT_MS = 55 * 1000;
+const UNCOMMITTED_ROUTE_TIMEOUT_MS = 55 * 1000;
 const INIT_TIMEOUT_MS = 30 * 1000;
 const SESSION_IDLE_MS = 30 * 60 * 1000;
 const SSE_HEARTBEAT_MS = 15 * 1000;
@@ -188,7 +188,7 @@ function attachTurnProgress(error, turn) {
   error.generatedTokens = Number(turn.generatedTokens || 0);
   error.generationSeconds = Number(turn.generationSeconds || 0);
   if (
-    error.mutationToolCalls > 0
+    error.toolCalls > 0
     || error.rzMcpTools.length > 0
     || error.subagentActivity
     || error.forbiddenToolName
@@ -200,7 +200,7 @@ function attachTurnProgress(error, turn) {
 
 function uncommittedMutationRouteTimeoutError() {
   const error = new BridgeError(
-    `Antigravity did not commit mutation-authorized work within ${UNCOMMITTED_MUTATION_ROUTE_TIMEOUT_MS}ms`,
+    `Antigravity did not begin provider tool work within ${UNCOMMITTED_ROUTE_TIMEOUT_MS}ms`,
     504,
   );
   error.uncommittedRouteTimeout = true;
@@ -212,7 +212,7 @@ function uncommittedMutationRouteTimeoutError() {
 function classifyUncommittedRouteTimeout(error, turn) {
   const classified = attachTurnProgress(error, turn);
   if (classified.uncommittedRouteTimeout !== true) return classified;
-  classified.safeToRetry = classified.mutationToolCalls === 0
+  classified.safeToRetry = classified.toolCalls === 0
     && classified.rzMcpTools.length === 0
     && !classified.subagentActivity
     && !classified.forbiddenToolName;
@@ -724,7 +724,7 @@ async function runWithInterruptedStreamRecovery(
       : null;
     if (remainingUncommittedMs !== null && remainingUncommittedMs <= 0) {
       const error = applyInterruptedProgress(uncommittedMutationRouteTimeoutError(), progress);
-      error.safeToRetry = error.mutationToolCalls === 0 && error.rzMcpTools.length === 0;
+      error.safeToRetry = error.toolCalls === 0 && error.rzMcpTools.length === 0;
       error.routeCommitted = !error.safeToRetry;
       session.close?.();
       throw error;
@@ -752,6 +752,29 @@ async function runWithInterruptedStreamRecovery(
       }
       accumulateInterruptedProgress(progress, error);
       progress.streamContinuations += 1;
+      if (progress.toolCalls > 0) {
+        const committedError = applyInterruptedProgress(
+          new BridgeError(
+            "Antigravity stream ended after provider tool work; the turn was not replayed",
+            502,
+          ),
+          progress,
+        );
+        committedError.safeToRetry = false;
+        committedError.routeCommitted = true;
+        session.close?.();
+        throw committedError;
+      }
+      if (attempt >= 1) {
+        const exhaustedError = applyInterruptedProgress(
+          new BridgeError("Antigravity remained stream-interrupted after one pre-work continuation", 502),
+          progress,
+        );
+        exhaustedError.safeToRetry = true;
+        exhaustedError.routeCommitted = false;
+        session.close?.();
+        throw exhaustedError;
+      }
       if (recoveryDeadline === null) {
         recoveryDeadline = Math.min(requestDeadline, now() + recoveryBudgetMs);
       }
@@ -1028,7 +1051,7 @@ class AntigravitySession {
       error.modelQuotaFailure = quotaFailure;
       error.sameSessionContinuation = interruptedStream;
       error.safeToRetry = !interruptedStream
-        && error.mutationToolCalls === 0
+        && error.toolCalls === 0
         && error.rzMcpTools.length === 0
         && !error.subagentActivity
         && !error.forbiddenToolName;
@@ -1346,9 +1369,7 @@ async function sessionFor(context) {
 async function handleResponses(request, response) {
   const body = await readRequestBody(request);
   const context = requestContext(body);
-  const uncommittedRouteDeadline = context.taskState.activeTask?.intent === "mutation"
-    ? Date.now() + UNCOMMITTED_MUTATION_ROUTE_TIMEOUT_MS
-    : null;
+  const uncommittedRouteDeadline = Date.now() + UNCOMMITTED_ROUTE_TIMEOUT_MS;
   runtime.lastWorkingDirectory = context.workingDirectory;
   runtime.lastCodexToolSchemaBytesIgnored = context.toolSchemaBytes;
   runtime.lastTaskId = context.taskState.activeTask?.id || null;
@@ -1592,7 +1613,7 @@ function health() {
       idleMilliseconds: SESSION_IDLE_MS,
       maximumSessions: MAX_SESSIONS,
       maximumConcurrentTurns: MAX_SESSIONS,
-      uncommittedMutationRouteTimeoutMs: UNCOMMITTED_MUTATION_ROUTE_TIMEOUT_MS,
+      uncommittedRouteTimeoutMs: UNCOMMITTED_ROUTE_TIMEOUT_MS,
     },
     activeSessions: sessions.size,
     activeTurns: [...sessions.values()].filter((session) => session.busy).length,
@@ -1722,8 +1743,8 @@ async function selfTest() {
   if (!safeQuotaFailure?.modelQuotaFailure || !safeQuotaFailure.safeToRetry || safeQuotaFailure.routeCommitted) {
     throw new Error("safe model-quota retry classification failed");
   }
-  if (!readOnlyQuotaFailure?.modelQuotaFailure || !readOnlyQuotaFailure.safeToRetry || readOnlyQuotaFailure.routeCommitted) {
-    throw new Error("read-only model-quota retry classification failed");
+  if (!readOnlyQuotaFailure?.modelQuotaFailure || readOnlyQuotaFailure.safeToRetry || !readOnlyQuotaFailure.routeCommitted) {
+    throw new Error("read-only provider work was incorrectly eligible for cross-provider replay");
   }
   if (!committedQuotaFailure?.modelQuotaFailure || committedQuotaFailure.safeToRetry || !committedQuotaFailure.routeCommitted) {
     throw new Error("committed model-quota failure classification failed");
@@ -1886,66 +1907,45 @@ async function selfTest() {
     run: async (currentPrompt, _signal, onProgress, timeoutMs) => {
       recoveryCalls.push({ prompt: currentPrompt, timeoutMs });
       recoveryRun += 1;
-      if (recoveryRun === 1) {
-        onProgress({ kind: "tool", index: 1, name: "replace_file_content" });
-        throw interruptedError("replace_file_content", 1, 10);
-      }
-      if (recoveryRun === 2) {
-        onProgress({ kind: "tool", index: 1, name: "view_file" });
-        throw interruptedError("view_file", 0, 5);
-      }
-      onProgress({ kind: "tool", index: 1, name: "grep_search" });
-      return {
-        text: "done",
-        usage: { input_tokens: 100, output_tokens: 20, thinking_tokens: 5, cache_read_tokens: 50, total_tokens: 120 },
-        peakContextTokens: 99,
-        generatedTokens: 5,
-        generationSeconds: 0.1,
-        outputTokensPerSecond: 50,
-        toolCalls: 1,
-        toolNames: ["grep_search"],
-        rzMcpTools: [],
-        mutationToolCalls: 0,
-        durationSeconds: 0.5,
-        conversationId: "recovery-conversation",
-      };
+      onProgress({ kind: "tool", index: 1, name: "replace_file_content" });
+      throw interruptedError("replace_file_content", 1, 10);
     },
   };
-  const recovered = await runWithInterruptedStreamRecovery(
-    recoverySession,
-    "original task payload",
-    undefined,
-    (event) => recoveryToolEvents.push(event),
-    (event) => recoveryEvents.push(event),
-    {
-      now: () => fakeNow,
-      deadline: 100_000,
-      delay: async (milliseconds) => {
-        recoveryDelays.push(milliseconds);
-        fakeNow += milliseconds;
+  let committedRecoveryFailure;
+  try {
+    await runWithInterruptedStreamRecovery(
+      recoverySession,
+      "original task payload",
+      undefined,
+      (event) => recoveryToolEvents.push(event),
+      (event) => recoveryEvents.push(event),
+      {
+        now: () => fakeNow,
+        deadline: 100_000,
+        delay: async (milliseconds) => {
+          recoveryDelays.push(milliseconds);
+          fakeNow += milliseconds;
+        },
       },
-    },
-  );
+    );
+  } catch (error) {
+    committedRecoveryFailure = error;
+  }
   if (
-    recoveryCalls.length !== 3
+    recoveryCalls.length !== 1
     || recoveryCalls[0].prompt !== "original task payload"
-    || recoveryCalls.slice(1).some(({ prompt }) => prompt.includes("original task payload"))
-    || recoveryCalls.slice(1).some(({ prompt }) => !prompt.includes("recovery-task-hash"))
-    || recoveryCalls.map(({ timeoutMs }) => timeoutMs).join(",") !== "99000,44000,42000"
-    || recoveryDelays.join(",") !== "1000,2000"
-    || recoveryEvents.map(({ attempt }) => attempt).join(",") !== "1,2"
-    || recoveryToolEvents.map(({ index }) => index).join(",") !== "1,2,3"
-    || recovered.streamContinuations !== 2
-    || recovered.toolCalls !== 3
-    || recovered.mutationToolCalls !== 1
-    || recovered.toolNames.join(",") !== "replace_file_content,view_file,grep_search"
-    || recovered.generatedTokens !== 20
-    || Math.abs(recovered.generationSeconds - 0.3) > 0.0001
-    || Math.abs(recovered.outputTokensPerSecond - (20 / 0.3)) > 0.0001
-    || recovered.durationSeconds !== 1
-    || recovered.conversationId !== "recovery-conversation"
+    || recoveryCalls[0].timeoutMs !== 99000
+    || recoveryDelays.length !== 0
+    || recoveryEvents.length !== 0
+    || recoveryToolEvents.map(({ index }) => index).join(",") !== "1"
+    || committedRecoveryFailure?.streamContinuations !== 1
+    || committedRecoveryFailure?.toolCalls !== 1
+    || committedRecoveryFailure?.mutationToolCalls !== 1
+    || committedRecoveryFailure?.toolNames.join(",") !== "replace_file_content"
+    || committedRecoveryFailure?.routeCommitted !== true
+    || committedRecoveryFailure?.safeToRetry !== false
   ) {
-    throw new Error("same-session interrupted-stream recovery failed");
+    throw new Error("post-tool Antigravity stream interruption was replayed");
   }
   let terminalRecoveryRun = 0;
   let terminalRecoveryFailure;

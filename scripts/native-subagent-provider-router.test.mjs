@@ -418,6 +418,7 @@ test("a committed provider stream fails explicitly instead of mixing later outpu
     onStageFailure: (stage, error) => observed.push({ stage, error }),
   }), /stream failed after output/);
   assert.equal(laterCalls, 0);
+  assert.equal(failure.failedStage, "ollama");
   assert.deepEqual(observed, [{ stage: "ollama", error: failure }]);
 });
 

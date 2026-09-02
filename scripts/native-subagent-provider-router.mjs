@@ -483,6 +483,7 @@ export async function runOrderedProviderChain({
       return { stage: stage.name, value, failures };
     } catch (error) {
       if (signal?.aborted || error?.name === "AbortError" || error?.status === 499) throw error;
+      error.failedStage ||= stage.name;
       onStageFailure(stage.name, error, index);
       if (error?.routeCommitted === true || index === stages.length - 1) throw error;
       failures.push({ stage: stage.name, error });

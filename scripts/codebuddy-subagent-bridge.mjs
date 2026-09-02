@@ -38,9 +38,7 @@ const MAX_PROMPT_CHARS = 120_000;
 const MAX_ACTIVE_TASK_CHARS = 40_000;
 const STDERR_LIMIT = 16 * 1024;
 const REQUEST_TIMEOUT_MS = 30 * 60 * 1000;
-// Finish before the outer managed-route inactivity budget (55s) so CodeBuddy can report an
-// authoritative provider failure and the router can continue to the native fallback cleanly.
-const PROVIDER_SILENCE_TIMEOUT_MS = 45_000;
+const ROUTE_OWNERSHIP_TIMEOUT_MS = 45_000;
 const TEXT_TOOL_NAME = "tool_search";
 const WIRE_TEXT_TOOL_NAME = "search_tools";
 const CODEX_HOME = process.env.CODEX_HOME || join(homedir(), ".codex");
@@ -1066,6 +1064,16 @@ function providerVisibleTextDelta(event) {
   return providerEvent.delta.text;
 }
 
+function providerToolWorkStarted(nativeToolNames) {
+  return Array.isArray(nativeToolNames) && nativeToolNames.length > 0;
+}
+
+function providerResponseErrorCode(error) {
+  return providerToolWorkStarted(error?.nativeToolNames)
+    ? "provider_state_changed"
+    : "external_provider_error";
+}
+
 function runCodeBuddy(context, onSpawn, onProviderEvent = () => {}) {
   if (!existsSync(CODEBUDDY_SCRIPT)) throw new BridgeError(`CodeBuddy CLI is not installed at ${CODEBUDDY_SCRIPT}`, 502);
   if (!existsSync(MCP_SERVER_SCRIPT)) throw new BridgeError(`Codex tool MCP adapter is missing at ${MCP_SERVER_SCRIPT}`, 502);
@@ -1086,7 +1094,7 @@ function runCodeBuddy(context, onSpawn, onProviderEvent = () => {}) {
     let initEvent = null;
     let resultEvent = null;
     let maxTurnInputTokens = 0;
-    let lastProviderActivityAt = Date.now();
+    const routeOwnershipDeadline = Date.now() + ROUTE_OWNERSHIP_TIMEOUT_MS;
     let requestTimer = null;
     let silenceTimer = null;
     const calls = new Map();
@@ -1112,7 +1120,6 @@ function runCodeBuddy(context, onSpawn, onProviderEvent = () => {}) {
         stderr = `${stderr}${line}\n`.slice(-STDERR_LIMIT);
         return;
       }
-      lastProviderActivityAt = Date.now();
       if (event.type === "system" && event.subtype === "init") {
         try { validateInit(context, event); } catch (error) { child.kill(); finish(error); return; }
         initEvent = event;
@@ -1156,12 +1163,16 @@ function runCodeBuddy(context, onSpawn, onProviderEvent = () => {}) {
       finish(new BridgeError(`CodeBuddy exceeded ${REQUEST_TIMEOUT_MS}ms`, 504));
     }, REQUEST_TIMEOUT_MS);
     silenceTimer = setInterval(() => {
-      if (Date.now() - lastProviderActivityAt < PROVIDER_SILENCE_TIMEOUT_MS) return;
+      if (providerToolWorkStarted(nativeToolNames)) {
+        clearInterval(silenceTimer);
+        return;
+      }
+      if (Date.now() < routeOwnershipDeadline) return;
       runtime.providerSilenceTimeouts += 1;
       runtime.lastProviderSilenceTimeoutAt = Date.now();
       child.kill();
       finish(new BridgeError(
-        `CodeBuddy produced no provider activity for ${PROVIDER_SILENCE_TIMEOUT_MS}ms`,
+        `CodeBuddy did not begin provider tool work within ${ROUTE_OWNERSHIP_TIMEOUT_MS}ms`,
         504,
       ));
     }, 1_000);
@@ -1601,7 +1612,7 @@ async function handleResponses(request, response) {
         object: "response",
         status: "failed",
         error: {
-          code: Number(error?.providerMutationCount || 0) > 0 ? "provider_state_changed" : "external_provider_error",
+          code: providerResponseErrorCode(error),
           type: "bridge_error",
           message: redactSecrets(error.message),
         },
@@ -1619,6 +1630,12 @@ async function handleResponses(request, response) {
 }
 
 function selfTest() {
+  if (
+    providerResponseErrorCode({ nativeToolNames: ["Read"] }) !== "provider_state_changed"
+    || providerResponseErrorCode({ nativeToolNames: [] }) !== "external_provider_error"
+  ) {
+    throw new Error("self-test failed: CodeBuddy read-only provider work was eligible for replay");
+  }
   const route = resolveRoute(MODEL_ALIAS);
   const catalogModel = managedModelsResponse().models[0];
   if (
@@ -2226,7 +2243,7 @@ function start() {
           explicitCostRequiredUsd: 0, codexManagedLazyTools: true,
           promptTransport: "single-native-cli-execution", transientProviderSessions: true,
           incrementalVisibleOutput: true,
-          providerSilenceTimeoutMs: PROVIDER_SILENCE_TIMEOUT_MS,
+          routeOwnershipTimeoutMs: ROUTE_OWNERSHIP_TIMEOUT_MS,
           providerProgressHeartbeatMaxHz: 1, runtime,
         });
         return;

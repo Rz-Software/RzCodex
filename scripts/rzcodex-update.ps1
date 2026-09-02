@@ -64,29 +64,31 @@ function Write-UpdateStatus {
     $status | ConvertTo-Json | Set-Content -LiteralPath $StatusPath -Encoding utf8
 }
 
-function Resolve-UpstreamBaseVersion {
-    $tagNames = @(& git -C $RepoRoot tag --list "rust-v*")
-    if ($LASTEXITCODE -ne 0) {
-        throw "Could not enumerate upstream Codex release tags."
-    }
-
-    $stableReleases = foreach ($tagName in $tagNames) {
-        if ($tagName -match '^rust-v(?<Version>\d+\.\d+\.\d+)$') {
-            $parsedVersion = $null
-            if (-not [System.Version]::TryParse($Matches.Version, [ref]$parsedVersion)) {
-                continue
+function Resolve-UpstreamRelease {
+    try {
+        $release = Invoke-RestMethod `
+            -Uri "https://api.github.com/repos/openai/codex/releases/latest" `
+            -Headers @{
+                Accept = "application/vnd.github+json"
+                "User-Agent" = "RzCodex-Updater"
+                "X-GitHub-Api-Version" = "2022-11-28"
             }
-            [pscustomobject]@{
-                Tag = $tagName
-                Version = $parsedVersion
-            }
-        }
     }
-    $latestRelease = $stableReleases | Sort-Object Version -Descending | Select-Object -First 1
-    if (-not $latestRelease) {
-        throw "No stable upstream Codex release tag is available."
+    catch {
+        throw "Could not resolve the latest published upstream Codex release: $($_.Exception.Message)"
     }
-    return $latestRelease.Version.ToString(3)
+    $tagName = $release.tag_name
+    if ($tagName -isnot [string] -or $tagName -notmatch '^rust-v(?<Version>\d+\.\d+\.\d+)$') {
+        throw "The latest published upstream Codex release has an unsupported tag: $tagName"
+    }
+    $parsedVersion = $null
+    if (-not [System.Version]::TryParse($Matches.Version, [ref]$parsedVersion)) {
+        throw "The latest published upstream Codex release has an invalid version: $($Matches.Version)"
+    }
+    return [pscustomobject]@{
+        Tag = $tagName
+        Version = $parsedVersion.ToString(3)
+    }
 }
 
 function Get-InstalledBuildMetadata {
@@ -346,15 +348,26 @@ try {
 
     Initialize-WindowsBuildEnvironment
 
-    Invoke-NativeCommand -FilePath "git" -ArgumentList @("fetch", "upstream", "main", "--tags", "--prune") -WorkingDirectory $RepoRoot
+    $upstreamRelease = Resolve-UpstreamRelease
+    $releaseTag = $upstreamRelease.Tag
+    Invoke-NativeCommand -FilePath "git" -ArgumentList @(
+        "fetch",
+        "--force",
+        "upstream",
+        "refs/tags/${releaseTag}:refs/tags/${releaseTag}"
+    ) -WorkingDirectory $RepoRoot
+    $releaseCommit = (& git -C $RepoRoot rev-list -n 1 $releaseTag).Trim()
+    if ($LASTEXITCODE -ne 0 -or -not $releaseCommit) {
+        throw "Could not resolve upstream Codex release tag $releaseTag."
+    }
 
-    & git -C $RepoRoot merge-base --is-ancestor upstream/main HEAD
+    & git -C $RepoRoot merge-base --is-ancestor $releaseCommit HEAD
     $ancestorExitCode = $LASTEXITCODE
     if ($ancestorExitCode -notin @(0, 1)) {
-        throw "Could not compare rz-main with upstream/main."
+        throw "Could not compare rz-main with upstream release $releaseTag."
     }
     $updateAvailable = $ancestorExitCode -eq 1
-    $baseVersion = Resolve-UpstreamBaseVersion
+    $baseVersion = $upstreamRelease.Version
     $currentCommit = (& git -C $RepoRoot rev-parse --short=12 HEAD).Trim()
     if ($LASTEXITCODE -ne 0 -or -not $currentCommit) {
         throw "Could not resolve the current RzCodex commit."
@@ -369,10 +382,10 @@ try {
 
     if (-not $buildRequired) {
         $message = if ($installedMetadata.commit -eq $currentCommit) {
-            "RzCodex $baseVersion already contains upstream/main."
+            "RzCodex $baseVersion already contains upstream release $releaseTag."
         }
         else {
-            "RzCodex $baseVersion already contains upstream/main; Rust binary inputs are unchanged since installed commit $($installedMetadata.commit)."
+            "RzCodex $baseVersion already contains upstream release $releaseTag; Rust binary inputs are unchanged since installed commit $($installedMetadata.commit)."
         }
         Write-UpdateStatus -Result "current" -Message $message -Commit $currentCommit
         exit 0
@@ -380,7 +393,7 @@ try {
 
     if ($updateAvailable) {
         $mergeStarted = $true
-        Invoke-NativeCommand -FilePath "git" -ArgumentList @("merge", "--no-commit", "--no-ff", "upstream/main") -WorkingDirectory $RepoRoot
+        Invoke-NativeCommand -FilePath "git" -ArgumentList @("merge", "--no-commit", "--no-ff", $releaseTag) -WorkingDirectory $RepoRoot
     }
 
     $env:RZCODEX_BASE_VERSION = $baseVersion
@@ -411,7 +424,7 @@ try {
     ) -WorkingDirectory $CodexRustRoot
 
     if ($mergeStarted) {
-        Invoke-NativeCommand -FilePath "git" -ArgumentList @("commit", "-m", "Merge upstream/main into rz-main") -WorkingDirectory $RepoRoot
+        Invoke-NativeCommand -FilePath "git" -ArgumentList @("commit", "-m", "Merge upstream release $releaseTag into rz-main") -WorkingDirectory $RepoRoot
         $mergeStarted = $false
     }
 

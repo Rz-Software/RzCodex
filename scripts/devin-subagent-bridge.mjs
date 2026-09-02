@@ -20,7 +20,6 @@ import {
 import {
   ActiveTaskProviderPins,
   ActiveTaskRoutePins,
-  completedResponseFromRecoverableStream,
   fallbackForwardBody,
   runOrderedProviderChain,
   runResponsesBridge,
@@ -50,12 +49,11 @@ const MAX_ACTIVE_TASK_CHARS = 40_000;
 const OUTPUT_LIMIT = 2 * 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 30 * 60 * 1000;
 const SSE_HEARTBEAT_MS = 15 * 1000;
-const PROVIDER_STREAM_INACTIVITY_MS = 55 * 1000;
 const PROVIDER_RECOVERY_BUDGET_MS = 45 * 1000;
 const PROVIDER_RECOVERY_BACKOFF_MS = 1 * 1000;
 const ROUTE_CAPACITY_WAIT_MS = PROVIDER_RECOVERY_BUDGET_MS;
 const NATIVE_PROGRESS_POLL_MS = 1 * 1000;
-const NATIVE_PROVIDER_INACTIVITY_MS = 60 * 1000;
+const NATIVE_PROVIDER_INACTIVITY_MS = 55 * 1000;
 const MAX_PROGRESS_EVENTS = 256;
 const FREE_ROUTE_CONCURRENCY = 2;
 const OLLAMA_CLOUD_CONCURRENCY = 3;
@@ -66,7 +64,6 @@ const ANTIGRAVITY_BRIDGE_ENDPOINT = "http://127.0.0.1:54549/v1/responses";
 const ANTIGRAVITY_REQUIRED_AUTH_SOURCE = "Antigravity cached OAuth session";
 const ANTIGRAVITY_REQUIRED_EFFORT = "high";
 const ANTIGRAVITY_CONTEXT_WINDOW = 131_072;
-const OLLAMA_RESPONSES_ENDPOINT = "http://127.0.0.1:11434/v1/responses";
 const OLLAMA_AUTH_SOURCE = "Ollama local signed-in session";
 const OLLAMA_CONTEXT_WINDOW = 1_048_576;
 const CODEBUDDY_BRIDGE_ENDPOINT = "http://127.0.0.1:54547/v1/responses";
@@ -434,6 +431,7 @@ const runtime = {
   activeOllamaRequests: 0, queuedOllamaRequests: 0,
   supersededTurns: 0,
   resourceRetries: 0, streamContinuations: 0, compactionCheckpoints: 0,
+  providerCheckpoints: 0,
   permissionCheckpoints: 0, activeResourceBackoffs: 0,
   lastResourceModel: null, lastResourceRetryAttempt: 0,
   lastResourceBackoffMs: 0, lastResourceRetryAt: null,
@@ -794,6 +792,70 @@ function terminalSelection(reason) {
     provider: "devin",
     model: models.terminal,
     reason,
+  };
+}
+
+function codeBuddySelection(reason) {
+  return {
+    key: "codebuddy",
+    provider: "codebuddy",
+    model: { model_uid: route.codeBuddyModel, label: route.codeBuddyModel },
+    reason,
+  };
+}
+
+function selectionForFailedStage(stage) {
+  if (stage === "antigravity") return antigravitySelection("provider_checkpoint");
+  if (stage === "ollama") return ollamaSelection("provider_checkpoint");
+  if (stage === "devin-free") return terminalSelection("provider_checkpoint");
+  if (stage === "codebuddy") return codeBuddySelection("provider_checkpoint");
+  if (stage === "devin") {
+    return { key: "primary", provider: "devin", model: models.primary, reason: "provider_checkpoint" };
+  }
+  return { key: stage || "external", provider: stage || "external", model: { model_uid: "unknown", label: "unknown" }, reason: "provider_checkpoint" };
+}
+
+function committedProviderResult(context, error) {
+  const selected = selectionForFailedStage(error?.failedStage);
+  const toolNames = [...new Set([
+    ...(Array.isArray(error?.nativeToolNames) ? error.nativeToolNames : []),
+    ...(Array.isArray(error?.toolNames) ? error.toolNames : []),
+  ].filter((name) => typeof name === "string" && name))];
+  const mutationCount = Math.max(
+    Number(error?.providerMutationCount || 0),
+    Number(error?.mutationToolCalls || 0),
+  );
+  const text = [
+    "[Authoritative native-provider checkpoint]",
+    `Task hash: ${context.taskDiagnostics.taskHash}`,
+    `Provider: ${selected.provider}`,
+    `Provider tool calls completed: ${Number(error?.toolCalls || toolNames.length)}`,
+    `Provider mutation calls observed: ${mutationCount}`,
+    `Tool names: ${toolNames.join(", ") || "not reported"}`,
+    `Last completed tool: ${toolNames.at(-1) || "not reported"}`,
+    "Concrete blocker: the provider stopped after beginning tool work and did not return a terminal response.",
+    "The provider turn was not replayed and no later provider was started. The delegated task may be incomplete; the parent should inspect the preserved work and decide whether to resume or reassign it.",
+  ].join("\n");
+  return {
+    text,
+    selected,
+    providerMetadata: { provider_checkpoint: true },
+    quotaFallback: false,
+    terminalFallback: selected.key === "terminal",
+    fallbackReason: null,
+    fallbackFailure: null,
+    creditCost: 0,
+    acuCost: 0,
+    inputTokens: 0,
+    cachedTokens: 0,
+    outputTokens: 0,
+    peakTurnContextTokens: Number(error?.peakContextTokens || 0),
+    outputTokensPerSecond: null,
+    toolCalls: [],
+    nativeToolNames: toolNames,
+    rzMcpTools: Array.isArray(error?.rzMcpTools) ? error.rzMcpTools : [],
+    toolSchemaBytesIgnored: context.toolSchemaBytes,
+    toolSchemaBytesForwarded: 0,
   };
 }
 
@@ -1216,7 +1278,7 @@ function runCli(
     let stdout = "";
     let stderr = "";
     let settled = false;
-    let lastProviderActivityAt = Date.now();
+    const routeOwnershipDeadline = Date.now() + NATIVE_PROVIDER_INACTIVITY_MS;
     let lastCompactionNodeId = Number(compactionBaseline || 0);
     const seenToolCalls = new Set();
     const reportProgress = () => {
@@ -1225,9 +1287,6 @@ function runCli(
         session = inspectSession(context.requestId);
       } catch {
         return;
-      }
-      if (session?.lastActivityAt > lastProviderActivityAt) {
-        lastProviderActivityAt = session.lastActivityAt;
       }
       if (session?.compactionNodeId > lastCompactionNodeId) {
         lastCompactionNodeId = session.compactionNodeId;
@@ -1244,15 +1303,15 @@ function runCli(
         const key = typeof call.id === "string" && call.id ? call.id : `${call.name}:${index}`;
         if (seenToolCalls.has(key)) continue;
         seenToolCalls.add(key);
-        lastProviderActivityAt = Date.now();
         onProgress?.({ kind: "tool", index: seenToolCalls.size, name: call.name });
       }
-      if (Date.now() - lastProviderActivityAt < NATIVE_PROVIDER_INACTIVITY_MS) return;
+      if (seenToolCalls.size > 0) return;
+      if (Date.now() < routeOwnershipDeadline) return;
       child.kill();
       finish(undefined, {
         code: 1,
         stdout: stdout.trim(),
-        stderr: `Devin stream was interrupted after ${NATIVE_PROVIDER_INACTIVITY_MS}ms without provider activity`,
+        stderr: `Devin did not begin provider tool work within ${NATIVE_PROVIDER_INACTIVITY_MS}ms`,
       });
     };
     const finish = (error, value) => {
@@ -1274,12 +1333,10 @@ function runCli(
     progressTimer.unref();
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (chunk) => {
-      lastProviderActivityAt = Date.now();
       stdout = `${stdout}${chunk}`.slice(-OUTPUT_LIMIT);
     });
     child.stderr.setEncoding("utf8");
     child.stderr.on("data", (chunk) => {
-      lastProviderActivityAt = Date.now();
       stderr = `${stderr}${chunk}`.slice(-OUTPUT_LIMIT);
     });
     child.once("error", (error) => finish(new BridgeError(`Devin failed to start: ${error.message}`, 502)));
@@ -1339,11 +1396,14 @@ function sanitizedProviderFailure(error) {
     .slice(0, 2_000);
 }
 
-function providerMutationToolCalls(session) {
-  const toolCalls = Array.isArray(session?.toolCalls)
+function providerToolCalls(session) {
+  return Array.isArray(session?.toolCalls)
     ? session.toolCalls.filter((call) => call?.name)
     : [];
-  return toolCalls.filter((call) => {
+}
+
+function providerMutationToolCalls(session) {
+  return providerToolCalls(session).filter((call) => {
     const name = String(call.name || "").toLowerCase();
     return [
       "apply_patch",
@@ -1359,17 +1419,45 @@ function providerMutationToolCalls(session) {
 }
 
 function preserveProviderCommit(error, session) {
-  const toolCalls = Array.isArray(session?.toolCalls)
-    ? session.toolCalls.filter((call) => call?.name)
-    : [];
+  const toolCalls = providerToolCalls(session);
   const mutationToolCalls = providerMutationToolCalls(session);
-  if (mutationToolCalls.length > 0) {
+  if (toolCalls.length > 0) {
     error.routeCommitted = true;
     error.toolCalls = toolCalls.length;
     error.toolNames = [...new Set(toolCalls.map((call) => call.name))];
     error.mutationToolCalls = mutationToolCalls.length;
   }
   return error;
+}
+
+function providerCheckpointReason({ resourceFailure, streamFailure, compactionFailure, permissionFailure, incompleteTurn }) {
+  if (resourceFailure) return "the provider reported a transient resource failure";
+  if (streamFailure) return "the provider stream ended before a terminal response";
+  if (compactionFailure) return "the provider compacted its context before a terminal response";
+  if (permissionFailure) return "an enforced provider permission rejected a required operation";
+  if (incompleteTurn) return "the provider process ended without a terminal assistant response";
+  return "the provider stopped before a terminal response";
+}
+
+function completedProviderCheckpoint(context, session, failureState) {
+  const toolCalls = providerToolCalls(session);
+  const toolNames = [...new Set(toolCalls.map((call) => String(call.name)))];
+  const mutations = providerMutationToolCalls(session).length;
+  const text = [
+    "[Authoritative native-provider checkpoint]",
+    `Task hash: ${context.taskDiagnostics.taskHash}`,
+    `Provider tool calls completed: ${toolCalls.length}`,
+    `Provider mutation calls observed: ${mutations}`,
+    `Tool names: ${toolNames.join(", ") || "none"}`,
+    `Last completed tool: ${toolNames.at(-1) || "none"}`,
+    `Concrete blocker: ${providerCheckpointReason(failureState)}.`,
+    "The provider turn was not replayed and no later provider was started. The delegated task may be incomplete; the parent should inspect the preserved work and decide whether to resume or reassign it.",
+  ].join("\n");
+  runtime.providerCheckpoints += 1;
+  return {
+    cliResult: { code: 0, stdout: text, stderr: "" },
+    session: { ...session, terminalText: text },
+  };
 }
 
 async function runCliWithProviderRecovery(
@@ -1421,6 +1509,9 @@ async function runCliWithProviderRecovery(
       );
     } catch (error) {
       const session = await findSession(context.requestId) || resumeSession;
+      if (!signal?.aborted && error?.status !== 499 && providerToolCalls(session).length > 0) {
+        return completedProviderCheckpoint(context, session, { streamFailure: true });
+      }
       const preserved = preserveProviderCommit(error, session);
       if (session) remove(session.id);
       throw preserved;
@@ -1434,6 +1525,20 @@ async function runCliWithProviderRecovery(
     const compactionFailure = isProviderCompactionFailure(cliResult);
     const permissionFailure = isPermissionRejection(cliResult);
     const incompleteTurn = cliResult.code === 0 && Boolean(cliResult.stdout) && session && !session.terminalText;
+    const recoverableProviderFailure = resourceFailure
+      || streamFailure
+      || compactionFailure
+      || permissionFailure
+      || incompleteTurn;
+    if (recoverableProviderFailure && providerToolCalls(session).length > 0) {
+      return completedProviderCheckpoint(context, session, {
+        resourceFailure,
+        streamFailure,
+        compactionFailure,
+        permissionFailure,
+        incompleteTurn,
+      });
+    }
     if (!resourceFailure && !streamFailure && !compactionFailure && !permissionFailure && !incompleteTurn) {
       return { cliResult, session };
     }
@@ -1621,8 +1726,7 @@ async function runAntigravityStage(context, requestBody, failures, onProgress, s
       endpoint: ANTIGRAVITY_BRIDGE_ENDPOINT,
       body: forwardedBody,
       signal,
-      inactivityTimeoutMs: PROVIDER_STREAM_INACTIVITY_MS,
-      onEvent: streamRelay.accept,
+        onEvent: streamRelay.accept,
     });
     validateOAuthFallbackCompletion(completion, {
       provider: route.antigravityProvider,
@@ -1662,8 +1766,7 @@ async function runCodeBuddyStage(context, requestBody, failures, onProgress, sig
       endpoint: CODEBUDDY_BRIDGE_ENDPOINT,
       body: forwardedBody,
       signal,
-      inactivityTimeoutMs: PROVIDER_STREAM_INACTIVITY_MS,
-      onEvent: streamRelay.accept,
+        onEvent: streamRelay.accept,
     });
     validateOAuthFallbackCompletion(completion, {
       provider: "codebuddy",
@@ -1673,9 +1776,7 @@ async function runCodeBuddyStage(context, requestBody, failures, onProgress, sig
     });
     const providerMetadata = completion.metadata || {};
     const selected = {
-      key: "codebuddy",
-      reason: "auto_codebuddy_after_prior_provider_failure",
-      provider: "codebuddy",
+      ...codeBuddySelection("auto_codebuddy_after_prior_provider_failure"),
       model: {
         model_uid: providerMetadata.actual_model,
         label: providerMetadata.actual_model_label || providerMetadata.actual_model,
@@ -1694,73 +1795,6 @@ async function runCodeBuddyStage(context, requestBody, failures, onProgress, sig
   } catch (error) {
     if (streamRelay.committed) error.routeCommitted = true;
     throw error;
-  }
-}
-
-function ollamaStreamContinuationBody(body, error, taskHash) {
-  const input = Array.isArray(body.input) ? [...body.input] : [];
-  if (typeof error?.partialOutputText === "string" && error.partialOutputText.trim()) {
-    input.push({
-      type: "message",
-      role: "assistant",
-      content: [{ type: "output_text", text: error.partialOutputText }],
-    });
-  }
-  input.push({
-    type: "message",
-    role: "user",
-    content: [{
-      type: "input_text",
-      text: `[Native Ollama stream recovery]\nThe previous stateless provider stream ended before its terminal response. Continue the same active task from the authoritative Codex history above. Task hash: ${taskHash}. Do not restart the investigation or repeat completed client tool calls. Return the next required tool call or the concise final result.`,
-    }],
-  });
-  return { ...body, input };
-}
-
-async function runOllamaResponsesWithRecovery(body, taskHash, signal, onEvent, onProgress) {
-  try {
-    return {
-      completion: await runResponsesBridge({
-        endpoint: OLLAMA_RESPONSES_ENDPOINT,
-        body,
-        signal,
-        inactivityTimeoutMs: PROVIDER_STREAM_INACTIVITY_MS,
-        onEvent,
-      }),
-      recovered: false,
-    };
-  } catch (error) {
-    if (error?.recoverableStreamFailure !== true) throw error;
-    const completed = completedResponseFromRecoverableStream(error);
-    if (completed) {
-      return { completion: completed, recovered: true, recoveredCompletedItems: true };
-    }
-    const deadline = Date.now() + PROVIDER_RECOVERY_BUDGET_MS;
-    onProgress?.(`Ollama stream ended without a terminal response; reconstructing one continuation after ${PROVIDER_RECOVERY_BACKOFF_MS}ms.\n`);
-    await delayWithAbort(PROVIDER_RECOVERY_BACKOFF_MS, signal);
-    const remainingMs = deadline - Date.now();
-    if (remainingMs <= 0) {
-      throw error;
-    }
-    const continuationBody = ollamaStreamContinuationBody(body, error, taskHash);
-    try {
-      const completion = await runResponsesBridge({
-        endpoint: OLLAMA_RESPONSES_ENDPOINT,
-        body: continuationBody,
-        signal,
-        inactivityTimeoutMs: Math.min(PROVIDER_STREAM_INACTIVITY_MS, remainingMs),
-        requestTimeoutMs: remainingMs,
-        onEvent,
-      });
-      return { completion, recovered: true, recoveredCompletedItems: false };
-    } catch (recoveryError) {
-      const recoveredCompletion = completedResponseFromRecoverableStream(recoveryError);
-      if (recoveredCompletion) {
-        return { completion: recoveredCompletion, recovered: true, recoveredCompletedItems: true };
-      }
-      recoveryError.streamRecoveryAttempted = true;
-      throw recoveryError;
-    }
   }
 }
 
@@ -1840,7 +1874,10 @@ async function runOllamaStage(
       };
     }, capacityOptions);
   } catch (error) {
-    if (streamRelay.committed || Number(error?.providerMutationCount || 0) > 0) error.routeCommitted = true;
+    if (
+      streamRelay.committed
+      || (Array.isArray(error?.nativeToolNames) && error.nativeToolNames.length > 0)
+    ) error.routeCommitted = true;
     throw error;
   }
 }
@@ -1859,19 +1896,25 @@ async function runDevinStage(
   const providerKey = freeModel ? "devinFree" : "devin";
   runtime.providerAttempts[providerKey] += 1;
   runtime.lastProviderSequence.push(terminalFallback ? "devin-free" : "devin");
-  const routeResult = await withRouteCapacity(selected, signal, () => {
-    onProgress?.(`Devin native worker started with ${selected.model.label}.\n`);
-    return runCliWithProviderRecovery(
-      context,
-      selected.model,
-      onSpawn,
-      ({ index, name }) => onProgress?.(`Devin native tool ${index}: ${progressToolName(name)}.\n`),
-      signal,
-      Date.now() + REQUEST_TIMEOUT_MS,
-    );
-  }, capacityOptions);
+  let routeResult;
+  try {
+    routeResult = await withRouteCapacity(selected, signal, () => {
+      onProgress?.(`Devin native worker started with ${selected.model.label}.\n`);
+      return runCliWithProviderRecovery(
+        context,
+        selected.model,
+        onSpawn,
+        ({ index, name }) => onProgress?.(`Devin native tool ${index}: ${progressToolName(name)}.\n`),
+        signal,
+        Date.now() + REQUEST_TIMEOUT_MS,
+      );
+    }, capacityOptions);
+  } catch (error) {
+    error.failedStage ||= terminalFallback ? "devin-free" : "devin";
+    throw error;
+  }
   if (!freeModel && isQuotaFailure(routeResult.cliResult)) {
-    if (providerMutationToolCalls(routeResult.session).length > 0) {
+    if (providerToolCalls(routeResult.session).length > 0) {
       const error = preserveProviderCommit(
         new BridgeError("Devin quota ended after executing native tools; the turn was not replayed", 502),
         routeResult.session,
@@ -1982,6 +2025,7 @@ async function executeAuto(context, requestBody, onSpawn, onProgress, signal, cr
       onStageFailure: (stage, error) => {
         if (
           stage === pinnedStage
+          && error?.routeCommitted !== true
           && providerTaskPins.release(context.threadId, context.taskDiagnostics.taskHash)
         ) runtime.providerTaskPinsReleasedOnFailure += 1;
         runtime.providerFailures[stage] += 1;
@@ -1994,7 +2038,11 @@ async function executeAuto(context, requestBody, onSpawn, onProgress, signal, cr
           error: sanitizedProviderFailure(error),
         });
         runtime.recentProviderFailures = runtime.recentProviderFailures.slice(-20);
-        if (!error.routeSkipped) onProgress?.(`${stage} was unavailable before committed work; trying the next configured provider.\n`);
+        if (!error.routeSkipped && error?.routeCommitted !== true) {
+          onProgress?.(`${stage} was unavailable before provider tool work; trying the next configured provider.\n`);
+        } else if (error?.routeCommitted === true) {
+          onProgress?.(`${stage} stopped after provider tool work; preserving that work without replay or rerouting.\n`);
+        }
       },
     });
   } catch (error) {
@@ -2012,21 +2060,33 @@ async function executeAuto(context, requestBody, onSpawn, onProgress, signal, cr
 
 async function execute(context, requestBody, initialRoute, onSpawn, onProgress, signal, createStreamRelay) {
   runtime.lastProviderSequence = [];
-  if (initialRoute.key === "terminal") {
-    return runDevinStage(context, initialRoute, [], onSpawn, onProgress, signal, false);
+  try {
+    if (initialRoute.key === "terminal") {
+      return await runDevinStage(context, initialRoute, [], onSpawn, onProgress, signal, false);
+    }
+    if (initialRoute.key === "ollama") {
+      try {
+        return await runOllamaStage(
+          context,
+          requestBody,
+          [],
+          onProgress,
+          signal,
+          createStreamRelay({ forwardReasoningSummaries: true, providerLabel: "Ollama" }),
+        );
+      } catch (error) {
+        error.failedStage ||= "ollama";
+        throw error;
+      }
+    }
+    runtime.fallbackAttempts += 1;
+    return await executeAuto(context, requestBody, onSpawn, onProgress, signal, createStreamRelay);
+  } catch (error) {
+    if (error?.routeCommitted === true && !signal?.aborted) {
+      return committedProviderResult(context, error);
+    }
+    throw error;
   }
-  if (initialRoute.key === "ollama") {
-    return runOllamaStage(
-      context,
-      requestBody,
-      [],
-      onProgress,
-      signal,
-      createStreamRelay({ forwardReasoningSummaries: true, providerLabel: "Ollama" }),
-    );
-  }
-  runtime.fallbackAttempts += 1;
-  return executeAuto(context, requestBody, onSpawn, onProgress, signal, createStreamRelay);
 }
 
 function usageFrom(result) {
@@ -2550,7 +2610,7 @@ function jsonResponse(response, status, value) {
 }
 
 async function selfTest() {
-  nativeCliAgentRunnerSelfTest();
+  await nativeCliAgentRunnerSelfTest();
   const fixedQuotaNow = new Date(2026, 7, 28, 12, 0, 0, 0).getTime();
   const selfTestQuotaState = new CalendarQuotaState(null, () => fixedQuotaNow);
   const selfTestTaskPins = new ActiveTaskRoutePins();
@@ -2761,15 +2821,14 @@ async function selfTest() {
     },
   };
   const recoveryModel = { model_uid: "recovery-model" };
-  const recoverySession = {
-    id: "devin-recovery-session",
-    toolCalls: [{ name: "apply_patch" }],
+  const preWorkRecoverySession = {
+    id: "devin-pre-work-recovery-session",
+    toolCalls: [],
     compactionNodeId: 0,
     terminalText: null,
   };
-  const refreshedRecoverySession = {
-    ...recoverySession,
-    toolCalls: [...recoverySession.toolCalls, { name: "exec_command" }],
+  const refreshedPreWorkRecoverySession = {
+    ...preWorkRecoverySession,
     terminalText: "recovered",
   };
   const recoveryCalls = [];
@@ -2791,7 +2850,7 @@ async function selfTest() {
       },
       waitForSession: async () => {
         recoverySessionReads += 1;
-        return recoverySessionReads === 1 ? recoverySession : refreshedRecoverySession;
+        return recoverySessionReads === 1 ? preWorkRecoverySession : refreshedPreWorkRecoverySession;
       },
       waitForTerminalSession: async (_requestId, session) => session,
       removeSession: () => { throw new Error("recovered Devin session was removed"); },
@@ -2804,21 +2863,56 @@ async function selfTest() {
     },
   );
   if (
-    recoveredCli.session !== refreshedRecoverySession
+    recoveredCli.session !== refreshedPreWorkRecoverySession
     || recoveryCalls.length !== 2
     || recoveryCalls[0].options !== undefined
-    || recoveryCalls[1].options?.resumeSessionId !== recoverySession.id
+    || recoveryCalls[1].options?.resumeSessionId !== preWorkRecoverySession.id
     || !recoveryCalls[1].options?.prompt.includes(recoveryContext.taskDiagnostics.taskHash)
     || recoveryCalls.map(({ timeoutMs }) => timeoutMs).join(",") !== "99000,44000"
     || recoveryDelays.join(",") !== "1000"
   ) {
     throw new Error("same-session Devin stream recovery failed");
   }
+  const committedSession = {
+    id: "devin-committed-session",
+    toolCalls: [{ name: "read" }, { name: "edit" }],
+    compactionNodeId: 0,
+    terminalText: null,
+  };
+  const committedCalls = [];
+  const committedCheckpoint = await runCliWithProviderRecovery(
+    recoveryContext,
+    recoveryModel,
+    () => {},
+    () => {},
+    undefined,
+    100_000,
+    {
+      now: () => 1_000,
+      delay: async () => { throw new Error("committed Devin work entered recovery backoff"); },
+      waitForSession: async () => committedSession,
+      waitForTerminalSession: async (_requestId, session) => session,
+      removeSession: () => { throw new Error("committed checkpoint session was removed before finalization"); },
+      runCli: async () => {
+        committedCalls.push(true);
+        return interruptedStreamFailure;
+      },
+    },
+  );
+  if (
+    committedCalls.length !== 1
+    || !committedCheckpoint.session.terminalText.includes("Authoritative native-provider checkpoint")
+    || !committedCheckpoint.session.terminalText.includes("Provider tool calls completed: 2")
+    || !committedCheckpoint.session.terminalText.includes("Provider mutation calls observed: 1")
+    || !committedCheckpoint.session.terminalText.includes("was not replayed")
+  ) {
+    throw new Error("Devin post-tool stream failure was replayed");
+  }
   const compactionSession = {
     id: "devin-compaction-session",
     toolCalls: [{ name: "exec" }],
     compactionNodeId: 12,
-    terminalText: "checkpoint reported",
+    terminalText: null,
   };
   const compactionCalls = [];
   const compactionDelays = [];
@@ -2841,22 +2935,18 @@ async function selfTest() {
       removeSession: () => { throw new Error("compaction checkpoint session was removed"); },
       runCli: async (_context, _model, _onSpawn, _onProgress, timeoutMs, options) => {
         compactionCalls.push({ timeoutMs, options });
-        return compactionCalls.length === 1
-          ? compactedProviderFailure
-          : { code: 0, stdout: "checkpoint reported", stderr: "" };
+        return compactedProviderFailure;
       },
     },
   );
   if (
-    recoveredCompaction.session !== compactionSession
-    || compactionCalls.length !== 2
-    || compactionCalls[1].options?.resumeSessionId !== compactionSession.id
-    || compactionCalls[1].options?.compactionBaseline !== 12
-    || !compactionCalls[1].options?.prompt.includes("Native Devin compaction checkpoint")
-    || !compactionCalls[1].options?.prompt.includes(recoveryContext.taskState.activeTask.text)
-    || compactionDelays.join(",") !== "1000"
+    compactionCalls.length !== 1
+    || compactionCalls[0].options !== undefined
+    || compactionDelays.length !== 0
+    || !recoveredCompaction.session.terminalText.includes("compacted its context")
+    || !recoveredCompaction.session.terminalText.includes("was not replayed")
   ) {
-    throw new Error("Devin provider compaction checkpoint recovery failed");
+    throw new Error("Devin provider compaction was not checkpointed without replay");
   }
   const permissionPrompt = devinPermissionCheckpointPrompt(recoveryContext);
   if (
@@ -2866,8 +2956,6 @@ async function selfTest() {
     throw new Error("Devin permission checkpoint did not retain the active task");
   }
   const incompleteCalls = [];
-  let incompleteSessionReads = 0;
-  let incompleteNow = 1_000;
   const recoveredIncomplete = await runCliWithProviderRecovery(
     recoveryContext,
     recoveryModel,
@@ -2876,30 +2964,31 @@ async function selfTest() {
     undefined,
     100_000,
     {
-      now: () => incompleteNow,
-      delay: async (milliseconds) => { incompleteNow += milliseconds; },
-      waitForSession: async () => {
-        incompleteSessionReads += 1;
-        return incompleteSessionReads === 1 ? recoverySession : refreshedRecoverySession;
-      },
+      now: () => 1_000,
+      delay: async () => { throw new Error("incomplete committed Devin turn entered recovery backoff"); },
+      waitForSession: async () => committedSession,
       waitForTerminalSession: async (_requestId, session) => session,
       removeSession: () => { throw new Error("incomplete Devin session was removed"); },
       runCli: async (_context, _model, _onSpawn, _onProgress, _timeoutMs, options) => {
         incompleteCalls.push(options);
-        return incompleteCalls.length === 1
-          ? { code: 0, stdout: "I'll start by inspecting the fixture.", stderr: "" }
-          : { code: 0, stdout: "recovered", stderr: "" };
+        return { code: 0, stdout: "I'll start by inspecting the fixture.", stderr: "" };
       },
     },
   );
   if (
-    recoveredIncomplete.session !== refreshedRecoverySession
-    || incompleteCalls.length !== 2
-    || incompleteCalls[1]?.resumeSessionId !== recoverySession.id
-    || !incompleteCalls[1]?.prompt.includes("terminal-message recovery")
+    incompleteCalls.length !== 1
+    || incompleteCalls[0] !== undefined
+    || !recoveredIncomplete.session.terminalText.includes("without a terminal assistant response")
+    || !recoveredIncomplete.session.terminalText.includes("was not replayed")
   ) {
-    throw new Error("Devin structurally incomplete turn recovery failed");
+    throw new Error("Devin structurally incomplete post-tool turn was replayed");
   }
+  const emptyRecoverySession = {
+    id: "devin-empty-recovery-session",
+    toolCalls: [],
+    compactionNodeId: 0,
+    terminalText: null,
+  };
   let exhaustedNow = 1_000;
   let exhaustedRemoved = 0;
   let exhaustedFailure;
@@ -2914,7 +3003,7 @@ async function selfTest() {
       {
         now: () => exhaustedNow,
         delay: async (milliseconds) => { exhaustedNow += milliseconds; },
-        waitForSession: async () => recoverySession,
+        waitForSession: async () => emptyRecoverySession,
         waitForTerminalSession: async (_requestId, session) => session,
         removeSession: () => { exhaustedRemoved += 1; },
         runCli: async () => interruptedStreamFailure,
@@ -2925,7 +3014,7 @@ async function selfTest() {
   }
   if (
     exhaustedFailure?.status !== 502
-    || exhaustedFailure?.routeCommitted !== true
+    || exhaustedFailure?.routeCommitted === true
     || !exhaustedFailure?.message.includes("after one same-session continuation")
     || exhaustedNow - 1_000 !== PROVIDER_RECOVERY_BACKOFF_MS
     || exhaustedRemoved !== 1
@@ -3332,20 +3421,6 @@ async function selfTest() {
   ) {
     throw new Error("Ollama request normalization failed");
   }
-  const ollamaContinuationFixture = ollamaStreamContinuationBody(
-    translatedOllamaFixture.body,
-    { partialOutputText: "partial provider answer" },
-    ollamaFixtureContext.taskDiagnostics.taskHash,
-  );
-  const ollamaContinuationJson = json(ollamaContinuationFixture);
-  if (
-    ollamaContinuationFixture.input.length !== translatedOllamaFixture.body.input.length + 2
-    || !ollamaContinuationJson.includes("partial provider answer")
-    || !ollamaContinuationJson.includes(ollamaFixtureContext.taskDiagnostics.taskHash)
-    || ollamaContinuationFixture.input[0].content[0].text.split(task).length - 1 !== 1
-  ) {
-    throw new Error("Ollama interrupted-stream continuation normalization failed");
-  }
   const restoredOllamaFixture = validateOllamaCompletion({
     status: "completed",
     model: route.ollamaResponseModels.at(-1),
@@ -3413,6 +3488,23 @@ async function selfTest() {
     || committedError.toolNames.join(",") !== "apply_patch,view_file"
   ) {
     throw new Error("Devin native-tool commitment classification failed");
+  }
+  const readOnlyCommittedError = preserveProviderCommit(new Error("fixture"), {
+    toolCalls: [{ name: "read" }],
+  });
+  readOnlyCommittedError.failedStage = "ollama";
+  const committedCheckpointResult = committedProviderResult(
+    { taskDiagnostics: recoveryContext.taskDiagnostics, toolSchemaBytes: 123 },
+    readOnlyCommittedError,
+  );
+  if (
+    readOnlyCommittedError.routeCommitted !== true
+    || committedCheckpointResult.selected.provider !== "ollama"
+    || committedCheckpointResult.nativeToolNames.join(",") !== "read"
+    || !committedCheckpointResult.text.includes("was not replayed")
+    || committedCheckpointResult.toolSchemaBytesIgnored !== 123
+  ) {
+    throw new Error("read-only provider checkpoint classification failed");
   }
   let concurrentFreeCalls = 0;
   let peakConcurrentFreeCalls = 0;
