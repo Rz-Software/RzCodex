@@ -57,7 +57,6 @@ const PROVIDER_RECOVERY_BACKOFF_MS = 1 * 1000;
 const ROUTE_CAPACITY_WAIT_MS = PROVIDER_RECOVERY_BUDGET_MS;
 const NATIVE_PROGRESS_POLL_MS = 1 * 1000;
 const NATIVE_PROVIDER_INACTIVITY_MS = 55 * 1000;
-const MAX_PROGRESS_EVENTS = 256;
 const FREE_ROUTE_CONCURRENCY = 2;
 const OLLAMA_CLOUD_CONCURRENCY = 3;
 const RESOURCE_BACKOFF_BASE_MS = 5 * 1000;
@@ -470,6 +469,12 @@ const ollamaCapacity = { active: 0, waiters: [] };
 const activeThreadTurns = new Map();
 const quotaTaskPins = new ActiveTaskRoutePins();
 const providerTaskPins = new ActiveTaskProviderPins();
+const retainedDevinSessions = new Map();
+
+function retainedDevinSessionKey(context, selectedModel) {
+  if (!context.threadId || !context.taskDiagnostics?.taskHash || !selectedModel?.model_uid) return null;
+  return `${context.threadId}:${context.taskDiagnostics.taskHash}:${selectedModel.model_uid}`;
+}
 
 function syncRouteCapacityRuntime() {
   runtime.activeFreeRequests = terminalCapacity.active;
@@ -478,12 +483,28 @@ function syncRouteCapacityRuntime() {
   runtime.queuedOllamaRequests = ollamaCapacity.waiters.length;
 }
 
-function registerThreadTurn(threadId, registration) {
+async function registerThreadTurn(threadId, registration) {
   if (!threadId) return;
   const previous = activeThreadTurns.get(threadId);
   if (previous && previous !== registration) {
     runtime.supersededTurns += 1;
     previous.abort();
+    if (previous.done) {
+      let timer;
+      try {
+        await Promise.race([
+          previous.done,
+          new Promise((_, reject) => {
+            timer = setTimeout(
+              () => reject(new BridgeError("Superseded provider turn did not release within 5 seconds", 409)),
+              5_000,
+            );
+          }),
+        ]);
+      } finally {
+        clearTimeout(timer);
+      }
+    }
   }
   activeThreadTurns.set(threadId, registration);
 }
@@ -941,6 +962,17 @@ function uniqueToolCalls(toolRows) {
   return toolCalls;
 }
 
+function completedToolCalls(toolCalls, conversationRows) {
+  const completedIds = new Set();
+  for (const row of conversationRows) {
+    const message = typeof row.chat_message === "string" ? JSON.parse(row.chat_message) : row.chat_message;
+    if (message.role !== "tool") continue;
+    const toolCallId = message.tool_call_id ?? message.toolCallId;
+    if (typeof toolCallId === "string" && toolCallId) completedIds.add(toolCallId);
+  }
+  return toolCalls.filter((call) => typeof call?.id === "string" && completedIds.has(call.id));
+}
+
 function providerToolCallKey(call, index) {
   return typeof call?.id === "string" && call.id
     ? call.id
@@ -1256,6 +1288,7 @@ function inspectSession(requestId) {
       metadata: JSON.parse(session.metadata || "{}"),
       metrics,
       toolCalls,
+      completedToolCalls: completedToolCalls(toolCalls, conversationRows),
       lastActivityAt: Number(session.last_activity_at || 0) * 1000,
       compactionNodeId: Number(compaction?.node_id || 0),
       ...terminal,
@@ -1332,6 +1365,7 @@ function runCli(
         .map((call, index) => call?.name ? providerToolCallKey(call, index) : null)
         .filter(Boolean),
     );
+    let providerWorkObserved = toolCallBaseline.length > 0;
     const reportProgress = () => {
       let session;
       try {
@@ -1349,10 +1383,11 @@ function runCli(
         });
         return;
       }
-      for (const progress of unseenProviderToolProgress(session?.toolCalls, seenToolCalls)) {
+      if (session?.toolCalls?.length > 0) providerWorkObserved = true;
+      for (const progress of unseenProviderToolProgress(session?.completedToolCalls, seenToolCalls)) {
         onProgress?.(progress);
       }
-      if (seenToolCalls.size > 0) return;
+      if (providerWorkObserved) return;
       if (Date.now() < routeOwnershipDeadline) return;
       child.kill();
       finish(undefined, {
@@ -1449,8 +1484,14 @@ function providerToolCalls(session) {
     : [];
 }
 
-function providerMutationToolCalls(session) {
-  return providerToolCalls(session).filter((call) => {
+function providerCompletedToolCalls(session) {
+  return Array.isArray(session?.completedToolCalls)
+    ? session.completedToolCalls.filter((call) => call?.name)
+    : providerToolCalls(session);
+}
+
+function mutationToolCalls(toolCalls) {
+  return toolCalls.filter((call) => {
     const name = String(call.name || "").toLowerCase();
     return [
       "apply_patch",
@@ -1465,6 +1506,14 @@ function providerMutationToolCalls(session) {
   });
 }
 
+function providerMutationToolCalls(session) {
+  return mutationToolCalls(providerToolCalls(session));
+}
+
+function providerCompletedMutationToolCalls(session) {
+  return mutationToolCalls(providerCompletedToolCalls(session));
+}
+
 function preserveProviderCommit(error, session) {
   const toolCalls = providerToolCalls(session);
   const mutationToolCalls = providerMutationToolCalls(session);
@@ -1473,6 +1522,17 @@ function preserveProviderCommit(error, session) {
     error.toolCalls = toolCalls.length;
     error.toolNames = [...new Set(toolCalls.map((call) => call.name))];
     error.mutationToolCalls = mutationToolCalls.length;
+  }
+  return error;
+}
+
+function preserveProviderSession(error, session) {
+  preserveProviderCommit(error, session);
+  if (providerToolCalls(session).length > 0) {
+    Object.defineProperty(error, "retainedProviderSession", {
+      value: session,
+      configurable: true,
+    });
   }
   return error;
 }
@@ -1487,9 +1547,9 @@ function providerCheckpointReason({ resourceFailure, streamFailure, compactionFa
 }
 
 function completedProviderCheckpoint(context, session, failureState) {
-  const toolCalls = providerToolCalls(session);
+  const toolCalls = providerCompletedToolCalls(session);
   const toolNames = [...new Set(toolCalls.map((call) => String(call.name)))];
-  const mutations = providerMutationToolCalls(session).length;
+  const mutations = providerCompletedMutationToolCalls(session).length;
   const text = [
     "[Authoritative native-provider checkpoint]",
     `Task hash: ${context.taskDiagnostics.taskHash}`,
@@ -1526,8 +1586,8 @@ async function runCliWithProviderRecovery(
   const delay = options.delay || delayWithAbort;
   let attempt = 0;
   let recoveryDeadline = null;
-  let resumeSession = null;
-  let recoveryKind = null;
+  let resumeSession = options.initialResumeSession || null;
+  let recoveryKind = resumeSession ? "parent_control" : null;
   let providerContinuationUsed = false;
   while (true) {
     throwIfAborted(signal);
@@ -1547,7 +1607,9 @@ async function runCliWithProviderRecovery(
         resumeSession
           ? {
               resumeSessionId: resumeSession.id,
-              prompt: recoveryKind === "compaction"
+              prompt: recoveryKind === "parent_control"
+                ? context.prompt
+                : recoveryKind === "compaction"
                 ? devinCompactionCheckpointPrompt(context)
                 : recoveryKind === "permission"
                   ? devinPermissionCheckpointPrompt(context)
@@ -1555,7 +1617,7 @@ async function runCliWithProviderRecovery(
                     ? devinIncompleteTurnPrompt(context)
                     : devinStreamContinuationPrompt(context),
               compactionBaseline: resumeSession.compactionNodeId,
-              toolCallBaseline: providerToolCalls(resumeSession),
+              toolCallBaseline: providerCompletedToolCalls(resumeSession),
             }
           : undefined,
       );
@@ -1570,8 +1632,8 @@ async function runCliWithProviderRecovery(
           stderr: sanitizedProviderFailure(error),
         };
       } else {
-        const preserved = preserveProviderCommit(error, session);
-        if (session) remove(session.id);
+        const preserved = preserveProviderSession(error, session);
+        if (session && !preserved.retainedProviderSession) remove(session.id);
         throw preserved;
       }
     }
@@ -1804,6 +1866,9 @@ function fallbackState(context, failures, terminalFallback = false) {
 async function runAntigravityStage(context, requestBody, failures, onProgress, signal, streamRelay) {
   runtime.providerAttempts.antigravity += 1;
   runtime.lastProviderSequence.push("antigravity");
+  if (context.requestedRoute === "auto") {
+    providerTaskPins.pin(context.threadId, context.taskDiagnostics.taskHash, "antigravity");
+  }
   onProgress?.("Automatic route started Antigravity Claude/Gemini pool selection.\n");
   try {
     const forwardedBody = fallbackForwardBody(
@@ -1841,7 +1906,10 @@ async function runAntigravityStage(context, requestBody, failures, onProgress, s
       streamRelay,
     };
   } catch (error) {
-    if (streamRelay.committed) error.routeCommitted = true;
+    if (streamRelay.providerWorkCommitted) error.routeCommitted = true;
+    if (context.requestedRoute === "auto" && error?.routeCommitted !== true) {
+      providerTaskPins.release(context.threadId, context.taskDiagnostics.taskHash);
+    }
     throw error;
   }
 }
@@ -1849,6 +1917,9 @@ async function runAntigravityStage(context, requestBody, failures, onProgress, s
 async function runCodeBuddyStage(context, requestBody, failures, onProgress, signal, streamRelay) {
   runtime.providerAttempts.codebuddy += 1;
   runtime.lastProviderSequence.push("codebuddy");
+  if (context.requestedRoute === "auto") {
+    providerTaskPins.pin(context.threadId, context.taskDiagnostics.taskHash, "codebuddy");
+  }
   onProgress?.("Automatic route started one self-contained CodeBuddy native CLI execution.\n");
   try {
     const forwardedBody = fallbackForwardBody(
@@ -1888,7 +1959,10 @@ async function runCodeBuddyStage(context, requestBody, failures, onProgress, sig
       streamRelay,
     };
   } catch (error) {
-    if (streamRelay.committed) error.routeCommitted = true;
+    if (streamRelay.providerWorkCommitted) error.routeCommitted = true;
+    if (context.requestedRoute === "auto" && error?.routeCommitted !== true) {
+      providerTaskPins.release(context.threadId, context.taskDiagnostics.taskHash);
+    }
     throw error;
   }
 }
@@ -1909,6 +1983,9 @@ async function runOllamaStage(
     return await withRouteCapacity(selected, signal, async () => {
       runtime.providerAttempts.ollama += 1;
       runtime.lastProviderSequence.push("ollama");
+      if (context.requestedRoute === "auto") {
+        providerTaskPins.pin(context.threadId, context.taskDiagnostics.taskHash, "ollama");
+      }
       onProgress?.("Ollama native CLI agent started one self-contained execution.\n");
       let nativeContext;
       try {
@@ -1982,9 +2059,12 @@ async function runOllamaStage(
     }, capacityOptions);
   } catch (error) {
     if (
-      streamRelay.committed
+      streamRelay.providerWorkCommitted
       || (Array.isArray(error?.nativeToolNames) && error.nativeToolNames.length > 0)
     ) error.routeCommitted = true;
+    if (context.requestedRoute === "auto" && error?.routeCommitted !== true) {
+      providerTaskPins.release(context.threadId, context.taskDiagnostics.taskHash);
+    }
     throw error;
   }
 }
@@ -2001,6 +2081,15 @@ async function runDevinStage(
 ) {
   const freeModel = selected.key === "terminal";
   const providerKey = freeModel ? "devinFree" : "devin";
+  const stage = terminalFallback ? "devin-free" : "devin";
+  if (context.requestedRoute === "auto") {
+    providerTaskPins.pin(context.threadId, context.taskDiagnostics.taskHash, stage);
+  }
+  const retainedSessionKey = retainedDevinSessionKey(context, selected.model);
+  const retainedSession = retainedSessionKey
+    ? retainedDevinSessions.get(retainedSessionKey) || null
+    : null;
+  if (retainedSessionKey) retainedDevinSessions.delete(retainedSessionKey);
   runtime.providerAttempts[providerKey] += 1;
   runtime.lastProviderSequence.push(terminalFallback ? "devin-free" : "devin");
   let routeResult;
@@ -2020,9 +2109,20 @@ async function runDevinStage(
         },
         signal,
         Date.now() + REQUEST_TIMEOUT_MS,
+        retainedSession ? { initialResumeSession: retainedSession } : undefined,
       );
     }, capacityOptions);
   } catch (error) {
+    if (retainedSessionKey && error?.retainedProviderSession) {
+      retainedDevinSessions.set(retainedSessionKey, error.retainedProviderSession);
+      if (providerTaskPins.pin(context.threadId, context.taskDiagnostics.taskHash, stage)) {
+        runtime.providerTaskPinsCreated += 1;
+      }
+      runtime.lastPinnedProviderStage = stage;
+    }
+    if (context.requestedRoute === "auto" && error?.routeCommitted !== true) {
+      providerTaskPins.release(context.threadId, context.taskDiagnostics.taskHash);
+    }
     error.failedStage ||= terminalFallback ? "devin-free" : "devin";
     throw error;
   }
@@ -2290,47 +2390,41 @@ function progressToolName(value) {
 }
 
 function createProgressEmitter(response) {
-  const itemId = `progress_${randomUUID()}`;
-  let added = false;
-  let completed = null;
-  let text = "";
-  let events = 0;
+  const completed = [];
   const emit = (delta) => {
-    if (completed || events >= MAX_PROGRESS_EVENTS || typeof delta !== "string" || !delta) return;
-    if (!added) {
-      added = true;
-      writeSse(response, "response.output_item.added", {
-        output_index: 0,
-        item: { type: "reasoning", id: itemId, status: "in_progress", summary: [] },
-      });
-    }
-    events += 1;
-    text += delta;
+    if (typeof delta !== "string" || !delta) return;
+    const itemId = `progress_${randomUUID()}`;
+    const outputIndex = completed.length;
+    writeSse(response, "response.output_item.added", {
+      output_index: outputIndex,
+      item: { type: "reasoning", id: itemId, status: "in_progress", summary: [] },
+    });
     writeSse(response, "response.reasoning_summary_text.delta", {
       item_id: itemId,
-      output_index: 0,
+      output_index: outputIndex,
       summary_index: 0,
       delta,
     });
-  };
-  const finish = () => {
-    if (completed || !added) return completed;
-    completed = {
+    const item = {
       type: "reasoning",
       id: itemId,
       status: "completed",
-      summary: text ? [{ type: "summary_text", text }] : [],
+      summary: [{ type: "summary_text", text: delta }],
     };
     writeSse(response, "response.reasoning_summary_text.done", {
       item_id: itemId,
-      output_index: 0,
+      output_index: outputIndex,
       summary_index: 0,
-      text,
+      text: delta,
     });
-    writeSse(response, "response.output_item.done", { output_index: 0, item: completed });
-    return completed;
+    writeSse(response, "response.output_item.done", { output_index: outputIndex, item });
+    completed.push(item);
   };
-  return { emit, finish, get added() { return added; } };
+  return {
+    emit,
+    finish: () => [...completed],
+    get added() { return completed.length > 0; },
+  };
 }
 
 function createProviderStreamRelay(
@@ -2346,6 +2440,7 @@ function createProviderStreamRelay(
   const forwardedReasoningIds = new Set();
   const announcedToolIds = new Set();
   let providerOutputObserved = false;
+  let providerWorkCommitted = false;
   const accept = async (event) => {
     const payload = event.payload || {};
     if (event.type === "response.in_progress") {
@@ -2376,6 +2471,7 @@ function createProviderStreamRelay(
       && typeof payload.delta === "string"
       && payload.delta
     ) {
+      if (/\bnative tool\b/i.test(payload.delta)) providerWorkCommitted = true;
       progress?.emit(payload.delta);
       return;
     }
@@ -2398,6 +2494,7 @@ function createProviderStreamRelay(
       && ["function_call", "custom_tool_call", "tool_search_call"].includes(payload.item?.type)
     ) {
       providerOutputObserved = true;
+      providerWorkCommitted = true;
       const toolName = payload.item?.type === "tool_search_call"
         ? "tool_search"
         : progressToolName(payload.item?.name);
@@ -2422,6 +2519,7 @@ function createProviderStreamRelay(
     accept,
     streamedMessageIds,
     get committed() { return false; },
+    get providerWorkCommitted() { return providerWorkCommitted; },
     get providerOutputObserved() { return providerOutputObserved; },
   };
 }
@@ -2465,8 +2563,13 @@ async function handleResponses(request, response) {
     abortController.abort();
     if (child && !child.killed) child.kill();
   };
-  const threadTurn = { requestId: context.requestId, abort };
-  registerThreadTurn(context.threadId, threadTurn);
+  let resolveThreadTurnDone;
+  const threadTurn = {
+    requestId: context.requestId,
+    abort,
+    done: new Promise((resolve) => { resolveThreadTurnDone = resolve; }),
+  };
+  await registerThreadTurn(context.threadId, threadTurn);
   request.once("aborted", abort);
   response.once("close", () => { if (!response.writableEnded) abort(); });
   response.writeHead(200, { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache", connection: "keep-alive" });
@@ -2538,12 +2641,12 @@ async function handleResponses(request, response) {
     runtime.lastRzMcpTools = [...new Set(result.rzMcpTools)];
     runtime.lastToolSchemaBytesIgnored = result.toolSchemaBytesIgnored;
     runtime.lastToolSchemaBytesForwarded = result.toolSchemaBytesForwarded;
-    const progressItem = progress.finish();
+    const progressItems = progress.finish();
     const output = emitOutputItems(
       response,
       result,
       streamRelay.streamedMessageIds,
-      progressItem ? [progressItem] : [],
+      progressItems,
     );
     writeSse(response, "response.completed", { response: {
       id: responseId, object: "response", created_at: Math.floor(Date.now() / 1000), status: "completed",
@@ -2580,6 +2683,7 @@ async function handleResponses(request, response) {
   } finally {
     clearInterval(heartbeat);
     unregisterThreadTurn(context.threadId, threadTurn);
+    resolveThreadTurnDone();
     runtime.activeRequests = Math.max(0, runtime.activeRequests - 1);
   }
 }
@@ -2939,6 +3043,13 @@ async function selfTest() {
     { id: "tool-1", name: "read" },
     { id: "tool-2", name: "grep" },
   ];
+  const recordedCompletions = completedToolCalls(priorProgressCalls, [
+    { node_id: 1, chat_message: { role: "assistant", tool_calls: priorProgressCalls } },
+    { node_id: 2, chat_message: { role: "tool", tool_call_id: "tool-1", content: "done" } },
+  ]);
+  if (recordedCompletions.length !== 1 || recordedCompletions[0].id !== "tool-1") {
+    throw new Error("Devin progress announced a provider tool before its result was recorded");
+  }
   const seenProgressCalls = new Set(
     priorProgressCalls.map((call, index) => providerToolCallKey(call, index)),
   );
@@ -3480,8 +3591,8 @@ async function selfTest() {
   let supersededAbortCalls = 0;
   const firstTurn = { requestId: "first", abort: () => { supersededAbortCalls += 1; } };
   const secondTurn = { requestId: "second", abort: () => {} };
-  registerThreadTurn("thread-self-test", firstTurn);
-  registerThreadTurn("thread-self-test", secondTurn);
+  await registerThreadTurn("thread-self-test", firstTurn);
+  await registerThreadTurn("thread-self-test", secondTurn);
   unregisterThreadTurn("thread-self-test", firstTurn);
   if (supersededAbortCalls !== 1 || activeThreadTurns.get("thread-self-test") !== secondTurn) throw new Error("thread turn replacement failed");
   unregisterThreadTurn("thread-self-test", secondTurn);
@@ -3566,8 +3677,15 @@ async function selfTest() {
     type: "response.output_item.done",
     payload: { output_index: 1, item: streamedToolItem },
   });
-  if (forwardedReasoningWrites.join("").split("Ollama requested native tool exec_command.").length - 1 !== 1) {
+  const forwardedToolDeltas = forwardedReasoningWrites.filter((value) => (
+    value.includes("event: response.reasoning_summary_text.delta")
+    && value.includes("Ollama requested native tool exec_command.")
+  ));
+  if (forwardedToolDeltas.length !== 1) {
     throw new Error("Ollama tool progress was not deduplicated");
+  }
+  if (!forwardedReasoningRelay.providerWorkCommitted) {
+    throw new Error("Ollama native tool progress did not commit the provider route");
   }
   await relay.accept({
     type: "response.output_item.added",

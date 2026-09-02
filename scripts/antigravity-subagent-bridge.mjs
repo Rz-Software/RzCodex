@@ -34,7 +34,6 @@ const INIT_TIMEOUT_MS = 30 * 1000;
 const SESSION_IDLE_MS = 30 * 60 * 1000;
 const SSE_HEARTBEAT_MS = 15 * 1000;
 const MAX_SESSIONS = 8;
-const MAX_PROGRESS_EVENTS = 256;
 const QUOTA_CACHE_MS = 30 * 1000;
 const PRIMARY_QUOTA_BUCKET_IDS = ["3p-weekly", "3p-5h"];
 const FALLBACK_QUOTA_BUCKET_IDS = ["gemini-weekly", "gemini-5h"];
@@ -805,25 +804,27 @@ async function runWithInterruptedStreamRecovery(
   }
 }
 
-function sessionArguments(selectedModel) {
+function sessionArguments(selectedModel, conversationId = null) {
   return [
     "--input-format", "stream-json", "--output-format", "stream-json",
     "--agent", AGENT_ID,
     "--model", selectedModel.id,
     ...(selectedModel.effort ? ["--effort", selectedModel.effort] : []),
+    ...(conversationId ? ["--conversation", conversationId] : []),
     "--dangerously-skip-permissions", "--disable-slash-commands",
     "--print-timeout", "30m",
   ];
 }
 
 class AntigravitySession {
-  constructor(key, workingDirectory, activeTaskHash, selectedModel, onClose) {
+  constructor(key, workingDirectory, activeTaskHash, selectedModel, onClose, conversationId = null) {
     this.key = key;
     this.workingDirectory = workingDirectory;
     this.activeTaskHash = activeTaskHash;
     this.model = selectedModel.id;
     this.modelLabel = selectedModel.label;
     this.modelEffort = selectedModel.effort;
+    this.resumeConversationId = conversationId;
     this.onClose = onClose;
     this.seenMessageKeys = new Set();
     this.child = null;
@@ -844,7 +845,10 @@ class AntigravitySession {
 
   async start() {
     if (this.child) return this.initPromise;
-    const args = sessionArguments({ id: this.model, effort: this.modelEffort });
+    const args = sessionArguments(
+      { id: this.model, effort: this.modelEffort },
+      this.resumeConversationId,
+    );
     this.child = spawn(AGY_EXE, args, {
       cwd: this.workingDirectory,
       env: sanitizedEnvironment(),
@@ -938,18 +942,21 @@ class AntigravitySession {
         const stepKey = `${step.conversation_id || this.init?.conversationId || "unknown"}:${stepIndex}`;
         const firstObservation = !this.turn.toolStepKeys.has(stepKey);
         this.turn.toolStepKeys.add(stepKey);
+        this.turn.completedToolStepKeys ||= new Set();
+        const completed = ["DONE", "COMPLETED", "SUCCESS"].includes(String(step.state || "").toUpperCase());
+        const firstCompletedObservation = completed && !this.turn.completedToolStepKeys.has(stepKey);
+        if (completed) this.turn.completedToolStepKeys.add(stepKey);
         if (typeof name === "string") this.turn.toolNames.add(name);
-        if (firstObservation) {
-          clearUncommittedRouteTimer(this.turn);
+        if (firstObservation) clearUncommittedRouteTimer(this.turn);
+        if (firstCompletedObservation) {
           this.turn.onProgress?.({
             kind: "tool",
-            index: this.turn.toolStepKeys.size,
+            index: this.turn.completedToolStepKeys.size,
             name: typeof name === "string" ? name : "unknown_tool",
           });
         }
-        if (firstObservation && MUTATION_TOOLS.has(name)) {
+        if (firstCompletedObservation && MUTATION_TOOLS.has(name)) {
           this.turn.mutationToolStepKeys.add(stepKey);
-          clearUncommittedRouteTimer(this.turn);
         }
         const invalidBoundedWait = name === BOUNDED_WAIT_TOOL
           && step.state === "DONE"
@@ -1002,6 +1009,7 @@ class AntigravitySession {
         generationSeconds: 0,
         toolNames: new Set(),
         toolStepKeys: new Set(),
+        completedToolStepKeys: new Set(),
         mutationToolStepKeys: new Set(),
         rzMcpTools: new Set(),
         subagentActivity: false,
@@ -1074,7 +1082,7 @@ class AntigravitySession {
       generatedTokens: turn.generatedTokens,
       generationSeconds: turn.generationSeconds,
       outputTokensPerSecond: turn.generationSeconds > 0 ? turn.generatedTokens / turn.generationSeconds : null,
-      toolCalls: turn.toolStepKeys.size,
+      toolCalls: turn.completedToolStepKeys?.size ?? turn.toolStepKeys.size,
       toolNames: [...turn.toolNames],
       rzMcpTools: [...turn.rzMcpTools],
       mutationToolCalls: turn.mutationToolStepKeys.size,
@@ -1130,47 +1138,41 @@ function progressToolName(value) {
 }
 
 function createProgressEmitter(response) {
-  const itemId = `progress_${randomUUID()}`;
-  let added = false;
-  let completed = null;
-  let text = "";
-  let events = 0;
+  const completed = [];
   const emit = (delta) => {
-    if (completed || events >= MAX_PROGRESS_EVENTS || typeof delta !== "string" || !delta) return;
-    if (!added) {
-      added = true;
-      writeSse(response, "response.output_item.added", {
-        output_index: 0,
-        item: { type: "reasoning", id: itemId, status: "in_progress", summary: [] },
-      });
-    }
-    events += 1;
-    text += delta;
+    if (typeof delta !== "string" || !delta) return;
+    const itemId = `progress_${randomUUID()}`;
+    const outputIndex = completed.length;
+    writeSse(response, "response.output_item.added", {
+      output_index: outputIndex,
+      item: { type: "reasoning", id: itemId, status: "in_progress", summary: [] },
+    });
     writeSse(response, "response.reasoning_summary_text.delta", {
       item_id: itemId,
-      output_index: 0,
+      output_index: outputIndex,
       summary_index: 0,
       delta,
     });
-  };
-  const finish = () => {
-    if (completed || !added) return completed;
-    completed = {
+    const item = {
       type: "reasoning",
       id: itemId,
       status: "completed",
-      summary: text ? [{ type: "summary_text", text }] : [],
+      summary: [{ type: "summary_text", text: delta }],
     };
     writeSse(response, "response.reasoning_summary_text.done", {
       item_id: itemId,
-      output_index: 0,
+      output_index: outputIndex,
       summary_index: 0,
-      text,
+      text: delta,
     });
-    writeSse(response, "response.output_item.done", { output_index: 0, item: completed });
-    return completed;
+    writeSse(response, "response.output_item.done", { output_index: outputIndex, item });
+    completed.push(item);
   };
-  return { emit, finish, get added() { return added; } };
+  return {
+    emit,
+    finish: () => [...completed],
+    get added() { return completed.length > 0; },
+  };
 }
 
 function usageFrom(result) {
@@ -1271,6 +1273,7 @@ const mcpConfig = verifyLazyMcpConfig();
 const quotaRouter = new AntigravityQuotaRouter();
 quotaRouter.snapshot(true);
 const sessions = new Map();
+const retainedConversations = new Map();
 const runtime = {
   incomingRequests: 0,
   completed: 0,
@@ -1325,6 +1328,11 @@ function evictIdleSession() {
 async function sessionFor(context) {
   let session = context.sessionKey ? sessions.get(context.sessionKey) : null;
   const taskHash = context.taskState.activeTask?.hash || null;
+  let retained = context.sessionKey ? retainedConversations.get(context.sessionKey) : null;
+  if (retained && retained.taskHash !== taskHash) {
+    retainedConversations.delete(context.sessionKey);
+    retained = null;
+  }
   const taskIncompatible = session && (
     session.closed
     || session.workingDirectory !== context.workingDirectory
@@ -1349,6 +1357,13 @@ async function sessionFor(context) {
     runtime.sessionsReused += 1;
     return { session, reused: true };
   }
+  const resumeConversationId = retained?.model === selectedModel.id
+    ? retained.conversationId
+    : null;
+  if (retained && !resumeConversationId) {
+    retainedConversations.delete(context.sessionKey);
+    retained = null;
+  }
   if (sessions.size >= MAX_SESSIONS) evictIdleSession();
   const key = context.sessionKey || `ephemeral:${context.requestId}`;
   session = new AntigravitySession(
@@ -1357,6 +1372,7 @@ async function sessionFor(context) {
     taskHash,
     selectedModel,
     removeSession,
+    resumeConversationId,
   );
   sessions.set(key, session);
   runtime.sessionsCreated += 1;
@@ -1386,11 +1402,24 @@ async function handleResponses(request, response) {
   writeHeartbeat(response, responseId);
   const progress = createProgressEmitter(response);
   const controller = new AbortController();
+  let selectedSession;
   response.once("close", () => {
-    if (!response.writableEnded) controller.abort();
+    if (response.writableEnded) return;
+    const conversationId = selectedSession?.init?.conversationId;
+    if (
+      context.sessionKey
+      && conversationId
+      && selectedSession?.turn?.completedToolStepKeys?.size > 0
+    ) {
+      retainedConversations.set(context.sessionKey, {
+        conversationId,
+        model: selectedSession.model,
+        taskHash: selectedSession.activeTaskHash,
+      });
+    }
+    controller.abort();
   });
   const heartbeat = setInterval(() => writeHeartbeat(response, responseId), SSE_HEARTBEAT_MS);
-  let selectedSession;
   try {
     let { session, reused } = await sessionFor(context);
     selectedSession = session;
@@ -1463,7 +1492,8 @@ async function handleResponses(request, response) {
     runtime.lastCompleteTaskDelivered = diagnostics.completeTaskDelivered;
     runtime.lastProviderSessionReused = reused;
     runtime.lastError = null;
-    const progressItem = progress.finish();
+    if (context.sessionKey) retainedConversations.delete(context.sessionKey);
+    const progressItems = progress.finish();
     emitCompleted(response, responseId, result, {
       provider: PROVIDER_ID,
       actual_provider: PROVIDER_ID,
@@ -1489,7 +1519,7 @@ async function handleResponses(request, response) {
       active_task_included_this_turn: diagnostics.activeTaskIncludedThisTurn,
       active_task_retained_in_provider_session: diagnostics.retainedInProviderSession,
       complete_active_task_delivered: diagnostics.completeTaskDelivered,
-    }, progressItem ? [progressItem] : []);
+    }, progressItems);
     response.end();
     if (!context.sessionKey) session.close();
   } catch (error) {
@@ -2343,16 +2373,18 @@ async function selfTest() {
   const testProgress = createProgressEmitter(testResponse);
   testProgress.emit("Antigravity native worker started.\n");
   testProgress.emit(`Antigravity native tool 1: ${progressToolName("view file with unsafe spacing")}.\n`);
-  const testProgressItem = testProgress.finish();
+  const testProgressItems = testProgress.finish();
   emitCompleted(testResponse, "resp-test", {
     text: "done",
     usage: { input_tokens: 10, cache_read_tokens: 2, output_tokens: 3, thinking_tokens: 1, total_tokens: 13 },
-  }, {}, [testProgressItem]);
+  }, {}, testProgressItems);
   const sse = writes.join("");
   if (
-    !sse.includes("response.reasoning_summary_text.delta")
+    testProgressItems.length !== 2
+    || writes.filter((value) => value.includes("event: response.output_item.done")).length !== 3
+    || !sse.includes("response.reasoning_summary_text.delta")
     || !sse.includes("Antigravity native tool 1: view_file_with_unsafe_spacing")
-    || !sse.includes('"output_index":1')
+    || !sse.includes('"output_index":2')
     || !sse.includes('"output":[{"type":"reasoning"')
     || !sse.includes("response.output_text.delta")
     || !sse.includes("response.completed")

@@ -141,6 +141,26 @@ const cursorRuntime = {
   lastNativeToolNames: [],
   lastWorkingDirectory: null,
 };
+const retainedCursorChats = new Map();
+const cursorTurnTails = new Map();
+
+function cursorStateKey(context) {
+  const taskHash = context.taskState.activeTask?.hash;
+  return context.threadId && taskHash ? `${context.threadId}:${taskHash}` : null;
+}
+
+async function acquireCursorTurn(key) {
+  if (!key) return () => {};
+  const previous = cursorTurnTails.get(key);
+  let resolveCurrent;
+  const current = new Promise((resolve) => { resolveCurrent = resolve; });
+  cursorTurnTails.set(key, current);
+  if (previous) await previous;
+  return () => {
+    if (cursorTurnTails.get(key) === current) cursorTurnTails.delete(key);
+    resolveCurrent();
+  };
+}
 
 function semanticVersion(value, label) {
   const match = /^(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/.exec(value);
@@ -1206,11 +1226,12 @@ function cursorContentText(value, label) {
   }).join("");
 }
 
-function preserveCursorCommit(error, nativeToolNames) {
+function preserveCursorCommit(error, nativeToolNames, chatId = null) {
   const names = [...new Set(nativeToolNames.filter((name) => typeof name === "string" && name))];
   if (names.length > 0) {
     error.routeCommitted = true;
     error.nativeToolNames = names;
+    if (chatId) error.cursorChatId = chatId;
   }
   return error;
 }
@@ -1294,7 +1315,15 @@ function cursorPromptFrom(body) {
   if (!isAbsolute(workingDirectory) || !existsSync(workingDirectory)) {
     throw new BridgeError(`Cursor working directory does not exist: ${JSON.stringify(workingDirectory)}`);
   }
-  return { model, prompt, workingDirectory, taskState };
+  return {
+    model,
+    prompt,
+    workingDirectory,
+    taskState,
+    threadId: typeof body.client_metadata?.thread_id === "string"
+      ? body.client_metadata.thread_id
+      : null,
+  };
 }
 
 function cursorAgentEntrypoint() {
@@ -1337,7 +1366,28 @@ function cursorPromptArgument(prompt) {
   };
 }
 
-function runCursorAgent(context, onSpawn) {
+function cursorConversationId(event) {
+  for (const value of [
+    event?.session_id,
+    event?.sessionId,
+    event?.chat_id,
+    event?.chatId,
+    event?.conversation_id,
+    event?.conversationId,
+  ]) {
+    if (typeof value === "string" && value) return value;
+  }
+  return null;
+}
+
+function cursorToolKey(part) {
+  for (const value of [part?.id, part?.tool_use_id, part?.toolUseId, part?.call_id, part?.callId]) {
+    if (typeof value === "string" && value) return value;
+  }
+  return createHash("sha256").update(jsonString(part)).digest("hex");
+}
+
+function runCursorAgent(context, onSpawn, onProgress, { resumeChatId = null } = {}) {
   const entrypoint = cursorAgentEntrypoint();
   const transportedPrompt = cursorPromptArgument(context.prompt);
   const args = [
@@ -1345,6 +1395,7 @@ function runCursorAgent(context, onSpawn) {
     "--print",
     "--output-format", "stream-json",
     "--trust",
+    ...(resumeChatId ? ["--resume", resumeChatId] : []),
     "--model", context.model,
     transportedPrompt.argument,
   ];
@@ -1362,13 +1413,25 @@ function runCursorAgent(context, onSpawn) {
     let finalText = "";
     let resultEvent = null;
     let initializedModel = "";
+    let chatId = resumeChatId;
     const nativeToolNames = [];
+    const seenNativeTools = new Set();
+    const pendingNativeTools = new Map();
+    const completedNativeTools = new Set();
+    const completeNativeTool = (toolId) => {
+      if (!toolId || completedNativeTools.has(toolId)) return;
+      const name = pendingNativeTools.get(toolId);
+      if (!name) return;
+      pendingNativeTools.delete(toolId);
+      completedNativeTools.add(toolId);
+      onProgress?.({ id: toolId, name, index: completedNativeTools.size });
+    };
     const finish = (error, value) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       transportedPrompt.cleanup();
-      error ? reject(preserveCursorCommit(error, nativeToolNames)) : resolve(value);
+      error ? reject(preserveCursorCommit(error, nativeToolNames, chatId)) : resolve(value);
     };
     const parseLine = (line) => {
       if (!line.trim()) return;
@@ -1380,10 +1443,15 @@ function runCursorAgent(context, onSpawn) {
       if (event.type === "system" && event.subtype === "init" && typeof event.model === "string") {
         initializedModel = event.model;
       }
+      chatId ||= cursorConversationId(event);
       if (event.type === "assistant" && Array.isArray(event.message?.content)) {
         for (const part of event.message.content) {
           if (part?.type === "tool_use" && typeof part.name === "string" && part.name) {
+            const toolKey = cursorToolKey(part);
+            if (seenNativeTools.has(toolKey)) continue;
+            seenNativeTools.add(toolKey);
             nativeToolNames.push(part.name);
+            pendingNativeTools.set(toolKey, part.name);
           }
         }
         const text = event.message.content
@@ -1392,7 +1460,20 @@ function runCursorAgent(context, onSpawn) {
           .join("");
         if (text) finalText = text;
       }
-      if (event.type === "result") resultEvent = event;
+      if (event.type === "user" && Array.isArray(event.message?.content)) {
+        for (const result of event.message.content.filter((part) => part?.type === "tool_result")) {
+          completeNativeTool(result.tool_use_id ?? result.toolUseId ?? result.call_id ?? result.callId);
+        }
+      }
+      if (event.type === "tool" || event.type === "tool_result") {
+        completeNativeTool(event.tool_use_id ?? event.toolUseId ?? event.call_id ?? event.callId);
+      }
+      if (event.type === "result") {
+        resultEvent = event;
+        if (event.subtype === "success" && event.is_error !== true) {
+          for (const toolId of [...pendingNativeTools.keys()]) completeNativeTool(toolId);
+        }
+      }
     };
     const timer = setTimeout(() => {
       child.kill();
@@ -1432,6 +1513,7 @@ function runCursorAgent(context, onSpawn) {
         text,
         usage: resultEvent.usage ?? {},
         initializedModel,
+        chatId,
         nativeToolNames: [...new Set(nativeToolNames)],
       });
     });
@@ -1454,6 +1536,10 @@ function cursorUsage(value) {
 
 async function handleCursorResponses(request, response) {
   const context = cursorPromptFrom(await readJsonRequest(request));
+  const stateKey = cursorStateKey(context);
+  const releaseCursorTurn = await acquireCursorTurn(stateKey);
+  const resumeChatId = stateKey ? retainedCursorChats.get(stateKey) || null : null;
+  if (stateKey) retainedCursorChats.delete(stateKey);
   cursorRuntime.requests += 1;
   cursorRuntime.lastWorkingDirectory = context.workingDirectory;
   let child = null;
@@ -1472,32 +1558,51 @@ async function handleCursorResponses(request, response) {
   const responseId = `resp_${randomUUID()}`;
   if (!writeSse(response, "response.created", {
     response: { id: responseId, object: "response", model: context.model, status: "in_progress" },
-  })) return;
+  })) {
+    releaseCursorTurn();
+    return;
+  }
+  const progress = nativeCliProgressEmitter(response);
   try {
-    const result = await runCursorAgent(context, (spawned) => { child = spawned; });
-    if (clientGone) return;
+    const result = await runCursorAgent(
+      context,
+      (spawned) => { child = spawned; },
+      ({ name, index }) => progress.emit(`cursor native tool ${index}: ${name}.\n`),
+      { resumeChatId },
+    );
+    if (clientGone) {
+      if (stateKey && result.chatId && result.nativeToolNames.length > 0) {
+        retainedCursorChats.set(stateKey, result.chatId);
+      }
+      return;
+    }
+    if (stateKey) retainedCursorChats.delete(stateKey);
     cursorRuntime.completed += 1;
     cursorRuntime.lastInitializedModel = result.initializedModel || null;
     cursorRuntime.lastInputTokens = Number.isInteger(result.usage?.inputTokens) ? result.usage.inputTokens : null;
     cursorRuntime.lastNativeToolNames = result.nativeToolNames;
+    const output = progress.finish();
+    const outputIndex = output.length;
     const itemId = `msg_${randomUUID()}`;
     const item = responseMessageItem(itemId, "");
-    writeSse(response, "response.output_item.added", { output_index: 0, item });
+    writeSse(response, "response.output_item.added", { output_index: outputIndex, item });
     writeSse(response, "response.content_part.added", {
-      item_id: itemId, output_index: 0, content_index: 0, part: { type: "output_text", text: "" },
+      item_id: itemId, output_index: outputIndex, content_index: 0, part: { type: "output_text", text: "" },
     });
     writeSse(response, "response.output_text.delta", {
-      item_id: itemId, output_index: 0, content_index: 0, delta: result.text,
+      item_id: itemId, output_index: outputIndex, content_index: 0, delta: result.text,
     });
     writeSse(response, "response.output_text.done", {
-      item_id: itemId, output_index: 0, content_index: 0, text: result.text,
+      item_id: itemId, output_index: outputIndex, content_index: 0, text: result.text,
     });
     writeSse(response, "response.content_part.done", {
-      item_id: itemId, output_index: 0, content_index: 0, part: { type: "output_text", text: result.text },
+      item_id: itemId, output_index: outputIndex, content_index: 0, part: { type: "output_text", text: result.text },
     });
+    const completedMessage = responseMessageItem(itemId, result.text, "completed");
     writeSse(response, "response.output_item.done", {
-      output_index: 0, item: responseMessageItem(itemId, result.text, "completed"),
+      output_index: outputIndex, item: completedMessage,
     });
+    output.push(completedMessage);
     writeSse(response, "response.completed", {
       response: {
         id: responseId,
@@ -1505,13 +1610,21 @@ async function handleCursorResponses(request, response) {
         model: context.model,
         status: "completed",
         usage: cursorUsage(result.usage),
-        output: [responseMessageItem(itemId, result.text, "completed")],
-        metadata: { cursor_initialized_model: result.initializedModel },
+        output,
+        metadata: {
+          cursor_initialized_model: result.initializedModel,
+          cursor_provider_session_resumed: Boolean(resumeChatId),
+        },
       },
     });
     response.end();
   } catch (error) {
-    if (clientGone) return;
+    if (clientGone) {
+      if (stateKey && error?.cursorChatId && Array.isArray(error?.nativeToolNames) && error.nativeToolNames.length > 0) {
+        retainedCursorChats.set(stateKey, error.cursorChatId);
+      }
+      return;
+    }
     cursorRuntime.failed += 1;
     writeSse(response, "response.failed", {
       response: {
@@ -1528,6 +1641,7 @@ async function handleCursorResponses(request, response) {
     response.end();
   } finally {
     request.removeListener("aborted", abort);
+    releaseCursorTurn();
   }
 }
 
@@ -2756,44 +2870,41 @@ async function handleLegacyOpenCodeResponses(request, response) {
 }
 
 function nativeCliProgressEmitter(response) {
-  const itemId = `progress_${randomUUID()}`;
-  let added = false;
-  let text = "";
+  const completed = [];
   const emit = (delta) => {
     if (typeof delta !== "string" || !delta) return;
-    if (!added) {
-      added = true;
-      writeSse(response, "response.output_item.added", {
-        output_index: 0,
-        item: { type: "reasoning", id: itemId, status: "in_progress", summary: [] },
-      });
-    }
-    text += delta;
+    const itemId = `progress_${randomUUID()}`;
+    const outputIndex = completed.length;
+    writeSse(response, "response.output_item.added", {
+      output_index: outputIndex,
+      item: { type: "reasoning", id: itemId, status: "in_progress", summary: [] },
+    });
     writeSse(response, "response.reasoning_summary_text.delta", {
       item_id: itemId,
-      output_index: 0,
+      output_index: outputIndex,
       summary_index: 0,
       delta,
     });
-  };
-  const finish = () => {
-    if (!added) return null;
     const item = {
       type: "reasoning",
       id: itemId,
       status: "completed",
-      summary: text ? [{ type: "summary_text", text }] : [],
+      summary: [{ type: "summary_text", text: delta }],
     };
     writeSse(response, "response.reasoning_summary_text.done", {
       item_id: itemId,
-      output_index: 0,
+      output_index: outputIndex,
       summary_index: 0,
-      text,
+      text: delta,
     });
-    writeSse(response, "response.output_item.done", { output_index: 0, item });
-    return item;
+    writeSse(response, "response.output_item.done", { output_index: outputIndex, item });
+    completed.push(item);
   };
-  return { emit, finish, get added() { return added; } };
+  return {
+    emit,
+    finish: () => [...completed],
+    get added() { return completed.length > 0; },
+  };
 }
 
 function nativeCliToolEvent(event) {
@@ -2801,7 +2912,7 @@ function nativeCliToolEvent(event) {
     return { id: event.part.callID || event.part.id, name: event.part.tool };
   }
   const payload = event?.type === "event" ? event.event : null;
-  if (payload?.type === "tool_running") {
+  if (payload?.type === "tool_completed") {
     return { id: payload.toolCallId, name: payload.toolName };
   }
   return null;
@@ -2867,8 +2978,8 @@ async function handleNativeCliResponses(request, response, provider) {
         });
     if (clientGone) return;
     const output = [];
-    const progressItem = progress.finish();
-    if (progressItem) output.push(progressItem);
+    const progressItems = progress.finish();
+    output.push(...progressItems);
     const outputIndex = output.length;
     const itemId = `msg_${randomUUID()}`;
     writeSse(response, "response.output_item.added", {
@@ -2963,6 +3074,12 @@ async function handleOpenCodeResponses(request, response) {
 
 function selfTest() {
   readCommandCodeInstallation();
+  if (
+    nativeCliToolEvent({ type: "event", event: { type: "tool_running", toolCallId: "call-1", toolName: "read" } }) !== null
+    || nativeCliToolEvent({ type: "event", event: { type: "tool_completed", toolCallId: "call-1", toolName: "read" } })?.name !== "read"
+  ) {
+    throw new Error("self-test failed: CommandCode progress boundary must follow tool completion");
+  }
   if (
     nativeCliResponseErrorCode({ nativeToolNames: ["read"] }) !== "provider_state_changed"
     || nativeCliResponseErrorCode({ nativeToolNames: [] }) !== "external_provider_error"
@@ -3249,6 +3366,28 @@ function selfTest() {
   emitUpstreamEvent(fakeResponse, { type: "finish", finishReason: "end_turn", totalUsage: {} }, state, context);
   if (!output.some((chunk) => chunk.includes("response.output_text.delta")) || !output.some((chunk) => chunk.includes("response.output_item.done"))) {
     throw new Error("self-test failed: Responses SSE translation");
+  }
+
+  const boundaryOutput = [];
+  const boundaryProgress = nativeCliProgressEmitter({
+    writableEnded: false,
+    destroyed: false,
+    write(chunk) { boundaryOutput.push(chunk); return true; },
+  });
+  boundaryProgress.emit("cursor native tool 1: read_file.\n");
+  boundaryProgress.emit("cursor native tool 2: apply_patch.\n");
+  const boundaryItems = boundaryProgress.finish();
+  const boundaryState = taskStateFromInput([
+    taskItem(nativeTaskPayload),
+    ...boundaryItems,
+  ], MAX_ACTIVE_TASK_CHARS);
+  if (
+    boundaryItems.length !== 2
+    || boundaryOutput.filter((chunk) => chunk.includes("event: response.output_item.done")).length !== 2
+    || boundaryState.progress.toolCallsSinceTask !== 2
+    || boundaryState.progress.lastCompletedTool !== "apply_patch"
+  ) {
+    throw new Error("self-test failed: native tools must produce independent mailbox boundaries and resumable progress");
   }
 
 

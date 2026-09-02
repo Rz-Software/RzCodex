@@ -235,6 +235,18 @@ function progressFrom(input, activeTaskIndex) {
   for (let index = activeTaskIndex + 1; index < input.length; index += 1) {
     const item = input[index];
     if (!item || typeof item !== "object") continue;
+    if (isBridgeProgressReasoning(item)) {
+      const summary = Array.isArray(item.summary)
+        ? item.summary.map((part) => part?.type === "summary_text" ? part.text || "" : "").join("")
+        : "";
+      for (const line of summary.split(/\r?\n/)) {
+        const match = /\bnative tool (?:\d+:\s*)?([A-Za-z0-9_.:-]+)\.?\s*$/i.exec(line);
+        if (!match) continue;
+        toolCallsSinceTask += 1;
+        lastCompletedTool = match[1].replace(/\.$/, "");
+      }
+      continue;
+    }
     if (["function_call", "custom_tool_call", "tool_search_call"].includes(item.type)) {
       const name = item.type === "tool_search_call" ? "tool_search" : item.name;
       if (typeof item.call_id === "string" && typeof name === "string") {

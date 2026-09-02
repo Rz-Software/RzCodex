@@ -413,6 +413,8 @@ class ProviderConversationRegistry {
         sessionId: providerSessionId(threadId),
         providerStarted: false,
         inFlight: false,
+        inFlightDone: Promise.resolve(),
+        finishInFlight: null,
         activeTask: null,
         checkpointRequested: false,
         immediateReturnRequested: false,
@@ -531,6 +533,7 @@ class ProviderConversationRegistry {
     const { state } = context.conversation;
     if (state.inFlight) throw new BridgeError("CodeBuddy provider session is already active", 409);
     state.inFlight = true;
+    state.inFlightDone = new Promise((resolve) => { state.finishInFlight = resolve; });
     writeManagedSessionMarker(state.sessionId, state.threadId);
     runtime.activeProviderSessions = this.#states.size;
   }
@@ -541,6 +544,8 @@ class ProviderConversationRegistry {
     for (const key of conversation.inputKeys) state.seenInputKeys.add(key);
     state.providerStarted = true;
     state.inFlight = false;
+    state.finishInFlight?.();
+    state.finishInFlight = null;
     if (conversation.providerSessionStarted) runtime.providerSessionResumes += 1;
     else runtime.providerSessionsStarted += 1;
     runtime.activeProviderSessions = this.#states.size;
@@ -554,6 +559,8 @@ class ProviderConversationRegistry {
     state.sessionId = providerSessionId(state.threadId);
     state.providerStarted = false;
     state.inFlight = false;
+    state.finishInFlight?.();
+    state.finishInFlight = null;
     state.seenInputKeys.clear();
     runtime.activeProviderSessions = this.#states.size;
   }
@@ -563,12 +570,34 @@ class ProviderConversationRegistry {
     try { cleanupManagedSessionArtifacts(state.sessionId); } catch (error) {
       process.stderr.write(`CodeBuddy terminal session cleanup failed: ${redactSecrets(error.message)}\n`);
     }
+    state.inFlight = false;
+    state.finishInFlight?.();
+    state.finishInFlight = null;
     this.#states.delete(state.threadId);
     runtime.activeProviderSessions = this.#states.size;
   }
 
   get size() {
     return this.#states.size;
+  }
+
+  async waitForIdle(threadId, timeoutMs = 5_000) {
+    const state = this.#states.get(threadId);
+    if (!state?.inFlight) return;
+    let timer;
+    try {
+      await Promise.race([
+        state.inFlightDone,
+        new Promise((_, reject) => {
+          timer = setTimeout(
+            () => reject(new BridgeError("Prior CodeBuddy turn did not release its provider session after cancellation", 409)),
+            timeoutMs,
+          );
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
   }
 }
 
@@ -1352,7 +1381,10 @@ function managedModelsResponse() {
 }
 
 async function handleResponses(request, response) {
-  const context = promptFrom(await readJsonRequest(request));
+  const requestBody = await readJsonRequest(request);
+  const threadId = requireString(requestBody.client_metadata?.thread_id, "client_metadata.thread_id");
+  await providerConversations.waitForIdle(threadId);
+  const context = promptFrom(requestBody);
   providerConversations.begin(context);
   runtime.activeRequests += 1;
   runtime.requests += 1;
@@ -1398,45 +1430,40 @@ async function handleResponses(request, response) {
   });
   const responseId = `resp_${randomUUID()}`;
   writeSse(response, "response.created", { response: { id: responseId, object: "response", model: context.model, status: "in_progress" } });
-  const progressItemId = `progress_${randomUUID()}`;
-  let progressAdded = false;
-  let progressText = "";
+  const progressItems = [];
   let nativeProgressTools = 0;
-  const nativeProgressToolIds = new Set();
+  const pendingNativeProgressTools = new Map();
+  const completedNativeProgressToolIds = new Set();
   const emitProgress = (delta) => {
     if (!delta || clientGone) return;
-    if (!progressAdded) {
-      progressAdded = true;
-      writeSse(response, "response.output_item.added", {
-        output_index: 0,
-        item: { type: "reasoning", id: progressItemId, status: "in_progress", summary: [] },
-      });
-    }
-    progressText += delta;
+    const progressItemId = `progress_${randomUUID()}`;
+    const outputIndex = progressItems.length;
+    writeSse(response, "response.output_item.added", {
+      output_index: outputIndex,
+      item: { type: "reasoning", id: progressItemId, status: "in_progress", summary: [] },
+    });
     writeSse(response, "response.reasoning_summary_text.delta", {
       item_id: progressItemId,
-      output_index: 0,
+      output_index: outputIndex,
       summary_index: 0,
       delta,
     });
-  };
-  const finishProgress = () => {
-    if (!progressAdded) return null;
     const item = {
       type: "reasoning",
       id: progressItemId,
       status: "completed",
-      summary: [{ type: "summary_text", text: progressText }],
+      summary: [{ type: "summary_text", text: delta }],
     };
     writeSse(response, "response.reasoning_summary_text.done", {
       item_id: progressItemId,
-      output_index: 0,
+      output_index: outputIndex,
       summary_index: 0,
-      text: progressText,
+      text: delta,
     });
-    writeSse(response, "response.output_item.done", { output_index: 0, item });
-    return item;
+    writeSse(response, "response.output_item.done", { output_index: outputIndex, item });
+    progressItems.push(item);
   };
+  const finishProgress = () => [...progressItems];
   let streamedMessageId = null;
   let streamedText = "";
   let lastProgressAt = 0;
@@ -1464,6 +1491,15 @@ async function handleResponses(request, response) {
       delta: text,
     });
   };
+  const completeNativeProgressTool = (toolId) => {
+    if (!toolId || completedNativeProgressToolIds.has(toolId)) return;
+    const name = pendingNativeProgressTools.get(toolId);
+    if (!name) return;
+    pendingNativeProgressTools.delete(toolId);
+    completedNativeProgressToolIds.add(toolId);
+    nativeProgressTools += 1;
+    emitProgress(`CodeBuddy native tool ${nativeProgressTools}: ${name}.\n`);
+  };
   const onProviderEvent = (event) => {
     if (event?.type === "assistant" && Array.isArray(event.message?.content)) {
       const nativeTools = event.message.content.filter((part) => part?.type === "tool_use" && typeof part.name === "string");
@@ -1476,10 +1512,9 @@ async function handleResponses(request, response) {
           const toolId = typeof tool.id === "string"
             ? tool.id
             : `${tool.name}:${jsonString(tool.input || {})}`;
-          if (nativeProgressToolIds.has(toolId)) continue;
-          nativeProgressToolIds.add(toolId);
-          nativeProgressTools += 1;
-          emitProgress(`CodeBuddy native tool ${nativeProgressTools}: ${tool.name}.\n`);
+          if (!completedNativeProgressToolIds.has(toolId)) {
+            pendingNativeProgressTools.set(toolId, tool.name);
+          }
         }
         writeSse(response, "response.in_progress", {
           response: {
@@ -1492,6 +1527,19 @@ async function handleResponses(request, response) {
         });
       }
       return;
+    }
+    if (event?.type === "user" && Array.isArray(event.message?.content)) {
+      for (const result of event.message.content.filter((part) => part?.type === "tool_result")) {
+        completeNativeProgressTool(result.tool_use_id ?? result.toolUseId ?? result.call_id ?? result.callId);
+      }
+      return;
+    }
+    if (event?.type === "tool_result") {
+      completeNativeProgressTool(event.tool_use_id ?? event.toolUseId ?? event.call_id ?? event.callId);
+      return;
+    }
+    if (event?.type === "result" && event.subtype === "success" && event.is_error !== true) {
+      for (const toolId of [...pendingNativeProgressTools.keys()]) completeNativeProgressTool(toolId);
     }
     if (event?.type !== "stream_event" || !event.event) return;
     const providerEvent = event.event;
@@ -1546,8 +1594,7 @@ async function handleResponses(request, response) {
       : providerFinalText;
     runtime.completed += 1;
     const output = [];
-    const progressItem = finishProgress();
-    if (progressItem) output.push(progressItem);
+    output.push(...finishProgress());
     let outputIndex = output.length;
     if (finalText) {
       const itemId = streamedMessageId || `msg_${randomUUID()}`;
@@ -1649,7 +1696,14 @@ async function handleResponses(request, response) {
     response.end();
   } finally {
     if (clientGone && !conversationReleased) {
-      providerConversations.release(context);
+      if (nativeProgressTools > 0) {
+        // A completed progress item is a Codex mailbox/preemption boundary. Preserve the provider
+        // conversation so the next request for this thread can deliver the parent's checkpoint or
+        // follow-up without discarding the native tool results that preceded that boundary.
+        providerConversations.commit(context);
+      } else {
+        providerConversations.release(context);
+      }
       conversationReleased = true;
     }
     runtime.activeRequests = Math.max(0, runtime.activeRequests - 1);
