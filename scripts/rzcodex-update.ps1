@@ -437,6 +437,9 @@ try {
         throw "Could not resolve the installed RzCodex commit."
     }
     Install-CodexBinary -Commit $installedCommit -BaseVersion $baseVersion
+    # The installed binaries are versioned outside Cargo's target tree. Drop the disposable
+    # compilation cache after a successful install so stable updates do not consume the C: drive.
+    Invoke-NativeCommand -FilePath "cargo" -ArgumentList @("clean") -WorkingDirectory $CodexRustRoot
     Write-UpdateStatus -Result "updated" -Message "RzCodex $baseVersion built, pushed, and installed successfully." -Commit $installedCommit
 }
 catch {
