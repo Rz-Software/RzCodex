@@ -14,6 +14,7 @@ import {
   taskOwnershipHash,
   taskStateFromInput,
 } from "./codebuddy-subagent-task-state.mjs";
+import { projectInstructionsPromptSection } from "./native-project-instructions.mjs";
 
 const MAX_ACTIVE_TASK_CHARS = 40_000;
 const OLLAMA_CLOUD_CONTEXT_WINDOW = 1_048_576;
@@ -206,9 +207,11 @@ export function nativeCliAgentContext(body, { provider, model, requiredEffort })
   if (!taskState.activeTask) {
     throw new NativeCliAgentError(`${provider} native CLI route received no active NEW_TASK payload`, 400);
   }
+  const workingDirectory = workingDirectoryFrom(body, input);
   const sections = [
     "[Single native-agent turn contract]\nComplete this delegated task within this one Codex subagent turn. Use your own local file, search, edit, and shell tools directly. Never delegate to another agent, task, teammate, swarm, or background worker. Do not return an intention, a deferred tool request, or a request for the parent to execute an ordinary file/shell operation. Return only when the bounded task is complete or a concrete blocker requires parent input. Honor the project AGENTS.md in the working directory. Builds, tests, editor control, PIE/SIE, runtime validation, and final integration remain owned by the parent whenever the task or project instructions reserve them.",
     "[Native tool boundary]\nThe host shell is PowerShell on Windows. Never read, grep, decode, strings-scan, hex-dump, or otherwise inspect Unreal .uasset or .umap bytes through file or shell tools. Use the lazy RzMCP semantic tools when the task authorizes asset access. If those tools are disabled, unavailable, or semantically insufficient, return that concrete blocker; do not approximate asset semantics from binary bytes or repeat equivalent offset/chunk probes. Never read secret environment files.",
+    projectInstructionsPromptSection(workingDirectory),
   ];
   const role = roleInstructionsFrom(body.instructions);
   if (role) sections.push(`[Role instructions]\n${role}`);
@@ -233,7 +236,7 @@ export function nativeCliAgentContext(body, { provider, model, requiredEffort })
       ? body.client_metadata.thread_id
       : null,
     prompt,
-    workingDirectory: workingDirectoryFrom(body, input),
+    workingDirectory,
     taskState,
     taskDiagnostics: diagnostics,
     executionPolicy: executionPolicy(taskState),
@@ -507,12 +510,34 @@ function openCodeConfig(context, providerKind) {
       },
       bash: {
         "*": "allow",
+        "rg *uasset*": "deny",
+        "rg *umap*": "deny",
+        "grep *uasset*": "deny",
+        "grep *umap*": "deny",
+        "Get-Content *uasset*": "deny",
+        "Get-Content *umap*": "deny",
+        "Select-String *uasset*": "deny",
+        "Select-String *umap*": "deny",
         "*.env*": "deny",
         "*.env.example*": "allow",
         "*.uasset*": "deny",
         "*.umap*": "deny",
         "*ReadAllBytes*": "deny",
         "*Format-Hex*": "deny",
+      },
+      grep: {
+        "*": "allow",
+        "*.uasset": "deny",
+        "**/*.uasset": "deny",
+        "*.umap": "deny",
+        "**/*.umap": "deny",
+      },
+      glob: {
+        "*": "allow",
+        "*.uasset": "deny",
+        "**/*.uasset": "deny",
+        "*.umap": "deny",
+        "**/*.umap": "deny",
       },
       task: "deny",
       question: "deny",
@@ -767,7 +792,7 @@ export async function runCommandCodeNativeAgent(context, { signal, onEvent }) {
 }
 
 export async function nativeCliAgentRunnerSelfTest() {
-  const authoritativeWorkspace = homedir();
+  const authoritativeWorkspace = join(import.meta.dirname, "..");
   const ollamaConfigFixture = JSON.parse(openCodeConfig({
     model: "glm-5.3-flash:cloud",
     executionPolicy: { rzMcpMode: "disabled" },
@@ -787,10 +812,14 @@ export async function nativeCliAgentRunnerSelfTest() {
     || ollamaConfigFixture.permission?.read?.["*.umap"] !== "deny"
     || ollamaConfigFixture.permission?.read?.["**/*.umap"] !== "deny"
     || bashPermissionEntries[0]?.[0] !== "*"
+    || ollamaConfigFixture.permission?.bash?.["rg *uasset*"] !== "deny"
+    || ollamaConfigFixture.permission?.bash?.["rg *umap*"] !== "deny"
     || ollamaConfigFixture.permission?.bash?.["*.uasset*"] !== "deny"
     || ollamaConfigFixture.permission?.bash?.["*.umap*"] !== "deny"
     || ollamaConfigFixture.permission?.bash?.["*ReadAllBytes*"] !== "deny"
     || ollamaConfigFixture.permission?.bash?.["*Format-Hex*"] !== "deny"
+    || ollamaConfigFixture.permission?.grep?.["**/*.uasset"] !== "deny"
+    || ollamaConfigFixture.permission?.glob?.["**/*.umap"] !== "deny"
     || ollamaConfigFixture.permission?.doom_loop !== "deny"
   ) {
     throw new Error("native OpenCode Unreal binary/tool-loop boundary was not enforced");
@@ -863,6 +892,7 @@ export async function nativeCliAgentRunnerSelfTest() {
   }
   if (
     !cwdContext.prompt.includes("[Native tool boundary]")
+    || !cwdContext.prompt.includes("[Project AGENTS instructions - authoritative and complete]")
     || !cwdContext.prompt.includes("Never read, grep, decode, strings-scan, hex-dump")
     || !cwdContext.prompt.includes("Use the lazy RzMCP semantic tools")
   ) {

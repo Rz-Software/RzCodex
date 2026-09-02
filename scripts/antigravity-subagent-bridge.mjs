@@ -17,6 +17,7 @@ import {
   taskOwnershipHash,
   taskStateFromInput,
 } from "./codebuddy-subagent-task-state.mjs";
+import { projectInstructionsPromptSection } from "./native-project-instructions.mjs";
 
 const PROVIDER_ID = "antigravity";
 const MODEL_ALIAS = "@preset/codex-subagents";
@@ -552,7 +553,10 @@ function requestContext(body) {
 }
 
 function fullPrompt(context) {
-  const sections = [delegationContract(context.requestId, context.workingDirectory)];
+  const sections = [
+    delegationContract(context.requestId, context.workingDirectory),
+    projectInstructionsPromptSection(context.workingDirectory),
+  ];
   if (context.roleInstructions) sections.push(`[Role instructions]\n${context.roleInstructions}`);
   const referencedPriorTask = referencedPriorTaskPromptSection(context.taskState);
   const activeTask = activeTaskPromptSection(context.taskState);
@@ -2245,6 +2249,9 @@ async function selfTest() {
   };
   const context = requestContext(fixture);
   const first = fullPrompt(context);
+  if (!first.includes("[Project AGENTS instructions - authoritative and complete]")) {
+    throw new Error("project AGENTS instructions did not reach Antigravity");
+  }
   const firstDiagnostics = taskDeliveryDiagnostics(context.taskState, first);
   if (
     first.length > MAX_PROMPT_CHARS

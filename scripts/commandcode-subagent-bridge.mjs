@@ -14,6 +14,7 @@ import {
   taskOwnershipHash,
   taskStateFromInput,
 } from "./codebuddy-subagent-task-state.mjs";
+import { projectInstructionsPromptSection } from "./native-project-instructions.mjs";
 import {
   NativeCliAgentError,
   nativeCliAgentContext,
@@ -718,6 +719,8 @@ function translateResponsesRequest(body) {
   const toolCalls = new Map();
   const messages = [];
   const systemParts = [NATIVE_DELEGATION_CONTRACT];
+  const projectInstructions = projectInstructionsPromptSection(body.client_metadata?.cwd);
+  if (projectInstructions) systemParts.push(projectInstructions);
   if (body.instructions !== undefined) systemParts.push(requireString(body.instructions, "instructions"));
   systemParts.push(...taskControlPromptSections(taskState));
 
@@ -1262,6 +1265,8 @@ function cursorPromptFrom(body) {
   const sections = [
     NATIVE_DELEGATION_CONTRACT,
   ];
+  const projectInstructions = projectInstructionsPromptSection(body.client_metadata?.cwd);
+  if (projectInstructions) sections.push(projectInstructions);
   if (body.instructions !== undefined) {
     const instructions = requireString(body.instructions, "instructions");
     const tagged = [...instructions.matchAll(/<cursor_route_instructions>([\s\S]*?)<\/cursor_route_instructions>/gi)];
@@ -1981,6 +1986,7 @@ function normalizeOpenCodeRequest(body) {
   const taskControlSections = taskControlPromptSections(taskState);
   const instructionSections = [
     taskState.activeTask ? NATIVE_DELEGATION_CONTRACT : "",
+    taskState.activeTask ? projectInstructionsPromptSection(body.client_metadata?.cwd) : "",
     typeof body.instructions === "string" ? body.instructions : "",
     ...taskControlSections,
   ].filter(Boolean);
@@ -3192,6 +3198,7 @@ function selfTest() {
     model: "opencode/muse-spark-1.2-contributor-free",
     input: [taskItem(analysisTaskText)],
     stream: true,
+    client_metadata: { cwd: process.cwd() },
   });
   for (const [label, normalized] of [
     ["CommandCode", commandCodeAnalysis],
@@ -3200,6 +3207,7 @@ function selfTest() {
   ]) {
     if (
       !normalized.includes("[Analysis convergence contract]")
+      || !normalized.includes("[Project AGENTS instructions - authoritative and complete]")
       || normalized.includes("[Immediate terminal report required]")
     ) {
       throw new Error(`self-test failed: ${label} analysis convergence control`);

@@ -30,6 +30,7 @@ import {
   taskDeliveryDiagnostics,
   taskStateFromInput,
 } from "./codebuddy-subagent-task-state.mjs";
+import { projectInstructionsPromptSection } from "./native-project-instructions.mjs";
 
 const PROVIDER_ID = "codebuddy";
 const MODEL_ALIAS = "@preset/codex-subagents";
@@ -817,11 +818,18 @@ function promptFrom(body, registry = providerConversations) {
   runtime.lastRetainedToolSurfaceUsed = retainedToolSurfaceUsed;
   conversation.state.toolInfo = toolInfo;
   if (retainedToolSurfaceUsed) runtime.retainedToolSurfaceUses += 1;
+  const workingDirectory = workingDirectoryFrom(body);
+  if (!isAbsolute(workingDirectory) || !existsSync(workingDirectory)) {
+    throw new BridgeError(`CodeBuddy working directory does not exist: ${JSON.stringify(workingDirectory)}`);
+  }
   const sections = [
     conversation.providerSessionStarted
       ? "[Native delegation continuation]\nContinue the same delegated task in this retained CodeBuddy conversation. Use your own local tools directly and return only when the bounded task is complete, the requested checkpoint is ready, or a concrete blocker requires parent input. Never delegate to another agent, teammate, swarm, or background worker."
       : "[Single native-agent execution contract]\nWork as the delegated CodeBuddy sub-agent in the current workspace and complete this bounded task in this one CLI execution. Use CodeBuddy's own Read, Write, Edit, Bash, Glob, and Grep tools directly. Never delegate to another agent, teammate, swarm, or background worker. Do not ask the parent to execute an ordinary file or shell operation. Honor project AGENTS.md ownership boundaries exactly; when builds, tests, editor control, PIE, runtime validation, or RzMCP execution are reserved to the parent, do not invoke them and instead report the exact checks the parent should run. On Windows, use PowerShell-native commands and never assume Unix-only commands such as head are installed. RzMCP is exposed lazily as only search_rzmcp_tools and call_rzmcp_tool through the rzmcp MCP server; search first, then call the selected tool only when the task allows RzMCP.",
   ];
+  if (!conversation.providerSessionStarted) {
+    sections.push(projectInstructionsPromptSection(workingDirectory));
+  }
   const roleInstructions = roleInstructionsFrom(body.instructions);
   if (roleInstructions && !conversation.providerSessionStarted) {
     sections.push(`[Role instructions]\n${roleInstructions}`);
@@ -958,10 +966,6 @@ function promptFrom(body, registry = providerConversations) {
   } catch (error) {
     if (error instanceof TaskStateError) throw new BridgeError(error.message);
     throw error;
-  }
-  const workingDirectory = workingDirectoryFrom(body);
-  if (!isAbsolute(workingDirectory) || !existsSync(workingDirectory)) {
-    throw new BridgeError(`CodeBuddy working directory does not exist: ${JSON.stringify(workingDirectory)}`);
   }
   if (images.length > 0 && !route.inputModalities.includes("image")) {
     throw new BridgeError("The managed CodeBuddy route does not support image input", 500);
@@ -1890,7 +1894,7 @@ function selfTest() {
           text: "Message Type: NEW_TASK\nTask name: /root/test\nPayload:\nInspect one file.",
         }],
       },
-      { type: "compaction", encrypted_content: "opaque" },
+      { type: "compaction", encrypted_content: "provider-opaque-compaction" },
       { type: "agent_message", author: "/root", recipient: "/root/test", content: [{ type: "input_text", text: "inspect one file" }] },
       { type: "tool_search_call", call_id: "search-1", arguments: { query: "project index" } },
       {
@@ -1903,7 +1907,12 @@ function selfTest() {
         }],
       },
     ]);
-  if (context.model !== route.model || !context.prompt.includes("inspect one file") || context.prompt.includes("opaque")) {
+  if (
+    context.model !== route.model
+    || !context.prompt.includes("inspect one file")
+    || !context.prompt.includes("[Project AGENTS instructions - authoritative and complete]")
+    || context.prompt.includes("provider-opaque-compaction")
+  ) {
     throw new Error("self-test failed: request normalization");
   }
   const taskHeader = "Message Type: NEW_TASK\nTask name: /root/test\nSender: /root\nPayload:\n";

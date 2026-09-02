@@ -21,6 +21,7 @@ import {
   taskOwnershipHash,
   taskStateFromInput,
 } from "./codebuddy-subagent-task-state.mjs";
+import { projectInstructionsPromptSection } from "./native-project-instructions.mjs";
 import {
   ActiveTaskProviderPins,
   ActiveTaskRoutePins,
@@ -710,6 +711,7 @@ function promptFrom(body) {
   const sections = [
     `[Native delegated coding contract]\nRzCodex request ID: ${requestId}\nWork directly in the supplied workspace as the bounded native sub-agent. Use the file and command tools available in this turn. Do not spawn provider-side subagents. Honor project AGENTS.md ownership boundaries exactly; when builds, tests, editor control, PIE, runtime validation, or RzMCP execution are reserved to the parent, do not invoke them and instead report the exact checks the parent should run. For Unreal/RzMCP work that is within your assigned ownership, use only the lazy RzMCP proxy surface: search with an exact or focused query, then call only a discovered tool. Never use or request the full RzMCP catalog. On Windows, use PowerShell-native commands, single-quote ripgrep patterns containing |, and never assume Unix-only commands such as head are installed. Return concise evidence as soon as the bounded task is complete or genuinely blocked.\nAuthoritative workspace: ${workingDirectory}`,
     `[Enforced provider permissions]\nNon-interactive native file and shell tools are enabled with Devin permission mode ${executionPolicy.permissionMode}. This permission mode does not expand the active task. RzMCP mode: ${executionPolicy.rzMcpMode}. The active task's scope and restrictions remain hard boundaries, not suggestions.`,
+    projectInstructionsPromptSection(workingDirectory),
   ];
   const roleInstructions = roleInstructionsFrom(body.instructions);
   if (roleInstructions) sections.push(`[Role instructions]\n${roleInstructions}`);
@@ -771,14 +773,16 @@ function promptFrom(body) {
   const retained = [];
   for (let index = history.length - 1; index >= 0; index -= 1) {
     const { text } = history[index];
-    if (retainedChars + text.length > historyBudget) {
-      if (retained.length === 0 && historyBudget > 0) {
-        retained.unshift({ ...history[index], text: text.slice(-historyBudget) });
+    const separatorChars = 2;
+    if (retainedChars + separatorChars + text.length > historyBudget) {
+      const remainingTextChars = historyBudget - retainedChars - separatorChars;
+      if (retained.length === 0 && remainingTextChars > 0) {
+        retained.unshift({ ...history[index], text: text.slice(-remainingTextChars) });
       }
       break;
     }
     retained.unshift(history[index]);
-    retainedChars += text.length;
+    retainedChars += separatorChars + text.length;
   }
   if (activeTask) {
     const activeTaskIndex = taskState.activeTask.index;
@@ -3465,11 +3469,29 @@ async function selfTest() {
   if (prompt.indexOf(task, taskIndex + task.length) !== -1) throw new Error("active task duplication failed");
   if (
     !prompt.includes("[Authoritative progress since active task]")
+    || !prompt.includes("[Project AGENTS instructions - authoritative and complete]")
     || !prompt.includes("[Mutation convergence contract]")
     || !prompt.includes("[On-demand checkpoint requested]")
     || !prompt.includes("[Immediate terminal report required]")
   ) {
     throw new Error("managed convergence state was not delivered to the provider");
+  }
+  const saturatedPrompt = promptFrom({
+    stream: true,
+    model: MODEL_ALIAS,
+    reasoning: { effort: REQUIRED_EFFORT },
+    input: [
+      ...Array.from({ length: 20 }, (_, index) => ({
+        type: "message",
+        role: index % 2 === 0 ? "user" : "assistant",
+        content: `saturated-history-${index}\n${"x".repeat(9_000)}`,
+      })),
+      { type: "agent_message", id: "self-test-saturated-task", author: "Codex", recipient: "/root/self_test", content: [{ type: "input_text", text: task }] },
+    ],
+    client_metadata: { cwd: process.cwd() },
+  }).prompt;
+  if (saturatedPrompt.length > MAX_PROMPT_CHARS || saturatedPrompt.split(task).length !== 2) {
+    throw new Error("managed saturated prompt lost its hard bound or duplicated the active task");
   }
   const analysisPrompt = promptFrom({
     stream: true,
