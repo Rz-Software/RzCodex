@@ -25,6 +25,7 @@ pub async fn load_agent_roles(
     cfg: &ConfigToml,
     config_layer_stack: &ConfigLayerStack,
     startup_warnings: &mut Vec<String>,
+    use_rzcodex_role_namespace: bool,
 ) -> std::io::Result<BTreeMap<String, AgentRoleConfig>> {
     let mut layers = config_layer_stack.layers_low_to_high().peekable();
     if layers.peek().is_none() {
@@ -75,7 +76,10 @@ pub async fn load_agent_roles(
         if let Some(config_folder) = layer.config_folder() {
             for (role_name, role) in discover_agent_roles_in_dir(
                 fs,
-                &config_folder.join("agents"),
+                &agent_roles_directory_for_config_folder(
+                    &config_folder,
+                    use_rzcodex_role_namespace,
+                ),
                 &declared_role_files,
                 startup_warnings,
             )
@@ -114,6 +118,27 @@ pub async fn load_agent_roles(
     }
 
     Ok(roles)
+}
+
+/// Resolve the auto-discovered role directory for one config layer.
+///
+/// RzCodex uses a sibling `.rzcodex` namespace so its centrally routed roles never leak into an
+/// official Codex process reading the same user and project configuration layers.
+pub fn agent_roles_directory_for_config_folder(
+    config_folder: &AbsolutePathBuf,
+    use_rzcodex_role_namespace: bool,
+) -> AbsolutePathBuf {
+    let role_config_folder = if use_rzcodex_role_namespace
+        && config_folder.as_path().file_name() == Some(std::ffi::OsStr::new(".codex"))
+    {
+        config_folder
+            .parent()
+            .map(|parent| parent.join(".rzcodex"))
+            .unwrap_or_else(|| config_folder.clone())
+    } else {
+        config_folder.clone()
+    };
+    role_config_folder.join("agents")
 }
 
 fn push_agent_role_warning(startup_warnings: &mut Vec<String>, err: std::io::Error) {

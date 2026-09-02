@@ -5,6 +5,7 @@ use crate::context::ContextualUserFragment;
 use crate::plugins::plugins_manager_for_config;
 use crate::session::multi_agents::resolve_usage_hints;
 use assert_matches::assert_matches;
+use codex_agent_roles::agent_roles_directory_for_config_folder;
 use codex_config::CONFIG_TOML_FILE;
 use codex_config::ConfigLayerEntry;
 use codex_config::ConfigLayerSource;
@@ -116,6 +117,23 @@ use pretty_assertions::assert_eq;
 use rmcp::model::ElicitationCapability;
 use rmcp::model::FormElicitationCapability;
 use rmcp::model::UrlElicitationCapability;
+
+#[test]
+fn rzcodex_agent_roles_use_a_separate_sibling_namespace() -> std::io::Result<()> {
+    let root = tempdir()?;
+    let codex_folder = AbsolutePathBuf::from_absolute_path(root.path().join(".codex"))?;
+
+    assert_eq!(
+        agent_roles_directory_for_config_folder(&codex_folder, false).as_path(),
+        root.path().join(".codex").join("agents")
+    );
+    assert_eq!(
+        agent_roles_directory_for_config_folder(&codex_folder, true).as_path(),
+        root.path().join(".rzcodex").join("agents")
+    );
+
+    Ok(())
+}
 
 use codex_config::test_support::CloudConfigBundleFixture;
 use std::collections::BTreeMap;

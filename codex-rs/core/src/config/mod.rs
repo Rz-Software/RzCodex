@@ -3712,8 +3712,16 @@ impl Config {
             .unwrap_or_default();
         let terminal_resize_reflow = resolve_terminal_resize_reflow_config(&cfg);
 
-        let agent_roles =
-            load_agent_roles(fs, &cfg, &config_layer_stack, &mut startup_warnings).await?;
+        let use_rzcodex_role_namespace = std::env::var_os("RZCODEX_SEPARATE_AGENT_ROLES")
+            .is_some_and(|value| value == "1");
+        let agent_roles = load_agent_roles(
+            fs,
+            &cfg,
+            &config_layer_stack,
+            &mut startup_warnings,
+            use_rzcodex_role_namespace,
+        )
+        .await?;
 
         let openai_base_url = cfg
             .openai_base_url
