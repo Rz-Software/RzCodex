@@ -184,14 +184,24 @@ function requireObject(value, label) {
   return value;
 }
 
-export function fallbackForwardBody(body, modelAlias, effort) {
+export function fallbackForwardBody(body, modelAlias, effort, workingDirectory) {
   requireObject(body, "request body");
-  return {
+  const forwarded = {
     ...body,
     model: modelAlias,
     stream: true,
     reasoning: { ...(body.reasoning || {}), effort },
   };
+  if (workingDirectory !== undefined) {
+    if (typeof workingDirectory !== "string" || !workingDirectory) {
+      throw new ProviderRouteError("forwarded provider working directory must be a non-empty string");
+    }
+    forwarded.client_metadata = {
+      ...(body.client_metadata || {}),
+      cwd: workingDirectory,
+    };
+  }
+  return forwarded;
 }
 
 async function readBoundedResponse(response, maxResponseBytes) {

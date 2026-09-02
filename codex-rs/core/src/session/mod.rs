@@ -2532,6 +2532,39 @@ impl Session {
         }
     }
 
+    async fn record_bridge_reasoning_progress(
+        &self,
+        turn_context: &TurnContext,
+        item_id: &str,
+        delta: &str,
+    ) {
+        if !item_id.starts_with("progress_") {
+            return;
+        }
+        let turn_state = {
+            let active = self.active_turn.lock().await;
+            active.as_ref().and_then(|active| {
+                active
+                    .task
+                    .as_ref()
+                    .filter(|task| task.turn_context.sub_id == turn_context.sub_id)
+                    .map(|_| Arc::clone(&active.turn_state))
+            })
+        };
+        let Some(turn_state) = turn_state else {
+            return;
+        };
+        let mut state = turn_state.lock().await;
+        state.last_activity_at_ms = Some(now_unix_timestamp_ms());
+        for line in delta.lines() {
+            let Some(tool) = bridge_progress_tool_name(line) else {
+                continue;
+            };
+            state.tool_calls = state.tool_calls.saturating_add(1);
+            state.last_completed_tool = Some(tool);
+        }
+    }
+
     /// Adds an execpolicy amendment to both the in-memory and on-disk policies so future
     /// commands can use the newly approved prefix.
     pub(crate) async fn persist_execpolicy_amendment(
@@ -4676,6 +4709,17 @@ impl Session {
     fn show_raw_agent_reasoning(&self) -> bool {
         self.services.show_raw_agent_reasoning
     }
+}
+
+fn bridge_progress_tool_name(line: &str) -> Option<String> {
+    let (_, suffix) = line.split_once("native tool ")?;
+    let tool = suffix
+        .split_once(':')
+        .map(|(_, tool)| tool)
+        .unwrap_or(suffix)
+        .trim()
+        .trim_end_matches('.');
+    (!tool.is_empty()).then(|| tool.to_string())
 }
 
 pub(crate) fn emit_subagent_session_started(

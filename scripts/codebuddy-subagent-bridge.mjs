@@ -22,6 +22,7 @@ import {
   authoritativeProgressReport,
   changedPathsFromApplyPatch,
   isBridgeProgressReasoning,
+  isExplicitReadOnlyTask,
   normalizeAgentMessageContent,
   taskControlPromptSections,
   taskDeliveryDiagnostics,
@@ -49,7 +50,6 @@ const CODEBUDDY_HOME = join(homedir(), ".codebuddy");
 const MANAGED_SESSION_PREFIX = "rzcodex-";
 const SCRIPT_DIRECTORY = dirname(fileURLToPath(import.meta.url));
 const MCP_SERVER_SCRIPT = join(SCRIPT_DIRECTORY, "devin-rzmcp-lazy-proxy.mjs");
-const EXPLICIT_READ_ONLY_TASK = /\bread[- ]only\b|\bno[- ]mutation\b|\bno\s+(?:edits?|modifications?|writes?|mutations?|file\s+changes|source\s+changes)\b|\b(?:do not|must not|never)\s+(?:edit|modify|write|mutate)(?:\s+(?:any|the|source|project|workspace|files?)){0,3}(?:[.;,]|$)/i;
 const RZMCP_RESTRICTED_TASK = /\b(?:do not|must not|never)[^.\n]{0,160}\b(?:use|invoke|control|call)\s+(?:any\s+|the\s+)?(?:editor|rzmcp)\b|\bno\s+[^.\n]{0,120}\b(?:editor|rzmcp|pie|sie)\b/i;
 const PROVIDER_MUTATION_TOOL = /^(?:Edit|Write|NotebookEdit|mcp__rzmcp__call_rzmcp_tool)$/i;
 const CODEBUDDY_SCRIPT = join(
@@ -67,7 +67,7 @@ class BridgeError extends Error {
 
 function executionPolicy(taskState) {
   const task = taskState.activeTask?.text || "";
-  const readOnly = taskState.activeTask?.intent === "analysis" || EXPLICIT_READ_ONLY_TASK.test(task);
+  const readOnly = taskState.activeTask?.intent === "analysis" || isExplicitReadOnlyTask(task);
   return {
     readOnly,
     rzMcpMode: RZMCP_RESTRICTED_TASK.test(task)
@@ -213,7 +213,9 @@ function workingDirectoryFrom(body) {
   };
   visit(body.instructions);
   visit(body.input);
-  return candidates.filter((candidate) => isAbsolute(candidate) && existsSync(candidate)).at(-1) || process.cwd();
+  const taggedCwd = candidates.filter((candidate) => isAbsolute(candidate) && existsSync(candidate)).at(-1);
+  if (taggedCwd) return taggedCwd;
+  throw new BridgeError("CodeBuddy request has no valid authoritative working directory");
 }
 
 function contentText(value, label) {
@@ -1692,7 +1694,7 @@ function selfTest() {
       stream: true,
       reasoning: { effort: "max" },
       client_metadata: {
-        cwd: process.cwd(),
+        cwd: options.cwd ?? process.cwd(),
         thread_id: options.threadId ?? `self-test-thread-${selfTestThread += 1}`,
       },
       instructions: "<external_cli_route_instructions>bounded role</external_cli_route_instructions>",
@@ -1710,7 +1712,10 @@ function selfTest() {
       type: "input_text",
       text: "Message Type: NEW_TASK\nTask name: /root/read_only\nPayload:\nRead two files. Do not edit files. Never create files.",
     }],
-  }]);
+  }], { cwd: homedir() });
+  if (readOnlyTask.workingDirectory !== homedir()) {
+    throw new Error("self-test failed: CodeBuddy ignored the authoritative request working directory");
+  }
   const boundedMutationTask = normalizeSelfTestRequest([{
     type: "agent_message",
     id: "self-test-bounded-mutation",

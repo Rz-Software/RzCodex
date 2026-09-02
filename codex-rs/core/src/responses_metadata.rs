@@ -27,6 +27,7 @@ use crate::client::X_OPENAI_SUBAGENT_HEADER;
 pub(crate) const INSTALLATION_ID_KEY: &str = "installation_id";
 pub(crate) const SESSION_ID_KEY: &str = "session_id";
 pub(crate) const THREAD_ID_KEY: &str = "thread_id";
+pub(crate) const CWD_KEY: &str = "cwd";
 pub(crate) const AGENT_NAME_KEY: &str = "agent_name";
 pub(crate) const TURN_ID_KEY: &str = "turn_id";
 pub(crate) const WINDOW_ID_KEY: &str = "window_id";
@@ -62,6 +63,7 @@ const RESERVED_METADATA_KEYS: &[&str] = &[
     X_CODEX_INSTALLATION_ID_HEADER,
     SESSION_ID_KEY,
     THREAD_ID_KEY,
+    CWD_KEY,
     AGENT_NAME_KEY,
     TURN_ID_KEY,
     WINDOW_ID_KEY,
@@ -220,6 +222,9 @@ pub struct CodexResponsesMetadata {
     pub(crate) installation_id: String,
     pub(crate) session_id: String,
     pub(crate) thread_id: String,
+    /// Absolute workspace directory for native subagent transports. This remains absent from
+    /// ordinary main-agent requests.
+    pub(crate) cwd: Option<String>,
     pub(crate) agent_name: Option<String>,
     pub(crate) turn_id: Option<String>,
     pub(crate) routing_hint: Option<HeaderValue>,
@@ -259,6 +264,7 @@ impl CodexResponsesMetadata {
             installation_id,
             session_id,
             thread_id,
+            cwd: None,
             agent_name: None,
             turn_id: None,
             routing_hint: None,
@@ -312,6 +318,11 @@ impl CodexResponsesMetadata {
         ]);
         if let Some(turn_id) = &self.turn_id {
             client_metadata.insert(TURN_ID_KEY.to_string(), turn_id.clone());
+        }
+        if self.subagent_header.is_some()
+            && let Some(cwd) = &self.cwd
+        {
+            client_metadata.insert(CWD_KEY.to_string(), cwd.clone());
         }
         if let Some(subagent_header) = &self.subagent_header {
             client_metadata.insert(
@@ -383,6 +394,7 @@ impl CodexResponsesMetadata {
             installation_id: has_request_identity.then_some(self.installation_id.as_str()),
             session_id: has_turn_identity.then_some(self.session_id.as_str()),
             thread_id: has_turn_identity.then_some(self.thread_id.as_str()),
+            cwd: self.cwd.as_deref(),
             agent_name: has_turn_identity
                 .then_some(self.agent_name.as_deref())
                 .flatten(),
@@ -512,6 +524,8 @@ struct CodexTurnMetadataPayload<'a> {
     session_id: Option<&'a str>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     thread_id: Option<&'a str>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cwd: Option<&'a str>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     agent_name: Option<&'a str>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

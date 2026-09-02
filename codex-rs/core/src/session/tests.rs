@@ -230,6 +230,19 @@ pub(crate) fn mcp_config_for_test(config: &crate::config::Config) -> Arc<codex_m
     ))
 }
 
+#[test]
+fn bridge_progress_extracts_provider_native_tool_names() {
+    assert_eq!(
+        bridge_progress_tool_name("Ollama native tool 12: bash."),
+        Some("bash".to_string())
+    );
+    assert_eq!(
+        bridge_progress_tool_name("CodeBuddy requested native tool read."),
+        Some("read".to_string())
+    );
+    assert_eq!(bridge_progress_tool_name("provider heartbeat"), None);
+}
+
 /// Updates both initial/current views before sharing a test turn context.
 pub(crate) fn update_turn_settings_for_test(
     turn: &mut TurnContext,

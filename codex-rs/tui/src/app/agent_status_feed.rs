@@ -82,12 +82,32 @@ impl AgentStatusThreadPreview {
         events: impl Iterator<Item = &'a ThreadBufferedEvent>,
     ) -> Self {
         let mut seen_item_ids = HashSet::new();
+        let mut seen_activity = HashSet::new();
         let mut activity = Vec::new();
         for event in events {
             let item = match event {
                 ThreadBufferedEvent::Notification(notification) => match notification.as_ref() {
                     ServerNotification::ItemCompleted(event) => &event.item,
                     ServerNotification::ItemStarted(event) => &event.item,
+                    ServerNotification::ReasoningSummaryTextDelta(event)
+                        if event.item_id.starts_with("progress_") =>
+                    {
+                        for line in event.delta.lines().rev() {
+                            let Some(summary) = bounded_summary(line) else {
+                                continue;
+                            };
+                            if seen_activity.insert(summary.clone()) {
+                                activity.push(summary);
+                            }
+                            if activity.len() == AGENT_STATUS_PREVIEW_ITEMS {
+                                break;
+                            }
+                        }
+                        if activity.len() == AGENT_STATUS_PREVIEW_ITEMS {
+                            break;
+                        }
+                        continue;
+                    }
                     _ => continue,
                 },
                 ThreadBufferedEvent::Request(_)
@@ -98,7 +118,9 @@ impl AgentStatusThreadPreview {
                 continue;
             }
             if let Some(summary) = activity_summary(item) {
-                activity.push(summary);
+                if seen_activity.insert(summary.clone()) {
+                    activity.push(summary);
+                }
                 if activity.len() == AGENT_STATUS_PREVIEW_ITEMS {
                     break;
                 }

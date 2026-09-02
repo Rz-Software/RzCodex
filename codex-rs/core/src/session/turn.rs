@@ -2793,10 +2793,13 @@ async fn try_run_sampling_request(
                     if !active_item_is_streaming_to_client {
                         continue;
                     }
+                    let item_id = active.id();
+                    sess.record_bridge_reasoning_progress(&turn_context, &item_id, &delta)
+                        .await;
                     let event = ReasoningContentDeltaEvent {
                         thread_id: sess.thread_id.to_string(),
                         turn_id: turn_context.sub_id.clone(),
-                        item_id: active.id(),
+                        item_id,
                         delta,
                         summary_index,
                     };

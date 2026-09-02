@@ -2,6 +2,7 @@ use super::*;
 
 use crate::responses_metadata::AUTO_REVIEW_ENABLED_KEY;
 use crate::responses_metadata::CONTEXT_WINDOW_ID_KEY;
+use crate::responses_metadata::CWD_KEY;
 use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::responses_metadata::CompactionTurnMetadata;
 use crate::responses_metadata::FORKED_FROM_ORDINAL_EXCLUSIVE_KEY;
@@ -687,6 +688,7 @@ fn turn_metadata_state_ignores_client_reserved_metadata_before_start() {
 fn turn_metadata_state_merges_client_metadata_without_replacing_reserved_fields() {
     let temp_dir = TempDir::new().expect("temp dir");
     let cwd = temp_dir.path().abs();
+    let expected_cwd = cwd.as_path().display().to_string();
     let permission_profile = PermissionProfile::read_only();
     let source_thread_id =
         ThreadId::from_string("44444444-4444-4444-8444-444444444444").expect("thread id");
@@ -880,6 +882,10 @@ fn turn_metadata_state_merges_client_metadata_without_replacing_reserved_fields(
     let model_request_header = test_turn_responses_metadata_json(&state, "thread-a:1");
     let model_request_json: Value =
         serde_json::from_str(&model_request_header).expect("model request json");
+    assert_eq!(
+        model_request_json[CWD_KEY].as_str(),
+        Some(expected_cwd.as_str())
+    );
     assert_eq!(model_request_json["request_kind"].as_str(), Some("turn"));
     assert_eq!(
         model_request_json[ROOT_TURN_ID_KEY].as_str(),
@@ -901,6 +907,14 @@ fn turn_metadata_state_merges_client_metadata_without_replacing_reserved_fields(
         model_request_json[WINDOW_ID_KEY].as_str(),
         Some("thread-a:1")
     );
+    let client_metadata = state
+        .to_responses_metadata(
+            "installation-a".to_string(),
+            "thread-a:1".to_string(),
+            CodexResponsesRequestKind::Turn,
+        )
+        .client_metadata();
+    assert_eq!(client_metadata.get(CWD_KEY), Some(&expected_cwd));
 
     let compatibility_headers = state
         .to_responses_metadata(

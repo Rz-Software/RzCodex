@@ -2,6 +2,7 @@ use super::*;
 use codex_app_server_protocol::CommandExecutionSource;
 use codex_app_server_protocol::CommandExecutionStatus;
 use codex_app_server_protocol::ItemCompletedNotification;
+use codex_app_server_protocol::ReasoningSummaryTextDeltaNotification;
 use codex_utils_absolute_path::AbsolutePathBuf;
 
 #[test]
@@ -111,4 +112,43 @@ fn agent_status_uses_reasoning_summaries_only() {
     "###);
     assert!(!rendered.contains("hidden raw reasoning"));
     assert!(!rendered.contains("raw-only reasoning"));
+}
+
+#[test]
+fn agent_status_shows_live_bridge_tool_progress() {
+    let mut store = ThreadEventStore::new(/*capacity*/ 8);
+    for (item_id, delta) in [
+        ("progress_provider", "Ollama native tool 1: grep.\n"),
+        ("progress_provider", "Ollama native tool 2: read.\n"),
+        ("rs-provider", "private model reasoning"),
+    ] {
+        store.push_notification(ServerNotification::ReasoningSummaryTextDelta(
+            ReasoningSummaryTextDeltaNotification {
+                thread_id: "thread-child".to_string(),
+                turn_id: "turn-1".to_string(),
+                item_id: item_id.to_string(),
+                delta: delta.to_string(),
+                summary_index: 0,
+            },
+        ));
+    }
+
+    let preview = AgentStatusThreadPreview::from_store("/root/reviewer".to_string(), &store);
+    let cell = AgentStatusHistoryCell::new(vec![preview]);
+    let rendered = cell
+        .display_lines(/*width*/ 80)
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        rendered.contains("Ollama native tool 1: grep."),
+        "rendered status: {rendered:?}"
+    );
+    assert!(
+        rendered.contains("Ollama native tool 2: read."),
+        "rendered status: {rendered:?}"
+    );
+    assert!(!rendered.contains("private model reasoning"));
 }

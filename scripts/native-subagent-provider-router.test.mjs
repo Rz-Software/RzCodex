@@ -71,12 +71,14 @@ test("fallback forwarding preserves the request and changes only provider effort
     stream: true,
     reasoning: { effort: "high", summary: "none" },
     input,
-  }, MODEL_ALIAS, "max");
+    client_metadata: { thread_id: "thread-a", cwd: "stale-cwd" },
+  }, MODEL_ALIAS, "max", "G:\\QANGA");
   assert.deepEqual(forwarded, {
     model: MODEL_ALIAS,
     stream: true,
     reasoning: { effort: "max", summary: "none" },
     input,
+    client_metadata: { thread_id: "thread-a", cwd: "G:\\QANGA" },
   });
 });
 

@@ -437,7 +437,9 @@ function environmentWorkingDirectoryFrom(input) {
 function workingDirectoryFrom(body, input) {
   const cwd = body.client_metadata?.cwd;
   if (typeof cwd === "string" && isAbsolute(cwd) && existsSync(cwd)) return normalize(cwd);
-  return environmentWorkingDirectoryFrom(input) || process.cwd();
+  const environmentCwd = environmentWorkingDirectoryFrom(input);
+  if (environmentCwd) return environmentCwd;
+  throw new BridgeError("Antigravity request has no valid authoritative working directory");
 }
 
 function delegationContract(requestId, workingDirectory) {
@@ -2217,7 +2219,7 @@ async function selfTest() {
     stream: true,
     model: MODEL_ALIAS,
     reasoning: { effort: REQUIRED_EFFORT },
-    client_metadata: { cwd: process.cwd(), thread_id: "thread-agy-analysis" },
+    client_metadata: { cwd: homedir(), thread_id: "thread-agy-analysis" },
     input: [{
       type: "agent_message",
       id: "agy-analysis-task",
@@ -2228,6 +2230,8 @@ async function selfTest() {
   });
   const analysisFirst = fullPrompt(analysisContext);
   if (
+    analysisContext.workingDirectory !== homedir()
+    ||
     !analysisFirst.includes("[Analysis convergence contract]")
     || analysisFirst.includes("[Immediate terminal report required]")
   ) {

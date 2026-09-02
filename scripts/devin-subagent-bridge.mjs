@@ -11,6 +11,7 @@ import { DatabaseSync } from "node:sqlite";
 import {
   TaskStateError,
   activeTaskPromptSection,
+  isExplicitReadOnlyTask,
   isBridgeProgressReasoning,
   normalizeAgentMessageContent,
   taskControlPromptSections,
@@ -84,7 +85,6 @@ const RESOURCE_EXHAUSTED = /cognition\.ai\/errorKind[\s\S]{0,100}resource_exhaus
 const INTERRUPTED_STREAM = /stream (?:was )?interrupted|stream disconnected|connection (?:closed|reset)|unexpected end of (?:file|stream)|please continue the task you were working on/i;
 const PROVIDER_COMPACTION = /provider context compacted/i;
 const PERMISSION_REJECTION = /rejected a tool call that requires confirmation|permission (?:was )?denied|requires (?:user )?confirmation/i;
-const EXPLICIT_READ_ONLY_TASK = /\bread[- ]only\b|\bno[- ]mutation\b|\bno\s+(?:edits?|modifications?|writes?|mutations?|file\s+changes|source\s+changes)\b|\b(?:do not|must not|never)\s+(?:edit|modify|write|mutate)(?:\s+(?:any|the|source|project|workspace|files?)){0,3}(?:[.;,]|$)/i;
 const VALIDATION_RESTRICTED_TASK = /\b(?:do not|must not|never)[^.\n]{0,160}\b(?:build|compile|run\s+(?:the\s+)?tests?|test|control\s+(?:the\s+)?editor|use\s+(?:the\s+)?editor|pie|sie)\b|\bno\s+(?:build|compile|tests?|editor|pie|sie)\b|\b(?:aucun(?:e)?|sans|interdiction\s+d['’](?:ex[eé]cuter|utiliser))[^.\n]{0,160}\b(?:build|compil(?:e|er|ation)|tests?|editor|[eé]diteur|pie|sie)\b/i;
 const RZMCP_RESTRICTED_TASK = /\b(?:do not|must not|never)[^.\n]{0,160}\b(?:use|invoke|control|call)\s+(?:any\s+|the\s+)?(?:editor|rzmcp)\b|\bno\s+[^.\n]{0,120}\b(?:editor|rzmcp|pie|sie)\b|\b(?:aucun(?:e)?|sans|interdiction\s+d['’](?:ex[eé]cuter|utiliser))[^.\n]{0,160}\b(?:editor|[eé]diteur|rzmcp|pie|sie)\b/i;
 const QUOTA_STATE_VERSION = 2;
@@ -256,7 +256,7 @@ function sanitizedEnvironment(source = process.env) {
 
 function executionPolicyFromTaskState(taskState) {
   const taskText = taskState?.activeTask?.text || "";
-  const readOnly = taskState?.activeTask?.intent === "analysis" || EXPLICIT_READ_ONLY_TASK.test(taskText);
+  const readOnly = taskState?.activeTask?.intent === "analysis" || isExplicitReadOnlyTask(taskText);
   const validationRestricted = VALIDATION_RESTRICTED_TASK.test(taskText);
   const rzMcpRestricted = RZMCP_RESTRICTED_TASK.test(taskText);
   return {
@@ -620,7 +620,7 @@ function workingDirectoryFrom(body, input) {
   if (typeof cwd === "string" && isAbsolute(cwd) && existsSync(cwd)) return cwd;
   const environmentCwd = environmentWorkingDirectoryFrom(input);
   if (environmentCwd) return environmentCwd;
-  return process.cwd();
+  throw new BridgeError("managed subagent request has no valid authoritative working directory");
 }
 
 function contentText(value, label) {
@@ -1721,7 +1721,12 @@ async function runAntigravityStage(context, requestBody, failures, onProgress, s
   runtime.lastProviderSequence.push("antigravity");
   onProgress?.("Automatic route started Antigravity Claude/Gemini pool selection.\n");
   try {
-    const forwardedBody = fallbackForwardBody(requestBody, MODEL_ALIAS, ANTIGRAVITY_REQUIRED_EFFORT);
+    const forwardedBody = fallbackForwardBody(
+      requestBody,
+      MODEL_ALIAS,
+      ANTIGRAVITY_REQUIRED_EFFORT,
+      context.workingDirectory,
+    );
     const completion = await runResponsesBridge({
       endpoint: ANTIGRAVITY_BRIDGE_ENDPOINT,
       body: forwardedBody,
@@ -1761,7 +1766,12 @@ async function runCodeBuddyStage(context, requestBody, failures, onProgress, sig
   runtime.lastProviderSequence.push("codebuddy");
   onProgress?.("Automatic route started one self-contained CodeBuddy native CLI execution.\n");
   try {
-    const forwardedBody = fallbackForwardBody(requestBody, MODEL_ALIAS, CODEBUDDY_REQUIRED_EFFORT);
+    const forwardedBody = fallbackForwardBody(
+      requestBody,
+      MODEL_ALIAS,
+      CODEBUDDY_REQUIRED_EFFORT,
+      context.workingDirectory,
+    );
     const completion = await runResponsesBridge({
       endpoint: CODEBUDDY_BRIDGE_ENDPOINT,
       body: forwardedBody,
@@ -1817,7 +1827,12 @@ async function runOllamaStage(
       onProgress?.("Ollama native CLI agent started one self-contained execution.\n");
       let nativeContext;
       try {
-        const forwardedBody = fallbackForwardBody(requestBody, requestBody.model, route.ollamaEffort);
+        const forwardedBody = fallbackForwardBody(
+          requestBody,
+          requestBody.model,
+          route.ollamaEffort,
+          context.workingDirectory,
+        );
         nativeContext = nativeCliAgentContext(forwardedBody, {
           provider: "ollama",
           model: route.ollamaModel,
@@ -2685,11 +2700,13 @@ async function selfTest() {
     autoEffortFixture,
     autoEffortFixture.model,
     route.ollamaEffort,
+    process.cwd(),
   );
   if (
     autoEffortFixture.reasoning.effort !== REQUIRED_EFFORT
     || forwardedOllamaFixture.reasoning.effort !== OLLAMA_REQUIRED_EFFORT
     || forwardedOllamaFixture.model !== MODEL_ALIAS
+    || forwardedOllamaFixture.client_metadata?.cwd !== process.cwd()
   ) {
     throw new Error("auto route did not translate the Ollama stage to its required effort");
   }
@@ -3032,11 +3049,24 @@ async function selfTest() {
     }],
   }).workingDirectory;
   if (environmentWorkspace !== process.cwd()) throw new Error("environment workspace detection failed");
+  const metadataWorkspace = promptFrom({
+    stream: true,
+    model: MODEL_ALIAS,
+    reasoning: { effort: REQUIRED_EFFORT },
+    client_metadata: { cwd: homedir() },
+    input: [{
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: `<environment_context><cwd>${process.cwd()}</cwd></environment_context>` }],
+    }],
+  }).workingDirectory;
+  if (metadataWorkspace !== homedir()) throw new Error("authoritative metadata workspace was not preferred");
   const directFreeContext = promptFrom({
     stream: true,
     model: DEVIN_FREE_MODEL_ALIAS,
     reasoning: { effort: REQUIRED_EFFORT },
     input: [{ type: "message", role: "user", content: "Use the direct free route." }],
+    client_metadata: { cwd: process.cwd() },
   });
   if (
     directFreeContext.requestedRoute !== "devin-free"
@@ -3049,6 +3079,7 @@ async function selfTest() {
     model: OLLAMA_MODEL_ALIAS,
     reasoning: { effort: OLLAMA_REQUIRED_EFFORT },
     input: [{ type: "message", role: "user", content: "Use the direct Ollama route." }],
+    client_metadata: { cwd: process.cwd() },
   });
   if (directOllamaContext.requestedRoute !== "ollama" || initialSelection(directOllamaContext).key !== "ollama") {
     throw new Error("direct Ollama route failed");
@@ -3078,6 +3109,7 @@ async function selfTest() {
       { type: "agent_message", id: "self-test-task", author: "Codex", recipient: "/root/self_test", content: [{ type: "input_text", text: task }] },
       { type: "agent_message", id: "self-test-checkpoint", author: "Codex", recipient: "/root/self_test", content: [{ type: "input_text", text: checkpoint }] },
     ],
+    client_metadata: { cwd: process.cwd() },
   }).prompt;
   const staleIndex = prompt.indexOf("Stale inherited instruction");
   const taskIndex = prompt.indexOf(task);
@@ -3106,12 +3138,37 @@ async function selfTest() {
         text: "Message Type: NEW_TASK\nTask name: /root/self_test\nPayload:\nInspect the bounded evidence and report only when complete.",
       }],
     }],
+    client_metadata: { cwd: process.cwd() },
   });
   if (
     !analysisPrompt.prompt.includes("[Analysis convergence contract]")
     || analysisPrompt.prompt.includes("[Immediate terminal report required]")
   ) {
     throw new Error("analysis convergence control produced a false immediate return");
+  }
+  const explicitReadOnlyAudit = promptFrom({
+    stream: true,
+    model: MODEL_ALIAS,
+    reasoning: { effort: REQUIRED_EFFORT },
+    input: [{
+      type: "agent_message",
+      id: "self-test-explicit-read-only",
+      author: "Codex",
+      recipient: "/root/self_test",
+      content: [{
+        type: "input_text",
+        text: "Message Type: NEW_TASK\nTask name: /root/self_test\nPayload:\nREAD-ONLY bounded audit. Audit whether the previous fix is correct. Do not mutate files/assets.",
+      }],
+    }],
+    client_metadata: { cwd: process.cwd() },
+  });
+  if (
+    explicitReadOnlyAudit.taskDiagnostics.taskIntent !== "analysis"
+    || explicitReadOnlyAudit.executionPolicy.permissionMode !== "auto"
+    || !explicitReadOnlyAudit.prompt.includes("[Analysis convergence contract]")
+    || explicitReadOnlyAudit.prompt.includes("[Mutation convergence contract]")
+  ) {
+    throw new Error("explicit read-only audit was misclassified as mutation");
   }
   const mutationReturnWhenDone = promptFrom({
     stream: true,
@@ -3127,6 +3184,7 @@ async function selfTest() {
         text: "Message Type: NEW_TASK\nTask name: /root/self_test\nPayload:\nImplement the bounded patch and return immediately when complete.",
       }],
     }],
+    client_metadata: { cwd: process.cwd() },
   });
   if (mutationReturnWhenDone.prompt.includes("[Immediate terminal report required]")) {
     throw new Error("mutation completion wording falsely triggered immediate return");
@@ -3139,6 +3197,7 @@ async function selfTest() {
       { type: "agent_message", id: "self-test-checkpoint-first", author: "Codex", recipient: "/root/self_test", content: [{ type: "input_text", text: checkpoint }] },
       { type: "agent_message", id: "self-test-task-last", author: "Codex", recipient: "/root/self_test", content: [{ type: "input_text", text: task }] },
     ],
+    client_metadata: { cwd: process.cwd() },
   }).prompt;
   const reversedTaskIndex = reversedPrompt.indexOf(task);
   const reversedCheckpointIndex = reversedPrompt.indexOf(checkpoint);
@@ -3170,6 +3229,7 @@ async function selfTest() {
         tools: [{ type: "function", name: "rzmcp__inspect_graph", parameters: { type: "object" } }],
       },
     ],
+    client_metadata: { cwd: process.cwd() },
   }).prompt;
   if (
     resumedPrompt.includes("BRIDGE_PROGRESS_MUST_NOT_REENTER")
@@ -3370,6 +3430,7 @@ async function selfTest() {
     stream: true,
     model: OLLAMA_MODEL_ALIAS,
     reasoning: { effort: OLLAMA_REQUIRED_EFFORT },
+    client_metadata: { cwd: process.cwd() },
     input: [
       {
         type: "agent_message",

@@ -6,6 +6,7 @@ import { isAbsolute, join } from "node:path";
 import {
   TaskStateError,
   activeTaskPromptSection,
+  isExplicitReadOnlyTask,
   taskControlPromptSections,
   taskDeliveryDiagnostics,
   taskStateFromInput,
@@ -33,7 +34,6 @@ const OPENCODE_STATE_DIRECTORY = join(
 );
 const LAZY_RZMCP_PROXY = join(import.meta.dirname, "devin-rzmcp-lazy-proxy.mjs");
 const ROLE_TAG = /<(?:external_cli|codebuddy|cursor)_route_instructions>([\s\S]*?)<\/(?:external_cli|codebuddy|cursor)_route_instructions>/gi;
-const EXPLICIT_READ_ONLY_TASK = /\bread[- ]only\b|\bno[- ]mutation\b|\bno\s+(?:edits?|modifications?|writes?|mutations?|file\s+changes|source\s+changes)\b|\b(?:do not|must not|never)\s+(?:edit|modify|write|mutate)(?:\s+(?:any|the|source|project|workspace|files?)){0,3}(?:[.;,]|$)/i;
 const VALIDATION_RESTRICTED_TASK = /\b(?:do not|must not|never)[^.\n]{0,160}\b(?:build|compile|run\s+(?:the\s+)?tests?|test|control\s+(?:the\s+)?editor|use\s+(?:the\s+)?editor|pie|sie)\b|\bno\s+(?:build|compile|tests?|editor|pie|sie)\b/i;
 const RZMCP_RESTRICTED_TASK = /\b(?:do not|must not|never)[^.\n]{0,160}\b(?:use|invoke|control|call)\s+(?:any\s+|the\s+)?(?:editor|rzmcp)\b|\bno\s+[^.\n]{0,120}\b(?:editor|rzmcp|pie|sie)\b/i;
 const MUTATION_TOOL = /^(?:apply_patch|edit|edit_file|write|write_file|create_file|delete_file|move_file|mcp__rzmcp__call_rzmcp_tool)$/i;
@@ -117,10 +117,28 @@ function inputArray(body) {
   return body.input;
 }
 
-function workingDirectoryFrom(body) {
+function environmentWorkingDirectoryFrom(input) {
+  for (let index = input.length - 1; index >= 0; index -= 1) {
+    const item = input[index];
+    if (!item || item.type !== "message") continue;
+    const content = typeof item.content === "string"
+      ? item.content
+      : Array.isArray(item.content)
+        ? item.content.map((part) => part?.text || "").join("")
+        : "";
+    const matches = [...content.matchAll(/<environment_context>[\s\S]*?<cwd>\s*([^<\r\n]+?)\s*<\/cwd>[\s\S]*?<\/environment_context>/gi)];
+    const cwd = matches.at(-1)?.[1]?.trim();
+    if (cwd && isAbsolute(cwd) && existsSync(cwd)) return cwd;
+  }
+  return null;
+}
+
+function workingDirectoryFrom(body, input) {
   const cwd = body.client_metadata?.cwd;
   if (typeof cwd === "string" && isAbsolute(cwd) && existsSync(cwd)) return cwd;
-  return process.cwd();
+  const environmentCwd = environmentWorkingDirectoryFrom(input);
+  if (environmentCwd) return environmentCwd;
+  throw new NativeCliAgentError("native CLI route received no valid authoritative working directory", 400);
 }
 
 function roleInstructionsFrom(instructions) {
@@ -141,7 +159,7 @@ function latestControlMessage(taskState) {
 
 function executionPolicy(taskState) {
   const task = taskState.activeTask?.text || "";
-  const readOnly = taskState.activeTask?.intent === "analysis" || EXPLICIT_READ_ONLY_TASK.test(task);
+  const readOnly = taskState.activeTask?.intent === "analysis" || isExplicitReadOnlyTask(task);
   return {
     readOnly,
     validationRestricted: VALIDATION_RESTRICTED_TASK.test(task),
@@ -195,7 +213,7 @@ export function nativeCliAgentContext(body, { provider, model, requiredEffort })
     model,
     requiredEffort,
     prompt,
-    workingDirectory: workingDirectoryFrom(body),
+    workingDirectory: workingDirectoryFrom(body, input),
     taskState,
     taskDiagnostics: diagnostics,
     executionPolicy: executionPolicy(taskState),
@@ -524,6 +542,53 @@ export async function runCommandCodeNativeAgent(context, { signal, onEvent }) {
 }
 
 export async function nativeCliAgentRunnerSelfTest() {
+  const authoritativeWorkspace = homedir();
+  const cwdTask = "Message Type: NEW_TASK\nTask name: /root/cwd_fixture\nPayload:\nInspect the bounded fixture and report.";
+  const cwdContext = nativeCliAgentContext({
+    model: "@preset/codex-subagents",
+    reasoning: { effort: "max" },
+    stream: true,
+    client_metadata: { cwd: authoritativeWorkspace },
+    input: [{
+      type: "agent_message",
+      id: "cwd-fixture-task",
+      author: "Codex",
+      recipient: "/root/cwd_fixture",
+      content: [{ type: "input_text", text: cwdTask }],
+    }],
+  }, {
+    provider: "fixture",
+    model: "fixture-model",
+    requiredEffort: "max",
+  });
+  if (cwdContext.workingDirectory !== authoritativeWorkspace) {
+    throw new Error("native CLI ignored the authoritative request working directory");
+  }
+  let missingCwdError = null;
+  try {
+    nativeCliAgentContext({
+      model: "@preset/codex-subagents",
+      reasoning: { effort: "max" },
+      stream: true,
+      input: [{
+        type: "agent_message",
+        id: "missing-cwd-fixture-task",
+        author: "Codex",
+        recipient: "/root/cwd_fixture",
+        content: [{ type: "input_text", text: cwdTask }],
+      }],
+    }, {
+      provider: "fixture",
+      model: "fixture-model",
+      requiredEffort: "max",
+    });
+  } catch (error) {
+    missingCwdError = error;
+  }
+  if (!missingCwdError?.message.includes("no valid authoritative working directory")) {
+    throw new Error("native CLI silently accepted a request without an authoritative working directory");
+  }
+
   const context = { provider: "fixture" };
   let incompleteError = null;
   try {

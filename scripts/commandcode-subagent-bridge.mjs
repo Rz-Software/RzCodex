@@ -299,7 +299,7 @@ function workingDirectoryFrom(body) {
   visit(body.input);
   const taggedCwd = candidates.filter((candidate) => isAbsolute(candidate) && existsSync(candidate)).at(-1);
   if (taggedCwd) return taggedCwd;
-  return process.cwd();
+  throw new BridgeError("native CLI request has no valid authoritative working directory");
 }
 
 function projectSlug(workingDirectory) {
@@ -2980,11 +2980,12 @@ function selfTest() {
       },
     ],
     stream: true,
-    client_metadata: { cwd: process.cwd() },
+    client_metadata: { cwd: homedir() },
   });
   if (
     cursorTask.prompt.split(cursorTaskPayload).length !== 2
     || cursorTask.prompt.includes("provider-opaque")
+    || cursorTask.workingDirectory !== homedir()
   ) {
     throw new Error("self-test failed: Cursor encrypted task and compaction portability");
   }
@@ -3009,7 +3010,7 @@ function selfTest() {
       taskItem(nativeTaskPayload),
     ],
     tools: [{ type: "function", name: "large_parent_schema", parameters: { type: "object", description: "z".repeat(50_000) } }],
-    client_metadata: { cwd: process.cwd() },
+    client_metadata: { cwd: homedir() },
   }, {
     provider: "commandcode",
     model: "z-ai/glm-5.3-flash",
@@ -3021,6 +3022,7 @@ function selfTest() {
     || nativeContext.prompt.includes("inherited-")
     || nativeContext.toolSchemaBytesIgnored < 50_000
     || nativeContext.taskDiagnostics.completeTaskDelivered !== true
+    || nativeContext.workingDirectory !== homedir()
   ) {
     throw new Error("self-test failed: native CLI must pin the complete task exactly once outside inherited history and parent schemas");
   }
@@ -3028,6 +3030,7 @@ function selfTest() {
     model: "commandcode/test-model",
     input: [taskItem(analysisTaskText)],
     stream: true,
+    client_metadata: { cwd: process.cwd() },
   }).upstream.params.system;
   const cursorAnalysis = cursorPromptFrom({
     model: "cursor/test-model",
@@ -3056,7 +3059,7 @@ function selfTest() {
     throw new Error("self-test failed: OpenCode lost native task state during normalization");
   }
   const immediatePrompts = [
-    translateResponsesRequest({ model: "commandcode/test-model", input: [taskItem(immediateTaskText)], stream: true }).upstream.params.system,
+    translateResponsesRequest({ model: "commandcode/test-model", input: [taskItem(immediateTaskText)], stream: true, client_metadata: { cwd: process.cwd() } }).upstream.params.system,
     cursorPromptFrom({ model: "cursor/test-model", input: [taskItem(immediateTaskText)], stream: true, client_metadata: { cwd: process.cwd() } }).prompt,
     normalizeOpenCodeRequest({ model: "opencode/muse-spark-1.2-contributor-free", input: [taskItem(immediateTaskText)], stream: true }).body.instructions,
   ];
@@ -3080,6 +3083,7 @@ function selfTest() {
     model: "commandcode/test-model",
     input: reasoningBoundaryInput,
     stream: true,
+    client_metadata: { cwd: process.cwd() },
   }).upstream.params.messages);
   const cursorReasoningBoundary = cursorPromptFrom({
     model: "cursor/test-model",
@@ -3122,6 +3126,7 @@ function selfTest() {
     model: "commandcode/test-model",
     input: [{ type: "agent_message", author: "/root", recipient: "/root/worker", content: [{ type: "input_text", text: "delegated" }] }],
     stream: true,
+    client_metadata: { cwd: process.cwd() },
   });
   if (
     commandCodeAgentMessage.upstream.params.messages[0]?.role !== "user" ||
@@ -3143,6 +3148,7 @@ function selfTest() {
         { type: "agent_message", content: [{ type: "input_text", text: "active-task" }] },
       ],
       stream: true,
+      client_metadata: { cwd: process.cwd() },
     });
     const compactedMessages = compactedCommandCode.upstream.params.messages;
     const serializedMessages = jsonString(compactedMessages);
@@ -3163,6 +3169,7 @@ function selfTest() {
       model: "commandcode/test-model",
       input: [{ type: "unknown-provider-state", value: "must-not-be-dropped" }],
       stream: true,
+      client_metadata: { cwd: process.cwd() },
     });
   } catch (error) {
     unknownCommandCodeInputRejected = error instanceof BridgeError
@@ -3183,6 +3190,7 @@ function selfTest() {
     ],
     tools: [{ type: "function", name: "echo", description: "Echo", parameters: { type: "object", properties: {} } }],
     stream: true,
+    client_metadata: { cwd: process.cwd() },
   });
   if (translated.upstream.params.messages[1]?.content[0]?.type !== "tool-call") {
     throw new Error("self-test failed: function call translation");
@@ -3215,6 +3223,7 @@ function selfTest() {
       tools: [{ type: "function", name: "recursive_tool", description: "recursive", parameters: recursive }],
     }],
     stream: true,
+    client_metadata: { cwd: process.cwd() },
   });
   const namespacedTool = namespaced.upstream.params.tools[0];
   if (namespacedTool.name.length > 64 || jsonString(namespacedTool.input_schema).includes('"$ref"')) {

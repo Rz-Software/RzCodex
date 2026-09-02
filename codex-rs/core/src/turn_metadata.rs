@@ -412,6 +412,10 @@ impl TurnMetadataState {
             extra.remove(key);
         }
         let mut metadata = CodexResponsesMetadata {
+            cwd: self
+                .subagent_header
+                .as_ref()
+                .map(|_| self.cwd.as_path().display().to_string()),
             turn_id: Some(self.turn_id.clone()),
             agent_name: Some(self.agent_name.clone()),
             forked_from_thread_id: self.forked_from_thread_id,
