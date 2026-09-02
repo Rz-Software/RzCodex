@@ -18,6 +18,7 @@ const MAX_ACTIVE_TASK_CHARS = 40_000;
 const OLLAMA_CLOUD_CONTEXT_WINDOW = 1_048_576;
 const REQUEST_TIMEOUT_MS = 30 * 60 * 1000;
 const ROUTE_OWNERSHIP_TIMEOUT_MS = 55 * 1000;
+const TERMINAL_RECOVERY_TIMEOUT_MS = 45 * 1000;
 const STDERR_LIMIT = 16 * 1024;
 const STATE_CLEANUP_RETRY_MS = 50;
 const STATE_CLEANUP_RELEASE_MS = 2 * 1000;
@@ -190,7 +191,8 @@ export function nativeCliAgentContext(body, { provider, model, requiredEffort })
     throw new NativeCliAgentError(`${provider} native CLI route received no active NEW_TASK payload`, 400);
   }
   const sections = [
-    "[Single native-agent execution contract]\nComplete this delegated task in this one CLI execution. Use your own local file, search, edit, and shell tools directly. Never delegate to another agent, task, teammate, swarm, or background worker. Do not return an intention, a deferred tool request, or a request for the parent to execute an ordinary file/shell operation. Return only when the bounded task is complete or a concrete blocker requires parent input. Honor the project AGENTS.md in the working directory. Builds, tests, editor control, PIE/SIE, runtime validation, and final integration remain owned by the parent whenever the task or project instructions reserve them.",
+    "[Single native-agent turn contract]\nComplete this delegated task within this one Codex subagent turn. Use your own local file, search, edit, and shell tools directly. Never delegate to another agent, task, teammate, swarm, or background worker. Do not return an intention, a deferred tool request, or a request for the parent to execute an ordinary file/shell operation. Return only when the bounded task is complete or a concrete blocker requires parent input. Honor the project AGENTS.md in the working directory. Builds, tests, editor control, PIE/SIE, runtime validation, and final integration remain owned by the parent whenever the task or project instructions reserve them.",
+    "[Native tool boundary]\nThe host shell is PowerShell on Windows. Never read, grep, decode, strings-scan, hex-dump, or otherwise inspect Unreal .uasset or .umap bytes through file or shell tools. Use the lazy RzMCP semantic tools when the task authorizes asset access. If those tools are disabled, unavailable, or semantically insufficient, return that concrete blocker; do not approximate asset semantics from binary bytes or repeat equivalent offset/chunk probes. Never read secret environment files.",
   ];
   const role = roleInstructionsFrom(body.instructions);
   if (role) sections.push(`[Role instructions]\n${role}`);
@@ -272,8 +274,7 @@ function nativeProcess({
       clearInterval(routeOwnershipTimer);
       signal?.removeEventListener("abort", abort);
       if (error) {
-        error.nativeToolNames = [...(state.toolNames || [])];
-        error.providerMutationCount = Number(state.mutationCount || 0);
+        attachNativeState(error, state);
       }
       error ? reject(error) : resolve(value);
     };
@@ -339,6 +340,110 @@ function validateResult(context, result) {
   return result;
 }
 
+function openCodeResult(context, state, model) {
+  return {
+    finalText: state.finalText || "",
+    toolNames: state.toolNames || [],
+    mutationCount: state.mutationCount || 0,
+    inputTokens: state.inputTokens || 0,
+    outputTokens: state.outputTokens || 0,
+    peakTurnInputTokens: state.peakTurnInputTokens || 0,
+    lastTextSequence: state.lastTextSequence || 0,
+    lastToolSequence: state.lastToolSequence || 0,
+    model,
+  };
+}
+
+function attachNativeState(error, state) {
+  const nativeState = state || {};
+  error.nativeToolNames = [...(nativeState.toolNames || error.nativeToolNames || [])];
+  error.providerMutationCount = Number(
+    nativeState.mutationCount ?? error.providerMutationCount ?? 0,
+  );
+  Object.defineProperty(error, "nativeState", {
+    value: nativeState,
+    configurable: true,
+  });
+  return error;
+}
+
+function terminalRecoveryPrompt(context, primary) {
+  return [
+    "[Native CLI terminal-message recovery]",
+    "The retained provider session ended immediately after completed native tool work without a terminal assistant response.",
+    "Continue this same bounded task in the same session. Do not restart the investigation, repeat completed tool calls, or delegate.",
+    "Return only when the task is complete or a concrete blocker requires parent input.",
+    `Task hash: ${context.taskDiagnostics.taskHash}`,
+    `Completed native tool calls before recovery: ${primary.toolNames.length}`,
+    `Observed mutation calls before recovery: ${primary.mutationCount}`,
+    referencedPriorTaskPromptSection(context.taskState),
+    activeTaskPromptSection(context.taskState),
+  ].join("\n");
+}
+
+function mergeRecoveredResult(primary, recovered) {
+  return {
+    ...recovered,
+    toolNames: [...primary.toolNames, ...recovered.toolNames],
+    mutationCount: primary.mutationCount + recovered.mutationCount,
+    inputTokens: primary.inputTokens + recovered.inputTokens,
+    outputTokens: primary.outputTokens + recovered.outputTokens,
+    peakTurnInputTokens: Math.max(primary.peakTurnInputTokens, recovered.peakTurnInputTokens),
+    executionCount: 2,
+    sameSessionContinuations: 1,
+  };
+}
+
+async function completeOpenCodeTurn(context, model, runInitial, runContinuation, onRecovery) {
+  let primary;
+  let initialFailure = null;
+  try {
+    const state = await runInitial();
+    primary = openCodeResult(context, state, model);
+    try {
+      return {
+        ...validateResult(context, primary),
+        executionCount: 1,
+        sameSessionContinuations: 0,
+      };
+    } catch (error) {
+      initialFailure = attachNativeState(error, state);
+    }
+  } catch (error) {
+    initialFailure = error;
+    primary = openCodeResult(context, error.nativeState || {
+      toolNames: error.nativeToolNames || [],
+      mutationCount: error.providerMutationCount || 0,
+    }, model);
+  }
+  if (initialFailure?.status === 499 || primary.toolNames.length === 0) throw initialFailure;
+  onRecovery?.({
+    toolCalls: primary.toolNames.length,
+    mutationCount: primary.mutationCount,
+  });
+  try {
+    const recoveryState = await runContinuation(terminalRecoveryPrompt(context, primary));
+    let recovered;
+    try {
+      recovered = validateResult(context, openCodeResult(context, recoveryState, model));
+    } catch (error) {
+      throw attachNativeState(error, recoveryState);
+    }
+    return mergeRecoveredResult(primary, recovered);
+  } catch (error) {
+    const recoveryState = error.nativeState || {
+      toolNames: error.nativeToolNames || [],
+      mutationCount: error.providerMutationCount || 0,
+    };
+    const combined = mergeRecoveredResult(primary, openCodeResult(context, recoveryState, model));
+    const failure = new NativeCliAgentError(
+      `${context.provider} CLI remained non-terminal after one same-session continuation: ${error.message}`,
+      error.status || 502,
+    );
+    throw attachNativeState(failure, combined);
+  }
+}
+
 function openCodeConfig(context, providerKind) {
   const rzMcpEnabled = context.executionPolicy.rzMcpMode !== "disabled";
   const config = {
@@ -350,6 +455,25 @@ function openCodeConfig(context, providerKind) {
     skills: { paths: [] },
     permission: {
       "*": "allow",
+      read: {
+        "*": "allow",
+        "*.env": "deny",
+        "*.env.*": "deny",
+        "*.env.example": "allow",
+        "*.uasset": "deny",
+        "**/*.uasset": "deny",
+        "*.umap": "deny",
+        "**/*.umap": "deny",
+      },
+      bash: {
+        "*": "allow",
+        "*.env*": "deny",
+        "*.env.example*": "allow",
+        "*.uasset*": "deny",
+        "*.umap*": "deny",
+        "*ReadAllBytes*": "deny",
+        "*Format-Hex*": "deny",
+      },
       task: "deny",
       question: "deny",
       webfetch: "deny",
@@ -411,7 +535,25 @@ function openCodeParser(event, state) {
   }
 }
 
-export async function runOpenCodeNativeAgent(context, { providerKind, signal, onEvent }) {
+function openCodeRunArgs(context, providerKind, prompt, continueSession = false) {
+  const args = ["run", "--pure", "--auto", "--format", "json"];
+  if (continueSession) args.push("--continue");
+  else args.push("--title", "RzCodex native subagent");
+  args.push(
+    "--model", `${providerKind}/${context.model}`,
+    "--variant", context.requiredEffort,
+    "--dir", context.workingDirectory,
+    prompt,
+  );
+  return args;
+}
+
+export async function runOpenCodeNativeAgent(context, {
+  providerKind,
+  signal,
+  onEvent,
+  onRecovery,
+}) {
   if (!existsSync(OPENCODE_EXE)) throw new NativeCliAgentError(`OpenCode CLI is missing at ${OPENCODE_EXE}`);
   if (!existsSync(LAZY_RZMCP_PROXY)) throw new NativeCliAgentError(`Lazy RzMCP proxy is missing at ${LAZY_RZMCP_PROXY}`);
   mkdirSync(OPENCODE_STATE_DIRECTORY, { recursive: true });
@@ -434,34 +576,29 @@ export async function runOpenCodeNativeAgent(context, { providerKind, signal, on
     OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER: "1",
   };
   const model = `${providerKind}/${context.model}`;
-  const args = [
-    "run", "--pure", "--auto", "--format", "json",
-    "--title", "RzCodex native subagent",
-    "--model", model, "--variant", context.requiredEffort,
-    "--dir", context.workingDirectory, context.prompt,
-  ];
-  try {
+  const run = async (prompt, continueSession, timeoutMs = REQUEST_TIMEOUT_MS) => {
     const { state } = await nativeProcess({
       command: OPENCODE_EXE,
-      args,
+      args: openCodeRunArgs(context, providerKind, prompt, continueSession),
       cwd: context.workingDirectory,
       env,
       signal,
       onEvent,
       parseLine: openCodeParser,
       label: `${context.provider} native OpenCode agent`,
+      requestTimeoutMs: timeoutMs,
+      routeOwnershipTimeoutMs: Math.min(ROUTE_OWNERSHIP_TIMEOUT_MS, timeoutMs),
     });
-    return validateResult(context, {
-      finalText: state.finalText || "",
-      toolNames: state.toolNames || [],
-      mutationCount: state.mutationCount || 0,
-      inputTokens: state.inputTokens || 0,
-      outputTokens: state.outputTokens || 0,
-      peakTurnInputTokens: state.peakTurnInputTokens || 0,
-      lastTextSequence: state.lastTextSequence || 0,
-      lastToolSequence: state.lastToolSequence || 0,
+    return state;
+  };
+  try {
+    return await completeOpenCodeTurn(
+      context,
       model,
-    });
+      () => run(context.prompt, false),
+      (prompt) => run(prompt, true, TERMINAL_RECOVERY_TIMEOUT_MS),
+      onRecovery,
+    );
   } finally {
     // OpenCode can close before its SQLite handles are released on Windows. Cleanup is not part of
     // provider task correctness: retry the release window, retain a named artifact if it remains
@@ -527,17 +664,21 @@ export async function runCommandCodeNativeAgent(context, { signal, onEvent }) {
     parseLine: commandCodeParser,
     label: `${context.provider} native CommandCode agent`,
   });
-  return validateResult(context, {
-    finalText: state.finalText || "",
-    toolNames: state.toolNames || [],
-    mutationCount: state.mutationCount || 0,
-    inputTokens: state.inputTokens || 0,
-    outputTokens: state.outputTokens || 0,
-    peakTurnInputTokens: state.peakTurnInputTokens || 0,
-    lastTextSequence: state.lastTextSequence || 0,
-    lastToolSequence: state.lastToolSequence || 0,
-    model: context.model,
-  });
+  return {
+    ...validateResult(context, {
+      finalText: state.finalText || "",
+      toolNames: state.toolNames || [],
+      mutationCount: state.mutationCount || 0,
+      inputTokens: state.inputTokens || 0,
+      outputTokens: state.outputTokens || 0,
+      peakTurnInputTokens: state.peakTurnInputTokens || 0,
+      lastTextSequence: state.lastTextSequence || 0,
+      lastToolSequence: state.lastToolSequence || 0,
+      model: context.model,
+    }),
+    executionCount: 1,
+    sameSessionContinuations: 0,
+  };
 }
 
 export async function nativeCliAgentRunnerSelfTest() {
@@ -551,6 +692,23 @@ export async function nativeCliAgentRunnerSelfTest() {
       !== OLLAMA_CLOUD_CONTEXT_WINDOW
   ) {
     throw new Error("Ollama cloud model context window was truncated by the OpenCode adapter");
+  }
+  const readPermissionEntries = Object.entries(ollamaConfigFixture.permission?.read || {});
+  const bashPermissionEntries = Object.entries(ollamaConfigFixture.permission?.bash || {});
+  if (
+    readPermissionEntries[0]?.[0] !== "*"
+    || ollamaConfigFixture.permission?.read?.["*.uasset"] !== "deny"
+    || ollamaConfigFixture.permission?.read?.["**/*.uasset"] !== "deny"
+    || ollamaConfigFixture.permission?.read?.["*.umap"] !== "deny"
+    || ollamaConfigFixture.permission?.read?.["**/*.umap"] !== "deny"
+    || bashPermissionEntries[0]?.[0] !== "*"
+    || ollamaConfigFixture.permission?.bash?.["*.uasset*"] !== "deny"
+    || ollamaConfigFixture.permission?.bash?.["*.umap*"] !== "deny"
+    || ollamaConfigFixture.permission?.bash?.["*ReadAllBytes*"] !== "deny"
+    || ollamaConfigFixture.permission?.bash?.["*Format-Hex*"] !== "deny"
+    || ollamaConfigFixture.permission?.doom_loop !== "deny"
+  ) {
+    throw new Error("native OpenCode Unreal binary/tool-loop boundary was not enforced");
   }
   const cwdTask = "Message Type: NEW_TASK\nTask name: /root/cwd_fixture\nPayload:\nInspect the bounded fixture and report.";
   const cwdContext = nativeCliAgentContext({
@@ -572,6 +730,13 @@ export async function nativeCliAgentRunnerSelfTest() {
   });
   if (cwdContext.workingDirectory !== authoritativeWorkspace) {
     throw new Error("native CLI ignored the authoritative request working directory");
+  }
+  if (
+    !cwdContext.prompt.includes("[Native tool boundary]")
+    || !cwdContext.prompt.includes("Never read, grep, decode, strings-scan, hex-dump")
+    || !cwdContext.prompt.includes("Use the lazy RzMCP semantic tools")
+  ) {
+    throw new Error("native CLI prompt omitted the Unreal semantic-tool boundary");
   }
   const policyContext = (payload) => nativeCliAgentContext({
     model: "@preset/codex-subagents",
@@ -734,6 +899,99 @@ export async function nativeCliAgentRunnerSelfTest() {
     lastToolSequence: 2,
   });
   if (completed.finalText !== "Work complete.") throw new Error("native CLI terminal tool turn detection failed");
+
+  let recoveryPrompt = "";
+  let recoveryNotices = 0;
+  const recovered = await completeOpenCodeTurn(
+    resumedMutationContext,
+    "ollama/glm-5.3-flash:cloud",
+    async () => ({
+      finalText: "I'll inspect the file now.",
+      toolNames: ["read"],
+      mutationCount: 0,
+      inputTokens: 100,
+      outputTokens: 10,
+      peakTurnInputTokens: 100,
+      lastTextSequence: 1,
+      lastToolSequence: 2,
+    }),
+    async (prompt) => {
+      recoveryPrompt = prompt;
+      return {
+        finalText: "Work complete.",
+        toolNames: ["edit"],
+        mutationCount: 1,
+        inputTokens: 120,
+        outputTokens: 20,
+        peakTurnInputTokens: 120,
+        lastTextSequence: 2,
+        lastToolSequence: 1,
+      };
+    },
+    () => { recoveryNotices += 1; },
+  );
+  if (
+    recovered.finalText !== "Work complete."
+    || recovered.toolNames.join(",") !== "read,edit"
+    || recovered.mutationCount !== 1
+    || recovered.inputTokens !== 220
+    || recovered.outputTokens !== 30
+    || recovered.peakTurnInputTokens !== 120
+    || recovered.executionCount !== 2
+    || recovered.sameSessionContinuations !== 1
+    || recoveryNotices !== 1
+    || !recoveryPrompt.includes("[Native CLI terminal-message recovery]")
+    || recoveryPrompt.split(mutationOriginText).length - 1 !== 1
+    || recoveryPrompt.split(mutationResumeText).length - 1 !== 1
+  ) {
+    throw new Error("native OpenCode same-session terminal recovery failed");
+  }
+  const initialArgs = openCodeRunArgs(resumedMutationContext, "ollama", resumedMutationContext.prompt);
+  const recoveryArgs = openCodeRunArgs(resumedMutationContext, "ollama", recoveryPrompt, true);
+  if (
+    initialArgs.includes("--continue")
+    || !initialArgs.includes("--title")
+    || !recoveryArgs.includes("--continue")
+    || recoveryArgs.includes("--title")
+  ) {
+    throw new Error("native OpenCode continuation did not retain the isolated provider session");
+  }
+
+  let recoveryFailure = null;
+  try {
+    await completeOpenCodeTurn(
+      resumedMutationContext,
+      "ollama/glm-5.3-flash:cloud",
+      async () => ({
+        finalText: "Starting.",
+        toolNames: ["read"],
+        mutationCount: 0,
+        lastTextSequence: 1,
+        lastToolSequence: 2,
+      }),
+      async () => {
+        throw attachNativeState(new NativeCliAgentError("stream interrupted"), {
+          toolNames: ["edit"],
+          mutationCount: 1,
+          inputTokens: 75,
+          outputTokens: 8,
+          peakTurnInputTokens: 75,
+        });
+      },
+    );
+  } catch (error) {
+    recoveryFailure = error;
+  }
+  if (
+    !recoveryFailure?.message.includes("after one same-session continuation")
+    || recoveryFailure.nativeToolNames.join(",") !== "read,edit"
+    || recoveryFailure.providerMutationCount !== 1
+    || recoveryFailure.nativeState?.inputTokens !== 75
+    || recoveryFailure.nativeState?.outputTokens !== 8
+    || recoveryFailure.nativeState?.peakTurnInputTokens !== 75
+  ) {
+    throw new Error("native OpenCode exhausted recovery lost committed tool evidence");
+  }
 
   const fixtureParser = (event, state) => {
     state.toolNames ||= [];

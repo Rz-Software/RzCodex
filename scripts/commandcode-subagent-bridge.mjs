@@ -2859,7 +2859,12 @@ async function handleNativeCliResponses(request, response, provider) {
   try {
     const result = commandCode
       ? await runCommandCodeNativeAgent(context, { signal: abortController.signal, onEvent })
-      : await runOpenCodeNativeAgent(context, { providerKind: "opencode", signal: abortController.signal, onEvent });
+      : await runOpenCodeNativeAgent(context, {
+          providerKind: "opencode",
+          signal: abortController.signal,
+          onEvent,
+          onRecovery: () => progress.emit("opencode resumed the same retained native session after a missing terminal response.\n"),
+        });
     if (clientGone) return;
     const output = [];
     const progressItem = progress.finish();
@@ -2909,7 +2914,9 @@ async function handleNativeCliResponses(request, response, provider) {
           actual_provider: provider,
           actual_model: result.model,
           actual_reasoning_effort: requiredEffort,
-          native_cli_single_execution: true,
+          native_cli_single_execution: result.executionCount === 1,
+          native_cli_execution_count: result.executionCount,
+          native_cli_same_session_continuations: result.sameSessionContinuations,
           native_tool_names: result.toolNames,
           native_tool_count: result.toolNames.length,
           provider_mutation_count: result.mutationCount,

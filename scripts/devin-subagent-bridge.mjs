@@ -429,7 +429,8 @@ const runtime = {
   activeFreeRequests: 0, queuedFreeRequests: 0,
   activeOllamaRequests: 0, queuedOllamaRequests: 0,
   supersededTurns: 0,
-  resourceRetries: 0, providerContinuations: 0, streamContinuations: 0, compactionCheckpoints: 0,
+  resourceRetries: 0, providerContinuations: 0, nativeTerminalContinuations: 0,
+  streamContinuations: 0, compactionCheckpoints: 0,
   providerCheckpoints: 0,
   permissionCheckpoints: 0, activeResourceBackoffs: 0,
   lastResourceModel: null, lastResourceRetryAttempt: 0,
@@ -1937,6 +1938,11 @@ async function runOllamaStage(
           if (key) announcedTools.add(key);
           onProgress?.(`Ollama native tool ${announcedTools.size}: ${progressToolName(event.part.tool)}.\n`);
         },
+        onRecovery: () => {
+          runtime.providerContinuations += 1;
+          runtime.nativeTerminalContinuations += 1;
+          onProgress?.("Ollama native CLI resumed the same retained session after a missing terminal response.\n");
+        },
       });
       const providerMetadata = {
         actual_provider: "ollama",
@@ -1944,7 +1950,9 @@ async function runOllamaStage(
         actual_model_label: route.ollamaLabel,
         actual_reasoning_effort: route.ollamaEffort,
         auth_source: OLLAMA_AUTH_SOURCE,
-        native_cli_single_execution: true,
+        native_cli_single_execution: nativeResult.executionCount === 1,
+        native_cli_execution_count: nativeResult.executionCount,
+        native_cli_same_session_continuations: nativeResult.sameSessionContinuations,
         native_tool_names: nativeResult.toolNames,
         provider_mutation_count: nativeResult.mutationCount,
         peak_turn_context_tokens: nativeResult.peakTurnInputTokens,
