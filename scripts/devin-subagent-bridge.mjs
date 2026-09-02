@@ -2678,7 +2678,7 @@ function health(requestedRoute = "auto") {
         authSource: OLLAMA_AUTH_SOURCE,
         endpoint: "OpenCode CLI -> authenticated local Ollama service",
         maxConcurrency: route.ollamaMaxConcurrency,
-        toolServing: "Provider-native file/shell tools plus two-tool lazy RzMCP proxy in one CLI execution",
+        toolServing: "Provider-native file/shell tools plus two-tool lazy RzMCP proxy in one retained CLI session per Codex turn",
       },
       terminalFallback: {
         provider: "devin",
@@ -2693,7 +2693,7 @@ function health(requestedRoute = "auto") {
         effort: CODEBUDDY_REQUIRED_EFFORT,
         authSource: CODEBUDDY_REQUIRED_AUTH_SOURCE,
         endpoint: CODEBUDDY_BRIDGE_ENDPOINT,
-        toolServing: "Provider-native file/shell tools plus two-tool lazy RzMCP proxy in one CLI execution",
+        toolServing: "Provider-native file/shell tools plus two-tool lazy RzMCP proxy in one retained CLI session per Codex turn",
       },
       nativeFallback: {
         route: route.nativeFallbackRoute,
