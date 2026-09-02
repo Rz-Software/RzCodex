@@ -1265,14 +1265,26 @@ function terminalAssistantFromRows(conversationRows) {
   let lastToolNodeId = -1;
   let terminalNodeId = -1;
   let terminalText = null;
+  let awaitingCompactionSummary = false;
   for (const row of conversationRows) {
     const message = typeof row.chat_message === "string" ? JSON.parse(row.chat_message) : row.chat_message;
+    if (message.role === "user") {
+      const content = typeof message.content === "string" ? message.content.trimStart() : "";
+      awaitingCompactionSummary = content.startsWith("Conversation to summarize:")
+        || content.startsWith("Now summarize the conversation above");
+      continue;
+    }
     if (message.role === "tool") {
       lastToolNodeId = Math.max(lastToolNodeId, Number(row.node_id));
       continue;
     }
     const content = typeof message.content === "string" ? message.content.trim() : "";
     const assistantToolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
+    if (awaitingCompactionSummary && content && assistantToolCalls.length === 0) {
+      awaitingCompactionSummary = false;
+      continue;
+    }
+    awaitingCompactionSummary = false;
     if (content && assistantToolCalls.length === 0 && Number(row.node_id) > lastToolNodeId) {
       terminalNodeId = Number(row.node_id);
       terminalText = content;
@@ -1318,7 +1330,7 @@ function inspectSession(requestId) {
       SELECT node_id, chat_message
       FROM message_nodes
       WHERE session_id = ?
-        AND json_extract(chat_message, '$.role') IN ('assistant', 'tool')
+        AND json_extract(chat_message, '$.role') IN ('assistant', 'tool', 'user')
       ORDER BY node_id
     `).all(session.id);
     const terminal = terminalAssistantFromRows(conversationRows);
@@ -3126,11 +3138,25 @@ async function selfTest() {
     { node_id: 2, chat_message: { role: "tool", content: "file contents" } },
     { node_id: 3, chat_message: { role: "assistant", content: "Review complete.", tool_calls: [] } },
   ]);
+  const compactedTopology = terminalAssistantFromRows([
+    { node_id: 1, chat_message: { role: "assistant", content: "Working.", tool_calls: [{ name: "read" }] } },
+    { node_id: 2, chat_message: { role: "tool", content: "file contents" } },
+    { node_id: 3, chat_message: { role: "user", content: "Conversation to summarize:\nprior work" } },
+    { node_id: 4, chat_message: { role: "assistant", content: "## Request and Intent\nCompaction summary.", tool_calls: [] } },
+  ]);
+  const completedAfterCompactionTopology = terminalAssistantFromRows([
+    { node_id: 1, chat_message: { role: "user", content: "Now summarize the conversation above" } },
+    { node_id: 2, chat_message: { role: "assistant", content: "Compaction summary.", tool_calls: [] } },
+    { node_id: 3, chat_message: { role: "user", content: "Continue the retained task." } },
+    { node_id: 4, chat_message: { role: "assistant", content: "Actual final report.", tool_calls: [] } },
+  ]);
   if (
     incompleteTopology.terminalText !== null
     || incompleteTopology.lastToolNodeId !== 2
     || completedTopology.terminalText !== "Review complete."
     || completedTopology.terminalNodeId !== 3
+    || compactedTopology.terminalText !== null
+    || completedAfterCompactionTopology.terminalText !== "Actual final report."
   ) {
     throw new Error("Devin terminal assistant topology detection failed");
   }
