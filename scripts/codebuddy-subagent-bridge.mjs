@@ -1248,6 +1248,14 @@ function responseMessageItem(id, text, status = "in_progress") {
   return { type: "message", id, status, role: "assistant", content: [{ type: "output_text", text, annotations: [] }] };
 }
 
+function codexToolServingMetadata(lazyRzMcpProxyTools) {
+  return {
+    codex_tool_schema_bytes_forwarded: 0,
+    codex_client_tool_schema_bytes_forwarded: 0,
+    lazy_rzmcp_proxy_tools: lazyRzMcpProxyTools,
+  };
+}
+
 function usageFrom(result) {
   const usage = result.usage || {};
   const inputTokens = Number.isInteger(usage.input_tokens) ? usage.input_tokens : 0;
@@ -1592,8 +1600,7 @@ async function handleResponses(request, response) {
           native_tool_count: result.nativeToolNames.length,
           provider_mutation_count: result.mutationCount,
           provider_changed_paths: result.nativeChangedPaths,
-          codex_client_tool_schema_bytes_forwarded: 0,
-          lazy_rzmcp_proxy_tools: context.executionPolicy.rzMcpMode === "disabled" ? 0 : 2,
+          ...codexToolServingMetadata(context.executionPolicy.rzMcpMode === "disabled" ? 0 : 2),
           active_task_id: context.taskDiagnostics.taskId,
           active_task_name: context.taskDiagnostics.taskName,
           active_task_hash: context.taskDiagnostics.taskHash,
@@ -1651,6 +1658,14 @@ async function handleResponses(request, response) {
 }
 
 function selfTest() {
+  const toolServingMetadata = codexToolServingMetadata(2);
+  if (
+    toolServingMetadata.codex_tool_schema_bytes_forwarded !== 0
+    || toolServingMetadata.codex_client_tool_schema_bytes_forwarded !== 0
+    || toolServingMetadata.lazy_rzmcp_proxy_tools !== 2
+  ) {
+    throw new Error("self-test failed: CodeBuddy completion metadata is incompatible with routed lazy tool validation");
+  }
   if (
     providerResponseErrorCode({ nativeToolNames: ["Read"] }) !== "provider_state_changed"
     || providerResponseErrorCode({ nativeToolNames: [] }) !== "external_provider_error"
