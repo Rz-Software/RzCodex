@@ -18,6 +18,7 @@ import {
   rzMcpModeForTask,
   taskControlPromptSections,
   taskDeliveryDiagnostics,
+  taskOwnershipHash,
   taskStateFromInput,
 } from "./codebuddy-subagent-task-state.mjs";
 import {
@@ -471,9 +472,14 @@ const quotaTaskPins = new ActiveTaskRoutePins();
 const providerTaskPins = new ActiveTaskProviderPins();
 const retainedDevinSessions = new Map();
 
+function ownershipTaskHash(context) {
+  return taskOwnershipHash(context.taskState) ?? context.taskDiagnostics?.taskHash ?? null;
+}
+
 function retainedDevinSessionKey(context, selectedModel) {
-  if (!context.threadId || !context.taskDiagnostics?.taskHash || !selectedModel?.model_uid) return null;
-  return `${context.threadId}:${context.taskDiagnostics.taskHash}:${selectedModel.model_uid}`;
+  const taskHash = ownershipTaskHash(context);
+  if (!context.threadId || !taskHash || !selectedModel?.model_uid) return null;
+  return `${context.threadId}:${taskHash}:${selectedModel.model_uid}`;
 }
 
 function syncRouteCapacityRuntime() {
@@ -914,7 +920,7 @@ function chooseDevinStage(context, quotaState = calendarQuotaState, taskPins = q
   runtime.lastQuotaPinCreated = false;
   runtime.lastQuotaProbeSkipped = taskPins.has(
     context.threadId,
-    context.taskDiagnostics.taskHash,
+    ownershipTaskHash(context),
   );
   runtime.lastQuotaSkipScope = runtime.lastQuotaProbeSkipped ? "active_task" : null;
   if (runtime.lastQuotaProbeSkipped) {
@@ -1791,7 +1797,7 @@ function responsesResult(completion, selected, fallbackState, transport) {
   };
 }
 
-function finalizeDevinResult(context, selected, routeResult, fallbackState) {
+function finalizeDevinResult(context, selected, routeResult, fallbackState, preserveSession = false) {
   const { cliResult, session } = routeResult;
   if (!session) {
     if (cliResult.code !== 0 || !cliResult.stdout) {
@@ -1799,6 +1805,7 @@ function finalizeDevinResult(context, selected, routeResult, fallbackState) {
     }
     throw new BridgeError("Devin completed without a traceable ephemeral session", 502);
   }
+  let validated = false;
   try {
     if (cliResult.code !== 0 || !cliResult.stdout) {
       throw new BridgeError(`Devin failed: ${cliResult.stderr || cliResult.stdout || `exit ${cliResult.code}`}`, 502);
@@ -1828,7 +1835,7 @@ function finalizeDevinResult(context, selected, routeResult, fallbackState) {
     const rzMcpTools = toolCalls
       .filter((call) => call.name === "mcp_call_tool" && call.arguments?.tool_name === "call_rzmcp_tool")
       .map((call) => call.arguments?.arguments?.name).filter((name) => typeof name === "string");
-    return {
+    const result = {
       text: session.terminalText, selected, providerMetadata: {},
       quotaFallback: fallbackState.quotaFallback,
       terminalFallback: fallbackState.terminalFallback,
@@ -1840,10 +1847,12 @@ function finalizeDevinResult(context, selected, routeResult, fallbackState) {
       toolSchemaBytesIgnored: fallbackState.toolSchemaBytesIgnored,
       toolSchemaBytesForwarded: 0,
     };
+    validated = true;
+    return result;
   } catch (error) {
     throw preserveProviderCommit(error, session);
   } finally {
-    removeSession(session.id);
+    if (!preserveSession || !validated) removeSession(session.id);
   }
 }
 
@@ -1867,7 +1876,7 @@ async function runAntigravityStage(context, requestBody, failures, onProgress, s
   runtime.providerAttempts.antigravity += 1;
   runtime.lastProviderSequence.push("antigravity");
   if (context.requestedRoute === "auto") {
-    providerTaskPins.pin(context.threadId, context.taskDiagnostics.taskHash, "antigravity");
+    providerTaskPins.pin(context.threadId, ownershipTaskHash(context), "antigravity");
   }
   onProgress?.("Automatic route started Antigravity Claude/Gemini pool selection.\n");
   try {
@@ -1908,7 +1917,7 @@ async function runAntigravityStage(context, requestBody, failures, onProgress, s
   } catch (error) {
     if (streamRelay.providerWorkCommitted) error.routeCommitted = true;
     if (context.requestedRoute === "auto" && error?.routeCommitted !== true) {
-      providerTaskPins.release(context.threadId, context.taskDiagnostics.taskHash);
+      providerTaskPins.release(context.threadId, ownershipTaskHash(context));
     }
     throw error;
   }
@@ -1918,7 +1927,7 @@ async function runCodeBuddyStage(context, requestBody, failures, onProgress, sig
   runtime.providerAttempts.codebuddy += 1;
   runtime.lastProviderSequence.push("codebuddy");
   if (context.requestedRoute === "auto") {
-    providerTaskPins.pin(context.threadId, context.taskDiagnostics.taskHash, "codebuddy");
+    providerTaskPins.pin(context.threadId, ownershipTaskHash(context), "codebuddy");
   }
   onProgress?.("Automatic route started one self-contained CodeBuddy native CLI execution.\n");
   try {
@@ -1961,7 +1970,7 @@ async function runCodeBuddyStage(context, requestBody, failures, onProgress, sig
   } catch (error) {
     if (streamRelay.providerWorkCommitted) error.routeCommitted = true;
     if (context.requestedRoute === "auto" && error?.routeCommitted !== true) {
-      providerTaskPins.release(context.threadId, context.taskDiagnostics.taskHash);
+      providerTaskPins.release(context.threadId, ownershipTaskHash(context));
     }
     throw error;
   }
@@ -1984,7 +1993,7 @@ async function runOllamaStage(
       runtime.providerAttempts.ollama += 1;
       runtime.lastProviderSequence.push("ollama");
       if (context.requestedRoute === "auto") {
-        providerTaskPins.pin(context.threadId, context.taskDiagnostics.taskHash, "ollama");
+        providerTaskPins.pin(context.threadId, ownershipTaskHash(context), "ollama");
       }
       onProgress?.("Ollama native CLI agent started one self-contained execution.\n");
       let nativeContext;
@@ -2063,7 +2072,7 @@ async function runOllamaStage(
       || (Array.isArray(error?.nativeToolNames) && error.nativeToolNames.length > 0)
     ) error.routeCommitted = true;
     if (context.requestedRoute === "auto" && error?.routeCommitted !== true) {
-      providerTaskPins.release(context.threadId, context.taskDiagnostics.taskHash);
+      providerTaskPins.release(context.threadId, ownershipTaskHash(context));
     }
     throw error;
   }
@@ -2083,7 +2092,7 @@ async function runDevinStage(
   const providerKey = freeModel ? "devinFree" : "devin";
   const stage = terminalFallback ? "devin-free" : "devin";
   if (context.requestedRoute === "auto") {
-    providerTaskPins.pin(context.threadId, context.taskDiagnostics.taskHash, stage);
+    providerTaskPins.pin(context.threadId, ownershipTaskHash(context), stage);
   }
   const retainedSessionKey = retainedDevinSessionKey(context, selected.model);
   const retainedSession = retainedSessionKey
@@ -2115,13 +2124,13 @@ async function runDevinStage(
   } catch (error) {
     if (retainedSessionKey && error?.retainedProviderSession) {
       retainedDevinSessions.set(retainedSessionKey, error.retainedProviderSession);
-      if (providerTaskPins.pin(context.threadId, context.taskDiagnostics.taskHash, stage)) {
+      if (providerTaskPins.pin(context.threadId, ownershipTaskHash(context), stage)) {
         runtime.providerTaskPinsCreated += 1;
       }
       runtime.lastPinnedProviderStage = stage;
     }
     if (context.requestedRoute === "auto" && error?.routeCommitted !== true) {
-      providerTaskPins.release(context.threadId, context.taskDiagnostics.taskHash);
+      providerTaskPins.release(context.threadId, ownershipTaskHash(context));
     }
     error.failedStage ||= terminalFallback ? "devin-free" : "devin";
     throw error;
@@ -2139,7 +2148,7 @@ async function runDevinStage(
     if (calendarQuotaState.record(routeResult.cliResult)) runtime.calendarQuotaActivations += 1;
     runtime.lastQuotaPinCreated = quotaTaskPins.pin(
       context.threadId,
-      context.taskDiagnostics.taskHash,
+      ownershipTaskHash(context),
     );
     const error = new BridgeError("Devin paid quota is unavailable before native work", 503);
     error.quotaFailure = true;
@@ -2148,19 +2157,23 @@ async function runDevinStage(
   if (!freeModel && !cliFailed(routeResult.cliResult) && calendarQuotaState.clear()) {
     runtime.calendarQuotaClears += 1;
   }
-  return finalizeDevinResult(
+  const preserveSession = context.taskState.checkpointRequested && Boolean(retainedSessionKey);
+  const result = finalizeDevinResult(
     context,
     selected,
     routeResult,
     fallbackState(context, failures, terminalFallback),
+    preserveSession,
   );
+  if (preserveSession) retainedDevinSessions.set(retainedSessionKey, routeResult.session);
+  return result;
 }
 
 async function executeAuto(context, requestBody, onSpawn, onProgress, signal, createStreamRelay) {
   runtime.lastProviderSequence = [];
   const pinnedStage = providerTaskPins.get(
     context.threadId,
-    context.taskDiagnostics.taskHash,
+    ownershipTaskHash(context),
   );
   runtime.lastPinnedProviderStage = pinnedStage;
   const stages = [
@@ -2239,7 +2252,7 @@ async function executeAuto(context, requestBody, onSpawn, onProgress, signal, cr
         if (
           stage === pinnedStage
           && error?.routeCommitted !== true
-          && providerTaskPins.release(context.threadId, context.taskDiagnostics.taskHash)
+          && providerTaskPins.release(context.threadId, ownershipTaskHash(context))
         ) runtime.providerTaskPinsReleasedOnFailure += 1;
         runtime.providerFailures[stage] += 1;
         runtime.fallbackFailed += 1;
@@ -2590,22 +2603,29 @@ async function handleResponses(request, response) {
       abortController.signal,
       createStreamRelay,
     );
+    const taskHash = ownershipTaskHash(context);
+    const completedWorkCount = context.taskState.progress.toolCallsSinceTask
+      + (result.toolCalls?.length || 0)
+      + (result.nativeToolNames?.length || 0);
+    const routeRetentionCount = context.taskState.checkpointRequested
+      ? Math.max(1, completedWorkCount)
+      : completedWorkCount;
     if (quotaTaskPins.releaseAfterFinalResponse(
       context.threadId,
-      context.taskDiagnostics.taskHash,
-      result.toolCalls.length,
+      taskHash,
+      routeRetentionCount,
     )) runtime.quotaPinsReleased += 1;
-    if (context.requestedRoute === "auto" && result.toolCalls.length > 0 && result.autoStage) {
+    if (context.requestedRoute === "auto" && routeRetentionCount > 0 && result.autoStage) {
       if (providerTaskPins.pin(
         context.threadId,
-        context.taskDiagnostics.taskHash,
+        taskHash,
         result.autoStage,
       )) runtime.providerTaskPinsCreated += 1;
       runtime.lastPinnedProviderStage = result.autoStage;
     } else if (providerTaskPins.releaseAfterFinalResponse(
       context.threadId,
-      context.taskDiagnostics.taskHash,
-      result.toolCalls.length,
+      taskHash,
+      routeRetentionCount,
     )) {
       runtime.providerTaskPinsReleased += 1;
       runtime.lastPinnedProviderStage = null;
@@ -3499,11 +3519,21 @@ async function selfTest() {
   }
   const priorResumeTaskText = "Message Type: NEW_TASK\nTask name: /root/resume_fixture\nPayload:\nImplement the original bounded diagnostic with the exact supplied ownership constraints.";
   const activeResumeTaskText = "Message Type: NEW_TASK\nTask name: /root/resume_fixture\nPayload:\nBridge repaired. Resume the same bounded implementation from your preserved state; keep the original scope and finish.";
+  const resumeThreadId = "devin-retained-checkpoint-fixture";
+  const beforeBridgeRestartResume = promptFrom({
+    stream: true,
+    model: OLLAMA_MODEL_ALIAS,
+    reasoning: { effort: OLLAMA_REQUIRED_EFFORT },
+    client_metadata: { cwd: process.cwd(), thread_id: resumeThreadId },
+    input: [
+      { type: "agent_message", id: "prior-resume-task-only", author: "Codex", recipient: "/root/resume_fixture", content: [{ type: "input_text", text: priorResumeTaskText }] },
+    ],
+  });
   const afterBridgeRestartResume = promptFrom({
     stream: true,
     model: OLLAMA_MODEL_ALIAS,
     reasoning: { effort: OLLAMA_REQUIRED_EFFORT },
-    client_metadata: { cwd: process.cwd() },
+    client_metadata: { cwd: process.cwd(), thread_id: resumeThreadId },
     input: [
       { type: "agent_message", id: "prior-resume-task", author: "Codex", recipient: "/root/resume_fixture", content: [{ type: "input_text", text: priorResumeTaskText }] },
       { type: "agent_message", id: "active-resume-task", author: "Codex", recipient: "/root/resume_fixture", content: [{ type: "input_text", text: activeResumeTaskText }] },
@@ -3515,6 +3545,8 @@ async function selfTest() {
     || !afterBridgeRestartResume.prompt.includes("[Referenced prior delegated context]")
     || afterBridgeRestartResume.taskDiagnostics.taskIntent !== "mutation"
     || !afterBridgeRestartResume.prompt.includes("[Mutation convergence contract]")
+    || retainedDevinSessionKey(beforeBridgeRestartResume, { model_uid: "fixture-model" })
+      !== retainedDevinSessionKey(afterBridgeRestartResume, { model_uid: "fixture-model" })
   ) {
     throw new Error("managed bridge restart lost referenced prior task context");
   }

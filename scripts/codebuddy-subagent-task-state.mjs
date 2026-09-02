@@ -411,6 +411,10 @@ export function taskStateFromInput(input, maxActiveTaskChars) {
   };
 }
 
+export function taskOwnershipHash(taskState) {
+  return taskState?.referencedPriorTask?.hash ?? taskState?.activeTask?.hash ?? null;
+}
+
 function occurrences(haystack, needle) {
   if (!needle) return 0;
   let count = 0;

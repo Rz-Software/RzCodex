@@ -14,6 +14,7 @@ import {
   referencedPriorTaskPromptSection,
   taskControlPromptSections,
   taskDeliveryDiagnostics,
+  taskOwnershipHash,
   taskStateFromInput,
 } from "./codebuddy-subagent-task-state.mjs";
 
@@ -1327,7 +1328,7 @@ function evictIdleSession() {
 
 async function sessionFor(context) {
   let session = context.sessionKey ? sessions.get(context.sessionKey) : null;
-  const taskHash = context.taskState.activeTask?.hash || null;
+  const taskHash = taskOwnershipHash(context.taskState);
   let retained = context.sessionKey ? retainedConversations.get(context.sessionKey) : null;
   if (retained && retained.taskHash !== taskHash) {
     retainedConversations.delete(context.sessionKey);
@@ -2322,6 +2323,21 @@ async function selfTest() {
       { type: "agent_message", id: "agy-active-resume", author: "Codex", recipient: "/root/agy_resume", content: [{ type: "input_text", text: activeResumeTaskText }] },
     ],
   });
+  const priorResumeContext = requestContext({
+    stream: true,
+    model: MODEL_ALIAS,
+    reasoning: { effort: REQUIRED_EFFORT },
+    client_metadata: { cwd: homedir(), thread_id: "thread-agy-before-restart" },
+    input: [
+      { type: "agent_message", id: "agy-prior-only", author: "Codex", recipient: "/root/agy_resume", content: [{ type: "input_text", text: priorResumeTaskText }] },
+    ],
+  });
+  if (
+    taskOwnershipHash(afterBridgeRestartResume.taskState)
+      !== taskOwnershipHash(priorResumeContext.taskState)
+  ) {
+    throw new Error("Antigravity continuation changed the retained conversation identity");
+  }
   const afterBridgeRestartPrompt = fullPrompt(afterBridgeRestartResume);
   if (
     afterBridgeRestartPrompt.split(priorResumeTaskText).length - 1 !== 1

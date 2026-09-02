@@ -11,6 +11,7 @@ import {
   rzMcpModeForTask,
   taskControlPromptSections,
   taskDeliveryDiagnostics,
+  taskOwnershipHash,
   taskStateFromInput,
 } from "./codebuddy-subagent-task-state.mjs";
 
@@ -241,12 +242,20 @@ export function nativeCliAgentContext(body, { provider, model, requiredEffort })
 }
 
 function retainedNativeStatePath(context, providerKind) {
-  if (!context.threadId || !context.taskDiagnostics?.taskHash) {
+  const ownershipHash = taskOwnershipHash(context.taskState) ?? context.taskDiagnostics?.taskHash;
+  if (!context.threadId || !ownershipHash) {
     return join(OPENCODE_STATE_DIRECTORY, `${randomUUID()}.db`);
   }
   const threadHash = createHash("sha256").update(context.threadId).digest("hex").slice(0, 20);
-  const taskHash = createHash("sha256").update(context.taskDiagnostics.taskHash).digest("hex").slice(0, 20);
+  const taskHash = createHash("sha256").update(ownershipHash).digest("hex").slice(0, 20);
   return join(OPENCODE_STATE_DIRECTORY, `${providerKind}-${threadHash}-${taskHash}.db`);
+}
+
+function commandCodeSessionName(context) {
+  const ownershipHash = taskOwnershipHash(context.taskState) ?? context.taskDiagnostics?.taskHash;
+  return context.threadId && ownershipHash
+    ? `rzcodex-${createHash("sha256").update(`${context.threadId}:${ownershipHash}`).digest("hex").slice(0, 24)}`
+    : null;
 }
 
 function nativeStateExists(dbPath) {
@@ -626,7 +635,7 @@ export async function runOpenCodeNativeAgent(context, {
     });
     return state;
   };
-  let preserveInterruptedSession = false;
+  let preserveRetainedSession = false;
   try {
     const result = await completeOpenCodeTurn(
       context,
@@ -635,20 +644,24 @@ export async function runOpenCodeNativeAgent(context, {
       (prompt) => run(prompt, true, TERMINAL_RECOVERY_TIMEOUT_MS),
       onRecovery,
     );
+    if (context.taskState.checkpointRequested) {
+      retainedOpenCodeStates.add(dbPath);
+      preserveRetainedSession = true;
+    }
     return {
       ...result,
       resumedProviderSession: resumeRetainedSession,
     };
   } catch (error) {
-    preserveInterruptedSession = error?.status === 499
+    preserveRetainedSession = error?.status === 499
       && (resumeRetainedSession || (error.nativeToolNames || []).length > 0);
-    if (preserveInterruptedSession) retainedOpenCodeStates.add(dbPath);
+    if (preserveRetainedSession) retainedOpenCodeStates.add(dbPath);
     throw error;
   } finally {
     // OpenCode can close before its SQLite handles are released on Windows. Cleanup is not part of
     // provider task correctness: retry the release window, retain a named artifact if it remains
     // locked, and let the age-based sweep remove it after no legitimate request can still own it.
-    if (!preserveInterruptedSession) {
+    if (!preserveRetainedSession) {
       retainedOpenCodeStates.delete(dbPath);
       await cleanupNativeState(dbPath);
     }
@@ -694,9 +707,7 @@ export async function runCommandCodeNativeAgent(context, { signal, onEvent }) {
   if (!existsSync(COMMAND_CODE_ENTRY)) {
     throw new NativeCliAgentError(`CommandCode CLI is missing at ${COMMAND_CODE_ENTRY}`);
   }
-  const sessionName = context.threadId && context.taskDiagnostics?.taskHash
-    ? `rzcodex-${createHash("sha256").update(`${context.threadId}:${context.taskDiagnostics.taskHash}`).digest("hex").slice(0, 24)}`
-    : null;
+  const sessionName = commandCodeSessionName(context);
   const releaseNativeState = await acquireNativeState(`commandcode:${sessionName || randomUUID()}`);
   const resumeRetainedSession = sessionName ? retainedCommandCodeSessions.has(sessionName) : false;
   const args = [
@@ -725,7 +736,10 @@ export async function runCommandCodeNativeAgent(context, { signal, onEvent }) {
       parseLine: commandCodeParser,
       label: `${context.provider} native CommandCode agent`,
     });
-    if (sessionName) retainedCommandCodeSessions.delete(sessionName);
+    if (sessionName) {
+      if (context.taskState.checkpointRequested) retainedCommandCodeSessions.add(sessionName);
+      else retainedCommandCodeSessions.delete(sessionName);
+    }
     return {
       ...validateResult(context, {
         finalText: state.finalText || "",
@@ -801,6 +815,51 @@ export async function nativeCliAgentRunnerSelfTest() {
   });
   if (cwdContext.workingDirectory !== authoritativeWorkspace) {
     throw new Error("native CLI ignored the authoritative request working directory");
+  }
+  const retainedThreadId = "native-retained-session-fixture";
+  const continuationTask = "Message Type: NEW_TASK\nTask name: /root/cwd_fixture\nPayload:\nContinue the original bounded task from the checkpoint and finish.";
+  const retainedContextBody = (input) => ({
+    model: "@preset/codex-subagents",
+    reasoning: { effort: "max" },
+    stream: true,
+    client_metadata: { cwd: authoritativeWorkspace, thread_id: retainedThreadId },
+    input,
+  });
+  const originalTaskItem = {
+    type: "agent_message",
+    id: "retained-original-task",
+    author: "Codex",
+    recipient: "/root/cwd_fixture",
+    content: [{ type: "input_text", text: cwdTask }],
+  };
+  const originalRetainedContext = nativeCliAgentContext(retainedContextBody([originalTaskItem]), {
+    provider: "fixture",
+    model: "fixture-model",
+    requiredEffort: "max",
+  });
+  const continuedRetainedContext = nativeCliAgentContext(retainedContextBody([
+    originalTaskItem,
+    {
+      type: "agent_message",
+      id: "retained-continuation-task",
+      author: "Codex",
+      recipient: "/root/cwd_fixture",
+      content: [{ type: "input_text", text: continuationTask }],
+    },
+  ]), {
+    provider: "fixture",
+    model: "fixture-model",
+    requiredEffort: "max",
+  });
+  if (
+    taskOwnershipHash(continuedRetainedContext.taskState)
+      !== originalRetainedContext.taskState.activeTask.hash
+    || retainedNativeStatePath(originalRetainedContext, "fixture")
+      !== retainedNativeStatePath(continuedRetainedContext, "fixture")
+    || commandCodeSessionName(originalRetainedContext)
+      !== commandCodeSessionName(continuedRetainedContext)
+  ) {
+    throw new Error("native CLI continuation changed the retained provider-session identity");
   }
   if (
     !cwdContext.prompt.includes("[Native tool boundary]")

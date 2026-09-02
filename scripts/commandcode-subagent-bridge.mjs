@@ -11,6 +11,7 @@ import {
   isBridgeProgressReasoning,
   normalizeAgentMessageContent,
   taskControlPromptSections,
+  taskOwnershipHash,
   taskStateFromInput,
 } from "./codebuddy-subagent-task-state.mjs";
 import {
@@ -145,7 +146,7 @@ const retainedCursorChats = new Map();
 const cursorTurnTails = new Map();
 
 function cursorStateKey(context) {
-  const taskHash = context.taskState.activeTask?.hash;
+  const taskHash = taskOwnershipHash(context.taskState);
   return context.threadId && taskHash ? `${context.threadId}:${taskHash}` : null;
 }
 
@@ -1576,7 +1577,13 @@ async function handleCursorResponses(request, response) {
       }
       return;
     }
-    if (stateKey) retainedCursorChats.delete(stateKey);
+    if (stateKey) {
+      if (context.taskState.checkpointRequested && result.chatId) {
+        retainedCursorChats.set(stateKey, result.chatId);
+      } else {
+        retainedCursorChats.delete(stateKey);
+      }
+    }
     cursorRuntime.completed += 1;
     cursorRuntime.lastInitializedModel = result.initializedModel || null;
     cursorRuntime.lastInputTokens = Number.isInteger(result.usage?.inputTokens) ? result.usage.inputTokens : null;
@@ -3162,6 +3169,25 @@ function selfTest() {
     stream: true,
     client_metadata: { cwd: process.cwd() },
   }).prompt;
+  const cursorRetainedThread = "cursor-retained-checkpoint-fixture";
+  const cursorOriginalContext = cursorPromptFrom({
+    model: "cursor/test-model",
+    input: [taskItem(analysisTaskText)],
+    stream: true,
+    client_metadata: { cwd: process.cwd(), thread_id: cursorRetainedThread },
+  });
+  const cursorContinuedContext = cursorPromptFrom({
+    model: "cursor/test-model",
+    input: [
+      taskItem(analysisTaskText),
+      taskItem("Message Type: NEW_TASK\nTask name: /root/worker\nPayload:\nContinue the original bounded task from the checkpoint."),
+    ],
+    stream: true,
+    client_metadata: { cwd: process.cwd(), thread_id: cursorRetainedThread },
+  });
+  if (cursorStateKey(cursorOriginalContext) !== cursorStateKey(cursorContinuedContext)) {
+    throw new Error("self-test failed: Cursor continuation changed the retained chat identity");
+  }
   const openCodeAnalysis = normalizeOpenCodeRequest({
     model: "opencode/muse-spark-1.2-contributor-free",
     input: [taskItem(analysisTaskText)],
