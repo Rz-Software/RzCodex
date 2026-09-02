@@ -2,7 +2,7 @@
 
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
@@ -53,6 +53,7 @@ const MAX_PROMPT_CHARS = 120_000;
 const MAX_ACTIVE_TASK_CHARS = 40_000;
 const OUTPUT_LIMIT = 2 * 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 30 * 60 * 1000;
+const STALE_REQUEST_FILE_AGE_MS = REQUEST_TIMEOUT_MS + 5 * 60 * 1000;
 const SSE_HEARTBEAT_MS = 15 * 1000;
 const PROVIDER_RECOVERY_BUDGET_MS = 45 * 1000;
 const PROVIDER_RECOVERY_BACKOFF_MS = 1 * 1000;
@@ -87,6 +88,7 @@ const QUOTA_FAILURE = /(?:daily|weekly|included|usage)[\s\S]{0,100}quota[\s\S]{0
 const RESOURCE_EXHAUSTED = /cognition\.ai\/errorKind[\s\S]{0,100}resource_exhausted|resource_exhausted[\s\S]{0,100}cognition\.ai\/retryable[\s\S]{0,20}true/i;
 const INTERRUPTED_STREAM = /stream (?:was )?interrupted|stream disconnected|connection (?:closed|reset)|unexpected end of (?:file|stream)|please continue the task you were working on/i;
 const PROVIDER_COMPACTION = /provider context compacted/i;
+const READ_ONLY_RZMCP_TOOL_NAME = /^(?:analyze|check|count|describe|discover|does|enumerate|find|get|has|inspect|is|list|locate|query|read|resolve|search|validate)_/i;
 const PERMISSION_REJECTION = /rejected a tool call that requires confirmation|permission (?:was )?denied|requires (?:user )?confirmation/i;
 const VALIDATION_RESTRICTED_TASK = /\b(?:do not|must not|never)[^.\n]{0,160}\b(?:build|compile|run\s+(?:the\s+)?tests?|test|control\s+(?:the\s+)?editor|use\s+(?:the\s+)?editor|pie|sie)\b|\bno\s+(?:build|compile|tests?|editor|pie|sie)\b|\b(?:aucun(?:e)?|sans|interdiction\s+d['’](?:ex[eé]cuter|utiliser))[^.\n]{0,160}\b(?:build|compil(?:e|er|ation)|tests?|editor|[eé]diteur|pie|sie)\b/i;
 const QUOTA_STATE_VERSION = 2;
@@ -380,6 +382,17 @@ function ensureRuntimeConfig() {
   const orgId = requireString(source.devin?.org_id, "Devin org_id");
   mkdirSync(DEVIN_HOME, { recursive: true });
   mkdirSync(REQUEST_DIRECTORY, { recursive: true });
+  for (const name of readdirSync(REQUEST_DIRECTORY)) {
+    if (!/^[0-9a-f-]{36}(?:-[0-9a-f-]{36})?\.txt$/i.test(name)) continue;
+    const path = join(REQUEST_DIRECTORY, name);
+    try {
+      if (Date.now() - statSync(path).mtimeMs >= STALE_REQUEST_FILE_AGE_MS) unlinkSync(path);
+    } catch (error) {
+      if (error?.code !== "ENOENT") {
+        process.stderr.write(`[RzCodex] Deferred stale Devin prompt cleanup for ${name}: ${error?.code || error?.name || "unknown_error"}\n`);
+      }
+    }
+  }
   writeFileSync(ISOLATED_CONFIG, `${json({
     version: 1,
     devin: { org_id: orgId },
@@ -1008,6 +1021,17 @@ function unseenProviderToolProgress(toolCalls, seenToolCalls) {
   return progress;
 }
 
+function observeDevinProviderProgress(session, progressState) {
+  // Compaction is live provider work. Let Devin finish its own summarization instead of killing the
+  // process at the compaction-request node and trapping every resume in the same half-finished step.
+  if (session?.compactionNodeId > progressState.lastCompactionNodeId) {
+    progressState.lastCompactionNodeId = session.compactionNodeId;
+    progressState.providerWorkObserved = true;
+  }
+  if (session?.toolCalls?.length > 0) progressState.providerWorkObserved = true;
+  return unseenProviderToolProgress(session?.completedToolCalls, progressState.seenToolCalls);
+}
+
 function ollamaWireToolName(namespace, name) {
   const fullName = namespace
     ? (namespace.endsWith("_") || name.startsWith("_") ? `${namespace}${name}` : `${namespace}__${name}`)
@@ -1376,13 +1400,15 @@ function runCli(
     let stderr = "";
     let settled = false;
     const routeOwnershipDeadline = Date.now() + NATIVE_PROVIDER_INACTIVITY_MS;
-    let lastCompactionNodeId = Number(compactionBaseline || 0);
-    const seenToolCalls = new Set(
-      toolCallBaseline
-        .map((call, index) => call?.name ? providerToolCallKey(call, index) : null)
-        .filter(Boolean),
-    );
-    let providerWorkObserved = toolCallBaseline.length > 0;
+    const providerProgress = {
+      lastCompactionNodeId: Number(compactionBaseline || 0),
+      seenToolCalls: new Set(
+        toolCallBaseline
+          .map((call, index) => call?.name ? providerToolCallKey(call, index) : null)
+          .filter(Boolean),
+      ),
+      providerWorkObserved: toolCallBaseline.length > 0,
+    };
     const reportProgress = () => {
       let session;
       try {
@@ -1390,21 +1416,10 @@ function runCli(
       } catch {
         return;
       }
-      if (session?.compactionNodeId > lastCompactionNodeId) {
-        lastCompactionNodeId = session.compactionNodeId;
-        child.kill();
-        finish(undefined, {
-          code: 1,
-          stdout: stdout.trim(),
-          stderr: `Devin provider context compacted at node ${lastCompactionNodeId}`,
-        });
-        return;
-      }
-      if (session?.toolCalls?.length > 0) providerWorkObserved = true;
-      for (const progress of unseenProviderToolProgress(session?.completedToolCalls, seenToolCalls)) {
+      for (const progress of observeDevinProviderProgress(session, providerProgress)) {
         onProgress?.(progress);
       }
-      if (providerWorkObserved) return;
+      if (providerProgress.providerWorkObserved) return;
       if (Date.now() < routeOwnershipDeadline) return;
       child.kill();
       finish(undefined, {
@@ -1507,10 +1522,29 @@ function providerCompletedToolCalls(session) {
     : providerToolCalls(session);
 }
 
-function mutationToolCalls(toolCalls) {
+function parsedToolArguments(value) {
+  if (value && typeof value === "object" && !Array.isArray(value)) return value;
+  if (typeof value !== "string") return null;
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function calledRzMcpToolName(call) {
+  if (String(call?.name || "").toLowerCase() !== "mcp_call_tool") return null;
+  const outer = parsedToolArguments(call.arguments);
+  if (outer?.tool_name !== "call_rzmcp_tool") return null;
+  const inner = parsedToolArguments(outer.arguments);
+  return typeof inner?.name === "string" && inner.name ? inner.name : null;
+}
+
+function mutationToolCalls(toolCalls, executionPolicy) {
   return toolCalls.filter((call) => {
     const name = String(call.name || "").toLowerCase();
-    return [
+    if ([
       "apply_patch",
       "edit",
       "edit_file",
@@ -1518,22 +1552,25 @@ function mutationToolCalls(toolCalls) {
       "create_file",
       "delete_file",
       "move_file",
-      "mcp_call_tool",
-    ].includes(name);
+    ].includes(name)) return true;
+    if (name !== "mcp_call_tool") return false;
+    if (executionPolicy?.rzMcpMode === "read-only") return false;
+    const rzMcpToolName = calledRzMcpToolName(call);
+    return rzMcpToolName === null || !READ_ONLY_RZMCP_TOOL_NAME.test(rzMcpToolName);
   });
 }
 
-function providerMutationToolCalls(session) {
-  return mutationToolCalls(providerToolCalls(session));
+function providerMutationToolCalls(session, executionPolicy) {
+  return mutationToolCalls(providerToolCalls(session), executionPolicy);
 }
 
-function providerCompletedMutationToolCalls(session) {
-  return mutationToolCalls(providerCompletedToolCalls(session));
+function providerCompletedMutationToolCalls(session, executionPolicy) {
+  return mutationToolCalls(providerCompletedToolCalls(session), executionPolicy);
 }
 
-function preserveProviderCommit(error, session) {
+function preserveProviderCommit(error, session, executionPolicy) {
   const toolCalls = providerToolCalls(session);
-  const mutationToolCalls = providerMutationToolCalls(session);
+  const mutationToolCalls = providerMutationToolCalls(session, executionPolicy);
   if (toolCalls.length > 0) {
     error.routeCommitted = true;
     error.toolCalls = toolCalls.length;
@@ -1543,8 +1580,8 @@ function preserveProviderCommit(error, session) {
   return error;
 }
 
-function preserveProviderSession(error, session) {
-  preserveProviderCommit(error, session);
+function preserveProviderSession(error, session, executionPolicy) {
+  preserveProviderCommit(error, session, executionPolicy);
   if (providerToolCalls(session).length > 0) {
     Object.defineProperty(error, "retainedProviderSession", {
       value: session,
@@ -1566,7 +1603,7 @@ function providerCheckpointReason({ resourceFailure, streamFailure, compactionFa
 function completedProviderCheckpoint(context, session, failureState) {
   const toolCalls = providerCompletedToolCalls(session);
   const toolNames = [...new Set(toolCalls.map((call) => String(call.name)))];
-  const mutations = providerCompletedMutationToolCalls(session).length;
+  const mutations = providerCompletedMutationToolCalls(session, context.executionPolicy).length;
   const text = [
     "[Authoritative native-provider checkpoint]",
     `Task hash: ${context.taskDiagnostics.taskHash}`,
@@ -1611,6 +1648,7 @@ async function runCliWithProviderRecovery(
     const activeDeadline = recoveryDeadline || deadline;
     const remainingMs = activeDeadline - now();
     if (remainingMs <= 0) throw new BridgeError("Devin provider recovery deadline exceeded", 504);
+    const iterationCompactionBaseline = Number(resumeSession?.compactionNodeId || 0);
     let cliResult;
     let sessionFromRunError = null;
     let runError = null;
@@ -1633,7 +1671,7 @@ async function runCliWithProviderRecovery(
                   : recoveryKind === "incomplete"
                     ? devinIncompleteTurnPrompt(context)
                     : devinStreamContinuationPrompt(context),
-              compactionBaseline: resumeSession.compactionNodeId,
+              compactionBaseline: iterationCompactionBaseline,
               toolCallBaseline: providerCompletedToolCalls(resumeSession),
             }
           : undefined,
@@ -1649,7 +1687,7 @@ async function runCliWithProviderRecovery(
           stderr: sanitizedProviderFailure(error),
         };
       } else {
-        const preserved = preserveProviderSession(error, session);
+        const preserved = preserveProviderSession(error, session, context.executionPolicy);
         if (session && !preserved.retainedProviderSession) remove(session.id);
         throw preserved;
       }
@@ -1664,7 +1702,9 @@ async function runCliWithProviderRecovery(
     }
     const resourceFailure = isRetryableResourceFailure(cliResult);
     const streamFailure = Boolean(runError) || isInterruptedStreamFailure(cliResult);
-    const compactionFailure = isProviderCompactionFailure(cliResult);
+    const compactionAdvanced = Number(session?.compactionNodeId || 0) > iterationCompactionBaseline;
+    const compactionFailure = isProviderCompactionFailure(cliResult)
+      || (compactionAdvanced && !session?.terminalText);
     const permissionFailure = isPermissionRejection(cliResult);
     const incompleteTurn = cliResult.code === 0 && Boolean(session) && !session.terminalText;
     if (!resourceFailure && !streamFailure && !compactionFailure && !permissionFailure && !incompleteTurn) {
@@ -1692,6 +1732,7 @@ async function runCliWithProviderRecovery(
       const error = preserveProviderCommit(
         new BridgeError("Devin provider conversation remained non-terminal after one same-session continuation", 502),
         session,
+        context.executionPolicy,
       );
       if (session) remove(session.id);
       throw error;
@@ -1714,6 +1755,7 @@ async function runCliWithProviderRecovery(
           504,
         ),
         session,
+        context.executionPolicy,
       );
       if (session) remove(session.id);
       throw error;
@@ -1843,9 +1885,7 @@ function finalizeDevinResult(context, selected, routeResult, fallbackState, pres
     const measuredOutputTokens = session.metrics.reduce((sum, metric) => sum + Number(metric.output_tokens || 0), 0);
     const outputTokensPerSecond = generationSeconds > 0 ? measuredOutputTokens / generationSeconds : null;
     const toolCalls = session.toolCalls.filter((call) => call?.name);
-    const rzMcpTools = toolCalls
-      .filter((call) => call.name === "mcp_call_tool" && call.arguments?.tool_name === "call_rzmcp_tool")
-      .map((call) => call.arguments?.arguments?.name).filter((name) => typeof name === "string");
+    const rzMcpTools = toolCalls.map(calledRzMcpToolName).filter(Boolean);
     const result = {
       text: session.terminalText, selected, providerMetadata: {},
       quotaFallback: fallbackState.quotaFallback,
@@ -1861,7 +1901,7 @@ function finalizeDevinResult(context, selected, routeResult, fallbackState, pres
     validated = true;
     return result;
   } catch (error) {
-    throw preserveProviderCommit(error, session);
+    throw preserveProviderCommit(error, session, context.executionPolicy);
   } finally {
     if (!preserveSession || !validated) removeSession(session.id);
   }
@@ -2139,6 +2179,7 @@ async function runDevinStage(
       const error = preserveProviderCommit(
         new BridgeError("Devin quota ended after executing native tools; the turn was not replayed", 502),
         routeResult.session,
+        context.executionPolicy,
       );
       removeSession(routeResult.session.id);
       throw error;
@@ -3106,6 +3147,46 @@ async function selfTest() {
     || resumedProgress[0].name !== "edit"
   ) {
     throw new Error("Devin resumed tool progress repeated completed calls");
+  }
+  const compactionProgressState = {
+    lastCompactionNodeId: 0,
+    seenToolCalls: new Set(),
+    providerWorkObserved: false,
+  };
+  const compactionProgress = observeDevinProviderProgress({
+    compactionNodeId: 12,
+    toolCalls: [],
+    completedToolCalls: [],
+  }, compactionProgressState);
+  if (
+    compactionProgress.length !== 0
+    || compactionProgressState.lastCompactionNodeId !== 12
+    || compactionProgressState.providerWorkObserved !== true
+  ) {
+    throw new Error("Devin provider compaction was not treated as continuing provider work");
+  }
+  const readOnlyRzMcpCall = {
+    name: "mcp_call_tool",
+    arguments: {
+      server_name: "rzcodex-lazy",
+      tool_name: "call_rzmcp_tool",
+      arguments: { name: "inspect_graph_by_path", arguments: {} },
+    },
+  };
+  const mutatingRzMcpCall = {
+    ...readOnlyRzMcpCall,
+    arguments: JSON.stringify({
+      server_name: "rzcodex-lazy",
+      tool_name: "call_rzmcp_tool",
+      arguments: JSON.stringify({ name: "connect_pins_with_details", arguments: {} }),
+    }),
+  };
+  if (
+    mutationToolCalls([readOnlyRzMcpCall], { rzMcpMode: "read-only" }).length !== 0
+    || mutationToolCalls([readOnlyRzMcpCall], { rzMcpMode: "full" }).length !== 0
+    || mutationToolCalls([mutatingRzMcpCall], { rzMcpMode: "full" }).length !== 1
+  ) {
+    throw new Error("Devin lazy RzMCP mutation accounting is not authoritative");
   }
   const recoveryContext = {
     requestId: "devin-recovery-fixture",
