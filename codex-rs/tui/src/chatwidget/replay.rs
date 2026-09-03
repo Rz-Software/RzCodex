@@ -127,7 +127,9 @@ impl ChatWidget {
             }
             ThreadItem::Plan { text, .. } => self.on_plan_item_completed(text),
             ThreadItem::Reasoning {
-                summary, content, ..
+                id,
+                summary,
+                content,
             } => {
                 if from_replay {
                     let reasoning_parts = summary.into_iter().chain(
@@ -145,6 +147,23 @@ impl ChatWidget {
                             delta,
                             ReasoningDeltaOrigin::CompletedItemReplay,
                         );
+                    }
+                } else if self.blocks_direct_input && id.starts_with("progress_") {
+                    // Provider bridges complete each progress item immediately after its delta.
+                    // If selection attached between those two events, the app-server can deliver
+                    // only ItemCompleted to this widget. Render that completed summary only when
+                    // its delta was not already shown, so the selected `/subagents` transcript
+                    // remains live without exposing or duplicating ordinary model reasoning.
+                    if !self.rendered_live_progress_item_ids.remove(&id) {
+                        for mut delta in summary {
+                            if !delta.ends_with('\n') {
+                                delta.push('\n');
+                            }
+                            self.on_agent_reasoning_delta(
+                                delta,
+                                ReasoningDeltaOrigin::LiveOrBuffered,
+                            );
+                        }
                     }
                 }
                 self.on_agent_reasoning_final();

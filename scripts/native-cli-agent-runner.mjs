@@ -21,6 +21,15 @@ const OLLAMA_CLOUD_CONTEXT_WINDOW = 1_048_576;
 const REQUEST_TIMEOUT_MS = 30 * 60 * 1000;
 const ROUTE_OWNERSHIP_TIMEOUT_MS = 55 * 1000;
 const TERMINAL_RECOVERY_TIMEOUT_MS = 45 * 1000;
+// OpenCode's native `steps` control forces a text-only response after this many agentic
+// iterations. A completed production scout used 33 tool iterations; 64 preserves substantial
+// headroom while preventing the unbounded 200+ iteration investigation loops seen in live runs.
+const OPENCODE_PRIMARY_AGENT = "rzcodex-native";
+const OPENCODE_PRIMARY_STEPS = 64;
+// Recovery exists only to close an interrupted provider stream. It may perform one final tool
+// iteration, after which OpenCode itself forces the terminal report.
+const OPENCODE_TERMINAL_AGENT = "rzcodex-terminal";
+const OPENCODE_TERMINAL_STEPS = 1;
 const STDERR_LIMIT = 16 * 1024;
 const STATE_CLEANUP_RETRY_MS = 50;
 const STATE_CLEANUP_RELEASE_MS = 2 * 1000;
@@ -450,7 +459,7 @@ function attachNativeState(error, state) {
 function terminalRecoveryPrompt(context, primary) {
   return [
     "[Native CLI terminal-message recovery]",
-    "The retained provider session ended immediately after completed native tool work without a terminal assistant response.",
+    "The retained provider stream was interrupted after completed native tool work and before a terminal assistant response.",
     "Continue this same bounded task in the same session. Do not restart the investigation, repeat completed tool calls, or delegate.",
     "Return only when the task is complete or a concrete blocker requires parent input.",
     `Task hash: ${context.taskDiagnostics.taskHash}`,
@@ -487,7 +496,12 @@ async function completeOpenCodeTurn(context, model, runInitial, runContinuation,
         sameSessionContinuations: 0,
       };
     } catch (error) {
-      initialFailure = attachNativeState(error, state);
+      // A zero-exit CLI execution is authoritative. Continuing it used to turn a provider that
+      // had exhausted its own loop into a second investigation, rather than recovering an
+      // interrupted stream. Fail this malformed terminal boundary explicitly instead.
+      const cleanExitError = attachNativeState(error, state);
+      cleanExitError.cleanProviderExit = true;
+      throw cleanExitError;
     }
   } catch (error) {
     initialFailure = error;
@@ -496,6 +510,7 @@ async function completeOpenCodeTurn(context, model, runInitial, runContinuation,
       mutationCount: error.providerMutationCount || 0,
     }, model);
   }
+  if (initialFailure?.cleanProviderExit) throw initialFailure;
   if (initialFailure?.status === 499 || primary.toolNames.length === 0) throw initialFailure;
   onRecovery?.({
     toolCalls: primary.toolNames.length,
@@ -533,6 +548,17 @@ function openCodeConfig(context, providerKind) {
     snapshot: false,
     autoupdate: false,
     skills: { paths: [] },
+    default_agent: OPENCODE_PRIMARY_AGENT,
+    agent: {
+      [OPENCODE_PRIMARY_AGENT]: {
+        mode: "primary",
+        steps: OPENCODE_PRIMARY_STEPS,
+      },
+      [OPENCODE_TERMINAL_AGENT]: {
+        mode: "primary",
+        steps: OPENCODE_TERMINAL_STEPS,
+      },
+    },
     permission: {
       "*": "allow",
       read: {
@@ -651,12 +677,19 @@ function openCodeParser(event, state, executionPolicy) {
   }
 }
 
-function openCodeRunArgs(context, providerKind, prompt, continueSession = false) {
+function openCodeRunArgs(
+  context,
+  providerKind,
+  prompt,
+  continueSession = false,
+  agent = OPENCODE_PRIMARY_AGENT,
+) {
   const args = ["run", "--pure", "--auto", "--format", "json"];
   if (providerKind === "ollama") args.push("--print-logs", "--log-level", "ERROR");
   if (continueSession) args.push("--continue");
   else args.push("--title", "RzCodex native subagent");
   args.push(
+    "--agent", agent,
     "--model", `${providerKind}/${context.model}`,
     "--variant", context.requiredEffort,
     "--dir", context.workingDirectory,
@@ -712,10 +745,15 @@ export async function runOpenCodeNativeAgent(context, {
     OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER: "1",
   };
   const model = `${providerKind}/${context.model}`;
-  const run = async (prompt, continueSession, timeoutMs = REQUEST_TIMEOUT_MS) => {
+  const run = async (
+    prompt,
+    continueSession,
+    timeoutMs = REQUEST_TIMEOUT_MS,
+    agent = OPENCODE_PRIMARY_AGENT,
+  ) => {
     const { state } = await nativeProcess({
       command: OPENCODE_EXE,
-      args: openCodeRunArgs(context, providerKind, prompt, continueSession),
+      args: openCodeRunArgs(context, providerKind, prompt, continueSession, agent),
       cwd: context.workingDirectory,
       env,
       signal,
@@ -734,7 +772,12 @@ export async function runOpenCodeNativeAgent(context, {
       context,
       model,
       () => run(context.prompt, resumeRetainedSession),
-      (prompt) => run(prompt, true, TERMINAL_RECOVERY_TIMEOUT_MS),
+      (prompt) => run(
+        prompt,
+        true,
+        TERMINAL_RECOVERY_TIMEOUT_MS,
+        OPENCODE_TERMINAL_AGENT,
+      ),
       onRecovery,
     );
     if (context.taskState.checkpointRequested) {
@@ -872,6 +915,13 @@ export async function nativeCliAgentRunnerSelfTest() {
       !== OLLAMA_CLOUD_CONTEXT_WINDOW
   ) {
     throw new Error("Ollama cloud model context window was truncated by the OpenCode adapter");
+  }
+  if (
+    ollamaConfigFixture.default_agent !== OPENCODE_PRIMARY_AGENT
+    || ollamaConfigFixture.agent?.[OPENCODE_PRIMARY_AGENT]?.steps !== OPENCODE_PRIMARY_STEPS
+    || ollamaConfigFixture.agent?.[OPENCODE_TERMINAL_AGENT]?.steps !== OPENCODE_TERMINAL_STEPS
+  ) {
+    throw new Error("native OpenCode agent iteration boundary was not configured");
   }
   const readPermissionEntries = Object.entries(ollamaConfigFixture.permission?.read || {});
   const bashPermissionEntries = Object.entries(ollamaConfigFixture.permission?.bash || {});
@@ -1145,16 +1195,18 @@ export async function nativeCliAgentRunnerSelfTest() {
   const recovered = await completeOpenCodeTurn(
     resumedMutationContext,
     "ollama/glm-5.3-flash:cloud",
-    async () => ({
-      finalText: "I'll inspect the file now.",
-      toolNames: ["read"],
-      mutationCount: 0,
-      inputTokens: 100,
-      outputTokens: 10,
-      peakTurnInputTokens: 100,
-      lastTextSequence: 1,
-      lastToolSequence: 2,
-    }),
+    async () => {
+      throw attachNativeState(new NativeCliAgentError("stream interrupted"), {
+        finalText: "I'll inspect the file now.",
+        toolNames: ["read"],
+        mutationCount: 0,
+        inputTokens: 100,
+        outputTokens: 10,
+        peakTurnInputTokens: 100,
+        lastTextSequence: 1,
+        lastToolSequence: 2,
+      });
+    },
     async (prompt) => {
       recoveryPrompt = prompt;
       return {
@@ -1187,15 +1239,23 @@ export async function nativeCliAgentRunnerSelfTest() {
     throw new Error("native OpenCode same-session terminal recovery failed");
   }
   const initialArgs = openCodeRunArgs(resumedMutationContext, "ollama", resumedMutationContext.prompt);
-  const recoveryArgs = openCodeRunArgs(resumedMutationContext, "ollama", recoveryPrompt, true);
+  const recoveryArgs = openCodeRunArgs(
+    resumedMutationContext,
+    "ollama",
+    recoveryPrompt,
+    true,
+    OPENCODE_TERMINAL_AGENT,
+  );
   const nonOllamaArgs = openCodeRunArgs(resumedMutationContext, "opencode", resumedMutationContext.prompt);
   if (
     initialArgs.includes("--continue")
     || !initialArgs.includes("--title")
+    || initialArgs[initialArgs.indexOf("--agent") + 1] !== OPENCODE_PRIMARY_AGENT
     || !initialArgs.includes("--print-logs")
     || !initialArgs.includes("ERROR")
     || !recoveryArgs.includes("--continue")
     || recoveryArgs.includes("--title")
+    || recoveryArgs[recoveryArgs.indexOf("--agent") + 1] !== OPENCODE_TERMINAL_AGENT
     || nonOllamaArgs.includes("--print-logs")
     || routeOwnershipTimeout(false, 120_000) !== ROUTE_OWNERSHIP_TIMEOUT_MS
     || routeOwnershipTimeout(true, 120_000) !== 120_000
@@ -1203,7 +1263,8 @@ export async function nativeCliAgentRunnerSelfTest() {
     throw new Error("native OpenCode continuation did not retain the isolated provider session");
   }
 
-  let recoveryFailure = null;
+  let cleanExitContinuationCalls = 0;
+  let cleanExitFailure = null;
   try {
     await completeOpenCodeTurn(
       resumedMutationContext,
@@ -1215,6 +1276,36 @@ export async function nativeCliAgentRunnerSelfTest() {
         lastTextSequence: 1,
         lastToolSequence: 2,
       }),
+      async () => {
+        cleanExitContinuationCalls += 1;
+        return { finalText: "must not run" };
+      },
+    );
+  } catch (error) {
+    cleanExitFailure = error;
+  }
+  if (
+    cleanExitContinuationCalls !== 0
+    || cleanExitFailure?.cleanProviderExit !== true
+    || !cleanExitFailure?.message.includes("without a terminal assistant message")
+  ) {
+    throw new Error("native OpenCode clean exit incorrectly started terminal recovery");
+  }
+
+  let recoveryFailure = null;
+  try {
+    await completeOpenCodeTurn(
+      resumedMutationContext,
+      "ollama/glm-5.3-flash:cloud",
+      async () => {
+        throw attachNativeState(new NativeCliAgentError("stream interrupted"), {
+          finalText: "Starting.",
+          toolNames: ["read"],
+          mutationCount: 0,
+          lastTextSequence: 1,
+          lastToolSequence: 2,
+        });
+      },
       async () => {
         throw attachNativeState(new NativeCliAgentError("stream interrupted"), {
           toolNames: ["edit"],

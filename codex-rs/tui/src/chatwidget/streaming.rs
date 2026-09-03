@@ -229,7 +229,11 @@ impl ChatWidget {
         }
     }
 
-    pub(super) fn on_agent_reasoning_delta(&mut self, delta: String, origin: ReasoningDeltaOrigin) {
+    pub(super) fn on_agent_reasoning_delta(
+        &mut self,
+        delta: String,
+        origin: ReasoningDeltaOrigin,
+    ) -> bool {
         // Accumulate the current reasoning block and extract the first bold element
         // (between **/**) as the chunk header, shown as the bottom shimmer status. For
         // parent-owned subagent threads (blocks_direct_input), complete newline-delimited
@@ -238,12 +242,7 @@ impl ChatWidget {
         self.reasoning_buffer.push_str(&delta);
 
         if self.safety_buffering_is_waiting() {
-            return;
-        }
-
-        if self.unified_exec_wait_streak.is_some() {
-            // Unified exec waiting should take precedence over reasoning-derived status headers.
-            return;
+            return false;
         }
 
         if self.reasoning_header.is_none() {
@@ -258,7 +257,7 @@ impl ChatWidget {
         } else {
             let Some(line) = extract_last_complete_line(&self.reasoning_buffer) else {
                 // No bold header and no complete line yet: leave existing header as-is.
-                return;
+                return false;
             };
             line
         };
@@ -266,8 +265,14 @@ impl ChatWidget {
         // Parent-owned subagent threads expose complete progress lines in the selected
         // `/subagents` view. This applies to both live delivery and replay of the active turn's
         // buffered notifications. Completed reasoning-item replay remains grouped.
-        if self.blocks_direct_input && origin == ReasoningDeltaOrigin::LiveOrBuffered {
-            self.commit_live_reasoning_progress_lines();
+        let committed_progress = self.blocks_direct_input
+            && origin == ReasoningDeltaOrigin::LiveOrBuffered
+            && self.commit_live_reasoning_progress_lines();
+
+        if self.unified_exec_wait_streak.is_some() {
+            // Unified exec waiting takes precedence over reasoning-derived status headers, but
+            // parent-owned bridge progress must still reach the transcript above.
+            return committed_progress;
         }
 
         let status = &self.status_state.current_status;
@@ -280,7 +285,7 @@ impl ChatWidget {
                 .status_widget()
                 .is_none_or(|status| status.header() == header)
         {
-            return;
+            return committed_progress;
         }
 
         // Update the shimmer header to the extracted reasoning chunk header.
@@ -288,6 +293,7 @@ impl ChatWidget {
         if !self.set_status_header(header) {
             self.request_redraw();
         }
+        committed_progress
     }
 
     /// Commit each complete newline-delimited line accumulated in `reasoning_buffer` as a visible
@@ -298,7 +304,8 @@ impl ChatWidget {
     /// on a single long-lived reasoning item. Without this, `on_agent_reasoning_delta` only
     /// updates the bottom shimmer header and the selected child transcript stays blank until the
     /// final assistant item arrives.
-    fn commit_live_reasoning_progress_lines(&mut self) {
+    fn commit_live_reasoning_progress_lines(&mut self) -> bool {
+        let mut committed = false;
         while let Some(nl_idx) = self.reasoning_buffer.find('\n') {
             // Own the trimmed line before draining so the borrow ends before the
             // mutable `drain` below (otherwise the borrow checker rejects this).
@@ -310,8 +317,10 @@ impl ChatWidget {
             }
             let cell = history_cell::new_live_reasoning_progress_line(line, &self.config.cwd);
             self.add_boxed_history(cell);
+            committed = true;
         }
         self.request_redraw();
+        committed
     }
 
     pub(super) fn on_agent_reasoning_final(&mut self) {

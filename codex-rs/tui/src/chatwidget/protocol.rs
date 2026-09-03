@@ -85,10 +85,17 @@ impl ChatWidget {
                 // replay goes through replay_thread_item -> handle_thread_item instead.
                 // So reasoning deltas here are always LiveOrBuffered, even during ThreadSnapshot
                 // replay, so parent-owned threads stream visible progress on selection.
-                self.on_agent_reasoning_delta(
+                let progress_item_id = notification
+                    .item_id
+                    .starts_with("progress_")
+                    .then_some(notification.item_id);
+                let rendered = self.on_agent_reasoning_delta(
                     notification.delta,
                     ReasoningDeltaOrigin::LiveOrBuffered,
                 );
+                if rendered && let Some(item_id) = progress_item_id {
+                    self.rendered_live_progress_item_ids.insert(item_id);
+                }
             }
             ServerNotification::ReasoningTextDelta(notification) => {
                 if self.config.show_raw_agent_reasoning {

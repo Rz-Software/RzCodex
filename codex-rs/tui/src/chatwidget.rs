@@ -659,6 +659,11 @@ pub(crate) struct ChatWidget {
     reasoning_header: Option<String>,
     // Preserves reasoning-summary part boundaries for transcript-only recording.
     reasoning_summary_parts: Vec<String>,
+    // Bridge progress normally arrives as live reasoning-summary deltas, but an app-server
+    // attachment can begin between a progress item's delta and completion events. Remember the
+    // progress items whose deltas were actually rendered so the completed-item path can fill only
+    // genuine delivery gaps without duplicating normal live output.
+    rendered_live_progress_item_ids: HashSet<String>,
     status_state: StatusState,
     review: ReviewState,
     // Active hook runs render in a dedicated live cell so they can run alongside tools.

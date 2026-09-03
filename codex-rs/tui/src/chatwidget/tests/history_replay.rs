@@ -1332,6 +1332,70 @@ async fn parent_owned_buffered_delta_replay_streams_visible_before_completion() 
 }
 
 #[tokio::test]
+async fn live_parent_owned_completed_bridge_progress_fills_a_missed_delta_once() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.show_welcome_banner = false;
+    chat.set_parent_owned_thread();
+
+    chat.handle_server_notification(
+        ServerNotification::ItemCompleted(ItemCompletedNotification {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            completed_at_ms: 0,
+            item: AppServerThreadItem::Reasoning {
+                id: "progress_provider".to_string(),
+                summary: vec!["Ollama native tool 1: read.".to_string()],
+                content: Vec::new(),
+            },
+        }),
+        /*replay_kind*/ None,
+    );
+
+    let rendered = drain_insert_history(&mut rx)
+        .into_iter()
+        .map(|lines| lines_to_single_string(&lines))
+        .collect::<String>();
+    insta::assert_snapshot!(rendered, @"• Ollama native tool 1: read.\n");
+}
+
+#[tokio::test]
+async fn live_parent_owned_completed_bridge_progress_does_not_duplicate_its_delta() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.show_welcome_banner = false;
+    chat.set_parent_owned_thread();
+
+    chat.handle_server_notification(
+        ServerNotification::ReasoningSummaryTextDelta(ReasoningSummaryTextDeltaNotification {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            item_id: "progress_provider".to_string(),
+            delta: "Ollama native tool 1: read.\n".to_string(),
+            summary_index: 0,
+        }),
+        /*replay_kind*/ None,
+    );
+    chat.handle_server_notification(
+        ServerNotification::ItemCompleted(ItemCompletedNotification {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            completed_at_ms: 0,
+            item: AppServerThreadItem::Reasoning {
+                id: "progress_provider".to_string(),
+                summary: vec!["Ollama native tool 1: read.\n".to_string()],
+                content: Vec::new(),
+            },
+        }),
+        /*replay_kind*/ None,
+    );
+
+    let rendered = drain_insert_history(&mut rx)
+        .into_iter()
+        .map(|lines| lines_to_single_string(&lines))
+        .collect::<String>();
+    assert_eq!(rendered.matches("Ollama native tool 1: read.").count(), 1);
+}
+
+#[tokio::test]
 async fn replayed_reasoning_item_shows_raw_reasoning_when_enabled() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.config.show_raw_agent_reasoning = true;

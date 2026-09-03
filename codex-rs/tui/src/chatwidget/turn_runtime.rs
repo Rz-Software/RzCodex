@@ -95,6 +95,7 @@ impl ChatWidget {
         self.reasoning_summary_parts.clear();
         self.reasoning_buffer.clear();
         self.reasoning_header = None;
+        self.rendered_live_progress_item_ids.clear();
         self.set_ambient_pet_notification(
             crate::pets::PetNotificationKind::Running,
             /*body*/ None,
