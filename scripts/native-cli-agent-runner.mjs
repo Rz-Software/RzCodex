@@ -263,6 +263,9 @@ function sweepStaleNativeState(now = Date.now()) {
     try {
       if (now - statSync(path).mtimeMs < STALE_STATE_AGE_MS) continue;
       unlinkSync(path);
+      const dbPath = path.replace(/-(?:shm|wal)$/, "");
+      retainedOpenCodeStates.delete(dbPath);
+      retainedOpenCodeProgress.delete(dbPath);
     } catch (error) {
       if (error?.code !== "ENOENT") reportRetainedNativeState(path, error);
     }
@@ -1595,7 +1598,6 @@ export async function nativeCliAgentRunnerSelfTest() {
   ) {
     throw new Error("native OpenCode retained-session progress was not cumulative");
   }
-
   let recoveryFailure = null;
   try {
     await completeOpenCodeTurn(

@@ -451,14 +451,13 @@ impl Session {
             return;
         }
 
-        let turn_state = {
+        {
             let mut active_turn = self.active_turn.lock().await;
             if active_turn.is_some() {
                 return;
             }
-            let active_turn = active_turn.get_or_insert_with(ActiveTurn::default);
-            Arc::clone(&active_turn.turn_state)
-        };
+            active_turn.get_or_insert_with(ActiveTurn::default);
+        }
 
         let (input, mut start_options) =
             self.input_queue.get_pending_input(&self.active_turn).await;
@@ -500,11 +499,10 @@ impl Session {
         }
         self.maybe_emit_model_warnings_for_turn(turn_context.as_ref())
             .await;
-        // Task completion must still save this mail if pre-turn compaction fails.
-        self.input_queue
-            .extend_pending_input_for_turn_state(turn_state.as_ref(), input)
-            .await;
-        self.start_task(turn_context, Vec::new(), RegularTask::new())
+        // A trigger-turn assignment must be recorded before pre-turn compaction can sample the
+        // previous task. Passing the drained mailbox as initial task input also keeps it attached
+        // to this reserved turn if startup is cancelled.
+        self.start_task(turn_context, input, RegularTask::new_inter_agent_turn())
             .await;
     }
 

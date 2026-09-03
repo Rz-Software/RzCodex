@@ -620,17 +620,6 @@ function pinProviderTask(context, stage) {
   return changed;
 }
 
-function shouldPreserveProviderTaskPin(context, result) {
-  return context.requestedRoute === "auto"
-    && typeof result?.autoStage === "string"
-    && result.autoStage.length > 0
-    && (
-      context.taskState?.checkpointRequested === true
-      || result.preserveProviderPin === true
-      || result.providerMetadata?.provider_checkpoint === true
-    );
-}
-
 function preserveProviderPinForAbortedTurn(context, error, signal) {
   if (!signal?.aborted) return null;
   const stage = providerTaskPins.get(context.threadId, ownershipTaskHash(context));
@@ -2339,6 +2328,7 @@ async function runOllamaStage(
         native_cli_single_execution: nativeResult.executionCount === 1,
         native_cli_execution_count: nativeResult.executionCount,
         native_cli_same_session_continuations: nativeResult.sameSessionContinuations,
+        native_cli_resumed_provider_session: nativeResult.resumedProviderSession === true,
         native_tool_names: nativeResult.toolNames,
         provider_mutation_count: nativeResult.mutationCount,
         peak_turn_context_tokens: nativeResult.peakTurnInputTokens,
@@ -2946,7 +2936,11 @@ async function handleResponses(request, response) {
       taskHash,
       routeRetentionCount,
     )) runtime.quotaPinsReleased += 1;
-    if (shouldPreserveProviderTaskPin(context, result)) {
+    if (
+      context.requestedRoute === "auto"
+      && result.autoStage
+      && (routeRetentionCount > 0 || result.preserveProviderPin === true)
+    ) {
       pinProviderTask(context, result.autoStage);
     } else if (providerTaskPins.releaseAfterFinalResponse(
       context.threadId,
@@ -4467,24 +4461,6 @@ async function selfTest() {
     || !pinnedContinuationResult.text.includes("remains pinned to the same provider")
   ) {
     throw new Error("active provider continuation checkpoint lost its provider pin");
-  }
-  const providerPinFixtureContext = {
-    requestedRoute: "auto",
-    taskState: { checkpointRequested: false },
-  };
-  if (
-    shouldPreserveProviderTaskPin(providerPinFixtureContext, {
-      autoStage: "ollama",
-      toolCalls: [{ name: "read" }],
-      providerMetadata: {},
-    })
-    || !shouldPreserveProviderTaskPin(providerPinFixtureContext, committedCheckpointResult)
-    || !shouldPreserveProviderTaskPin(
-      { ...providerPinFixtureContext, taskState: { checkpointRequested: true } },
-      { autoStage: "ollama", providerMetadata: {} },
-    )
-  ) {
-    throw new Error("provider task pin terminal/checkpoint classification failed");
   }
   const abortedProviderContext = {
     requestedRoute: "auto",

@@ -3070,6 +3070,7 @@ async function handleNativeCliResponses(request, response, provider) {
           native_cli_single_execution: result.executionCount === 1,
           native_cli_execution_count: result.executionCount,
           native_cli_same_session_continuations: result.sameSessionContinuations,
+          native_cli_resumed_provider_session: result.resumedProviderSession === true,
           native_tool_names: result.toolNames,
           native_tool_count: result.toolNames.length,
           rzmcp_tools_called: [...new Set(result.rzMcpTools || [])],

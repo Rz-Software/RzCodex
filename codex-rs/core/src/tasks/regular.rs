@@ -20,11 +20,22 @@ use super::SessionTask;
 use super::SessionTaskResult;
 
 #[derive(Default)]
-pub(crate) struct RegularTask;
+pub(crate) struct RegularTask {
+    record_initial_input_before_compaction: bool,
+}
 
 impl RegularTask {
     pub(crate) fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    /// Inter-agent tasks must become authoritative before pre-turn compaction can sample the
+    /// previous task's history. Their initial mailbox input is therefore recorded before
+    /// `run_turn`; ordinary user turns retain the existing pre-compaction ordering.
+    pub(crate) fn new_inter_agent_turn() -> Self {
+        Self {
+            record_initial_input_before_compaction: true,
+        }
     }
 }
 
@@ -73,6 +84,14 @@ impl SessionTask for RegularTask {
             }
         };
         let mut next_input = input;
+        if self.record_initial_input_before_compaction {
+            if run_hooks_and_record_inputs(&sess, &ctx, &next_input, PersistContext::TurnStart)
+                .await
+            {
+                return Ok(None);
+            }
+            next_input.clear();
+        }
         let mut prewarmed_client_session = prewarmed_client_session;
         loop {
             let last_agent_message = run_turn(

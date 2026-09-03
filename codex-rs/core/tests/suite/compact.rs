@@ -11,6 +11,7 @@ use codex_login::CodexAuth;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::built_in_model_providers;
 use codex_models_manager::bundled_models_response;
+use codex_protocol::AgentPath;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
@@ -26,6 +27,7 @@ use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::HookEventName;
 use codex_protocol::protocol::HookRunStatus;
+use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::ItemCompletedEvent;
 use codex_protocol::protocol::ItemStartedEvent;
 use codex_protocol::protocol::Op;
@@ -4965,6 +4967,90 @@ async fn snapshot_request_shape_pre_turn_compaction_including_incoming_user_mess
             .any(|url| url == image_url.as_str()),
         "expected post-compaction follow-up request to keep incoming user image content"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pre_turn_compaction_includes_triggering_agent_task_before_compacting() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+    let request_log = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_assistant_message("m1", "INITIAL_REPLY"),
+                ev_completed_with_tokens("r1", /*total_tokens*/ 500),
+            ]),
+            sse(vec![
+                ev_assistant_message("m2", "PRE_TURN_SUMMARY"),
+                ev_completed_with_tokens("r2", /*total_tokens*/ 100),
+            ]),
+            sse(vec![
+                ev_assistant_message("m3", "FOLLOWUP_REPLY"),
+                ev_completed_with_tokens("r3", /*total_tokens*/ 80),
+            ]),
+        ],
+    )
+    .await;
+
+    let model_provider = non_openai_model_provider(&server);
+    let codex = test_codex()
+        .with_config(move |config| {
+            config.model_provider = model_provider;
+            set_test_compact_prompt(config);
+            config.model_auto_compact_token_limit = Some(200);
+        })
+        .build(&server)
+        .await
+        .expect("build codex")
+        .codex;
+
+    codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "INITIAL_TASK".to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await
+        .expect("submit initial turn");
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+
+    let followup_payload = "FOLLOWUP_TASK_MUST_BE_AUTHORITATIVE_BEFORE_COMPACTION";
+    codex
+        .submit(Op::InterAgentCommunication {
+            communication: InterAgentCommunication::new_encrypted(
+                AgentPath::root(),
+                AgentPath::root().join("worker").expect("valid worker path"),
+                Vec::new(),
+                followup_payload.to_string(),
+                /*trigger_turn*/ true,
+            ),
+            start_options: Default::default(),
+        })
+        .await
+        .expect("submit triggering follow-up task");
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+
+    let requests = request_log.requests();
+    assert_eq!(
+        requests.len(),
+        3,
+        "expected initial, pre-turn compact, and follow-up requests"
+    );
+    for (label, request) in [
+        ("pre-turn compact", &requests[1]),
+        ("post-compact follow-up", &requests[2]),
+    ] {
+        let occurrences = request
+            .inputs_of_type("agent_message")
+            .iter()
+            .flat_map(|item| item["content"].as_array().into_iter().flatten())
+            .filter(|part| part["encrypted_content"].as_str() == Some(followup_payload))
+            .count();
+        assert_eq!(
+            occurrences, 1,
+            "{label} request must contain the complete triggering task exactly once"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
