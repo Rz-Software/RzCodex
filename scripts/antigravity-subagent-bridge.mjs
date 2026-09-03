@@ -9,6 +9,7 @@ import { isAbsolute, join, normalize } from "node:path";
 import {
   TaskStateError,
   activeTaskPromptSection,
+  formatNativeToolProgress,
   isBridgeProgressReasoning,
   normalizeAgentMessageContent,
   referencedPriorTaskPromptSection,
@@ -958,6 +959,7 @@ class AntigravitySession {
             kind: "tool",
             index: this.turn.completedToolStepKeys.size,
             name: typeof name === "string" ? name : "unknown_tool",
+            input: parameters,
           });
         }
         if (firstCompletedObservation && MUTATION_TOOLS.has(name)) {
@@ -1449,8 +1451,8 @@ async function handleResponses(request, response) {
       currentSession,
       currentPrompt,
       controller.signal,
-      ({ index, name }) => {
-        progress.emit(`Antigravity native tool ${index}: ${progressToolName(name)}.\n`);
+      ({ index, name, input }) => {
+        progress.emit(formatNativeToolProgress("Antigravity", index, name, input));
       },
       ({ backoffMs, conversationId }) => {
         runtime.streamContinuations += 1;

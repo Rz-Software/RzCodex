@@ -21,10 +21,12 @@ import {
   applyPatchSucceeded,
   authoritativeProgressReport,
   changedPathsFromApplyPatch,
+  formatNativeToolProgress,
   isBridgeProgressReasoning,
   isExplicitReadOnlyTask,
   normalizeAgentMessageContent,
   referencedPriorTaskPromptSection,
+  rzMcpToolNameFromNativeProgress,
   rzMcpModeForTask,
   taskControlPromptSections,
   taskDeliveryDiagnostics,
@@ -1171,6 +1173,7 @@ function runCodeBuddy(context, onSpawn, onProviderEvent = () => {}) {
     let silenceTimer = null;
     const calls = new Map();
     const nativeToolNames = [];
+    const nativeRzMcpTools = [];
     const nativeChangedPaths = [];
     const nativeToolIds = new Set();
     let nativeMutationCount = 0;
@@ -1183,6 +1186,7 @@ function runCodeBuddy(context, onSpawn, onProviderEvent = () => {}) {
       artifacts.cleanup();
       if (error) {
         error.nativeToolNames = [...nativeToolNames];
+        error.nativeRzMcpTools = [...new Set(nativeRzMcpTools)];
         error.providerMutationCount = nativeMutationCount;
       }
       error ? reject(error) : resolve(value);
@@ -1221,6 +1225,8 @@ function runCodeBuddy(context, onSpawn, onProviderEvent = () => {}) {
           if (typeof part.name === "string" && !nativeToolIds.has(nativeToolId)) {
             nativeToolIds.add(nativeToolId);
             nativeToolNames.push(part.name);
+            const rzMcpTool = rzMcpToolNameFromNativeProgress(part.name, part.input);
+            if (rzMcpTool) nativeRzMcpTools.push(rzMcpTool);
             if (providerToolIsMutation(part.name, part.input, context.executionPolicy)) {
               nativeMutationCount += 1;
               const changedPath = part.input?.file_path ?? part.input?.filePath ?? part.input?.path;
@@ -1293,6 +1299,7 @@ function runCodeBuddy(context, onSpawn, onProviderEvent = () => {}) {
         resultEvent,
         maxTurnInputTokens,
         nativeToolNames,
+        nativeRzMcpTools: [...new Set(nativeRzMcpTools)],
         nativeChangedPaths: [...new Set(nativeChangedPaths)],
         mutationCount: nativeMutationCount,
       });
@@ -1521,12 +1528,12 @@ async function handleResponses(request, response) {
   };
   const completeNativeProgressTool = (toolId) => {
     if (!toolId || completedNativeProgressToolIds.has(toolId)) return;
-    const name = pendingNativeProgressTools.get(toolId);
-    if (!name) return;
+    const tool = pendingNativeProgressTools.get(toolId);
+    if (!tool) return;
     pendingNativeProgressTools.delete(toolId);
     completedNativeProgressToolIds.add(toolId);
     nativeProgressTools += 1;
-    emitProgress(`CodeBuddy native tool ${nativeProgressTools}: ${name}.\n`);
+    emitProgress(formatNativeToolProgress("CodeBuddy", nativeProgressTools, tool.name, tool.input));
   };
   const onProviderEvent = (event) => {
     if (event?.type === "assistant" && Array.isArray(event.message?.content)) {
@@ -1541,7 +1548,7 @@ async function handleResponses(request, response) {
             ? tool.id
             : `${tool.name}:${jsonString(tool.input || {})}`;
           if (!completedNativeProgressToolIds.has(toolId)) {
-            pendingNativeProgressTools.set(toolId, tool.name);
+            pendingNativeProgressTools.set(toolId, { name: tool.name, input: tool.input });
           }
         }
         writeSse(response, "response.in_progress", {
@@ -1673,6 +1680,7 @@ async function handleResponses(request, response) {
           native_cli_single_execution: true,
           native_tool_names: result.nativeToolNames,
           native_tool_count: result.nativeToolNames.length,
+          rzmcp_tools_called: result.nativeRzMcpTools,
           provider_mutation_count: result.mutationCount,
           provider_changed_paths: result.nativeChangedPaths,
           ...codexToolServingMetadata(context.executionPolicy.rzMcpMode === "disabled" ? 0 : 2),
@@ -1740,6 +1748,38 @@ async function handleResponses(request, response) {
 }
 
 function selfTest() {
+  const safeProgress = formatNativeToolProgress("CodeBuddy", 2, "Bash", {
+    command: "rg -n 'SetInteractText' G:/QANGA --api-key=or-secretsecretsecret",
+  });
+  const lazyProgress = formatNativeToolProgress("CodeBuddy", 3, "mcp__rzmcp__call_rzmcp_tool", {
+    name: "inspect_graph_by_path",
+    arguments: { blueprint: "/Game/Fixture" },
+  });
+  const deferredLazyProgress = formatNativeToolProgress("CodeBuddy", 4, "DeferExecuteTool", {
+    toolName: "mcp__rzmcp__call_rzmcp_tool",
+    params: { name: "find_blueprint_nodes", arguments: { search_term: "Fixture" } },
+  });
+  const pathProgress = formatNativeToolProgress("CodeBuddy", 4, "Bash", {
+    command: "rg -n 'AfterCheck' G:/QANGA/Plugins/QSystem/Source/QSystem/Private/Component/QPlayerControllerInteractComponent.cpp",
+  });
+  const mcpCatalogProgress = formatNativeToolProgress("Devin", 5, "mcp_list_tools", {
+    server_name: "rzmcp",
+  });
+  if (
+    !safeProgress.includes("rg -n 'SetInteractText' G:/QANGA")
+    || safeProgress.includes("secretsecretsecret")
+    || !lazyProgress.includes("RzMCP inspect_graph_by_path")
+    || !deferredLazyProgress.includes("mcp__rzmcp__call_rzmcp_tool - RzMCP find_blueprint_nodes")
+    || rzMcpToolNameFromNativeProgress("DeferExecuteTool", {
+      toolName: "mcp__rzmcp__call_rzmcp_tool",
+      params: { name: "find_blueprint_nodes" },
+    }) !== "find_blueprint_nodes"
+    || !pathProgress.includes("QPlayerControllerInteractComponent.cpp")
+    || pathProgress.includes("[REDACTED].cpp")
+    || !mcpCatalogProgress.includes("server rzmcp")
+  ) {
+    throw new Error("self-test failed: native tool progress was not useful and secret-safe");
+  }
   if (
     providerToolIsMutation("mcp__rzmcp__call_rzmcp_tool", { name: "inspect_graph_by_path" }, { rzMcpMode: "full" })
     || providerToolIsMutation("mcp__rzmcp__call_rzmcp_tool", { name: "connect_pins_with_details" }, { rzMcpMode: "read-only" })
@@ -1858,8 +1898,18 @@ function selfTest() {
     "self-test-rzmcp-forbidden",
     "Read-only inspection. Use repository text tools, but do not use or invoke RzDirectMCP.",
   );
+  const explicitLazyProxyRequirement = rzMcpPolicyTask(
+    "self-test-rzmcp-lazy-proxy-required",
+    "Read-only inspection. Do not control the editor. Use search_rzmcp_tools before call_rzmcp_tool. Never request the full RzMCP catalog.",
+  );
+  const naturalReadOnlyRzMcp = rzMcpPolicyTask(
+    "self-test-rzmcp-natural-required",
+    "Make at least twelve useful rg/file-read calls plus exactly two read-only RzMCP calls. Do not use any other RzMCP calls. Never edit, build, test, or start PIE.",
+  );
   if (
     explicitReadOnlyRzMcp.executionPolicy.rzMcpMode !== "read-only"
+    || explicitLazyProxyRequirement.executionPolicy.rzMcpMode !== "read-only"
+    || naturalReadOnlyRzMcp.executionPolicy.rzMcpMode !== "read-only"
     || explicitRzMcpBan.executionPolicy.rzMcpMode !== "disabled"
   ) {
     throw new Error("self-test failed: CodeBuddy RzMCP task capability classification");

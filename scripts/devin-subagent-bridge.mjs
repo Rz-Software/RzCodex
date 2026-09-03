@@ -11,6 +11,7 @@ import { DatabaseSync } from "node:sqlite";
 import {
   TaskStateError,
   activeTaskPromptSection,
+  formatNativeToolProgress,
   isExplicitReadOnlyTask,
   isBridgeProgressReasoning,
   normalizeAgentMessageContent,
@@ -1165,7 +1166,7 @@ function unseenProviderToolProgress(toolCalls, seenToolCalls) {
     const key = providerToolCallKey(call, index);
     if (seenToolCalls.has(key)) continue;
     seenToolCalls.add(key);
-    progress.push({ kind: "tool", index: index + 1, name: call.name });
+    progress.push({ kind: "tool", index: index + 1, name: call.name, input: call.arguments });
   }
   return progress;
 }
@@ -2300,7 +2301,12 @@ async function runOllamaStage(
           const key = event.part.callID || event.part.id;
           if (key && announcedTools.has(key)) return;
           if (key) announcedTools.add(key);
-          onProgress?.(`Ollama native tool ${announcedTools.size}: ${progressToolName(event.part.tool)}.\n`);
+          onProgress?.(formatNativeToolProgress(
+            "Ollama",
+            announcedTools.size,
+            event.part.tool,
+            event.part?.state?.input,
+          ));
         },
         onRecovery: () => {
           runtime.providerContinuations += 1;
@@ -2339,7 +2345,7 @@ async function runOllamaStage(
         outputTokensPerSecond: null,
         toolCalls: [],
         nativeToolNames: nativeResult.toolNames,
-        rzMcpTools: nativeResult.toolNames.filter((name) => name === "call_rzmcp_tool"),
+        rzMcpTools: [...new Set(nativeResult.rzMcpTools || [])],
         toolSchemaBytesIgnored: context.toolSchemaBytes,
         toolSchemaBytesForwarded: 0,
         streamRelay,
@@ -2392,7 +2398,7 @@ async function runDevinStage(
             onProgress?.(`Devin native same-session recovery: ${progress.reason}.\n`);
             return;
           }
-          onProgress?.(`Devin native tool ${progress.index}: ${progressToolName(progress.name)}.\n`);
+          onProgress?.(formatNativeToolProgress("Devin", progress.index, progress.name, progress.input));
         },
         signal,
         Date.now() + REQUEST_TIMEOUT_MS,
@@ -3343,6 +3349,12 @@ async function selfTest() {
   const explicitRzMcpBanPolicy = executionPolicyFromTaskState({
     activeTask: { text: "Read-only inspection. Use repository text tools, but do not use or invoke RzDirectMCP." },
   });
+  const explicitLazyProxyPolicy = executionPolicyFromTaskState({
+    activeTask: { text: "Read-only inspection. Do not control the editor. Use search_rzmcp_tools before call_rzmcp_tool. Never request the full RzMCP catalog." },
+  });
+  const scopedRzMcpLimitPolicy = executionPolicyFromTaskState({
+    activeTask: { text: "Make exactly two read-only RzMCP calls. Do not use any other RzMCP calls. Never edit, build, test, control the editor, or start PIE." },
+  });
   if (
     readOnlyPolicy.permissionMode !== "dangerous"
     || readOnlyPolicy.rzMcpMode !== "disabled"
@@ -3360,6 +3372,10 @@ async function selfTest() {
     || frenchBoundedReviewPolicy.rzMcpMode !== "disabled"
     || explicitReadOnlyRzMcpPolicy.permissionMode !== "dangerous"
     || explicitReadOnlyRzMcpPolicy.rzMcpMode !== "read-only"
+    || explicitLazyProxyPolicy.permissionMode !== "dangerous"
+    || explicitLazyProxyPolicy.rzMcpMode !== "read-only"
+    || scopedRzMcpLimitPolicy.permissionMode !== "dangerous"
+    || scopedRzMcpLimitPolicy.rzMcpMode !== "read-only"
     || explicitRzMcpBanPolicy.permissionMode !== "dangerous"
     || explicitRzMcpBanPolicy.rzMcpMode !== "disabled"
   ) {

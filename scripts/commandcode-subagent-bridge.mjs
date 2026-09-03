@@ -8,8 +8,10 @@ import { basename, isAbsolute, join } from "node:path";
 import { existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from "node:fs";
 import {
   TaskStateError,
+  formatNativeToolProgress,
   isBridgeProgressReasoning,
   normalizeAgentMessageContent,
+  rzMcpToolNameFromNativeProgress,
   taskControlPromptSections,
   taskOwnershipHash,
   taskStateFromInput,
@@ -143,6 +145,7 @@ const cursorRuntime = {
   lastInitializedModel: null,
   lastInputTokens: null,
   lastNativeToolNames: [],
+  lastRzMcpTools: [],
   lastWorkingDirectory: null,
 };
 const retainedCursorChats = new Map();
@@ -1423,16 +1426,17 @@ function runCursorAgent(context, onSpawn, onProgress, { resumeChatId = null } = 
     let initializedModel = "";
     let chatId = resumeChatId;
     const nativeToolNames = [];
+    const nativeRzMcpTools = [];
     const seenNativeTools = new Set();
     const pendingNativeTools = new Map();
     const completedNativeTools = new Set();
     const completeNativeTool = (toolId) => {
       if (!toolId || completedNativeTools.has(toolId)) return;
-      const name = pendingNativeTools.get(toolId);
-      if (!name) return;
+      const tool = pendingNativeTools.get(toolId);
+      if (!tool) return;
       pendingNativeTools.delete(toolId);
       completedNativeTools.add(toolId);
-      onProgress?.({ id: toolId, name, index: completedNativeTools.size });
+      onProgress?.({ id: toolId, ...tool, index: completedNativeTools.size });
     };
     const finish = (error, value) => {
       if (settled) return;
@@ -1459,7 +1463,9 @@ function runCursorAgent(context, onSpawn, onProgress, { resumeChatId = null } = 
             if (seenNativeTools.has(toolKey)) continue;
             seenNativeTools.add(toolKey);
             nativeToolNames.push(part.name);
-            pendingNativeTools.set(toolKey, part.name);
+            const rzMcpTool = rzMcpToolNameFromNativeProgress(part.name, part.input);
+            if (rzMcpTool) nativeRzMcpTools.push(rzMcpTool);
+            pendingNativeTools.set(toolKey, { name: part.name, input: part.input });
           }
         }
         const text = event.message.content
@@ -1523,6 +1529,7 @@ function runCursorAgent(context, onSpawn, onProgress, { resumeChatId = null } = 
         initializedModel,
         chatId,
         nativeToolNames: [...new Set(nativeToolNames)],
+        nativeRzMcpTools: [...new Set(nativeRzMcpTools)],
       });
     });
   });
@@ -1575,7 +1582,7 @@ async function handleCursorResponses(request, response) {
     const result = await runCursorAgent(
       context,
       (spawned) => { child = spawned; },
-      ({ name, index }) => progress.emit(`cursor native tool ${index}: ${name}.\n`),
+      ({ name, input, index }) => progress.emit(formatNativeToolProgress("cursor", index, name, input)),
       { resumeChatId },
     );
     if (clientGone) {
@@ -1595,6 +1602,7 @@ async function handleCursorResponses(request, response) {
     cursorRuntime.lastInitializedModel = result.initializedModel || null;
     cursorRuntime.lastInputTokens = Number.isInteger(result.usage?.inputTokens) ? result.usage.inputTokens : null;
     cursorRuntime.lastNativeToolNames = result.nativeToolNames;
+    cursorRuntime.lastRzMcpTools = result.nativeRzMcpTools;
     const output = progress.finish();
     const outputIndex = output.length;
     const itemId = `msg_${randomUUID()}`;
@@ -1626,8 +1634,13 @@ async function handleCursorResponses(request, response) {
         usage: cursorUsage(result.usage),
         output,
         metadata: {
+          actual_provider: "cursor",
+          actual_model: result.initializedModel || context.model,
           cursor_initialized_model: result.initializedModel,
           cursor_provider_session_resumed: Boolean(resumeChatId),
+          native_tool_names: result.nativeToolNames,
+          native_tool_count: result.nativeToolNames.length,
+          rzmcp_tools_called: result.nativeRzMcpTools,
         },
       },
     });
@@ -2922,13 +2935,26 @@ function nativeCliProgressEmitter(response) {
   };
 }
 
-function nativeCliToolEvent(event) {
+function nativeCliToolEvent(event, state) {
   if (event?.type === "tool_use" && event.part?.state?.status === "completed") {
-    return { id: event.part.callID || event.part.id, name: event.part.tool };
+    return {
+      id: event.part.callID || event.part.id,
+      name: event.part.tool,
+      input: event.part.state.input,
+    };
   }
   const payload = event?.type === "event" ? event.event : null;
   if (payload?.type === "tool_completed") {
-    return { id: payload.toolCallId, name: payload.toolName };
+    return {
+      id: payload.toolCallId,
+      name: payload.toolName,
+      input: payload.toolInput
+        ?? payload.input
+        ?? payload.arguments
+        ?? (state?.lastCompletedToolCallId === payload.toolCallId
+          ? state.lastCompletedToolInput
+          : undefined),
+    };
   }
   return null;
 }
@@ -2967,7 +2993,7 @@ async function handleNativeCliResponses(request, response, provider) {
   const progress = nativeCliProgressEmitter(response);
   const announcedTools = new Set();
   let lastHeartbeatAt = 0;
-  const onEvent = (event) => {
+  const onEvent = (event, state) => {
     const now = Date.now();
     if (now - lastHeartbeatAt >= 5_000) {
       lastHeartbeatAt = now;
@@ -2975,12 +3001,12 @@ async function handleNativeCliResponses(request, response, provider) {
         response: { id: responseId, object: "response", model: body.model, status: "in_progress" },
       });
     }
-    const tool = nativeCliToolEvent(event);
+    const tool = nativeCliToolEvent(event, state);
     if (!tool?.name) return;
     const key = tool.id || `${tool.name}:${announcedTools.size}`;
     if (announcedTools.has(key)) return;
     announcedTools.add(key);
-    progress.emit(`${provider} native tool ${announcedTools.size}: ${tool.name}.\n`);
+    progress.emit(formatNativeToolProgress(provider, announcedTools.size, tool.name, tool.input));
   };
   try {
     const result = commandCode
@@ -3039,13 +3065,14 @@ async function handleNativeCliResponses(request, response, provider) {
         metadata: {
           actual_provider: provider,
           actual_model: result.model,
-          actual_reasoning_effort: requiredEffort,
+          actual_reasoning_effort: result.actualReasoningEffort || requiredEffort,
           ...(provider === "opencode" ? { auth_source: OPENCODE_AUTH_SOURCE } : {}),
           native_cli_single_execution: result.executionCount === 1,
           native_cli_execution_count: result.executionCount,
           native_cli_same_session_continuations: result.sameSessionContinuations,
           native_tool_names: result.toolNames,
           native_tool_count: result.toolNames.length,
+          rzmcp_tools_called: [...new Set(result.rzMcpTools || [])],
           provider_mutation_count: result.mutationCount,
           peak_turn_context_tokens: result.peakTurnInputTokens,
           normalized_prompt_chars: context.prompt.length,
@@ -3153,7 +3180,7 @@ function selfTest() {
     client_metadata: { cwd: homedir() },
   }, {
     provider: "commandcode",
-    model: "z-ai/glm-5.3-flash",
+    model: "meta/muse-spark-1.3-contributor",
     requiredEffort: COMMANDCODE_REQUIRED_EFFORT,
   });
   if (

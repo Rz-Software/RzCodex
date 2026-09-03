@@ -21,15 +21,18 @@ const IMMEDIATE_RETURN_DIRECTIVE = [
 const CONDITIONAL_TIMING = /\b(?:if|when|once|unless|until|after)\b/i;
 const RZMCP_NAME = String.raw`rz(?:direct)?mcp`;
 const RZMCP_EXPLICIT_PROHIBITION = [
-  new RegExp(String.raw`\b(?:do not|don't|must not|never|cannot|can't)\b[^\n.;]{0,160}\b${RZMCP_NAME}\b`, "i"),
-  new RegExp(String.raw`\bno\s+[^\n.;]{0,160}\b${RZMCP_NAME}\b`, "i"),
-  new RegExp(String.raw`\b(?:ne\s+(?:pas|jamais)|sans|aucun(?:e)?|interdiction\s+d['’](?:utiliser|invoquer|appeler))\b[^\n.;]{0,160}\b${RZMCP_NAME}\b`, "i"),
+  new RegExp(String.raw`\b(?:do not|don't|must not|never|cannot|can't)\b[^\n.;]{0,80}\b(?:use|invoke|call|access|query|enable)\b(?!\s+(?:(?:any|the)\s+)?(?:other|additional|further|extra)\b)[^\n.;]{0,60}\b${RZMCP_NAME}\b`, "i"),
+  new RegExp(String.raw`\b${RZMCP_NAME}\b[^\n.;]{0,60}\b(?:must not|cannot|can't|should not)\s+(?:be\s+)?(?:used|invoked|called|accessed|queried|enabled)\b`, "i"),
+  new RegExp(String.raw`\bno\s+(?:use|access|calls?|queries?)\s+(?:(?:of|to)\s+)?(?:the\s+)?${RZMCP_NAME}\b`, "i"),
+  new RegExp(String.raw`\b(?:ne\s+(?:pas|jamais)|sans|aucun(?:e)?|interdiction\s+d['’])\b[^\n.;]{0,80}\b(?:utiliser|invoquer|appeler|acc[eé]der)\b[^\n.;]{0,60}\b${RZMCP_NAME}\b`, "i"),
 ];
 const RZMCP_EXPLICIT_REQUIREMENT = [
   new RegExp(String.raw`\b(?:use|invoke|call|access|query)\b[^\n.;]{0,120}\b${RZMCP_NAME}\b`, "i"),
   new RegExp(String.raw`\b(?:using|via|through|with)\s+(?:the\s+)?${RZMCP_NAME}\b`, "i"),
+  new RegExp(String.raw`\b${RZMCP_NAME}\b\s+(?:semantic\s+|read[- ]only\s+|native\s+|tool\s+){0,3}(?:calls?|queries?|inspections?|operations?)\b`, "i"),
   new RegExp(String.raw`\b(?:utiliser|utilisez|utilise|invoquer|invoquez|appeler|appelez|acc[eé]der)\b[^\n.;]{0,120}\b${RZMCP_NAME}\b`, "i"),
   /\bmcp__rzmcp__[a-z0-9_]+\b/i,
+  /\b(?:search_rzmcp_tools|call_rzmcp_tool)\b/i,
 ];
 const GENERIC_EDITOR_RESTRICTION = /\b(?:do not|must not|never)[^.\n]{0,160}\b(?:use|invoke|control|call)\s+(?:any\s+|the\s+)?editor\b|\bno\s+[^.\n]{0,120}\b(?:editor|pie|sie)\b|\b(?:aucun(?:e)?|sans|interdiction\s+d['’](?:ex[eé]cuter|utiliser))[^.\n]{0,160}\b(?:editor|[eé]diteur|pie|sie)\b/i;
 const PRIOR_TASK_REFERENCE = [
@@ -49,6 +52,107 @@ export function isBridgeProgressReasoning(item) {
   return item?.type === "reasoning"
     && typeof item.id === "string"
     && item.id.startsWith("progress_");
+}
+
+function progressInputObject(value) {
+  if (value && typeof value === "object" && !Array.isArray(value)) return value;
+  if (typeof value !== "string") return null;
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function redactProgressText(value) {
+  return String(value)
+    .replace(/(authorization\s*[:=]\s*bearer\s+)[^\s,;]+/gi, "$1[REDACTED]")
+    .replace(/([?&](?:api[_-]?key|token|secret|password)=)[^&\s]+/gi, "$1[REDACTED]")
+    .replace(/\b((?:api[_-]?key|access[_-]?token|auth[_-]?token|secret|password)\s*[:=]\s*)[^\s,;]+/gi, "$1[REDACTED]")
+    .replace(/\b(?:sk|or)-[a-z0-9_-]{12,}\b/gi, "[REDACTED]")
+    .replace(/\b[A-Za-z0-9+_=.-]{80,}\b/g, "[REDACTED]")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function progressValue(input, names) {
+  for (const name of names) {
+    const value = input?.[name];
+    if (typeof value === "string" && value.trim()) return value;
+    if (Array.isArray(value) && value.every((item) => typeof item === "string")) {
+      return value.join(" ");
+    }
+  }
+  return null;
+}
+
+export function progressToolName(value) {
+  return String(value || "unknown_tool")
+    .replace(/[^A-Za-z0-9_.:-]+/g, "_")
+    .slice(0, 80) || "unknown_tool";
+}
+
+function unwrappedProgressTool(name, rawInput) {
+  const input = progressInputObject(rawInput);
+  if (/^DeferExecuteTool$/i.test(String(name || "")) && typeof input?.toolName === "string") {
+    return {
+      name: input.toolName.replace(/^mcp__codex__/, ""),
+      input: progressInputObject(input.params) || input.params,
+    };
+  }
+  return { name, input };
+}
+
+export function rzMcpToolNameFromNativeProgress(name, rawInput) {
+  const tool = unwrappedProgressTool(name, rawInput);
+  const normalizedName = String(tool.name || "").toLowerCase();
+  if (!/(?:^|[_:.-])call_rzmcp_tool$/.test(normalizedName) && normalizedName !== "mcp_call_tool") {
+    return null;
+  }
+  const input = progressInputObject(tool.input);
+  const outerArguments = progressInputObject(input?.arguments);
+  const nested = input?.tool_name === "call_rzmcp_tool"
+    ? progressInputObject(input.arguments)
+    : outerArguments?.tool_name === "call_rzmcp_tool"
+      ? progressInputObject(outerArguments.arguments)
+      : input;
+  return progressValue(nested, ["name", "tool_name", "toolName"]);
+}
+
+export function nativeToolProgressDetail(name, rawInput) {
+  const tool = unwrappedProgressTool(name, rawInput);
+  const input = progressInputObject(tool.input);
+  if (!input) return "";
+  const normalizedName = String(tool.name || "").toLowerCase();
+  if (/(?:^|[_:.-])call_rzmcp_tool$/.test(normalizedName) || normalizedName === "mcp_call_tool") {
+    const rzMcpTool = rzMcpToolNameFromNativeProgress(tool.name, tool.input);
+    if (rzMcpTool) return `RzMCP ${redactProgressText(rzMcpTool).slice(0, 140)}`;
+    const wrapperTool = progressValue(input, ["tool_name", "toolName", "name"]);
+    if (wrapperTool) return `RzMCP ${redactProgressText(wrapperTool).slice(0, 140)}`;
+  }
+  if (normalizedName === "mcp_list_tools") {
+    const server = progressValue(input, ["server_name", "serverName", "server", "mcp_server"]);
+    return server ? `server ${redactProgressText(server).slice(0, 140)}` : "provider MCP catalog";
+  }
+  if (/(?:^|[_:.-])search_rzmcp_tools$/.test(normalizedName)) {
+    const query = progressValue(input, ["query", "search", "searchQuery", "description", "search_term", "searchTerm"]);
+    return query ? `RzMCP search: ${redactProgressText(query).slice(0, 140)}` : "RzMCP schema search";
+  }
+  const command = progressValue(input, ["command", "cmd", "script"]);
+  if (command) return redactProgressText(command).slice(0, 200);
+  const path = progressValue(input, ["file_path", "filePath", "path", "absolute_path", "absolutePath"]);
+  const pattern = progressValue(input, ["pattern", "query", "search", "searchQuery", "description", "search_term", "searchTerm", "glob"]);
+  const detail = [pattern, path].filter(Boolean).map(redactProgressText).join(" in ");
+  return detail.slice(0, 200);
+}
+
+export function formatNativeToolProgress(provider, index, name, input) {
+  const safeProvider = String(provider || "Provider").replace(/[^A-Za-z0-9 ._-]+/g, "").slice(0, 40) || "Provider";
+  const tool = unwrappedProgressTool(name, input);
+  const safeName = progressToolName(tool.name);
+  const detail = nativeToolProgressDetail(name, input);
+  return `${safeProvider} native tool ${index}: ${safeName}${detail ? ` - ${detail}` : ""}.\n`;
 }
 
 function sha256(value) {
@@ -255,7 +359,7 @@ function progressFrom(input, activeTaskIndex) {
         ? item.summary.map((part) => part?.type === "summary_text" ? part.text || "" : "").join("")
         : "";
       for (const line of summary.split(/\r?\n/)) {
-        const match = /\bnative tool (?:\d+:\s*)?([A-Za-z0-9_.:-]+)\.?\s*$/i.exec(line);
+        const match = /\bnative tool (?:\d+:\s*)?([A-Za-z0-9_.:-]+)/i.exec(line);
         if (!match) continue;
         toolCallsSinceTask += 1;
         lastCompletedTool = match[1].replace(/\.$/, "");

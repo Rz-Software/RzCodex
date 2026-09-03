@@ -1,8 +1,16 @@
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, statSync, unlinkSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, join } from "node:path";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import {
   TaskStateError,
   activeTaskPromptSection,
@@ -21,11 +29,14 @@ const OLLAMA_CLOUD_CONTEXT_WINDOW = 1_048_576;
 const REQUEST_TIMEOUT_MS = 30 * 60 * 1000;
 const ROUTE_OWNERSHIP_TIMEOUT_MS = 55 * 1000;
 const TERMINAL_RECOVERY_TIMEOUT_MS = 45 * 1000;
+const COMMANDCODE_FIXED_REASONING_MODELS = new Set([
+  "meta/muse-spark-1.3-contributor",
+]);
 // OpenCode's native `steps` control forces a text-only response after this many agentic
-// iterations. A completed production scout used 33 tool iterations; 64 preserves substantial
-// headroom while preventing the unbounded 200+ iteration investigation loops seen in live runs.
+// iterations. Completed production workers converge around 24-34 tool calls; 40 preserves room for
+// that proven workload while preventing the 64-step, 76-call investigation loop seen in live use.
 const OPENCODE_PRIMARY_AGENT = "rzcodex-native";
-const OPENCODE_PRIMARY_STEPS = 64;
+const OPENCODE_PRIMARY_STEPS = 40;
 // Recovery exists only to close an interrupted provider stream. It may perform one final tool
 // iteration, after which OpenCode itself forces the terminal report.
 const OPENCODE_TERMINAL_AGENT = "rzcodex-terminal";
@@ -47,16 +58,27 @@ const OPENCODE_STATE_DIRECTORY = join(
   process.env.LOCALAPPDATA || join(homedir(), "AppData", "Local"),
   "RzCodex", "native-cli-agents",
 );
+const COMMAND_CODE_HOME_DIRECTORY = join(
+  process.env.LOCALAPPDATA || join(homedir(), "AppData", "Local"),
+  "RzCodex", "commandcode-native-home",
+);
+const COMMAND_CODE_HOME_CONFIG_DIRECTORY = join(COMMAND_CODE_HOME_DIRECTORY, ".commandcode");
+const COMMAND_CODE_LAUNCH_DIRECTORY = join(COMMAND_CODE_HOME_DIRECTORY, "workspace-root");
 const LAZY_RZMCP_PROXY = join(import.meta.dirname, "devin-rzmcp-lazy-proxy.mjs");
 const ROLE_TAG = /<(?:external_cli|codebuddy|cursor)_route_instructions>([\s\S]*?)<\/(?:external_cli|codebuddy|cursor)_route_instructions>/gi;
 const VALIDATION_RESTRICTED_TASK = /\b(?:do not|must not|never)[^.\n]{0,160}\b(?:build|compile|run\s+(?:the\s+)?tests?|test|control\s+(?:the\s+)?editor|use\s+(?:the\s+)?editor|pie|sie)\b|\bno\s+(?:build|compile|tests?|editor|pie|sie)\b/i;
 const MUTATION_TOOL = /^(?:apply_patch|edit|edit_file|write|write_file|create_file|delete_file|move_file)$/i;
 const LAZY_RZMCP_CALL_TOOL = /(?:^|[_:.-])call_rzmcp_tool$/i;
+const NATIVE_MCP_CALL_TOOL = /^mcp_call_tool$/i;
 const READ_ONLY_RZMCP_TOOL_NAME = /^(?:analyze|check|count|describe|discover|does|enumerate|find|get|has|inspect|is|list|locate|query|read|resolve|search|validate)_/i;
 const OLLAMA_USAGE_LIMIT = /providerID=ollama[\s\S]{0,2000}(?:reached|exceeded)[\s\S]{0,120}(?:session\s+)?usage limit|providerID=ollama[\s\S]{0,2000}\b429\b[\s\S]{0,120}(?:quota|usage|limit)/i;
 const retainedOpenCodeStates = new Set();
 const retainedCommandCodeSessions = new Set();
 const nativeStateTails = new Map();
+
+function commandCodeReasoningArgs(model, effort) {
+  return COMMANDCODE_FIXED_REASONING_MODELS.has(model) ? [] : ["--effort", effort];
+}
 
 async function acquireNativeState(key) {
   const previous = nativeStateTails.get(key);
@@ -93,15 +115,38 @@ function parsedToolInput(value) {
   }
 }
 
-function nativeToolIsMutation(name, input, executionPolicy) {
-  if (MUTATION_TOOL.test(String(name || ""))) return true;
-  if (!LAZY_RZMCP_CALL_TOOL.test(String(name || ""))) return false;
-  if (executionPolicy?.rzMcpMode === "read-only") return false;
+function nativeRzMcpToolName(name, input) {
+  const toolName = String(name || "");
+  if (!LAZY_RZMCP_CALL_TOOL.test(toolName) && !NATIVE_MCP_CALL_TOOL.test(toolName)) return null;
   const outer = parsedToolInput(input);
-  const nested = outer?.tool_name === "call_rzmcp_tool"
+  const nested = NATIVE_MCP_CALL_TOOL.test(toolName) && outer?.tool_name === "call_rzmcp_tool"
     ? parsedToolInput(outer.arguments)
     : outer;
-  const rzMcpToolName = typeof nested?.name === "string" ? nested.name : null;
+  return typeof nested?.name === "string" && nested.name ? nested.name : null;
+}
+
+function toolMutationPath(input) {
+  const parsed = parsedToolInput(input);
+  for (const key of ["file_path", "filePath", "path", "absolute_path", "absolutePath"]) {
+    if (typeof parsed?.[key] === "string" && parsed[key]) return parsed[key];
+  }
+  return null;
+}
+
+function pathIsWithinWorkspace(path, workingDirectory) {
+  if (!workingDirectory || !isAbsolute(path)) return true;
+  const offset = relative(resolve(workingDirectory), resolve(path));
+  return offset === "" || (!offset.startsWith("..") && !isAbsolute(offset));
+}
+
+function nativeToolIsMutation(name, input, executionPolicy) {
+  if (MUTATION_TOOL.test(String(name || ""))) {
+    const path = toolMutationPath(input);
+    return path === null || pathIsWithinWorkspace(path, executionPolicy?.workingDirectory);
+  }
+  if (!LAZY_RZMCP_CALL_TOOL.test(String(name || "")) && !NATIVE_MCP_CALL_TOOL.test(String(name || ""))) return false;
+  if (executionPolicy?.rzMcpMode === "read-only") return false;
+  const rzMcpToolName = nativeRzMcpToolName(name, input);
   return rzMcpToolName === null || !READ_ONLY_RZMCP_TOOL_NAME.test(rzMcpToolName);
 }
 
@@ -114,6 +159,69 @@ function sanitizedEnvironment(source = process.env) {
     "CODEBUDDY_API_KEY", "COMMAND_CODE_API_KEY", "OLLAMA_API_KEY",
   ]) delete env[key];
   return env;
+}
+
+function commandCodeMcpConfigText() {
+  return `${JSON.stringify({
+    mcpServers: {
+      rzmcp: {
+        // CommandCode starts stdio MCP servers with `shell: true` on Windows. An absolute
+        // node.exe path under Program Files is split by cmd.exe before the proxy can start.
+        command: "node",
+        args: [LAZY_RZMCP_PROXY],
+        enabled: true,
+      },
+    },
+  })}\n`;
+}
+
+function ensureCommandCodeHome() {
+  mkdirSync(COMMAND_CODE_HOME_CONFIG_DIRECTORY, { recursive: true });
+  mkdirSync(COMMAND_CODE_LAUNCH_DIRECTORY, { recursive: true });
+  const projectMcpPath = join(COMMAND_CODE_LAUNCH_DIRECTORY, ".mcp.json");
+  if (existsSync(projectMcpPath)) {
+    throw new NativeCliAgentError(
+      `CommandCode isolated launch directory unexpectedly contains ${projectMcpPath}`,
+    );
+  }
+  const configPath = join(COMMAND_CODE_HOME_CONFIG_DIRECTORY, "mcp.json");
+  const configText = commandCodeMcpConfigText();
+  let existing = null;
+  try {
+    existing = readFileSync(configPath, "utf8");
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      throw new NativeCliAgentError(`Cannot read CommandCode isolated MCP configuration: ${error.message}`);
+    }
+  }
+  if (existing !== configText) writeFileSync(configPath, configText, { encoding: "utf8" });
+}
+
+function commandCodeApiKey(source = process.env) {
+  const environmentKey = typeof source.COMMAND_CODE_API_KEY === "string"
+    ? source.COMMAND_CODE_API_KEY.trim()
+    : "";
+  if (environmentKey) return environmentKey;
+  try {
+    const auth = JSON.parse(readFileSync(join(homedir(), ".commandcode", "auth.json"), "utf8"));
+    return typeof auth?.apiKey === "string" && auth.apiKey.trim() ? auth.apiKey.trim() : null;
+  } catch {
+    return null;
+  }
+}
+
+function commandCodeEnvironment() {
+  ensureCommandCodeHome();
+  const env = sanitizedEnvironment();
+  env.HOME = COMMAND_CODE_HOME_DIRECTORY;
+  env.USERPROFILE = COMMAND_CODE_HOME_DIRECTORY;
+  const apiKey = commandCodeApiKey();
+  if (apiKey) env.COMMAND_CODE_API_KEY = apiKey;
+  return env;
+}
+
+function commandCodePrompt(context) {
+  return `[CommandCode workspace boundary]\nThe CLI launch directory is an internal MCP-isolation directory, not the project. The authoritative workspace is ${context.workingDirectory}. Use absolute paths for file tools. Begin every shell command by changing to that workspace with PowerShell Set-Location -LiteralPath. Do not inspect or write the internal launch directory.\n\n${context.prompt}`;
 }
 
 function delay(milliseconds) {
@@ -245,7 +353,7 @@ export function nativeCliAgentContext(body, { provider, model, requiredEffort })
   const workingDirectory = workingDirectoryFrom(body, input);
   const sections = [
     "[Single native-agent turn contract]\nComplete this delegated task within this one Codex subagent turn. Use your own local file, search, edit, and shell tools directly. Never delegate to another agent, task, teammate, swarm, or background worker. Do not return an intention, a deferred tool request, or a request for the parent to execute an ordinary file/shell operation. Return only when the bounded task is complete or a concrete blocker requires parent input. Honor the project AGENTS.md in the working directory. Builds, tests, editor control, PIE/SIE, runtime validation, and final integration remain owned by the parent whenever the task or project instructions reserve them.",
-    "[Native tool boundary]\nThe host shell is PowerShell on Windows. Never read, grep, decode, strings-scan, hex-dump, or otherwise inspect Unreal .uasset or .umap bytes through file or shell tools. Use the lazy RzMCP semantic tools when the task authorizes asset access. If those tools are disabled, unavailable, or semantically insufficient, return that concrete blocker; do not approximate asset semantics from binary bytes or repeat equivalent offset/chunk probes. Never read secret environment files.",
+    "[Native tool boundary]\nThe host shell is PowerShell on Windows. Never read, grep, decode, strings-scan, hex-dump, or otherwise inspect Unreal .uasset or .umap bytes through file or shell tools. When the task authorizes RzMCP, it is exposed lazily as exactly search_rzmcp_tools and call_rzmcp_tool: search for a focused schema first, then call only a discovered tool. Never enumerate or request the full RzMCP catalog. If those tools are disabled, unavailable, or semantically insufficient, return that concrete blocker; do not approximate asset semantics from binary bytes or repeat equivalent offset/chunk probes. Never read secret environment files.",
     projectInstructionsPromptSection(workingDirectory),
   ];
   const role = roleInstructionsFrom(body.instructions);
@@ -433,6 +541,8 @@ function openCodeResult(context, state, model) {
   return {
     finalText: state.finalText || "",
     toolNames: state.toolNames || [],
+    toolInputs: state.toolInputs || [],
+    rzMcpTools: state.rzMcpTools || [],
     mutationCount: state.mutationCount || 0,
     inputTokens: state.inputTokens || 0,
     outputTokens: state.outputTokens || 0,
@@ -446,6 +556,7 @@ function openCodeResult(context, state, model) {
 function attachNativeState(error, state) {
   const nativeState = state || {};
   error.nativeToolNames = [...(nativeState.toolNames || error.nativeToolNames || [])];
+  error.nativeRzMcpTools = [...(nativeState.rzMcpTools || error.nativeRzMcpTools || [])];
   error.providerMutationCount = Number(
     nativeState.mutationCount ?? error.providerMutationCount ?? 0,
   );
@@ -474,6 +585,8 @@ function mergeRecoveredResult(primary, recovered) {
   return {
     ...recovered,
     toolNames: [...primary.toolNames, ...recovered.toolNames],
+    toolInputs: [...(primary.toolInputs || []), ...(recovered.toolInputs || [])],
+    rzMcpTools: [...(primary.rzMcpTools || []), ...(recovered.rzMcpTools || [])],
     mutationCount: primary.mutationCount + recovered.mutationCount,
     inputTokens: primary.inputTokens + recovered.inputTokens,
     outputTokens: primary.outputTokens + recovered.outputTokens,
@@ -640,6 +753,8 @@ function openCodeConfig(context, providerKind) {
 function openCodeParser(event, state, executionPolicy) {
   state.finalText ||= "";
   state.toolNames ||= [];
+  state.toolInputs ||= [];
+  state.rzMcpTools ||= [];
   state.mutationCount ||= 0;
   state.inputTokens ||= 0;
   state.outputTokens ||= 0;
@@ -663,9 +778,18 @@ function openCodeParser(event, state, executionPolicy) {
   if (event.type === "tool_use") state.providerToolStarted = true;
   if (event.type === "tool_use" && event.part?.state?.status === "completed") {
     const name = String(event.part.tool || "unknown_tool");
+    const input = event.part?.state?.input;
     state.toolNames.push(name);
+    state.toolInputs.push(input ?? null);
+    if (LAZY_RZMCP_CALL_TOOL.test(name)) {
+      const outer = parsedToolInput(input);
+      const nested = outer?.tool_name === "call_rzmcp_tool"
+        ? parsedToolInput(outer.arguments)
+        : outer;
+      if (typeof nested?.name === "string" && nested.name) state.rzMcpTools.push(nested.name);
+    }
     state.lastToolSequence = state.eventSequence;
-    if (nativeToolIsMutation(name, event.part?.state?.input, executionPolicy)) {
+    if (nativeToolIsMutation(name, input, executionPolicy)) {
       state.mutationCount += 1;
     }
   }
@@ -745,6 +869,10 @@ export async function runOpenCodeNativeAgent(context, {
     OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER: "1",
   };
   const model = `${providerKind}/${context.model}`;
+  const parserPolicy = {
+    ...context.executionPolicy,
+    workingDirectory: context.workingDirectory,
+  };
   const run = async (
     prompt,
     continueSession,
@@ -758,7 +886,7 @@ export async function runOpenCodeNativeAgent(context, {
       env,
       signal,
       onEvent,
-      parseLine: (event, state) => openCodeParser(event, state, context.executionPolicy),
+      parseLine: (event, state) => openCodeParser(event, state, parserPolicy),
       inspectStderr: (stderr) => inspectOpenCodeStderr(providerKind, stderr),
       label: `${context.provider} native OpenCode agent`,
       requestTimeoutMs: timeoutMs,
@@ -810,10 +938,13 @@ function commandCodeParser(event, state, executionPolicy) {
   const payload = event?.type === "event" ? event.event : event;
   state.finalText ||= "";
   state.toolNames ||= [];
+  state.toolInputs ||= [];
+  state.rzMcpTools ||= [];
   state.mutationCount ||= 0;
   state.inputTokens ||= 0;
   state.outputTokens ||= 0;
   state.peakTurnInputTokens ||= 0;
+  state.pendingToolInputs ||= new Map();
   state.eventSequence = Number(state.eventSequence || 0) + 1;
   if (payload?.type === "text_delta" && typeof payload.delta === "string") {
     state.finalText += payload.delta;
@@ -822,11 +953,23 @@ function commandCodeParser(event, state, executionPolicy) {
   if (payload?.type === "tool_running" || payload?.type === "tool_completed") {
     state.providerToolStarted = true;
   }
+  if (payload?.type === "tool_queued" && payload.toolCallId) {
+    state.pendingToolInputs.set(payload.toolCallId, payload.input);
+  }
   if (payload?.type === "tool_completed") {
     const name = String(payload.toolName || "unknown_tool");
+    const input = payload.toolInput
+      ?? payload.input
+      ?? payload.arguments
+      ?? state.pendingToolInputs.get(payload.toolCallId);
+    state.pendingToolInputs.delete(payload.toolCallId);
+    state.lastCompletedToolCallId = payload.toolCallId;
+    state.lastCompletedToolInput = input;
     state.toolNames.push(name);
+    state.toolInputs.push(input ?? null);
+    const rzMcpTool = nativeRzMcpToolName(name, input);
+    if (rzMcpTool) state.rzMcpTools.push(rzMcpTool);
     state.lastToolSequence = state.eventSequence;
-    const input = payload.toolInput ?? payload.input ?? payload.arguments;
     if (nativeToolIsMutation(name, input, executionPolicy)) state.mutationCount += 1;
   }
   if (payload?.type === "model_request_end") {
@@ -848,30 +991,37 @@ export async function runCommandCodeNativeAgent(context, { signal, onEvent }) {
   const sessionName = commandCodeSessionName(context);
   const releaseNativeState = await acquireNativeState(`commandcode:${sessionName || randomUUID()}`);
   const resumeRetainedSession = sessionName ? retainedCommandCodeSessions.has(sessionName) : false;
+  const reasoningArgs = commandCodeReasoningArgs(context.model, context.requiredEffort);
   const args = [
     COMMAND_CODE_ENTRY,
-    "-p", context.prompt,
+    "-p", commandCodePrompt(context),
     "--output-format", "json",
+    "--add-dir", context.workingDirectory,
     ...(sessionName
       ? resumeRetainedSession ? ["--resume", sessionName] : ["--name", sessionName]
       : ["--no-session"]),
     "--no-skills", "--skip-onboarding", "--no-auto-update",
-    "--model", context.model, "--effort", context.requiredEffort,
+    "--model", context.model,
+    ...reasoningArgs,
     "--yolo",
   ];
+  const parserPolicy = {
+    ...context.executionPolicy,
+    workingDirectory: context.workingDirectory,
+  };
   try {
     const { state } = await nativeProcess({
       command: process.execPath,
       args,
-      cwd: context.workingDirectory,
+      cwd: COMMAND_CODE_LAUNCH_DIRECTORY,
       env: {
-        ...sanitizedEnvironment(),
+        ...commandCodeEnvironment(),
         COMMANDCODE_SKIP_UPDATES: "1",
         RZCODEX_SUBAGENT_RZMCP_MODE: context.executionPolicy.rzMcpMode,
       },
       signal,
       onEvent,
-      parseLine: (event, state) => commandCodeParser(event, state, context.executionPolicy),
+      parseLine: (event, state) => commandCodeParser(event, state, parserPolicy),
       label: `${context.provider} native CommandCode agent`,
     });
     if (sessionName) {
@@ -882,6 +1032,8 @@ export async function runCommandCodeNativeAgent(context, { signal, onEvent }) {
       ...validateResult(context, {
         finalText: state.finalText || "",
         toolNames: state.toolNames || [],
+        toolInputs: state.toolInputs || [],
+        rzMcpTools: state.rzMcpTools || [],
         mutationCount: state.mutationCount || 0,
         inputTokens: state.inputTokens || 0,
         outputTokens: state.outputTokens || 0,
@@ -893,6 +1045,7 @@ export async function runCommandCodeNativeAgent(context, { signal, onEvent }) {
       executionCount: 1,
       sameSessionContinuations: resumeRetainedSession ? 1 : 0,
       resumedProviderSession: resumeRetainedSession,
+      actualReasoningEffort: reasoningArgs.length > 0 ? context.requiredEffort : "fixed-model-maximum",
     };
   } catch (error) {
     if (sessionName && error?.status === 499 && (error.nativeToolNames || []).length > 0) {
@@ -906,6 +1059,84 @@ export async function runCommandCodeNativeAgent(context, { signal, onEvent }) {
 
 export async function nativeCliAgentRunnerSelfTest() {
   const authoritativeWorkspace = join(import.meta.dirname, "..");
+  if (
+    commandCodeReasoningArgs("meta/muse-spark-1.3-contributor", "max").length !== 0
+    || commandCodeReasoningArgs("z-ai/glm-5.3-flash", "max").join(" ") !== "--effort max"
+  ) {
+    throw new Error("CommandCode fixed-reasoning CLI arguments are incorrect");
+  }
+  const commandCodeServers = JSON.parse(commandCodeMcpConfigText()).mcpServers;
+  if (
+    Object.keys(commandCodeServers || {}).length !== 1
+    || commandCodeServers.rzmcp?.command !== "node"
+    || commandCodeServers.rzmcp?.args?.length !== 1
+    || commandCodeServers.rzmcp?.args?.[0] !== LAZY_RZMCP_PROXY
+    || commandCodeServers.rzmcp?.enabled !== true
+  ) {
+    throw new Error("CommandCode MCP isolation must expose exactly the lazy RzMCP proxy");
+  }
+  const mutationScopeFixture = {};
+  openCodeParser({
+    type: "tool_use",
+    part: {
+      tool: "write",
+      state: { status: "completed", input: { filePath: join(homedir(), "AppData", "Local", "Temp", "scratch.txt") } },
+    },
+  }, mutationScopeFixture, { rzMcpMode: "no-validation", workingDirectory: authoritativeWorkspace });
+  openCodeParser({
+    type: "tool_use",
+    part: {
+      tool: "write",
+      state: { status: "completed", input: { filePath: join(authoritativeWorkspace, "fixture.txt") } },
+    },
+  }, mutationScopeFixture, { rzMcpMode: "no-validation", workingDirectory: authoritativeWorkspace });
+  if (mutationScopeFixture.mutationCount !== 1) {
+    throw new Error("native OpenCode mutation accounting did not distinguish workspace files from scratch artifacts");
+  }
+  const lazyRzMcpProgressFixture = {};
+  openCodeParser({
+    type: "tool_use",
+    part: {
+      tool: "rzmcp_call_rzmcp_tool",
+      state: {
+        status: "completed",
+        input: { name: "inspect_graph_by_path", arguments: { blueprint: "/Game/Fixture" } },
+      },
+    },
+  }, lazyRzMcpProgressFixture, { rzMcpMode: "read-only" });
+  if (
+    lazyRzMcpProgressFixture.toolNames?.join(",") !== "rzmcp_call_rzmcp_tool"
+    || lazyRzMcpProgressFixture.rzMcpTools?.join(",") !== "inspect_graph_by_path"
+    || lazyRzMcpProgressFixture.mutationCount !== 0
+  ) {
+    throw new Error("native OpenCode lazy RzMCP calls were not identified authoritatively");
+  }
+  const commandCodeLazyRzMcpFixture = {};
+  commandCodeParser({
+    type: "event",
+    event: {
+      type: "tool_queued",
+      toolCallId: "commandcode-lazy-fixture",
+      toolName: "mcp__rzmcp__call_rzmcp_tool",
+      input: { name: "get_project_info", arguments: {} },
+    },
+  }, commandCodeLazyRzMcpFixture, { rzMcpMode: "read-only" });
+  commandCodeParser({
+    type: "event",
+    event: {
+      type: "tool_completed",
+      toolCallId: "commandcode-lazy-fixture",
+      toolName: "mcp__rzmcp__call_rzmcp_tool",
+      result: [],
+    },
+  }, commandCodeLazyRzMcpFixture, { rzMcpMode: "read-only" });
+  if (
+    commandCodeLazyRzMcpFixture.rzMcpTools?.join(",") !== "get_project_info"
+    || commandCodeLazyRzMcpFixture.mutationCount !== 0
+    || commandCodeLazyRzMcpFixture.lastCompletedToolInput?.name !== "get_project_info"
+  ) {
+    throw new Error("native CommandCode queued tool input was not retained through completion");
+  }
   const ollamaConfigFixture = JSON.parse(openCodeConfig({
     model: "glm-5.3-flash:cloud",
     executionPolicy: { rzMcpMode: "disabled" },
@@ -1014,7 +1245,7 @@ export async function nativeCliAgentRunnerSelfTest() {
     !cwdContext.prompt.includes("[Native tool boundary]")
     || !cwdContext.prompt.includes("[Project AGENTS instructions - authoritative and complete]")
     || !cwdContext.prompt.includes("Never read, grep, decode, strings-scan, hex-dump")
-    || !cwdContext.prompt.includes("Use the lazy RzMCP semantic tools")
+    || !cwdContext.prompt.includes("it is exposed lazily as exactly search_rzmcp_tools and call_rzmcp_tool")
   ) {
     throw new Error("native CLI prompt omitted the Unreal semantic-tool boundary");
   }
