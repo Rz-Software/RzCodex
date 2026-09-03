@@ -858,6 +858,7 @@ export async function runOpenCodeNativeAgent(context, {
   signal,
   onEvent,
   onRecovery,
+  onSessionStart,
 }) {
   if (!existsSync(OPENCODE_EXE)) throw new NativeCliAgentError(`OpenCode CLI is missing at ${OPENCODE_EXE}`);
   if (!existsSync(LAZY_RZMCP_PROXY)) throw new NativeCliAgentError(`Lazy RzMCP proxy is missing at ${LAZY_RZMCP_PROXY}`);
@@ -866,6 +867,7 @@ export async function runOpenCodeNativeAgent(context, {
   const dbPath = retainedNativeStatePath(context, providerKind);
   const releaseNativeState = await acquireNativeState(dbPath);
   const resumeRetainedSession = retainedOpenCodeStates.has(dbPath) && nativeStateExists(dbPath);
+  onSessionStart?.({ resumed: resumeRetainedSession });
   const priorProgress = resumeRetainedSession ? retainedOpenCodeProgress.get(dbPath) : null;
   retainedOpenCodeStates.delete(dbPath);
   if (!resumeRetainedSession) {

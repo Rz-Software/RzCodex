@@ -562,7 +562,8 @@ const runtime = {
   activeRequests: 0,
   activeFreeRequests: 0, queuedFreeRequests: 0,
   activeOllamaRequests: 0, queuedOllamaRequests: 0,
-  supersededTurns: 0,
+  supersededTurns: 0, clientCancelledRequests: 0,
+  lastClientCancellationReason: null,
   resourceRetries: 0, providerContinuations: 0, nativeTerminalContinuations: 0,
   streamContinuations: 0, compactionCheckpoints: 0,
   providerCheckpoints: 0,
@@ -2267,7 +2268,6 @@ async function runOllamaStage(
       runtime.providerAttempts.ollama += 1;
       runtime.lastProviderSequence.push("ollama");
       pinProviderTask(context, "ollama");
-      onProgress?.("Ollama native CLI agent started one self-contained execution.\n");
       let nativeContext;
       try {
         const forwardedBody = fallbackForwardBody(
@@ -2316,6 +2316,11 @@ async function runOllamaStage(
           runtime.providerContinuations += 1;
           runtime.nativeTerminalContinuations += 1;
           onProgress?.("Ollama native CLI resumed the same retained session after a missing terminal response.\n");
+        },
+        onSessionStart: ({ resumed }) => {
+          onProgress?.(resumed
+            ? "Ollama native CLI resumed the same task-owned provider session for new parent input.\n"
+            : "Ollama native CLI agent started one self-contained execution.\n");
         },
       });
       if (ollamaQuotaState.clear()) runtime.ollamaQuotaClears += 1;
@@ -2888,14 +2893,16 @@ async function handleResponses(request, response) {
   runtime.lastFallbackStreamedMessageCount = 0;
   let child = null;
   const abortController = new AbortController();
-  const abort = () => {
+  let cancellationReason = null;
+  const abort = (reason) => {
+    cancellationReason ??= reason;
     abortController.abort();
     if (child && !child.killed) child.kill();
   };
   let resolveThreadTurnDone;
   const threadTurn = {
     requestId: context.requestId,
-    abort,
+    abort: () => abort("superseded_request"),
     done: new Promise((resolve) => { resolveThreadTurnDone = resolve; }),
   };
   try {
@@ -2904,8 +2911,8 @@ async function handleResponses(request, response) {
     runtime.activeRequests = Math.max(0, runtime.activeRequests - 1);
     throw error;
   }
-  request.once("aborted", abort);
-  response.once("close", () => { if (!response.writableEnded) abort(); });
+  request.once("aborted", () => abort("request_aborted"));
+  response.once("close", () => { if (!response.writableEnded) abort("response_closed"); });
   response.writeHead(200, { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache", connection: "keep-alive" });
   const responseId = `resp_${randomUUID()}`;
   writeSse(response, "response.created", { response: { id: responseId, object: "response", model: context.modelAlias, status: "in_progress" } });
@@ -3012,7 +3019,13 @@ async function handleResponses(request, response) {
     } });
     response.end();
   } catch (error) {
-    runtime.failed += 1;
+    const clientCancelled = abortController.signal.aborted && error?.status === 499;
+    if (clientCancelled) {
+      runtime.clientCancelledRequests += 1;
+      runtime.lastClientCancellationReason = cancellationReason;
+    } else {
+      runtime.failed += 1;
+    }
     progress.finish();
     const responseError = { code: providerResponseErrorCode(error), message: error.message };
     if (typeof error?.nativeFallbackRoute === "string") {
