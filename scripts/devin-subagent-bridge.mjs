@@ -1076,7 +1076,10 @@ function committedProviderResult(context, error) {
     outputTokensPerSecond: null,
     toolCalls: [],
     nativeToolNames: toolNames,
-    rzMcpTools: Array.isArray(error?.rzMcpTools) ? error.rzMcpTools : [],
+    rzMcpTools: [...new Set([
+      ...(Array.isArray(error?.nativeRzMcpTools) ? error.nativeRzMcpTools : []),
+      ...(Array.isArray(error?.rzMcpTools) ? error.rzMcpTools : []),
+    ])],
     toolSchemaBytesIgnored: context.toolSchemaBytes,
     toolSchemaBytesForwarded: 0,
     autoStage: error?.failedStage || null,
@@ -1782,6 +1785,7 @@ function completedProviderCheckpoint(context, session, failureState) {
   return {
     cliResult: { code: 0, stdout: text, stderr: "" },
     session: { ...session, terminalText: text },
+    preserveProviderSession: true,
   };
 }
 
@@ -2436,7 +2440,8 @@ async function runDevinStage(
   if (!freeModel && !cliFailed(routeResult.cliResult) && calendarQuotaState.clear()) {
     runtime.calendarQuotaClears += 1;
   }
-  const preserveSession = context.taskState.checkpointRequested && Boolean(retainedSessionKey);
+  const preserveSession = Boolean(retainedSessionKey)
+    && (context.taskState.checkpointRequested || routeResult.preserveProviderSession === true);
   const result = finalizeDevinResult(
     context,
     selected,
@@ -3669,6 +3674,7 @@ async function selfTest() {
   if (
     terminalFailureCalls.length !== 2
     || terminalFailureDelays.join(",") !== "1000"
+    || committedCheckpoint.preserveProviderSession !== true
     || !committedCheckpoint.session.terminalText.includes("Authoritative native-provider checkpoint")
     || !committedCheckpoint.session.terminalText.includes("Provider tool calls completed: 2")
     || !committedCheckpoint.session.terminalText.includes("Provider mutation calls observed: 1")
@@ -4426,6 +4432,7 @@ async function selfTest() {
     toolCalls: [{ name: "read" }],
   });
   readOnlyCommittedError.failedStage = "ollama";
+  readOnlyCommittedError.nativeRzMcpTools = ["inspect_graph_by_path"];
   const committedCheckpointResult = committedProviderResult(
     { taskDiagnostics: recoveryContext.taskDiagnostics, toolSchemaBytes: 123 },
     readOnlyCommittedError,
@@ -4434,6 +4441,7 @@ async function selfTest() {
     readOnlyCommittedError.routeCommitted !== true
     || committedCheckpointResult.selected.provider !== "ollama"
     || committedCheckpointResult.nativeToolNames.join(",") !== "read"
+    || committedCheckpointResult.rzMcpTools.join(",") !== "inspect_graph_by_path"
     || !committedCheckpointResult.text.includes("was not replayed")
     || committedCheckpointResult.toolSchemaBytesIgnored !== 123
   ) {

@@ -9,6 +9,7 @@ use crate::session::turn::run_turn;
 use crate::session::turn_context::TurnContext;
 use crate::session_startup_prewarm::SessionStartupPrewarmResolution;
 use crate::state::TaskKind;
+use codex_protocol::error::CodexErr;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_thread_store::PersistContext;
@@ -64,7 +65,7 @@ impl SessionTask for RegularTask {
         let prewarmed_client_session = match prewarmed_client_session {
             SessionStartupPrewarmResolution::Cancelled => {
                 run_hooks_and_record_inputs(&sess, &ctx, &input, PersistContext::Standard).await;
-                return Ok(None);
+                return Err(CodexErr::TurnAborted);
             }
             SessionStartupPrewarmResolution::Unavailable { .. } => None,
             SessionStartupPrewarmResolution::Ready(prewarmed_client_session) => {

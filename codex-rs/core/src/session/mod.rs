@@ -2171,9 +2171,12 @@ impl Session {
                 status
             }
             None => {
-                let Some(status) = agent_status_from_event(msg) else {
+                let Some(status) =
+                    crate::agent::status::spawned_agent_terminal_status_from_event(msg)
+                else {
                     return;
                 };
+                self.agent_status.send_replace(status.clone());
                 status
             }
         };

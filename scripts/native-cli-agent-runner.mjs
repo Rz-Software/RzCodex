@@ -32,11 +32,7 @@ const TERMINAL_RECOVERY_TIMEOUT_MS = 45 * 1000;
 const COMMANDCODE_FIXED_REASONING_MODELS = new Set([
   "meta/muse-spark-1.3-contributor",
 ]);
-// OpenCode's native `steps` control forces a text-only response after this many agentic
-// iterations. Completed production workers converge around 24-34 tool calls; 40 preserves room for
-// that proven workload while preventing the 64-step, 76-call investigation loop seen in live use.
 const OPENCODE_PRIMARY_AGENT = "rzcodex-native";
-const OPENCODE_PRIMARY_STEPS = 40;
 // Recovery exists only to close an interrupted provider stream. It may perform one final tool
 // iteration, after which OpenCode itself forces the terminal report.
 const OPENCODE_TERMINAL_AGENT = "rzcodex-terminal";
@@ -73,6 +69,7 @@ const NATIVE_MCP_CALL_TOOL = /^mcp_call_tool$/i;
 const READ_ONLY_RZMCP_TOOL_NAME = /^(?:analyze|check|count|describe|discover|does|enumerate|find|get|has|inspect|is|list|locate|query|read|resolve|search|validate)_/i;
 const OLLAMA_USAGE_LIMIT = /providerID=ollama[\s\S]{0,2000}(?:reached|exceeded)[\s\S]{0,120}(?:session\s+)?usage limit|providerID=ollama[\s\S]{0,2000}\b429\b[\s\S]{0,120}(?:quota|usage|limit)/i;
 const retainedOpenCodeStates = new Set();
+const retainedOpenCodeProgress = new Map();
 const retainedCommandCodeSessions = new Set();
 const nativeStateTails = new Map();
 
@@ -557,6 +554,8 @@ function attachNativeState(error, state) {
   const nativeState = state || {};
   error.nativeToolNames = [...(nativeState.toolNames || error.nativeToolNames || [])];
   error.nativeRzMcpTools = [...(nativeState.rzMcpTools || error.nativeRzMcpTools || [])];
+  error.toolCalls = error.nativeToolNames.length;
+  error.rzMcpTools = [...error.nativeRzMcpTools];
   error.providerMutationCount = Number(
     nativeState.mutationCount ?? error.providerMutationCount ?? 0,
   );
@@ -565,6 +564,26 @@ function attachNativeState(error, state) {
     configurable: true,
   });
   return error;
+}
+
+function mergeNativeExecutionResults(previous, current) {
+  if (!previous) return current;
+  return {
+    ...current,
+    toolNames: [...(previous.toolNames || []), ...(current.toolNames || [])],
+    toolInputs: [...(previous.toolInputs || []), ...(current.toolInputs || [])],
+    rzMcpTools: [...(previous.rzMcpTools || []), ...(current.rzMcpTools || [])],
+    mutationCount: Number(previous.mutationCount || 0) + Number(current.mutationCount || 0),
+    inputTokens: Number(previous.inputTokens || 0) + Number(current.inputTokens || 0),
+    outputTokens: Number(previous.outputTokens || 0) + Number(current.outputTokens || 0),
+    peakTurnInputTokens: Math.max(
+      Number(previous.peakTurnInputTokens || 0),
+      Number(current.peakTurnInputTokens || 0),
+    ),
+    executionCount: Number(previous.executionCount || 1) + Number(current.executionCount || 1),
+    sameSessionContinuations: Number(previous.sameSessionContinuations || 0)
+      + Number(current.sameSessionContinuations || 0),
+  };
 }
 
 function terminalRecoveryPrompt(context, primary) {
@@ -609,12 +628,7 @@ async function completeOpenCodeTurn(context, model, runInitial, runContinuation,
         sameSessionContinuations: 0,
       };
     } catch (error) {
-      // A zero-exit CLI execution is authoritative. Continuing it used to turn a provider that
-      // had exhausted its own loop into a second investigation, rather than recovering an
-      // interrupted stream. Fail this malformed terminal boundary explicitly instead.
-      const cleanExitError = attachNativeState(error, state);
-      cleanExitError.cleanProviderExit = true;
-      throw cleanExitError;
+      throw attachNativeState(error, state);
     }
   } catch (error) {
     initialFailure = error;
@@ -623,7 +637,6 @@ async function completeOpenCodeTurn(context, model, runInitial, runContinuation,
       mutationCount: error.providerMutationCount || 0,
     }, model);
   }
-  if (initialFailure?.cleanProviderExit) throw initialFailure;
   if (initialFailure?.status === 499 || primary.toolNames.length === 0) throw initialFailure;
   onRecovery?.({
     toolCalls: primary.toolNames.length,
@@ -665,7 +678,6 @@ function openCodeConfig(context, providerKind) {
     agent: {
       [OPENCODE_PRIMARY_AGENT]: {
         mode: "primary",
-        steps: OPENCODE_PRIMARY_STEPS,
       },
       [OPENCODE_TERMINAL_AGENT]: {
         mode: "primary",
@@ -851,8 +863,12 @@ export async function runOpenCodeNativeAgent(context, {
   const dbPath = retainedNativeStatePath(context, providerKind);
   const releaseNativeState = await acquireNativeState(dbPath);
   const resumeRetainedSession = retainedOpenCodeStates.has(dbPath) && nativeStateExists(dbPath);
+  const priorProgress = resumeRetainedSession ? retainedOpenCodeProgress.get(dbPath) : null;
   retainedOpenCodeStates.delete(dbPath);
-  if (!resumeRetainedSession && nativeStateExists(dbPath)) await cleanupNativeState(dbPath);
+  if (!resumeRetainedSession) {
+    retainedOpenCodeProgress.delete(dbPath);
+    if (nativeStateExists(dbPath)) await cleanupNativeState(dbPath);
+  }
   const env = {
     ...sanitizedEnvironment(),
     RZCODEX_SUBAGENT_RZMCP_MODE: context.executionPolicy.rzMcpMode,
@@ -896,7 +912,7 @@ export async function runOpenCodeNativeAgent(context, {
   };
   let preserveRetainedSession = false;
   try {
-    const result = await completeOpenCodeTurn(
+    const currentResult = await completeOpenCodeTurn(
       context,
       model,
       () => run(context.prompt, resumeRetainedSession),
@@ -908,8 +924,10 @@ export async function runOpenCodeNativeAgent(context, {
       ),
       onRecovery,
     );
+    const result = mergeNativeExecutionResults(priorProgress, currentResult);
     if (context.taskState.checkpointRequested) {
       retainedOpenCodeStates.add(dbPath);
+      retainedOpenCodeProgress.set(dbPath, result);
       preserveRetainedSession = true;
     }
     return {
@@ -917,10 +935,23 @@ export async function runOpenCodeNativeAgent(context, {
       resumedProviderSession: resumeRetainedSession,
     };
   } catch (error) {
+    const currentProgress = {
+      ...openCodeResult(context, error.nativeState || {
+        toolNames: error.nativeToolNames || [],
+        rzMcpTools: error.nativeRzMcpTools || [],
+        mutationCount: error.providerMutationCount || 0,
+      }, model),
+      executionCount: Number(error.nativeState?.executionCount || 1),
+      sameSessionContinuations: Number(error.nativeState?.sameSessionContinuations || 0),
+    };
+    const cumulativeProgress = mergeNativeExecutionResults(priorProgress, currentProgress);
+    attachNativeState(error, cumulativeProgress);
     if (resumeRetainedSession) error.routeCommitted = true;
-    preserveRetainedSession = resumeRetainedSession
-      || (error?.status === 499 && (error.nativeToolNames || []).length > 0);
-    if (preserveRetainedSession) retainedOpenCodeStates.add(dbPath);
+    preserveRetainedSession = resumeRetainedSession || cumulativeProgress.toolNames.length > 0;
+    if (preserveRetainedSession) {
+      retainedOpenCodeStates.add(dbPath);
+      retainedOpenCodeProgress.set(dbPath, cumulativeProgress);
+    }
     throw error;
   } finally {
     // OpenCode can close before its SQLite handles are released on Windows. Cleanup is not part of
@@ -928,6 +959,7 @@ export async function runOpenCodeNativeAgent(context, {
     // locked, and let the age-based sweep remove it after no legitimate request can still own it.
     if (!preserveRetainedSession) {
       retainedOpenCodeStates.delete(dbPath);
+      retainedOpenCodeProgress.delete(dbPath);
       await cleanupNativeState(dbPath);
     }
     releaseNativeState();
@@ -1149,10 +1181,10 @@ export async function nativeCliAgentRunnerSelfTest() {
   }
   if (
     ollamaConfigFixture.default_agent !== OPENCODE_PRIMARY_AGENT
-    || ollamaConfigFixture.agent?.[OPENCODE_PRIMARY_AGENT]?.steps !== OPENCODE_PRIMARY_STEPS
+    || Object.hasOwn(ollamaConfigFixture.agent?.[OPENCODE_PRIMARY_AGENT] || {}, "steps")
     || ollamaConfigFixture.agent?.[OPENCODE_TERMINAL_AGENT]?.steps !== OPENCODE_TERMINAL_STEPS
   ) {
-    throw new Error("native OpenCode agent iteration boundary was not configured");
+    throw new Error("native OpenCode primary execution must not have an artificial step boundary");
   }
   const readPermissionEntries = Object.entries(ollamaConfigFixture.permission?.read || {});
   const bashPermissionEntries = Object.entries(ollamaConfigFixture.permission?.bash || {});
@@ -1495,32 +1527,73 @@ export async function nativeCliAgentRunnerSelfTest() {
   }
 
   let cleanExitContinuationCalls = 0;
-  let cleanExitFailure = null;
-  try {
-    await completeOpenCodeTurn(
-      resumedMutationContext,
-      "ollama/glm-5.3-flash:cloud",
-      async () => ({
-        finalText: "Starting.",
-        toolNames: ["read"],
+  const cleanExitRecovered = await completeOpenCodeTurn(
+    resumedMutationContext,
+    "ollama/glm-5.3-flash:cloud",
+    async () => ({
+      finalText: "Starting.",
+      toolNames: ["read"],
+      mutationCount: 0,
+      lastTextSequence: 1,
+      lastToolSequence: 2,
+    }),
+    async () => {
+      cleanExitContinuationCalls += 1;
+      return {
+        finalText: "Recovered terminal report.",
+        toolNames: [],
         mutationCount: 0,
         lastTextSequence: 1,
-        lastToolSequence: 2,
-      }),
-      async () => {
-        cleanExitContinuationCalls += 1;
-        return { finalText: "must not run" };
-      },
-    );
-  } catch (error) {
-    cleanExitFailure = error;
-  }
+        lastToolSequence: 0,
+      };
+    },
+  );
   if (
-    cleanExitContinuationCalls !== 0
-    || cleanExitFailure?.cleanProviderExit !== true
-    || !cleanExitFailure?.message.includes("without a terminal assistant message")
+    cleanExitContinuationCalls !== 1
+    || cleanExitRecovered.finalText !== "Recovered terminal report."
+    || cleanExitRecovered.toolNames.join(",") !== "read"
+    || cleanExitRecovered.sameSessionContinuations !== 1
   ) {
-    throw new Error("native OpenCode clean exit incorrectly started terminal recovery");
+    throw new Error("native OpenCode clean incomplete exit did not recover in the retained session");
+  }
+
+  const cumulativeFixture = mergeNativeExecutionResults(
+    {
+      finalText: "",
+      toolNames: ["read", "search_rzmcp_tools"],
+      toolInputs: [{ path: "a" }, { query: "asset" }],
+      rzMcpTools: [],
+      mutationCount: 0,
+      inputTokens: 100,
+      outputTokens: 10,
+      peakTurnInputTokens: 100,
+      executionCount: 1,
+      sameSessionContinuations: 0,
+    },
+    {
+      finalText: "Complete.",
+      toolNames: ["call_rzmcp_tool", "edit"],
+      toolInputs: [{ name: "inspect_graph_by_path" }, { path: "b" }],
+      rzMcpTools: ["inspect_graph_by_path"],
+      mutationCount: 1,
+      inputTokens: 80,
+      outputTokens: 20,
+      peakTurnInputTokens: 120,
+      executionCount: 2,
+      sameSessionContinuations: 1,
+    },
+  );
+  if (
+    cumulativeFixture.toolNames.join(",") !== "read,search_rzmcp_tools,call_rzmcp_tool,edit"
+    || cumulativeFixture.rzMcpTools.join(",") !== "inspect_graph_by_path"
+    || cumulativeFixture.mutationCount !== 1
+    || cumulativeFixture.inputTokens !== 180
+    || cumulativeFixture.outputTokens !== 30
+    || cumulativeFixture.peakTurnInputTokens !== 120
+    || cumulativeFixture.executionCount !== 3
+    || cumulativeFixture.sameSessionContinuations !== 1
+  ) {
+    throw new Error("native OpenCode retained-session progress was not cumulative");
   }
 
   let recoveryFailure = null;

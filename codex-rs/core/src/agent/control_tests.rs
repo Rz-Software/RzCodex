@@ -556,6 +556,28 @@ async fn on_event_updates_status_from_task_complete() {
 }
 
 #[tokio::test]
+async fn spawned_agent_empty_task_complete_is_an_error() {
+    let status = crate::agent::status::spawned_agent_terminal_status_from_event(
+        &EventMsg::TurnComplete(TurnCompleteEvent {
+            turn_id: "turn-1".to_string(),
+            started_at: None,
+            last_agent_message: None,
+            error: None,
+            completed_at: None,
+            duration_ms: None,
+            time_to_first_token_ms: None,
+        }),
+    );
+
+    assert_eq!(
+        status,
+        Some(AgentStatus::Errored(
+            "subagent turn completed without a terminal assistant response".to_string()
+        ))
+    );
+}
+
+#[tokio::test]
 async fn on_event_updates_status_from_error() {
     let status = agent_status_from_event(&EventMsg::Error(ErrorEvent {
         misalignment: None,
