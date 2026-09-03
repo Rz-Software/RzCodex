@@ -26,6 +26,10 @@ pub struct SubagentRoute {
     pub label: String,
     pub model_provider: String,
     pub model: String,
+    /// Optional provider model alias used when this route drives the root conversation.
+    /// The delegated model remains `model`, so bridge contracts can keep the two roles distinct.
+    #[serde(default)]
+    pub main_model: Option<String>,
     pub reasoning_effort: ReasoningEffort,
     #[serde(default)]
     pub input_modalities: Option<Vec<InputModality>>,
@@ -228,6 +232,13 @@ fn validate_route(id: &str, route: &SubagentRoute) -> Result<()> {
             bail!("subagent route `{id}` has an empty `{field}`");
         }
     }
+    if route
+        .main_model
+        .as_deref()
+        .is_some_and(|main_model| main_model.trim().is_empty())
+    {
+        bail!("subagent route `{id}` has an empty `mainModel`");
+    }
     Ok(())
 }
 
@@ -382,6 +393,7 @@ mod tests {
                   "label": "Native OpenAI",
                   "modelProvider": "openai",
                   "model": "test-model",
+                  "mainModel": "@preset/rzcodex-main",
                   "reasoningEffort": "max"
                 }
               }
@@ -426,6 +438,10 @@ mod tests {
         let resolved = resolve_active_subagent_route(home.path()).unwrap().unwrap();
         assert_eq!(resolved.id, "native");
         assert_eq!(resolved.route.model_provider, "openai");
+        assert_eq!(
+            resolved.route.main_model.as_deref(),
+            Some("@preset/rzcodex-main")
+        );
         assert_eq!(resolved.route.reasoning_effort, ReasoningEffort::Max);
     }
 
@@ -468,6 +484,28 @@ mod tests {
         assert!(load_subagent_route_catalog(home.path()).is_err());
 
         write_fallback_catalog(home.path(), "native", "bridge");
+        assert!(load_subagent_route_catalog(home.path()).is_err());
+    }
+
+    #[test]
+    fn rejects_empty_main_model_alias() {
+        let home = TempDir::new().unwrap();
+        std::fs::write(
+            home.path().join(SUBAGENT_ROUTE_CATALOG_FILE),
+            r#"{
+              "routes": {
+                "bridge": {
+                  "label": "Bridge",
+                  "modelProvider": "bridge",
+                  "model": "subagent-model",
+                  "mainModel": "   ",
+                  "reasoningEffort": "high"
+                }
+              }
+            }"#,
+        )
+        .unwrap();
+
         assert!(load_subagent_route_catalog(home.path()).is_err());
     }
 }

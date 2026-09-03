@@ -164,8 +164,13 @@ pub(crate) async fn run_turn(
     // Record results from hooks that finished after the previous turn before this turn's user prompt.
     drain_async_hook_results(&sess, &turn_context, /*before_user_prompt*/ true).await;
 
-    let mut client_session =
-        prewarmed_client_session.unwrap_or_else(|| sess.services.model_client.new_session());
+    let mut client_session = match prewarmed_client_session {
+        Some(prewarmed) if prewarmed.provider_info() == turn_context.provider.info() => prewarmed,
+        _ => sess
+            .services
+            .model_client
+            .new_session_for_provider(turn_context.provider.clone()),
+    };
     let mut execution_turn_context = Arc::clone(&turn_context);
     let mut native_fallback_active = false;
     // TODO(ccunningham): Pre-turn compaction runs before context updates and the

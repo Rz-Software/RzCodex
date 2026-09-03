@@ -4908,6 +4908,21 @@ fn thread_settings_update_params_preserve_explicit_null_service_tier() {
 }
 
 #[test]
+fn thread_settings_update_params_round_trip_model_provider() {
+    let params: ThreadSettingsUpdateParams = serde_json::from_value(json!({
+        "threadId": "thread_123",
+        "model": "@preset/rzcodex-main",
+        "modelProvider": "codebuddy"
+    }))
+    .expect("params should deserialize");
+    assert_eq!(params.model.as_deref(), Some("@preset/rzcodex-main"));
+    assert_eq!(params.model_provider.as_deref(), Some("codebuddy"));
+
+    let serialized = serde_json::to_value(params).expect("params should serialize");
+    assert_eq!(serialized["modelProvider"], "codebuddy");
+}
+
+#[test]
 fn thread_settings_update_params_preserve_field_level_experimental_gates() {
     let permissions = ThreadSettingsUpdateParams {
         thread_id: "thread_123".to_string(),

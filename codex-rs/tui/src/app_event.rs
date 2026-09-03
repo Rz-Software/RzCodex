@@ -281,6 +281,12 @@ pub(crate) enum AppEvent {
     SetSubagentRoute {
         route_id: String,
     },
+    /// Open the centrally configured provider routes that can drive the root conversation.
+    OpenMainAgentRoutePicker,
+    /// Switch the active root conversation and persisted defaults to one provider route.
+    SetMainAgentRoute {
+        route_id: String,
+    },
     /// Merge a completed root-scoped agent-picker refresh without blocking terminal input.
     AgentPickerThreadsLoaded {
         primary_thread_id: ThreadId,

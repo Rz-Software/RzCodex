@@ -36,6 +36,7 @@ import { projectInstructionsPromptSection } from "./native-project-instructions.
 
 const PROVIDER_ID = "codebuddy";
 const MODEL_ALIAS = "@preset/codex-subagents";
+const MAIN_MODEL_ALIAS = "@preset/rzcodex-main";
 const REQUIRED_AUTH_SOURCE = "www.codebuddy.ai";
 const REQUIRED_EFFORT = "max";
 const DEFAULT_PORT = 54547;
@@ -61,6 +62,7 @@ const CODEBUDDY_SCRIPT = join(
   process.env.APPDATA || join(homedir(), "AppData", "Roaming"),
   "npm", "node_modules", "@tencent-ai", "codebuddy-code", "bin", "codebuddy",
 );
+const MAIN_AGENT_CONTRACT = "[RzCodex main-agent contract]\nAct as the primary coding agent for this conversation. Use CodeBuddy's own Read, Write, Edit, Bash, Glob, and Grep tools directly. Follow the complete RzCodex, project, and user instructions supplied this turn, preserve unrelated work, verify changes in proportion to risk, and return only after the current user request is complete or concretely blocked. RzMCP is exposed lazily as only search_rzmcp_tools and call_rzmcp_tool through the rzmcp MCP server; search first, then call the selected tool.";
 
 class BridgeError extends Error {
   constructor(message, status = 400) {
@@ -180,8 +182,8 @@ function configuredPort() {
 }
 
 function resolveRoute(requested) {
-  if (requested !== MODEL_ALIAS) {
-    throw new BridgeError(`CodeBuddy subagents must use the centrally managed ${MODEL_ALIAS} alias`);
+  if (requested !== MODEL_ALIAS && requested !== MAIN_MODEL_ALIAS) {
+    throw new BridgeError(`CodeBuddy bridge must use the centrally managed ${MODEL_ALIAS} or ${MAIN_MODEL_ALIAS} alias`);
   }
   let routes;
   try {
@@ -405,7 +407,7 @@ function inputShouldReachResumedProvider(item, message) {
 class ProviderConversationRegistry {
   #states = new Map();
 
-  prepare(threadId, input, incomingTaskState) {
+  prepare(threadId, input, incomingTaskState, { mainAgent = false } = {}) {
     if (typeof threadId !== "string" || threadId.length === 0) {
       throw new BridgeError("client_metadata.thread_id must be a non-empty string");
     }
@@ -415,7 +417,7 @@ class ProviderConversationRegistry {
     }
     const incomingTask = incomingTaskState.activeTask;
     if (!state) {
-      if (!incomingTask) {
+      if (!mainAgent && !incomingTask) {
         throw new BridgeError(
           "CodeBuddy received a subagent turn without an active NEW_TASK and has no retained provider session",
         );
@@ -447,7 +449,7 @@ class ProviderConversationRegistry {
     const taskChanged = Boolean(
       incomingTask && incomingTask.hash !== state.activeTask?.hash,
     );
-    if (!state.activeTask || taskChanged) {
+    if (!mainAgent && (!state.activeTask || taskChanged)) {
       if (!incomingTask) {
         throw new BridgeError("CodeBuddy provider state has no active task to retain", 500);
       }
@@ -471,7 +473,7 @@ class ProviderConversationRegistry {
 
     const keys = itemKeys(input);
     const messagesByIndex = new Map(incomingTaskState.messages.map((message) => [message.index, message]));
-    const relevantStart = incomingTask?.hash === state.activeTask.hash
+    const relevantStart = incomingTask && state.activeTask && incomingTask.hash === state.activeTask.hash
       ? incomingTask.index + 1
       : 0;
 
@@ -802,10 +804,12 @@ function mergeRetainedToolInfo(retained, incoming) {
 function promptFrom(body, registry = providerConversations) {
   assertObject(body, "request body");
   if (body.stream !== true) throw new BridgeError("The CodeBuddy bridge requires stream=true");
-  const route = resolveRoute(requireString(body.model, "model"));
+  const requestedModel = requireString(body.model, "model");
+  const mainAgent = requestedModel === MAIN_MODEL_ALIAS;
+  const route = resolveRoute(requestedModel);
   const requestedEffort = body.reasoning?.effort;
   if (requestedEffort !== undefined && requestedEffort !== REQUIRED_EFFORT) {
-    throw new BridgeError(`CodeBuddy subagents require reasoning effort ${REQUIRED_EFFORT}, got ${requestedEffort}`);
+    throw new BridgeError(`CodeBuddy bridge requires reasoning effort ${REQUIRED_EFFORT}, got ${requestedEffort}`);
   }
   const input = typeof body.input === "string" ? [{ type: "message", role: "user", content: body.input }] : body.input;
   if (!Array.isArray(input)) throw new BridgeError("input must be a string or array");
@@ -817,7 +821,7 @@ function promptFrom(body, registry = providerConversations) {
     throw error;
   }
   const threadId = requireString(body.client_metadata?.thread_id, "client_metadata.thread_id");
-  const conversation = registry.prepare(threadId, input, incomingTaskState);
+  const conversation = registry.prepare(threadId, input, incomingTaskState, { mainAgent });
   const taskState = conversation.taskState;
   const incomingToolInfo = codexToolsFrom(body, route.inputModalities);
   const incomingManagedSurface = Array.isArray(body.tools) && body.tools.length > 0;
@@ -834,26 +838,36 @@ function promptFrom(body, registry = providerConversations) {
     throw new BridgeError(`CodeBuddy working directory does not exist: ${JSON.stringify(workingDirectory)}`);
   }
   const sections = [
-    conversation.providerSessionStarted
-      ? "[Native delegation continuation]\nContinue the same delegated task in this retained CodeBuddy conversation. Use your own local tools directly and return only when the bounded task is complete, the requested checkpoint is ready, or a concrete blocker requires parent input. Never delegate to another agent, teammate, swarm, or background worker."
-      : "[Single native-agent execution contract]\nWork as the delegated CodeBuddy sub-agent in the current workspace and complete this bounded task in this one CLI execution. Use CodeBuddy's own Read, Write, Edit, Bash, Glob, and Grep tools directly. Never delegate to another agent, teammate, swarm, or background worker. Do not ask the parent to execute an ordinary file or shell operation. Honor project AGENTS.md ownership boundaries exactly; when builds, tests, editor control, PIE, runtime validation, or RzMCP execution are reserved to the parent, do not invoke them and instead report the exact checks the parent should run. On Windows, use PowerShell-native commands and never assume Unix-only commands such as head are installed. RzMCP is exposed lazily as only search_rzmcp_tools and call_rzmcp_tool through the rzmcp MCP server; search first, then call the selected tool only when the task allows RzMCP.",
+    mainAgent
+      ? (conversation.providerSessionStarted
+        ? "[RzCodex main-agent continuation]\nContinue this conversation as the primary coding agent. Use your own local tools directly and return only when the current user request is complete or concretely blocked."
+        : MAIN_AGENT_CONTRACT)
+      : (conversation.providerSessionStarted
+        ? "[Native delegation continuation]\nContinue the same delegated task in this retained CodeBuddy conversation. Use your own local tools directly and return only when the bounded task is complete, the requested checkpoint is ready, or a concrete blocker requires parent input. Never delegate to another agent, teammate, swarm, or background worker."
+        : "[Single native-agent execution contract]\nWork as the delegated CodeBuddy sub-agent in the current workspace and complete this bounded task in this one CLI execution. Use CodeBuddy's own Read, Write, Edit, Bash, Glob, and Grep tools directly. Never delegate to another agent, teammate, swarm, or background worker. Do not ask the parent to execute an ordinary file or shell operation. Honor project AGENTS.md ownership boundaries exactly; when builds, tests, editor control, PIE, runtime validation, or RzMCP execution are reserved to the parent, do not invoke them and instead report the exact checks the parent should run. On Windows, use PowerShell-native commands and never assume Unix-only commands such as head are installed. RzMCP is exposed lazily as only search_rzmcp_tools and call_rzmcp_tool through the rzmcp MCP server; search first, then call the selected tool only when the task allows RzMCP."),
   ];
   if (!conversation.providerSessionStarted) {
     sections.push(projectInstructionsPromptSection(workingDirectory));
   }
-  const roleInstructions = roleInstructionsFrom(body.instructions);
-  if (roleInstructions && !conversation.providerSessionStarted) {
-    sections.push(`[Role instructions]\n${roleInstructions}`);
+  if (mainAgent) {
+    if (typeof body.instructions === "string" && body.instructions.trim() && !conversation.providerSessionStarted) {
+      sections.push(`[RzCodex instructions]\n${body.instructions.trim()}`);
+    }
+  } else {
+    const roleInstructions = roleInstructionsFrom(body.instructions);
+    if (roleInstructions && !conversation.providerSessionStarted) {
+      sections.push(`[Role instructions]\n${roleInstructions}`);
+    }
   }
-  const activeTaskSection = conversation.activeTaskIncludedThisTurn
+  const activeTaskSection = !mainAgent && conversation.activeTaskIncludedThisTurn
     ? activeTaskPromptSection(taskState)
     : "";
-  const referencedPriorTaskSection = !conversation.providerSessionStarted
+  const referencedPriorTaskSection = !mainAgent && !conversation.providerSessionStarted
     ? referencedPriorTaskPromptSection(taskState)
     : "";
   if (referencedPriorTaskSection) sections.push(referencedPriorTaskSection);
   if (activeTaskSection) sections.push(activeTaskSection);
-  sections.push(...taskControlPromptSections(taskState));
+  if (!mainAgent) sections.push(...taskControlPromptSections(taskState));
   if (toolInfo.definitions.length > 0) {
     sections.push(
       `[Codex client tool surface intentionally internalized]\n${toolInfo.definitions.length} parent tool schemas were not forwarded. ` +
@@ -960,7 +974,8 @@ function promptFrom(body, registry = providerConversations) {
     throw new BridgeError("CodeBuddy normalized prompt exceeded its hard limit", 500);
   }
   if (
-    conversation.providerSessionStarted
+    !mainAgent
+    && conversation.providerSessionStarted
     && !conversation.activeTaskIncludedThisTurn
     && conversation.inputIndexes.length === 0
   ) {
@@ -970,10 +985,12 @@ function promptFrom(body, registry = providerConversations) {
   }
   let taskDiagnostics;
   try {
-    taskDiagnostics = taskDeliveryDiagnostics(taskState, prompt, {
-      activeTaskIncludedThisTurn: conversation.activeTaskIncludedThisTurn,
-      retainedInProviderSession: conversation.retainedInProviderSession,
-    });
+    taskDiagnostics = mainAgent
+      ? { taskId: null, taskName: null, taskHash: null, taskIntent: null, taskDeliveryMode: null, taskPartTypes: [], taskPartLengths: [], completeTaskDelivered: true, activeTaskIncludedThisTurn: true, retainedInProviderSession: conversation.providerSessionStarted }
+      : taskDeliveryDiagnostics(taskState, prompt, {
+          activeTaskIncludedThisTurn: conversation.activeTaskIncludedThisTurn,
+          retainedInProviderSession: conversation.retainedInProviderSession,
+        });
   } catch (error) {
     if (error instanceof TaskStateError) throw new BridgeError(error.message);
     throw error;
@@ -991,11 +1008,14 @@ function promptFrom(body, registry = providerConversations) {
     taskDiagnostics,
     conversation,
     threadId,
+    mainAgent,
     providerSessionId: conversation.providerSessionId,
     providerSessionStarted: conversation.providerSessionStarted,
     incomingCodexToolCount: incomingToolInfo.definitions.length,
     retainedToolSurfaceUsed,
-    executionPolicy: executionPolicy(taskState),
+    executionPolicy: mainAgent
+      ? { readOnly: false, rzMcpMode: "full" }
+      : executionPolicy(taskState),
   };
 }
 
@@ -1376,42 +1396,52 @@ function jsonResponse(response, status, value) {
 
 function managedModelsResponse() {
   const route = resolveRoute(MODEL_ALIAS);
+  const baseModel = {
+    display_name: "Managed native subagent",
+    description: "Centrally managed native subagent route",
+    base_instructions: "You are a delegated coding sub-agent. Follow the supplied role and task instructions, use the available tools when needed, verify your work, and report concise evidence to the parent agent.",
+    default_reasoning_level: REQUIRED_EFFORT,
+    supported_reasoning_levels: [{ effort: REQUIRED_EFFORT, description: "Maximum" }],
+    shell_type: "unified_exec",
+    visibility: "none",
+    supported_in_api: true,
+    priority: 0,
+    availability_nux: null,
+    upgrade: null,
+    include_skills_usage_instructions: false,
+    include_plugin_usage_instructions: false,
+    include_apps_usage_instructions: false,
+    supports_reasoning_summary_parameter: false,
+    default_reasoning_summary: "none",
+    support_verbosity: false,
+    default_verbosity: null,
+    apply_patch_tool_type: "freeform",
+    web_search_tool_type: "text",
+    truncation_policy: { mode: "tokens", limit: 10_000 },
+    supports_image_detail_original: false,
+    context_window: 131_072,
+    max_context_window: 131_072,
+    experimental_supported_tools: [],
+    input_modalities: route.inputModalities,
+    supports_search_tool: true,
+    use_responses_lite: false,
+    node_repl_auto_review_required: false,
+    node_repl_disabled: false,
+    tool_mode: "direct",
+    multi_agent_version: "v2",
+  };
   return {
-    models: [{
-      slug: MODEL_ALIAS,
-      display_name: "Managed native subagent",
-      description: "Centrally managed native subagent route",
-      base_instructions: "You are a delegated coding sub-agent. Follow the supplied role and task instructions, use the available tools when needed, verify your work, and report concise evidence to the parent agent.",
-      default_reasoning_level: REQUIRED_EFFORT,
-      supported_reasoning_levels: [{ effort: REQUIRED_EFFORT, description: "Maximum" }],
-      shell_type: "unified_exec",
-      visibility: "none",
-      supported_in_api: true,
-      priority: 0,
-      availability_nux: null,
-      upgrade: null,
-      include_skills_usage_instructions: false,
-      include_plugin_usage_instructions: false,
-      include_apps_usage_instructions: false,
-      supports_reasoning_summary_parameter: false,
-      default_reasoning_summary: "none",
-      support_verbosity: false,
-      default_verbosity: null,
-      apply_patch_tool_type: "freeform",
-      web_search_tool_type: "text",
-      truncation_policy: { mode: "tokens", limit: 10_000 },
-      supports_image_detail_original: false,
-      context_window: 131_072,
-      max_context_window: 131_072,
-      experimental_supported_tools: [],
-      input_modalities: route.inputModalities,
-      supports_search_tool: true,
-      use_responses_lite: false,
-      node_repl_auto_review_required: false,
-      node_repl_disabled: false,
-      tool_mode: "direct",
-      multi_agent_version: "v2",
-    }],
+    models: [
+      { ...baseModel, slug: MODEL_ALIAS },
+      {
+        ...baseModel,
+        slug: MAIN_MODEL_ALIAS,
+        display_name: "RzCodex main agent (CodeBuddy)",
+        description: "CodeBuddy Hy4 Preview as the primary main-agent provider",
+        base_instructions: "You are the primary coding agent. Follow the supplied RzCodex and project instructions, use the available tools, verify your work, and complete the current request.",
+        visibility: "visible",
+      },
+    ],
   };
 }
 
@@ -1803,13 +1833,16 @@ function selfTest() {
     throw new Error("self-test failed: CodeBuddy read-only provider work was eligible for replay");
   }
   const route = resolveRoute(MODEL_ALIAS);
-  const catalogModel = managedModelsResponse().models[0];
+  const advertisedModels = managedModelsResponse().models;
+  const catalogModel = advertisedModels[0];
   if (
+    advertisedModels.length !== 2 ||
     catalogModel.slug !== MODEL_ALIAS ||
     !catalogModel.base_instructions.includes("delegated coding sub-agent") ||
     catalogModel.default_reasoning_level !== REQUIRED_EFFORT ||
     catalogModel.apply_patch_tool_type !== "freeform" ||
     catalogModel.input_modalities.join(",") !== route.inputModalities.join(",")
+    || !advertisedModels.some((model) => model.slug === MAIN_MODEL_ALIAS && model.visibility === "visible")
   ) {
     throw new Error("self-test failed: managed model catalog disagrees with the route");
   }
@@ -1867,6 +1900,43 @@ function selfTest() {
     if (!options.omitTools) request.tools = options.tools ?? selfTestTools;
     return promptFrom(request, options.registry ?? selfTestRegistry);
   };
+  const mainRegistry = new ProviderConversationRegistry();
+  const mainRequest = (input) => promptFrom({
+    model: MAIN_MODEL_ALIAS,
+    stream: true,
+    reasoning: { effort: REQUIRED_EFFORT },
+    client_metadata: { cwd: homedir(), thread_id: "codebuddy-main-fixture" },
+    instructions: "MAIN_AGENT_INSTRUCTIONS",
+    input,
+    tools: selfTestTools,
+  }, mainRegistry);
+  const firstMainTurn = mainRequest([
+    { type: "message", id: "main-user-1", role: "user", content: "MAIN_AGENT_REQUEST_ONE" },
+  ]);
+  if (
+    !firstMainTurn.mainAgent
+    || firstMainTurn.taskState.activeTask !== null
+    || !firstMainTurn.prompt.includes(MAIN_AGENT_CONTRACT)
+    || !firstMainTurn.prompt.includes("MAIN_AGENT_INSTRUCTIONS")
+    || !firstMainTurn.prompt.includes("MAIN_AGENT_REQUEST_ONE")
+    || firstMainTurn.executionPolicy.rzMcpMode !== "full"
+  ) {
+    throw new Error("self-test failed: CodeBuddy main-agent alias rejected ordinary history");
+  }
+  mainRegistry.begin(firstMainTurn);
+  mainRegistry.commit(firstMainTurn);
+  const resumedMainTurn = mainRequest([
+    { type: "message", id: "main-user-1", role: "user", content: "MAIN_AGENT_REQUEST_ONE" },
+    { type: "message", id: "main-assistant-1", role: "assistant", content: "MAIN_AGENT_RESPONSE_ONE" },
+    { type: "message", id: "main-user-2", role: "user", content: "MAIN_AGENT_REQUEST_TWO" },
+  ]);
+  if (
+    !resumedMainTurn.providerSessionStarted
+    || !resumedMainTurn.prompt.includes("MAIN_AGENT_REQUEST_TWO")
+    || resumedMainTurn.prompt.includes("MAIN_AGENT_REQUEST_ONE")
+  ) {
+    throw new Error("self-test failed: CodeBuddy main-agent continuation did not send only new user input");
+  }
   const readOnlyTask = normalizeSelfTestRequest([{
     type: "agent_message",
     id: "self-test-read-only",
@@ -2555,6 +2625,7 @@ function start() {
       if (request.method === "GET" && request.url === "/health") {
         jsonResponse(response, 200, {
           ok: true, provider: PROVIDER_ID, port, modelAlias: MODEL_ALIAS,
+          mainModelAlias: MAIN_MODEL_ALIAS,
           configuredModel: resolveRoute(MODEL_ALIAS).model, effort: REQUIRED_EFFORT,
           inputModalities: resolveRoute(MODEL_ALIAS).inputModalities,
           authSourceRequired: REQUIRED_AUTH_SOURCE, fallbackModel: null,

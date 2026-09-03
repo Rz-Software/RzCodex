@@ -275,6 +275,19 @@ impl ChatWidget {
         self.refresh_model_dependent_surfaces();
     }
 
+    /// Set the provider used by the active thread and refresh provider-dependent UI state.
+    pub(crate) fn set_model_provider(&mut self, model_provider: &str) -> bool {
+        let Some(provider) = self.config.model_providers.get(model_provider).cloned() else {
+            tracing::warn!(model_provider, "thread selected an unknown model provider");
+            return false;
+        };
+        self.config.model_provider_id = model_provider.to_string();
+        self.runtime_model_provider_base_url = provider.base_url.clone();
+        self.config.model_provider = provider;
+        self.refresh_model_dependent_surfaces();
+        true
+    }
+
     pub(crate) fn current_model(&self) -> &str {
         if !self.collaboration_modes_enabled() {
             return self.current_collaboration_mode.model();
@@ -457,7 +470,7 @@ impl ChatWidget {
     fn apply_thread_settings(&mut self, mut settings: ThreadSettings) {
         let cwd_changed = self.config.cwd != settings.cwd;
         self.apply_thread_settings_cwd(settings.cwd.clone());
-        self.config.model_provider_id = settings.model_provider.clone();
+        self.set_model_provider(&settings.model_provider);
         self.set_service_tier(settings.service_tier.clone());
         self.set_approval_policy(settings.approval_policy);
         self.set_approvals_reviewer(settings.approvals_reviewer.to_core());

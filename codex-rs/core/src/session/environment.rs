@@ -4,6 +4,7 @@ use codex_exec_server::LOCAL_ENVIRONMENT_ID;
 use codex_exec_server::MAX_SELECTED_CAPABILITY_ROOTS;
 use codex_exec_server::SelectedCapabilityRootsStatus;
 use codex_execpolicy::Policy;
+use codex_model_provider::create_model_provider;
 use codex_protocol::capabilities::CapabilityRootLocation;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
@@ -126,7 +127,29 @@ impl Session {
             });
         }
 
-        current.apply(updates, &current_environments)
+        let mut next = current.apply(updates, &current_environments)?;
+        if let Some(model_provider) = updates.model_provider.as_deref() {
+            let provider_info = current
+                .original_config_do_not_use
+                .model_providers
+                .get(model_provider)
+                .cloned()
+                .ok_or_else(|| ConstraintError::InvalidValue {
+                    field_name: "model_provider",
+                    candidate: model_provider.to_string(),
+                    allowed: "a configured model provider".to_string(),
+                    requirement_source: codex_config::RequirementSource::Unknown,
+                })?;
+            next.provider = create_model_provider(
+                provider_info.clone(),
+                Some(self.services.auth_manager.clone()),
+            );
+            let mut config = (*next.original_config_do_not_use).clone();
+            config.model_provider_id = model_provider.to_string();
+            config.model_provider = provider_info;
+            next.original_config_do_not_use = std::sync::Arc::new(config);
+        }
+        Ok(next)
     }
 
     pub(crate) async fn environment_ready(

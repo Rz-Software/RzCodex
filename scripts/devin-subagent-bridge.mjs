@@ -42,6 +42,9 @@ const PROVIDER_ID = "devin";
 const MODEL_ALIAS = "@preset/codex-subagents";
 const DEVIN_FREE_MODEL_ALIAS = "@preset/codex-subagents-devin-free";
 const OLLAMA_MODEL_ALIAS = "@preset/codex-subagents-ollama";
+const MAIN_MODEL_ALIAS = "@preset/rzcodex-main";
+const DEVIN_FREE_MAIN_MODEL_ALIAS = "@preset/rzcodex-main-devin-free";
+const OLLAMA_MAIN_MODEL_ALIAS = "@preset/rzcodex-main-ollama";
 const REQUIRED_EFFORT = "high";
 const OLLAMA_REQUIRED_EFFORT = "max";
 const LEGACY_REQUEST_EFFORTS = new Set(["max"]);
@@ -831,11 +834,16 @@ function promptFrom(body) {
   assertObject(body, "request body");
   if (body.stream !== true) throw new BridgeError("The Devin bridge requires stream=true");
   const modelAlias = requireString(body.model, "model");
-  const requestedRoute = modelAlias === MODEL_ALIAS
+  const mainAgent = [
+    MAIN_MODEL_ALIAS,
+    DEVIN_FREE_MAIN_MODEL_ALIAS,
+    OLLAMA_MAIN_MODEL_ALIAS,
+  ].includes(modelAlias);
+  const requestedRoute = modelAlias === MODEL_ALIAS || modelAlias === MAIN_MODEL_ALIAS
     ? "auto"
-    : modelAlias === DEVIN_FREE_MODEL_ALIAS
+    : modelAlias === DEVIN_FREE_MODEL_ALIAS || modelAlias === DEVIN_FREE_MAIN_MODEL_ALIAS
       ? "devin-free"
-      : modelAlias === OLLAMA_MODEL_ALIAS
+      : modelAlias === OLLAMA_MODEL_ALIAS || modelAlias === OLLAMA_MAIN_MODEL_ALIAS
         ? "ollama"
         : null;
   if (!requestedRoute) throw new BridgeError(`Unknown managed model alias ${json(modelAlias)}`);
@@ -858,17 +866,27 @@ function promptFrom(body) {
   }
   const requestId = randomUUID();
   const workingDirectory = workingDirectoryFrom(body, input);
-  const executionPolicy = executionPolicyFromTaskState(taskState);
+  const executionPolicy = mainAgent
+    ? { permissionMode: "dangerous", rzMcpMode: "full", readOnly: false, validationRestricted: false }
+    : executionPolicyFromTaskState(taskState);
   const threadId = typeof body.client_metadata?.thread_id === "string"
     ? body.client_metadata.thread_id
     : null;
   const sections = [
-    `[Native delegated coding contract]\nRzCodex request ID: ${requestId}\nWork directly in the supplied workspace as the bounded native sub-agent. Use the file and command tools available in this turn. Do not spawn provider-side subagents. Honor project AGENTS.md ownership boundaries exactly; when builds, tests, editor control, PIE, runtime validation, or RzMCP execution are reserved to the parent, do not invoke them and instead report the exact checks the parent should run. For Unreal/RzMCP work that is within your assigned ownership, use only the lazy RzMCP proxy surface: search with an exact or focused query, then call only a discovered tool. Never use or request the full RzMCP catalog. On Windows, use PowerShell-native commands, single-quote ripgrep patterns containing |, and never assume Unix-only commands such as head are installed. Return concise evidence as soon as the bounded task is complete or genuinely blocked.\nAuthoritative workspace: ${workingDirectory}`,
-    `[Enforced provider permissions]\nNon-interactive native file and shell tools are enabled with Devin permission mode ${executionPolicy.permissionMode}. This permission mode does not expand the active task. RzMCP mode: ${executionPolicy.rzMcpMode}. The active task's scope and restrictions remain hard boundaries, not suggestions.`,
+    mainAgent
+      ? `[RzCodex main-agent contract]\nRzCodex request ID: ${requestId}\nAct as the primary coding agent for this conversation. Work directly in the supplied workspace with the available file, command, and lazy RzMCP tools. Follow the complete RzCodex, project, and user instructions, preserve unrelated work, and finish the current request before returning unless concrete user input is required.\nAuthoritative workspace: ${workingDirectory}`
+      : `[Native delegated coding contract]\nRzCodex request ID: ${requestId}\nWork directly in the supplied workspace as the bounded native sub-agent. Use the file and command tools available in this turn. Do not spawn provider-side subagents. Honor project AGENTS.md ownership boundaries exactly; when builds, tests, editor control, PIE, runtime validation, or RzMCP execution are reserved to the parent, do not invoke them and instead report the exact checks the parent should run. For Unreal/RzMCP work that is within your assigned ownership, use only the lazy RzMCP proxy surface: search with an exact or focused query, then call only a discovered tool. Never use or request the full RzMCP catalog. On Windows, use PowerShell-native commands, single-quote ripgrep patterns containing |, and never assume Unix-only commands such as head are installed. Return concise evidence as soon as the bounded task is complete or genuinely blocked.\nAuthoritative workspace: ${workingDirectory}`,
+    mainAgent
+      ? `[Provider permissions]\nNon-interactive native file, shell, and full lazy RzMCP access are enabled for the main agent. These capabilities do not expand the user request or project instructions.`
+      : `[Enforced provider permissions]\nNon-interactive native file and shell tools are enabled with Devin permission mode ${executionPolicy.permissionMode}. This permission mode does not expand the active task. RzMCP mode: ${executionPolicy.rzMcpMode}. The active task's scope and restrictions remain hard boundaries, not suggestions.`,
     projectInstructionsPromptSection(workingDirectory),
   ];
-  const roleInstructions = roleInstructionsFrom(body.instructions);
-  if (roleInstructions) sections.push(`[Role instructions]\n${roleInstructions}`);
+  if (mainAgent && typeof body.instructions === "string" && body.instructions.trim()) {
+    sections.push(`[RzCodex instructions]\n${body.instructions.trim()}`);
+  } else {
+    const roleInstructions = roleInstructionsFrom(body.instructions);
+    if (roleInstructions) sections.push(`[Role instructions]\n${roleInstructions}`);
+  }
   const agentMessages = new Map(taskState.messages.map((message) => [message.index, message]));
   const history = [];
   for (let index = 0; index < input.length; index += 1) {
@@ -973,6 +991,7 @@ function promptFrom(body) {
     executionPolicy,
     toolSchemaBytes,
     modelAlias,
+    mainAgent,
     requestedRoute,
   };
 }
@@ -2107,7 +2126,7 @@ async function runAntigravityStage(context, requestBody, failures, onProgress, s
   try {
     const forwardedBody = fallbackForwardBody(
       requestBody,
-      MODEL_ALIAS,
+      context.mainAgent ? MAIN_MODEL_ALIAS : MODEL_ALIAS,
       ANTIGRAVITY_REQUIRED_EFFORT,
       context.workingDirectory,
     );
@@ -2153,7 +2172,7 @@ async function runCodeBuddyStage(context, requestBody, failures, onProgress, sig
   try {
     const forwardedBody = fallbackForwardBody(
       requestBody,
-      MODEL_ALIAS,
+      context.mainAgent ? MAIN_MODEL_ALIAS : MODEL_ALIAS,
       CODEBUDDY_REQUIRED_EFFORT,
       context.workingDirectory,
     );
@@ -2201,7 +2220,7 @@ async function runOpenCodeStage(context, requestBody, failures, onProgress, sign
   try {
     const forwardedBody = fallbackForwardBody(
       requestBody,
-      MODEL_ALIAS,
+      context.mainAgent ? MAIN_MODEL_ALIAS : MODEL_ALIAS,
       route.openCodeEffort,
       context.workingDirectory,
     );
@@ -2280,6 +2299,7 @@ async function runOllamaStage(
           provider: "ollama",
           model: route.ollamaModel,
           requiredEffort: route.ollamaEffort,
+          mainAgent: context.mainAgent,
         });
       } catch (error) {
         if (error instanceof NativeCliAgentError) throw new BridgeError(error.message, error.status);
@@ -3048,11 +3068,13 @@ function managedModelsResponse() {
     ANTIGRAVITY_CONTEXT_WINDOW,
     OLLAMA_CONTEXT_WINDOW,
   );
-  const modelDefinition = (slug, displayName, description, contextWindow, effort) => ({
+  const modelDefinition = (slug, displayName, description, contextWindow, effort, mainAgent = false) => ({
     slug, display_name: displayName, description,
-    base_instructions: "You are a bounded delegated coding sub-agent. Use local tools and return concise evidence.",
+    base_instructions: mainAgent
+      ? "You are the primary coding agent. Follow the supplied RzCodex and project instructions, use local tools, verify your work, and complete the current request."
+      : "You are a bounded delegated coding sub-agent. Use local tools and return concise evidence.",
     default_reasoning_level: effort, supported_reasoning_levels: [{ effort, description: "Maximum configured effort" }],
-    shell_type: "unified_exec", visibility: "none", supported_in_api: true, priority: 0, availability_nux: null,
+    shell_type: "unified_exec", visibility: mainAgent ? "visible" : "none", supported_in_api: true, priority: 0, availability_nux: null,
     upgrade: null, include_skills_usage_instructions: false, include_plugin_usage_instructions: false,
     include_apps_usage_instructions: false, supports_reasoning_summary_parameter: false, default_reasoning_summary: "none",
     support_verbosity: false, default_verbosity: null, apply_patch_tool_type: "freeform", web_search_tool_type: "text",
@@ -3084,6 +3106,30 @@ function managedModelsResponse() {
       OLLAMA_CONTEXT_WINDOW,
       OLLAMA_REQUIRED_EFFORT,
     ),
+    modelDefinition(
+      MAIN_MODEL_ALIAS,
+      "RzCodex main agent (automatic route)",
+      "Automatic external-provider chain as the primary main-agent route",
+      managedContextWindow,
+      REQUIRED_EFFORT,
+      true,
+    ),
+    modelDefinition(
+      DEVIN_FREE_MAIN_MODEL_ALIAS,
+      `RzCodex main agent (${models.terminal.label})`,
+      `Direct ${models.terminal.label} primary main-agent route`,
+      models.terminal.max_context_tokens,
+      REQUIRED_EFFORT,
+      true,
+    ),
+    modelDefinition(
+      OLLAMA_MAIN_MODEL_ALIAS,
+      `RzCodex main agent (Ollama ${route.ollamaLabel})`,
+      "Direct Ollama primary main-agent route using the signed-in Ollama session",
+      OLLAMA_CONTEXT_WINDOW,
+      OLLAMA_REQUIRED_EFFORT,
+      true,
+    ),
   ] };
 }
 
@@ -3096,7 +3142,14 @@ function health(requestedRoute = "auto") {
   const routeActual = runtime.actualByConfiguredRoute[requestedRoute] || defaultActual;
   return {
     ok: true, provider: PROVIDER_ID, port, modelAlias: MODEL_ALIAS,
-    modelAliases: { auto: MODEL_ALIAS, devinFree: DEVIN_FREE_MODEL_ALIAS, ollama: OLLAMA_MODEL_ALIAS },
+    modelAliases: {
+      auto: MODEL_ALIAS,
+      devinFree: DEVIN_FREE_MODEL_ALIAS,
+      ollama: OLLAMA_MODEL_ALIAS,
+      mainAuto: MAIN_MODEL_ALIAS,
+      mainDevinFree: DEVIN_FREE_MAIN_MODEL_ALIAS,
+      mainOllama: OLLAMA_MAIN_MODEL_ALIAS,
+    },
     effort: requestedRoute === "ollama" ? OLLAMA_REQUIRED_EFFORT : REQUIRED_EFFORT,
     lastActualProvider: routeActual.provider,
     lastActualModel: routeActual.model,
@@ -3918,12 +3971,50 @@ async function selfTest() {
   if (directOllamaContext.requestedRoute !== "ollama" || initialSelection(directOllamaContext).key !== "ollama") {
     throw new Error("direct Ollama route failed");
   }
+  const mainAutoContext = promptFrom({
+    stream: true,
+    model: MAIN_MODEL_ALIAS,
+    reasoning: { effort: REQUIRED_EFFORT },
+    instructions: "MAIN_AGENT_INSTRUCTIONS",
+    input: [{ type: "message", role: "user", content: "MAIN_AGENT_REQUEST" }],
+    client_metadata: { cwd: process.cwd(), thread_id: "devin-main-fixture" },
+  });
+  const mainFreeContext = promptFrom({
+    stream: true,
+    model: DEVIN_FREE_MAIN_MODEL_ALIAS,
+    reasoning: { effort: REQUIRED_EFFORT },
+    input: [{ type: "message", role: "user", content: "MAIN_AGENT_REQUEST" }],
+    client_metadata: { cwd: process.cwd(), thread_id: "devin-free-main-fixture" },
+  });
+  const mainOllamaContext = promptFrom({
+    stream: true,
+    model: OLLAMA_MAIN_MODEL_ALIAS,
+    reasoning: { effort: OLLAMA_REQUIRED_EFFORT },
+    input: [{ type: "message", role: "user", content: "MAIN_AGENT_REQUEST" }],
+    client_metadata: { cwd: process.cwd(), thread_id: "ollama-main-fixture" },
+  });
+  if (
+    !mainAutoContext.mainAgent
+    || mainAutoContext.taskState.activeTask !== null
+    || mainAutoContext.requestedRoute !== "auto"
+    || !mainAutoContext.prompt.includes("[RzCodex main-agent contract]")
+    || !mainAutoContext.prompt.includes("MAIN_AGENT_INSTRUCTIONS")
+    || mainFreeContext.requestedRoute !== "devin-free"
+    || initialSelection(mainFreeContext).key !== "terminal"
+    || mainOllamaContext.requestedRoute !== "ollama"
+    || initialSelection(mainOllamaContext).key !== "ollama"
+  ) {
+    throw new Error("main-agent route aliases failed ordinary-history normalization");
+  }
   const advertisedModels = managedModelsResponse().models;
   if (
-    advertisedModels.length !== 3
+    advertisedModels.length !== 6
     || !advertisedModels.some((model) => model.slug === MODEL_ALIAS)
     || !advertisedModels.some((model) => model.slug === DEVIN_FREE_MODEL_ALIAS)
     || !advertisedModels.some((model) => model.slug === OLLAMA_MODEL_ALIAS && model.default_reasoning_level === OLLAMA_REQUIRED_EFFORT)
+    || !advertisedModels.some((model) => model.slug === MAIN_MODEL_ALIAS && model.visibility === "visible")
+    || !advertisedModels.some((model) => model.slug === DEVIN_FREE_MAIN_MODEL_ALIAS && model.visibility === "visible")
+    || !advertisedModels.some((model) => model.slug === OLLAMA_MAIN_MODEL_ALIAS && model.visibility === "visible")
   ) {
     throw new Error("managed route aliases were not all advertised");
   }

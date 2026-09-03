@@ -1355,6 +1355,10 @@ impl Drop for ModelClientSession {
 }
 
 impl ModelClientSession {
+    pub(crate) fn provider_info(&self) -> &ModelProviderInfo {
+        self.client.state.provider.info()
+    }
+
     pub(crate) fn turn_state(&self) -> Arc<OnceLock<String>> {
         Arc::clone(&self.turn_state)
     }

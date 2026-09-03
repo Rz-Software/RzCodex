@@ -10,6 +10,7 @@ use codex_app_server_protocol::ApprovalsReviewer as AppServerApprovalsReviewer;
 use codex_app_server_protocol::AskForApproval as AppServerAskForApproval;
 use codex_app_server_protocol::ThreadSettings;
 use codex_app_server_protocol::ThreadSettingsUpdateParams;
+use codex_config::resolve_subagent_route;
 use codex_config::types::ApprovalsReviewer;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::ModeKind;
@@ -18,6 +19,93 @@ use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::MODEL_SPECIALTY_CYBER;
 
 impl App {
+    pub(super) async fn set_main_agent_route(
+        &mut self,
+        app_server: &mut AppServerSession,
+        route_id: &str,
+    ) {
+        let selected = match resolve_subagent_route(self.config.codex_home.as_ref(), route_id) {
+            Ok(selected) => selected,
+            Err(err) => {
+                self.chat_widget
+                    .add_error_message(format!("Main-agent provider was not changed: {err:#}"));
+                return;
+            }
+        };
+        let provider_id = selected.route.model_provider.clone();
+        let Some(provider) = self.config.model_providers.get(&provider_id).cloned() else {
+            self.chat_widget.add_error_message(format!(
+                "Main-agent provider was not changed: provider `{provider_id}` is not configured."
+            ));
+            return;
+        };
+        let model = selected
+            .route
+            .main_model
+            .clone()
+            .unwrap_or_else(|| selected.route.model.clone());
+        let effort = selected.route.reasoning_effort.clone();
+        let Some(thread_id) = self.active_thread_id else {
+            self.chat_widget.add_error_message(
+                "Main-agent provider cannot be changed before startup completes.".to_string(),
+            );
+            return;
+        };
+        let collaboration_mode = self
+            .chat_widget
+            .effective_collaboration_mode()
+            .with_updates(
+                Some(model.clone()),
+                Some(Some(effort.clone())),
+                /*developer_instructions*/ None,
+            );
+        let params = ThreadSettingsUpdateParams {
+            thread_id: thread_id.to_string(),
+            model: Some(model.clone()),
+            model_provider: Some(provider_id.clone()),
+            effort: Some(effort.clone()),
+            collaboration_mode: Some(collaboration_mode),
+            ..ThreadSettingsUpdateParams::default()
+        };
+        if !self.send_thread_settings_update(app_server, params).await {
+            return;
+        }
+
+        self.config.model_provider_id.clone_from(&provider_id);
+        self.config.model_provider = provider;
+        self.chat_widget.set_model_provider(&provider_id);
+        self.chat_widget.set_model(&model);
+        self.on_update_reasoning_effort(Some(effort.clone()));
+        self.sync_active_thread_service_tier_to_cached_session()
+            .await;
+
+        match crate::config_update::write_config_batch(
+            app_server.request_handle(),
+            crate::config_update::build_model_provider_selection_edits(
+                &provider_id,
+                &model,
+                Some(&effort),
+            ),
+        )
+        .await
+        {
+            Ok(_) => self.chat_widget.add_info_message(
+                format!(
+                    "Main agent changed to {} (`{provider_id}` / `{model}` / {effort}).",
+                    selected.route.label
+                ),
+                /*hint*/ None,
+            ),
+            Err(err) => {
+                let error = crate::config_update::format_config_error(&err);
+                tracing::error!(error = %error, "failed to persist main-agent provider selection");
+                self.chat_widget.add_error_message(format!(
+                    "Main agent changed for this conversation, but its defaults could not be saved: {error}"
+                ));
+            }
+        }
+    }
+
     pub(super) async fn sync_active_thread_model_setting(
         &mut self,
         app_server: &mut AppServerSession,
@@ -257,6 +345,7 @@ fn thread_settings_update_has_changes(params: &ThreadSettingsUpdateParams) -> bo
         || params.sandbox_policy.is_some()
         || params.permissions.is_some()
         || params.model.is_some()
+        || params.model_provider.is_some()
         || params.service_tier.is_some()
         || params.effort.is_some()
         || params.summary.is_some()

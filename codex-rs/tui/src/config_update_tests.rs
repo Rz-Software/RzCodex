@@ -29,6 +29,30 @@ fn trusted_project_edit_targets_project_trust_level() {
     );
 }
 
+#[test]
+fn model_provider_selection_edits_persist_one_coherent_default() {
+    assert_eq!(
+        build_model_provider_selection_edits("codebuddy", "@preset/rzcodex-main", Some("max"),),
+        vec![
+            ConfigEdit {
+                key_path: "model_provider".to_string(),
+                value: serde_json::json!("codebuddy"),
+                merge_strategy: MergeStrategy::Replace,
+            },
+            ConfigEdit {
+                key_path: "model".to_string(),
+                value: serde_json::json!("@preset/rzcodex-main"),
+                merge_strategy: MergeStrategy::Replace,
+            },
+            ConfigEdit {
+                key_path: "model_reasoning_effort".to_string(),
+                value: serde_json::json!("max"),
+                merge_strategy: MergeStrategy::Replace,
+            },
+        ]
+    );
+}
+
 #[tokio::test]
 async fn remote_project_trust_guards_thread_start_and_preserves_repository_decisions() -> Result<()>
 {

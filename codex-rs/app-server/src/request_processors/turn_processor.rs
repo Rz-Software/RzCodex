@@ -120,6 +120,7 @@ struct ThreadSettingsBuildParams {
     sandbox_policy: Option<codex_app_server_protocol::SandboxPolicy>,
     permissions: Option<String>,
     model: Option<String>,
+    model_provider: Option<String>,
     service_tier: Option<Option<String>>,
     effort: Option<ReasoningEffort>,
     summary: Option<ReasoningSummary>,
@@ -614,6 +615,7 @@ impl TurnRequestProcessor {
                     sandbox_policy: params.sandbox_policy,
                     permissions: params.permissions,
                     model: params.model,
+                    model_provider: None,
                     service_tier: params.service_tier,
                     effort: params.effort,
                     summary: params.summary,
@@ -762,6 +764,7 @@ impl TurnRequestProcessor {
             sandbox_policy,
             permissions,
             model,
+            model_provider,
             service_tier,
             effort,
             summary,
@@ -793,6 +796,7 @@ impl TurnRequestProcessor {
             || sandbox_policy.is_some()
             || permissions.is_some()
             || model.is_some()
+            || model_provider.is_some()
             || service_tier.is_some()
             || effort.is_some()
             || summary.is_some()
@@ -861,6 +865,7 @@ impl TurnRequestProcessor {
                     profile_workspace_roots: profile_workspace_roots.clone(),
                     windows_sandbox_level: None,
                     model: model.clone(),
+                    model_provider: model_provider.clone(),
                     effort: effort.clone(),
                     summary,
                     service_tier: service_tier.clone(),
@@ -883,6 +888,7 @@ impl TurnRequestProcessor {
             active_permission_profile,
             windows_sandbox_level: None,
             model,
+            model_provider,
             effort,
             summary,
             service_tier,
@@ -919,6 +925,7 @@ impl TurnRequestProcessor {
                     sandbox_policy: params.sandbox_policy,
                     permissions: params.permissions,
                     model: params.model,
+                    model_provider: params.model_provider,
                     service_tier: params.service_tier,
                     effort: params.effort,
                     summary: params.summary,

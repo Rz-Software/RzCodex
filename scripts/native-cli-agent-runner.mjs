@@ -25,6 +25,7 @@ import {
 import { projectInstructionsPromptSection } from "./native-project-instructions.mjs";
 
 const MAX_ACTIVE_TASK_CHARS = 40_000;
+const MAX_MAIN_PROMPT_CHARS = 120_000;
 const OLLAMA_CLOUD_CONTEXT_WINDOW = 1_048_576;
 const REQUEST_TIMEOUT_MS = 30 * 60 * 1000;
 const ROUTE_OWNERSHIP_TIMEOUT_MS = 55 * 1000;
@@ -314,6 +315,59 @@ function roleInstructionsFrom(instructions) {
   return sections.join("\n\n");
 }
 
+function portableText(value) {
+  if (typeof value === "string") return value;
+  if (!Array.isArray(value)) return value == null ? "" : json(value);
+  return value.map((part) => {
+    if (typeof part === "string") return part;
+    if (!part || typeof part !== "object") return "";
+    if (typeof part.text === "string") return part.text;
+    if (part.type === "input_image" || part.type === "image") return "[Image input]";
+    return "";
+  }).filter(Boolean).join("\n");
+}
+
+function mainAgentHistory(input) {
+  const sections = [];
+  for (let index = 0; index < input.length; index += 1) {
+    const item = input[index];
+    if (!item || typeof item !== "object") continue;
+    if (item.type === "message") {
+      const text = portableText(item.content);
+      if (text) sections.push(`[${item.role || "message"}]\n${text}`);
+      continue;
+    }
+    if (item.type === "agent_message") {
+      const text = portableText(item.content);
+      if (text) sections.push(`[Agent message]\n${text}`);
+      continue;
+    }
+    if (item.type === "reasoning") {
+      const text = Array.isArray(item.summary)
+        ? item.summary.map((part) => part?.text || "").join("")
+        : "";
+      if (text) sections.push(`[Prior reasoning summary]\n${text}`);
+      continue;
+    }
+    if (["function_call", "custom_tool_call", "tool_search_call"].includes(item.type)) {
+      sections.push(`[Prior Codex tool request ${item.name || "tool_search"}]\n${portableText(item.arguments ?? item.input ?? item.query)}`);
+      continue;
+    }
+    if (["function_call_output", "custom_tool_call_output", "tool_search_output"].includes(item.type)) {
+      sections.push(`[Prior Codex tool result]\n${portableText(item.output ?? item.tools)}`);
+    }
+  }
+  const retained = [];
+  let chars = 0;
+  for (let index = sections.length - 1; index >= 0; index -= 1) {
+    const section = sections[index];
+    if (chars + section.length + 2 > MAX_MAIN_PROMPT_CHARS) break;
+    retained.unshift(section);
+    chars += section.length + 2;
+  }
+  return retained;
+}
+
 function latestControlMessage(taskState) {
   if (!taskState.activeTask) return "";
   const message = taskState.messages.filter((entry) => entry.index > taskState.activeTask.index).at(-1);
@@ -330,7 +384,7 @@ function executionPolicy(taskState) {
   };
 }
 
-export function nativeCliAgentContext(body, { provider, model, requiredEffort }) {
+export function nativeCliAgentContext(body, { provider, model, requiredEffort, mainAgent = false }) {
   if (!body || typeof body !== "object" || Array.isArray(body)) {
     throw new NativeCliAgentError("request body must be an object", 400);
   }
@@ -347,22 +401,31 @@ export function nativeCliAgentContext(body, { provider, model, requiredEffort })
     if (error instanceof TaskStateError) throw new NativeCliAgentError(error.message, 400);
     throw error;
   }
-  if (!taskState.activeTask) {
+  if (!mainAgent && !taskState.activeTask) {
     throw new NativeCliAgentError(`${provider} native CLI route received no active NEW_TASK payload`, 400);
   }
   const workingDirectory = workingDirectoryFrom(body, input);
   const sections = [
-    "[Single native-agent turn contract]\nComplete this delegated task within this one Codex subagent turn. Use your own local file, search, edit, and shell tools directly. Never delegate to another agent, task, teammate, swarm, or background worker. Do not return an intention, a deferred tool request, or a request for the parent to execute an ordinary file/shell operation. Return only when the bounded task is complete or a concrete blocker requires parent input. Honor the project AGENTS.md in the working directory. Builds, tests, editor control, PIE/SIE, runtime validation, and final integration remain owned by the parent whenever the task or project instructions reserve them.",
+    mainAgent
+      ? "[RzCodex main-agent contract]\nAct as the primary coding agent for this conversation. Use your local file, search, edit, shell, and lazy RzMCP tools directly. Follow the supplied RzCodex and project instructions, preserve unrelated work, and complete the current user request before returning unless a concrete blocker requires user input."
+      : "[Single native-agent turn contract]\nComplete this delegated task within this one Codex subagent turn. Use your own local file, search, edit, and shell tools directly. Never delegate to another agent, task, teammate, swarm, or background worker. Do not return an intention, a deferred tool request, or a request for the parent to execute an ordinary file/shell operation. Return only when the bounded task is complete or a concrete blocker requires parent input. Honor the project AGENTS.md in the working directory. Builds, tests, editor control, PIE/SIE, runtime validation, and final integration remain owned by the parent whenever the task or project instructions reserve them.",
     "[Native tool boundary]\nThe host shell is PowerShell on Windows. Never read, grep, decode, strings-scan, hex-dump, or otherwise inspect Unreal .uasset or .umap bytes through file or shell tools. When the task authorizes RzMCP, it is exposed lazily as exactly search_rzmcp_tools and call_rzmcp_tool: search for a focused schema first, then call only a discovered tool. Never enumerate or request the full RzMCP catalog. If those tools are disabled, unavailable, or semantically insufficient, return that concrete blocker; do not approximate asset semantics from binary bytes or repeat equivalent offset/chunk probes. Never read secret environment files.",
     projectInstructionsPromptSection(workingDirectory),
   ];
-  const role = roleInstructionsFrom(body.instructions);
-  if (role) sections.push(`[Role instructions]\n${role}`);
-  sections.push(referencedPriorTaskPromptSection(taskState));
-  sections.push(activeTaskPromptSection(taskState));
-  sections.push(...taskControlPromptSections(taskState));
-  const control = latestControlMessage(taskState);
-  if (control && control !== taskState.activeTask.text) sections.push(`[Latest parent control message]\n${control}`);
+  if (mainAgent) {
+    if (typeof body.instructions === "string" && body.instructions.trim()) {
+      sections.push(`[RzCodex instructions]\n${body.instructions.trim()}`);
+    }
+    sections.push(...mainAgentHistory(input));
+  } else {
+    const role = roleInstructionsFrom(body.instructions);
+    if (role) sections.push(`[Role instructions]\n${role}`);
+    sections.push(referencedPriorTaskPromptSection(taskState));
+    sections.push(activeTaskPromptSection(taskState));
+    sections.push(...taskControlPromptSections(taskState));
+    const control = latestControlMessage(taskState);
+    if (control && control !== taskState.activeTask.text) sections.push(`[Latest parent control message]\n${control}`);
+  }
   const prompt = sections.filter(Boolean).join("\n\n");
   let diagnostics;
   try {
@@ -375,6 +438,7 @@ export function nativeCliAgentContext(body, { provider, model, requiredEffort })
     provider,
     model,
     requiredEffort,
+    mainAgent,
     threadId: typeof body.client_metadata?.thread_id === "string"
       ? body.client_metadata.thread_id
       : null,
@@ -382,7 +446,9 @@ export function nativeCliAgentContext(body, { provider, model, requiredEffort })
     workingDirectory,
     taskState,
     taskDiagnostics: diagnostics,
-    executionPolicy: executionPolicy(taskState),
+    executionPolicy: mainAgent
+      ? { readOnly: false, validationRestricted: false, rzMcpMode: "full" }
+      : executionPolicy(taskState),
     toolSchemaBytesIgnored: Buffer.byteLength(json(body.tools || [])),
   };
 }

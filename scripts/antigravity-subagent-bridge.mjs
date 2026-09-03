@@ -22,6 +22,7 @@ import { projectInstructionsPromptSection } from "./native-project-instructions.
 
 const PROVIDER_ID = "antigravity";
 const MODEL_ALIAS = "@preset/codex-subagents";
+const MAIN_MODEL_ALIAS = "@preset/rzcodex-main";
 const REQUIRED_EFFORT = "high";
 const DEFAULT_PORT = 54549;
 const MAX_REQUEST_BYTES = 32 * 1024 * 1024;
@@ -449,6 +450,10 @@ function delegationContract(requestId, workingDirectory) {
   return `[Native Antigravity delegation contract]\nRzCodex request ID: ${requestId}\nWork directly in the supplied workspace as the bounded native sub-agent. Use Antigravity's local file and shell tools; do not emit Codex tool calls and do not invoke Antigravity subagents. AGY's run_command tool starts in an internal scratch directory, so every shell command must begin by changing to the authoritative workspace with Set-Location -LiteralPath, and every file-tool path must be absolute. For Unreal/RzMCP work, use only MCP server ${LAZY_MCP_SERVER}: discover a small focused schema with search_rzmcp_tools, then call only a discovered tool through call_rzmcp_tool. Never request or enumerate the full RzMCP catalog. Return concise evidence as soon as the bounded task is complete or genuinely blocked.\nAuthoritative workspace: ${workingDirectory}`;
 }
 
+function mainAgentContract(requestId, workingDirectory) {
+  return `[RzCodex main-agent contract]\nRzCodex request ID: ${requestId}\nAct as the primary coding agent for this conversation. Use Antigravity's local file and shell tools directly; do not emit Codex tool calls and do not invoke Antigravity subagents. AGY's run_command tool starts in an internal scratch directory, so every shell command must begin by changing to the authoritative workspace with Set-Location -LiteralPath, and every file-tool path must be absolute. Follow the complete RzCodex, project, and user instructions supplied this turn, preserve unrelated work, verify changes in proportion to risk, and return only after the current user request is complete or concretely blocked. For Unreal/RzMCP work, use only MCP server ${LAZY_MCP_SERVER}: discover a small focused schema with search_rzmcp_tools, then call only a discovered tool through call_rzmcp_tool.\nAuthoritative workspace: ${workingDirectory}`;
+}
+
 function messageKey(item, text) {
   const identity = typeof item.id === "string" ? item.id : `${item.type}:${item.role || ""}`;
   return `${identity}:${sha256(text)}`;
@@ -515,12 +520,14 @@ function boundedEntries(entries, budget, activeTaskText, entrySeparatorChars = 0
 function requestContext(body) {
   assertObject(body, "request body");
   if (body.stream !== true) throw new BridgeError("The Antigravity bridge requires stream=true");
-  if (requireString(body.model, "model") !== MODEL_ALIAS) {
+  const requestedModel = requireString(body.model, "model");
+  const mainAgent = requestedModel === MAIN_MODEL_ALIAS;
+  if (requestedModel !== MODEL_ALIAS && requestedModel !== MAIN_MODEL_ALIAS) {
     throw new BridgeError(`Unknown managed model alias ${json(body.model)}`);
   }
   const effort = body.reasoning?.effort;
   if (effort !== undefined && effort !== REQUIRED_EFFORT) {
-    throw new BridgeError(`Antigravity subagents require centrally configured effort ${REQUIRED_EFFORT}`);
+    throw new BridgeError(`Antigravity bridge requires centrally configured effort ${REQUIRED_EFFORT}`);
   }
   const input = typeof body.input === "string"
     ? [{ type: "message", role: "user", content: body.input }]
@@ -539,13 +546,19 @@ function requestContext(body) {
   const threadId = typeof body.client_metadata?.thread_id === "string" && body.client_metadata.thread_id
     ? body.client_metadata.thread_id
     : null;
-  const sessionKey = threadId || taskState.activeTask?.name || null;
+  const conversationKey = threadId || taskState.activeTask?.name || null;
+  const sessionKey = conversationKey
+    ? `${conversationKey}:${mainAgent ? "main" : "subagent"}`
+    : null;
   return {
     requestId,
     workingDirectory,
     threadId,
     sessionKey,
-    roleInstructions: roleInstructionsFrom(body.instructions),
+    modelAlias: requestedModel,
+    mainAgent,
+    roleInstructions: mainAgent ? "" : roleInstructionsFrom(body.instructions),
+    mainInstructions: mainAgent && typeof body.instructions === "string" ? body.instructions.trim() : "",
     taskState,
     entries,
     messageKeys: new Set(entries.map((entry) => entry.key)),
@@ -555,13 +568,19 @@ function requestContext(body) {
 
 function fullPrompt(context) {
   const sections = [
-    delegationContract(context.requestId, context.workingDirectory),
+    context.mainAgent
+      ? mainAgentContract(context.requestId, context.workingDirectory)
+      : delegationContract(context.requestId, context.workingDirectory),
     projectInstructionsPromptSection(context.workingDirectory),
   ];
-  if (context.roleInstructions) sections.push(`[Role instructions]\n${context.roleInstructions}`);
-  const referencedPriorTask = referencedPriorTaskPromptSection(context.taskState);
-  const activeTask = activeTaskPromptSection(context.taskState);
-  const taskControlSections = taskControlPromptSections(context.taskState);
+  if (context.mainAgent) {
+    if (context.mainInstructions) sections.push(`[RzCodex instructions]\n${context.mainInstructions}`);
+  } else if (context.roleInstructions) {
+    sections.push(`[Role instructions]\n${context.roleInstructions}`);
+  }
+  const referencedPriorTask = context.mainAgent ? "" : referencedPriorTaskPromptSection(context.taskState);
+  const activeTask = context.mainAgent ? "" : activeTaskPromptSection(context.taskState);
+  const taskControlSections = context.mainAgent ? [] : taskControlPromptSections(context.taskState);
   const mandatorySectionCount = sections.length + (referencedPriorTask ? 1 : 0) + (activeTask ? 1 : 0) + taskControlSections.length;
   const mandatoryChars = sections.reduce((sum, section) => sum + section.length, 0)
     + referencedPriorTask.length
@@ -595,15 +614,18 @@ function fullPrompt(context) {
 
 function resumePrompt(context, session) {
   const unseen = context.entries.filter((entry) => !session.seenMessageKeys.has(entry.key));
-  const taskControlSections = taskControlPromptSections(context.taskState);
+  const taskControlSections = context.mainAgent ? [] : taskControlPromptSections(context.taskState);
   const controlChars = taskControlSections.reduce((sum, section) => sum + section.length + 2, 0);
   const retained = boundedEntries(
     unseen,
     MAX_RESUME_PROMPT_CHARS - controlChars,
     context.taskState.activeTask?.text,
   );
+  const resumeHeader = context.mainAgent
+    ? `[RzCodex main-agent continuation]\nContinue this conversation as the primary coding agent in ${context.workingDirectory}. Use your local tools directly and return only when the current user request is complete or concretely blocked.`
+    : `[Native Antigravity resume]\nContinue the retained active task in ${context.workingDirectory}. Task hash: ${context.taskState.activeTask?.hash || "none"}. The original task remains authoritative; do not restart the investigation.`;
   const sections = [
-    `[Native Antigravity resume]\nContinue the retained active task in ${context.workingDirectory}. Task hash: ${context.taskState.activeTask?.hash || "none"}. The original task remains authoritative; do not restart the investigation.`,
+    resumeHeader,
     ...retained.filter((entry) => !entry.checkpoint).map((entry) => entry.text),
     ...retained.filter((entry) => entry.checkpoint).map((entry) => entry.text),
     ...taskControlSections,
@@ -1132,9 +1154,9 @@ function writeSse(response, type, payload) {
   response.write(`event: ${type}\ndata: ${json({ type, ...payload })}\n\n`);
 }
 
-function writeHeartbeat(response, responseId) {
+function writeHeartbeat(response, responseId, modelAlias = MODEL_ALIAS) {
   writeSse(response, "response.in_progress", {
-    response: { id: responseId, object: "response", model: MODEL_ALIAS, status: "in_progress" },
+    response: { id: responseId, object: "response", model: modelAlias, status: "in_progress" },
   });
 }
 
@@ -1192,7 +1214,7 @@ function usageFrom(result) {
   };
 }
 
-function emitCompleted(response, responseId, result, metadata, prefixOutput = []) {
+function emitCompleted(response, responseId, result, metadata, prefixOutput = [], modelAlias = MODEL_ALIAS) {
   const messageId = `msg_${randomUUID()}`;
   const outputIndex = prefixOutput.length;
   const item = {
@@ -1222,7 +1244,7 @@ function emitCompleted(response, responseId, result, metadata, prefixOutput = []
     object: "response",
     created_at: Math.floor(Date.now() / 1000),
     status: "completed",
-    model: MODEL_ALIAS,
+    model: modelAlias,
     output: [...prefixOutput, item],
     usage: usageFrom(result),
     error: null,
@@ -1404,9 +1426,9 @@ async function handleResponses(request, response) {
     connection: "keep-alive",
   });
   writeSse(response, "response.created", {
-    response: { id: responseId, object: "response", model: MODEL_ALIAS, status: "in_progress" },
+    response: { id: responseId, object: "response", model: context.modelAlias, status: "in_progress" },
   });
-  writeHeartbeat(response, responseId);
+  writeHeartbeat(response, responseId, context.modelAlias);
   const progress = createProgressEmitter(response);
   const controller = new AbortController();
   let selectedSession;
@@ -1426,13 +1448,16 @@ async function handleResponses(request, response) {
     }
     controller.abort();
   });
-  const heartbeat = setInterval(() => writeHeartbeat(response, responseId), SSE_HEARTBEAT_MS);
+  const heartbeat = setInterval(() => writeHeartbeat(response, responseId, context.modelAlias), SSE_HEARTBEAT_MS);
   try {
     let { session, reused } = await sessionFor(context);
     selectedSession = session;
-    progress.emit(`Antigravity native worker started with ${session.modelLabel}.\n`);
+    progress.emit(`${context.mainAgent ? "Antigravity main agent" : "Antigravity native worker"} started with ${session.modelLabel}.\n`);
     let prompt = reused ? resumePrompt(context, session) : fullPrompt(context);
     const diagnosticsFor = (currentPrompt, currentReused) => {
+      if (context.mainAgent) {
+        return { taskId: null, taskName: null, taskHash: null, taskIntent: null, taskDeliveryMode: null, taskPartTypes: [], taskPartLengths: [], completeTaskDelivered: true, activeTaskIncludedThisTurn: true, retainedInProviderSession: currentReused };
+      }
       try {
         return taskDeliveryDiagnostics(context.taskState, currentPrompt, {
           activeTaskIncludedThisTurn: !currentReused,
@@ -1526,7 +1551,7 @@ async function handleResponses(request, response) {
       active_task_included_this_turn: diagnostics.activeTaskIncludedThisTurn,
       active_task_retained_in_provider_session: diagnostics.retainedInProviderSession,
       complete_active_task_delivered: diagnostics.completeTaskDelivered,
-    }, progressItems);
+    }, progressItems, context.modelAlias);
     response.end();
     if (!context.sessionKey) session.close();
   } catch (error) {
@@ -1544,7 +1569,7 @@ async function handleResponses(request, response) {
       response: {
         id: responseId,
         object: "response",
-        model: MODEL_ALIAS,
+        model: context.modelAlias,
         status: "failed",
         error: {
           code: error?.code || (error?.routeCommitted === true ? "provider_state_changed" : "external_provider_error"),
@@ -1561,8 +1586,7 @@ async function handleResponses(request, response) {
 
 function managedModelsResponse() {
   const contextWindow = 131_072;
-  return { models: [{
-    slug: MODEL_ALIAS,
+  const baseModel = {
     display_name: "Managed Antigravity subagent",
     description: "Centrally routed native Antigravity subagent",
     base_instructions: "You are a bounded delegated coding sub-agent. Use local tools and return concise evidence.",
@@ -1595,7 +1619,18 @@ function managedModelsResponse() {
     node_repl_disabled: false,
     tool_mode: "direct",
     multi_agent_version: "v2",
-  }] };
+  };
+  return { models: [
+    { ...baseModel, slug: MODEL_ALIAS },
+    {
+      ...baseModel,
+      slug: MAIN_MODEL_ALIAS,
+      display_name: "RzCodex main agent (Antigravity)",
+      description: "Antigravity Claude Opus / Gemini as the primary main-agent provider",
+      base_instructions: "You are the primary coding agent. Follow the supplied RzCodex and project instructions, use local tools, and complete the current request.",
+      visibility: "visible",
+    },
+  ] };
 }
 
 function health() {
@@ -1605,6 +1640,7 @@ function health() {
     provider: PROVIDER_ID,
     port,
     modelAlias: MODEL_ALIAS,
+    mainModelAlias: MAIN_MODEL_ALIAS,
     configuredModel: route.primaryModel,
     configuredModelLabel: models.primary.label,
     agent: {
@@ -2227,6 +2263,30 @@ async function selfTest() {
   }
   if (!AGENT_DEFINITION.includes("subagent: false\n") || !AGENT_DEFINITION.includes("forceDisableFundamentalComponents: true\n")) {
     throw new Error("agent definition did not disable provider-side nesting");
+  }
+  const mainContext = requestContext({
+    stream: true,
+    model: MAIN_MODEL_ALIAS,
+    reasoning: { effort: REQUIRED_EFFORT },
+    instructions: "MAIN_AGENT_INSTRUCTIONS",
+    client_metadata: { cwd: homedir(), thread_id: "thread-agy-main" },
+    tools: [{ type: "function", name: "ignored_parent_schema", parameters: { type: "object" } }],
+    input: [{ type: "message", role: "user", content: "MAIN_AGENT_REQUEST" }],
+  });
+  const mainPrompt = fullPrompt(mainContext);
+  const advertisedModels = managedModelsResponse().models;
+  if (
+    !mainContext.mainAgent
+    || mainContext.modelAlias !== MAIN_MODEL_ALIAS
+    || mainContext.sessionKey !== "thread-agy-main:main"
+    || mainContext.taskState.activeTask !== null
+    || !mainPrompt.includes("[RzCodex main-agent contract]")
+    || !mainPrompt.includes("MAIN_AGENT_INSTRUCTIONS")
+    || !mainPrompt.includes("MAIN_AGENT_REQUEST")
+    || advertisedModels.length !== 2
+    || !advertisedModels.some((model) => model.slug === MAIN_MODEL_ALIAS && model.visibility === "visible")
+  ) {
+    throw new Error("Antigravity main-agent alias failed ordinary-history normalization");
   }
   const taskHeader = "Message Type: NEW_TASK\nTask name: /root/agy_fixture\nPayload:\n";
   const taskPayload = "Implement the bounded fixture now.";

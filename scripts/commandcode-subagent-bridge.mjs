@@ -32,11 +32,13 @@ const COMMAND_CODE_GENERATE_URL = "https://api.commandcode.ai/alpha/generate";
 const OPENCODE_RESPONSES_URL = "https://opencode.ai/zen/v1/responses";
 const OPENCODE_CHAT_COMPLETIONS_URL = "https://opencode.ai/zen/v1/chat/completions";
 const SUBAGENT_MODEL_ALIAS = "@preset/codex-subagents";
+const MAIN_AGENT_MODEL_ALIAS = "@preset/rzcodex-main";
 const COMMANDCODE_REQUIRED_EFFORT = "max";
 const OPENCODE_REQUIRED_EFFORT = "xhigh";
 const OPENCODE_AUTH_SOURCE = "OpenCode locally authenticated session";
 const MAX_ACTIVE_TASK_CHARS = 40_000;
 const NATIVE_DELEGATION_CONTRACT = "[Native delegation contract]\nWork as the bounded native sub-agent in the current workspace. Honor project AGENTS.md ownership boundaries exactly; when builds, tests, editor control, PIE, runtime validation, or RzMCP execution are reserved to the parent, do not invoke them and instead report the exact checks the parent should run. On Windows, use PowerShell-native commands, single-quote ripgrep patterns containing |, and never assume Unix-only commands such as head are installed. Complete only the assigned scope and return a concise result or concrete blocker.";
+const MAIN_AGENT_CONTRACT = "[RzCodex main-agent contract]\nAct as the primary coding agent for the conversation. Follow the complete system, developer, project, and user instructions supplied by RzCodex. Use Codex tool calls for investigation and implementation, preserve unrelated work, verify changes in proportion to risk, and return only after the current user request is complete or concretely blocked.";
 const SUBAGENT_MODEL_ROUTES_FILE = join(
   process.env.CODEX_HOME || join(homedir(), ".codex"),
   "subagent-models.json",
@@ -153,6 +155,7 @@ const cursorTurnTails = new Map();
 
 function cursorStateKey(context) {
   const taskHash = taskOwnershipHash(context.taskState);
+  if (context.mainAgent && context.threadId) return `${context.threadId}:main`;
   return context.threadId && taskHash ? `${context.threadId}:${taskHash}` : null;
 }
 
@@ -207,7 +210,9 @@ function subagentModelRoute(provider) {
 }
 
 function resolveSubagentModelAlias(model, provider) {
-  return model === SUBAGENT_MODEL_ALIAS ? subagentModelRoute(provider) : model;
+  return model === SUBAGENT_MODEL_ALIAS || model === MAIN_AGENT_MODEL_ALIAS
+    ? subagentModelRoute(provider)
+    : model;
 }
 
 function exitWhenParentStops() {
@@ -723,7 +728,7 @@ function translateResponsesRequest(body) {
   const toolsByWireName = new Map(translatedTools.map((tool) => [tool.wireName, tool]));
   const toolCalls = new Map();
   const messages = [];
-  const systemParts = [NATIVE_DELEGATION_CONTRACT];
+  const systemParts = [body.model === MAIN_AGENT_MODEL_ALIAS ? MAIN_AGENT_CONTRACT : NATIVE_DELEGATION_CONTRACT];
   const projectInstructions = projectInstructionsPromptSection(body.client_metadata?.cwd);
   if (projectInstructions) systemParts.push(projectInstructions);
   if (body.instructions !== undefined) systemParts.push(requireString(body.instructions, "instructions"));
@@ -1258,7 +1263,9 @@ function nativeCliResponseErrorCode(error) {
 function cursorPromptFrom(body) {
   assertObject(body, "request body");
   if (body.stream !== true) throw new BridgeError("The Cursor bridge only supports stream=true Responses requests");
-  const model = resolveSubagentModelAlias(requireString(body.model, "model"), "cursor");
+  const requestedModel = requireString(body.model, "model");
+  const mainAgent = requestedModel === MAIN_AGENT_MODEL_ALIAS;
+  const model = resolveSubagentModelAlias(requestedModel, "cursor");
   const input = body.input;
   if (input === undefined || input === null) throw new BridgeError("input is required");
   const items = typeof input === "string"
@@ -1268,15 +1275,19 @@ function cursorPromptFrom(body) {
   const taskState = taskStateFromInput(items, MAX_ACTIVE_TASK_CHARS);
 
   const sections = [
-    NATIVE_DELEGATION_CONTRACT,
+    mainAgent ? MAIN_AGENT_CONTRACT : NATIVE_DELEGATION_CONTRACT,
   ];
   const projectInstructions = projectInstructionsPromptSection(body.client_metadata?.cwd);
   if (projectInstructions) sections.push(projectInstructions);
   if (body.instructions !== undefined) {
     const instructions = requireString(body.instructions, "instructions");
-    const tagged = [...instructions.matchAll(/<cursor_route_instructions>([\s\S]*?)<\/cursor_route_instructions>/gi)];
-    const roleInstructions = tagged.at(-1)?.[1]?.trim();
-    if (roleInstructions) sections.push(`[Cursor role instructions]\n${roleInstructions}`);
+    if (mainAgent) {
+      sections.push(`[RzCodex instructions]\n${instructions}`);
+    } else {
+      const tagged = [...instructions.matchAll(/<cursor_route_instructions>([\s\S]*?)<\/cursor_route_instructions>/gi)];
+      const roleInstructions = tagged.at(-1)?.[1]?.trim();
+      if (roleInstructions) sections.push(`[Cursor role instructions]\n${roleInstructions}`);
+    }
   }
   for (let index = 0; index < items.length; index += 1) {
     const item = assertObject(items[index], `input[${index}]`);
@@ -1328,6 +1339,7 @@ function cursorPromptFrom(body) {
   }
   return {
     model,
+    mainAgent,
     prompt,
     workingDirectory,
     taskState,
@@ -1672,9 +1684,9 @@ async function handleCursorResponses(request, response) {
   }
 }
 
-async function handleLegacyCommandCodeResponses(request, response) {
+async function handleLegacyCommandCodeResponses(request, response, parsedBody = null) {
   const authorization = bearerFrom(request);
-  const body = await readJsonRequest(request);
+  const body = parsedBody ?? await readJsonRequest(request);
   const translated = translateResponsesRequest(body);
   const installation = readCommandCodeInstallation();
   const abortController = new AbortController();
@@ -1866,12 +1878,14 @@ function openCodeTransport(model) {
 function normalizeOpenCodeRequest(body) {
   assertObject(body, "request body");
   if (body.stream !== true) throw new BridgeError("The OpenCode bridge only supports stream=true Responses requests");
+  const requestedModel = requireString(body.model, "model").replace(/^opencode\//i, "");
+  const mainAgent = requestedModel === MAIN_AGENT_MODEL_ALIAS;
   const taskInput = typeof body.input === "string"
     ? [{ type: "message", role: "user", content: body.input }]
     : body.input;
   if (!Array.isArray(taskInput)) throw new BridgeError("input must be a string or array");
   const taskState = taskStateFromInput(taskInput, MAX_ACTIVE_TASK_CHARS);
-  body.model = openCodeModelId(body.model);
+  body.model = openCodeModelId(requestedModel);
   if (body.reasoning?.summary === "none") delete body.reasoning.summary;
   if (body.reasoning?.effort === "none" || (body.reasoning && Object.keys(body.reasoning).length === 0)) delete body.reasoning;
   const customTools = new Map();
@@ -2000,8 +2014,8 @@ function normalizeOpenCodeRequest(body) {
   if (body.tool_choice?.type === "custom") body.tool_choice.type = "function";
   const taskControlSections = taskControlPromptSections(taskState);
   const instructionSections = [
-    taskState.activeTask ? NATIVE_DELEGATION_CONTRACT : "",
-    taskState.activeTask ? projectInstructionsPromptSection(body.client_metadata?.cwd) : "",
+    mainAgent ? MAIN_AGENT_CONTRACT : taskState.activeTask ? NATIVE_DELEGATION_CONTRACT : "",
+    mainAgent || taskState.activeTask ? projectInstructionsPromptSection(body.client_metadata?.cwd) : "",
     typeof body.instructions === "string" ? body.instructions : "",
     ...taskControlSections,
   ].filter(Boolean);
@@ -2797,9 +2811,9 @@ function transformOpenCodeChatSseBlock(block, state, toolInfo) {
   return events.join("");
 }
 
-async function handleLegacyOpenCodeResponses(request, response) {
+async function handleLegacyOpenCodeResponses(request, response, parsedBody = null) {
   const authorization = bearerFrom(request);
-  const translated = normalizeOpenCodeRequest(await readJsonRequest(request));
+  const translated = normalizeOpenCodeRequest(parsedBody ?? await readJsonRequest(request));
   const taskState = translated.taskState;
   const transport = openCodeTransport(translated.body.model);
   const chatRequest = transport === "chat-completions"
@@ -2959,8 +2973,8 @@ function nativeCliToolEvent(event, state) {
   return null;
 }
 
-async function handleNativeCliResponses(request, response, provider) {
-  const body = await readJsonRequest(request);
+async function handleNativeCliResponses(request, response, provider, parsedBody = null) {
+  const body = parsedBody ?? await readJsonRequest(request);
   const commandCode = provider === "commandcode";
   const requiredEffort = commandCode ? COMMANDCODE_REQUIRED_EFFORT : OPENCODE_REQUIRED_EFFORT;
   const model = resolveSubagentModelAlias(body.model, provider);
@@ -3109,11 +3123,17 @@ async function handleNativeCliResponses(request, response, provider) {
 }
 
 async function handleResponses(request, response) {
-  return handleNativeCliResponses(request, response, "commandcode");
+  const body = await readJsonRequest(request);
+  return body.model === SUBAGENT_MODEL_ALIAS
+    ? handleNativeCliResponses(request, response, "commandcode", body)
+    : handleLegacyCommandCodeResponses(request, response, body);
 }
 
 async function handleOpenCodeResponses(request, response) {
-  return handleNativeCliResponses(request, response, "opencode");
+  const body = await readJsonRequest(request);
+  return body.model === SUBAGENT_MODEL_ALIAS
+    ? handleNativeCliResponses(request, response, "opencode", body)
+    : handleLegacyOpenCodeResponses(request, response, body);
 }
 
 function selfTest() {
@@ -3193,6 +3213,77 @@ function selfTest() {
     || nativeContext.workingDirectory !== homedir()
   ) {
     throw new Error("self-test failed: native CLI must pin the complete task exactly once outside inherited history and parent schemas");
+  }
+  const mainAgentContext = nativeCliAgentContext({
+    model: MAIN_AGENT_MODEL_ALIAS,
+    reasoning: { effort: COMMANDCODE_REQUIRED_EFFORT },
+    stream: true,
+    instructions: "MAIN_AGENT_INSTRUCTIONS",
+    input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "MAIN_AGENT_REQUEST" }] }],
+    tools: [{ type: "function", name: "ignored_parent_schema", parameters: { type: "object" } }],
+    client_metadata: { cwd: homedir(), thread_id: "main-agent-fixture" },
+  }, {
+    provider: "commandcode",
+    model: subagentModelRoute("commandcode"),
+    requiredEffort: COMMANDCODE_REQUIRED_EFFORT,
+    mainAgent: true,
+  });
+  if (
+    !mainAgentContext.mainAgent
+    || mainAgentContext.taskState.activeTask !== null
+    || !mainAgentContext.prompt.includes("[RzCodex main-agent contract]")
+    || !mainAgentContext.prompt.includes("MAIN_AGENT_INSTRUCTIONS")
+    || !mainAgentContext.prompt.includes("MAIN_AGENT_REQUEST")
+  ) {
+    throw new Error("self-test failed: native main-agent context must accept ordinary history without NEW_TASK");
+  }
+  const commandCodeMain = translateResponsesRequest({
+    model: MAIN_AGENT_MODEL_ALIAS,
+    instructions: "MAIN_AGENT_INSTRUCTIONS",
+    input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "MAIN_AGENT_REQUEST" }] }],
+    tools: [{ type: "function", name: "echo", parameters: { type: "object", properties: {} } }],
+    stream: true,
+    client_metadata: { cwd: homedir() },
+  });
+  if (
+    commandCodeMain.upstream.params.model !== subagentModelRoute("commandcode")
+    || !commandCodeMain.upstream.params.system.includes(MAIN_AGENT_CONTRACT)
+    || !commandCodeMain.upstream.params.system.includes("MAIN_AGENT_INSTRUCTIONS")
+    || commandCodeMain.upstream.params.tools.length !== 1
+  ) {
+    throw new Error("self-test failed: CommandCode main-agent alias must preserve the full tool protocol");
+  }
+  const openCodeMain = normalizeOpenCodeRequest({
+    model: MAIN_AGENT_MODEL_ALIAS,
+    instructions: "MAIN_AGENT_INSTRUCTIONS",
+    input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "MAIN_AGENT_REQUEST" }] }],
+    tools: [{ type: "function", name: "echo", parameters: { type: "object", properties: {} } }],
+    stream: true,
+    client_metadata: { cwd: homedir() },
+  });
+  if (
+    openCodeMain.body.model !== subagentModelRoute("opencode")
+    || !openCodeMain.body.instructions.includes(MAIN_AGENT_CONTRACT)
+    || !openCodeMain.body.instructions.includes("MAIN_AGENT_INSTRUCTIONS")
+    || openCodeMain.responseTools.size !== 1
+  ) {
+    throw new Error("self-test failed: OpenCode main-agent alias must preserve the full tool protocol");
+  }
+  const cursorMain = cursorPromptFrom({
+    model: MAIN_AGENT_MODEL_ALIAS,
+    instructions: "MAIN_AGENT_INSTRUCTIONS",
+    input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "MAIN_AGENT_REQUEST" }] }],
+    stream: true,
+    client_metadata: { cwd: homedir(), thread_id: "cursor-main-fixture" },
+  });
+  if (
+    !cursorMain.mainAgent
+    || cursorMain.model !== subagentModelRoute("cursor")
+    || !cursorMain.prompt.includes(MAIN_AGENT_CONTRACT)
+    || !cursorMain.prompt.includes("MAIN_AGENT_INSTRUCTIONS")
+    || cursorStateKey(cursorMain) !== "cursor-main-fixture:main"
+  ) {
+    throw new Error("self-test failed: Cursor main-agent alias must accept ordinary history without NEW_TASK");
   }
   const commandCodeAnalysis = translateResponsesRequest({
     model: "commandcode/test-model",

@@ -8,6 +8,8 @@ use app_test_support::write_models_cache;
 use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::SandboxPolicy;
+use codex_app_server_protocol::ThreadCompactStartParams;
+use codex_app_server_protocol::ThreadCompactStartResponse;
 use codex_app_server_protocol::ThreadListResponse;
 use codex_app_server_protocol::ThreadReadParams;
 use codex_app_server_protocol::ThreadReadResponse;
@@ -163,6 +165,79 @@ async fn thread_settings_update_emits_notification_and_updates_future_turns() ->
         }),
         "future turn did not use updated model/service tier: {request_bodies:#?}"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_settings_update_switches_model_provider_for_future_turns() -> Result<()> {
+    let initial_server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
+    let selected_server = create_mock_responses_server_sequence_unchecked(vec![
+        create_final_assistant_message_sse_response("done")?,
+        create_final_assistant_message_sse_response("compacted")?,
+    ])
+    .await;
+    let codex_home = TempDir::new()?;
+    MockResponsesConfig::new(&initial_server.uri())
+        .with_provider_config("supports_websockets = false")
+        .with_extra_config(&format!(
+            r#"
+[model_providers.selected_provider]
+name = "Selected provider"
+base_url = "{}/v1"
+wire_api = "responses"
+request_max_retries = 0
+stream_max_retries = 0
+supports_websockets = false
+"#,
+            selected_server.uri()
+        ))
+        .write(codex_home.path())?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+        .await?;
+    let thread = start_thread(&mut mcp).await?.thread;
+
+    send_thread_settings_update(
+        &mut mcp,
+        ThreadSettingsUpdateParams {
+            thread_id: thread.id.clone(),
+            model: Some("selected-model".to_string()),
+            model_provider: Some("selected_provider".to_string()),
+            ..Default::default()
+        },
+    )
+    .await?;
+    let updated = read_thread_settings_updated(&mut mcp).await?;
+    assert_eq!(updated.thread_settings.model, "selected-model");
+    assert_eq!(updated.thread_settings.model_provider, "selected_provider");
+
+    start_text_turn(&mut mcp, thread.id.clone()).await?;
+    timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+
+    let compact_request = mcp
+        .send_thread_compact_start_request(ThreadCompactStartParams {
+            thread_id: thread.id.clone(),
+        })
+        .await?;
+    let _: ThreadCompactStartResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(compact_request)).await??;
+    timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+
+    assert!(received_response_bodies(&initial_server).await?.is_empty());
+    let selected_requests = received_response_bodies(&selected_server).await?;
+    assert_eq!(selected_requests.len(), 2);
+    assert_eq!(selected_requests[0]["model"], "selected-model");
+    assert_eq!(selected_requests[1]["model"], "selected-model");
     Ok(())
 }
 

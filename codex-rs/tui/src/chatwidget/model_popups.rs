@@ -144,6 +144,8 @@ impl ChatWidget {
             })
             .collect();
 
+        items.push(main_agent_routes_selection_item());
+
         if !other_presets.is_empty() {
             let actions: Vec<SelectionAction> = vec![Box::new(|tx| {
                 tx.send(AppEvent::OpenAllModelsPopup);
@@ -239,6 +241,7 @@ impl ChatWidget {
                 ..Default::default()
             });
         }
+        items.push(main_agent_routes_selection_item());
 
         let header = self.model_menu_header(
             "Select Model and Effort",
@@ -726,5 +729,19 @@ impl ChatWidget {
         self.apply_model_and_effort_without_persist(model.clone(), effort.clone());
         self.app_event_tx
             .send(AppEvent::PersistModelSelection { model, effort });
+    }
+}
+
+fn main_agent_routes_selection_item() -> SelectionItem {
+    SelectionItem {
+        name: "Provider routes…".to_string(),
+        description: Some(
+            "Use Native OpenAI or a configured external provider as the main agent".to_string(),
+        ),
+        actions: vec![Box::new(|tx| {
+            tx.send(AppEvent::OpenMainAgentRoutePicker);
+        })],
+        dismiss_on_select: true,
+        ..Default::default()
     }
 }
