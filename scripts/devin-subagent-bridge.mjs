@@ -71,10 +71,13 @@ const ANTIGRAVITY_REQUIRED_EFFORT = "high";
 const ANTIGRAVITY_CONTEXT_WINDOW = 131_072;
 const OLLAMA_AUTH_SOURCE = "Ollama local signed-in session";
 const OLLAMA_CONTEXT_WINDOW = 1_048_576;
+const OPENCODE_BRIDGE_ENDPOINT = "http://127.0.0.1:54545/opencode/v1/responses";
+const OPENCODE_REQUIRED_AUTH_SOURCE = "OpenCode locally authenticated session";
+const OPENCODE_REQUIRED_EFFORT = "xhigh";
 const CODEBUDDY_BRIDGE_ENDPOINT = "http://127.0.0.1:54547/v1/responses";
 const CODEBUDDY_REQUIRED_AUTH_SOURCE = "www.codebuddy.ai";
 const CODEBUDDY_REQUIRED_EFFORT = "max";
-const REQUIRED_AUTO_PROVIDER_ORDER = ["antigravity", "devin", "ollama", "devin-free", "codebuddy"];
+const REQUIRED_AUTO_PROVIDER_ORDER = ["antigravity", "devin", "ollama", "opencode", "codebuddy", "devin-free"];
 const SCRIPT_DIRECTORY = dirname(fileURLToPath(import.meta.url));
 const CENTRAL_CONFIG = join(homedir(), ".codex", "subagent-models.json");
 const USER_DEVIN_CONFIG = join(process.env.APPDATA || join(homedir(), "AppData", "Roaming"), "devin", "config.json");
@@ -398,6 +401,7 @@ function centralRoute() {
   const antigravityRoute = assertObject(parsed.antigravity, "central route antigravity");
   const ollamaRoute = assertObject(parsed.ollama, "central route ollama");
   const codeBuddyRoute = assertObject(parsed.codebuddy, "central route codebuddy");
+  const openCodeRoute = assertObject(parsed.routes?.opencode, "central managed route opencode");
   const autoRoute = assertObject(parsed.routes?.auto, "central managed route auto");
   const inputModalities = route.inputModalities;
   if (!Array.isArray(inputModalities) || inputModalities.length !== 1 || inputModalities[0] !== "text") {
@@ -420,6 +424,20 @@ function centralRoute() {
       500,
     );
   }
+  const openCodeInputModalities = openCodeRoute.inputModalities;
+  if (
+    openCodeRoute.modelProvider !== "opencode"
+    || !Array.isArray(openCodeInputModalities)
+    || openCodeInputModalities.length !== 1
+    || openCodeInputModalities[0] !== "text"
+  ) {
+    throw new BridgeError("OpenCode managed route must use the opencode provider and exactly the text modality", 500);
+  }
+  const openCodeEffort = requireString(openCodeRoute.reasoningEffort, "routes.opencode.reasoningEffort");
+  if (openCodeEffort !== OPENCODE_REQUIRED_EFFORT) {
+    throw new BridgeError(`OpenCode managed route must use ${OPENCODE_REQUIRED_EFFORT} reasoning`, 500);
+  }
+  const openCodeModel = requireString(parsed.opencode, "opencode");
   const nativeFallbackRoute = requireString(autoRoute.nativeFallbackRoute, "routes.auto.nativeFallbackRoute");
   const nativeRoute = assertObject(parsed.routes?.[nativeFallbackRoute], `central managed route ${nativeFallbackRoute}`);
   if (nativeFallbackRoute === "auto" || nativeRoute.modelProvider !== "openai") {
@@ -435,6 +453,10 @@ function centralRoute() {
     ],
     codeBuddyModel: requireString(codeBuddyRoute.model, "codebuddy.model"),
     nativeFallbackRoute,
+    openCodeModel,
+    openCodeResponseModel: `opencode/${openCodeModel}`,
+    openCodeEffort,
+    openCodeInputModalities,
     ollamaModel: requireString(ollamaRoute.model, "ollama.model"),
     ollamaLabel: requireString(ollamaRoute.label, "ollama.label"),
     ollamaResponseModels: ollamaRoute.responseModels.map((model, index) =>
@@ -551,8 +573,8 @@ const runtime = {
   lastActualProvider: null, lastModelLabel: null, lastQuotaFallback: false,
   lastTerminalFallback: false, lastFallbackReason: null,
   fallbackAttempts: 0, fallbackCompleted: 0, fallbackFailed: 0, terminalFallbacks: 0,
-  providerAttempts: { antigravity: 0, devin: 0, ollama: 0, devinFree: 0, codebuddy: 0 },
-  providerFailures: { antigravity: 0, devin: 0, ollama: 0, "devin-free": 0, codebuddy: 0 },
+  providerAttempts: { antigravity: 0, devin: 0, ollama: 0, opencode: 0, codebuddy: 0, devinFree: 0 },
+  providerFailures: { antigravity: 0, devin: 0, ollama: 0, opencode: 0, codebuddy: 0, "devin-free": 0 },
   recentProviderFailures: [],
   lastProviderSequence: [],
   fallbackStreamCommits: 0, lastFallbackStreamCommitted: false,
@@ -989,9 +1011,19 @@ function codeBuddySelection(reason) {
   };
 }
 
+function openCodeSelection(reason) {
+  return {
+    key: "opencode",
+    provider: "opencode",
+    model: { model_uid: route.openCodeResponseModel, label: route.openCodeModel },
+    reason,
+  };
+}
+
 function selectionForFailedStage(stage) {
   if (stage === "antigravity") return antigravitySelection("provider_checkpoint");
   if (stage === "ollama") return ollamaSelection("provider_checkpoint");
+  if (stage === "opencode") return openCodeSelection("provider_checkpoint");
   if (stage === "devin-free") return terminalSelection("provider_checkpoint");
   if (stage === "codebuddy") return codeBuddySelection("provider_checkpoint");
   if (stage === "devin") {
@@ -2155,6 +2187,54 @@ async function runCodeBuddyStage(context, requestBody, failures, onProgress, sig
   }
 }
 
+async function runOpenCodeStage(context, requestBody, failures, onProgress, signal, streamRelay) {
+  runtime.providerAttempts.opencode += 1;
+  runtime.lastProviderSequence.push("opencode");
+  pinProviderTask(context, "opencode");
+  onProgress?.("Automatic route started one self-contained OpenCode native CLI execution.\n");
+  try {
+    const forwardedBody = fallbackForwardBody(
+      requestBody,
+      MODEL_ALIAS,
+      route.openCodeEffort,
+      context.workingDirectory,
+    );
+    const completion = await runResponsesBridge({
+      endpoint: OPENCODE_BRIDGE_ENDPOINT,
+      body: forwardedBody,
+      signal,
+      onEvent: streamRelay.accept,
+    });
+    validateOAuthFallbackCompletion(completion, {
+      provider: "opencode",
+      models: [route.openCodeResponseModel],
+      authSource: OPENCODE_REQUIRED_AUTH_SOURCE,
+      lazyRzMcpProxyTools: context.executionPolicy.rzMcpMode === "disabled" ? 0 : 2,
+    });
+    const providerMetadata = completion.metadata || {};
+    const selected = {
+      ...openCodeSelection("auto_opencode_after_prior_provider_failure"),
+      model: {
+        model_uid: providerMetadata.actual_model,
+        label: providerMetadata.actual_model,
+      },
+      maxConcurrency: null,
+    };
+    return {
+      ...responsesResult(
+        completion,
+        selected,
+        fallbackState(context, failures),
+        { ignoredBytes: context.toolSchemaBytes, forwardedBytes: 0 },
+      ),
+      streamRelay,
+    };
+  } catch (error) {
+    if (streamRelay.providerWorkCommitted) error.routeCommitted = true;
+    throw error;
+  }
+}
+
 async function runOllamaStage(
   context,
   requestBody,
@@ -2369,7 +2449,7 @@ async function executeAuto(context, requestBody, onSpawn, onProgress, signal, cr
     ownershipTaskHash(context),
   );
   runtime.lastPinnedProviderStage = pinnedStage;
-  const stages = [
+  const availableStages = [
     {
       name: "antigravity",
       run: ({ failures }) => runAntigravityStage(
@@ -2406,6 +2486,28 @@ async function executeAuto(context, requestBody, onSpawn, onProgress, signal, cr
       ),
     },
     {
+      name: "opencode",
+      run: ({ failures }) => runOpenCodeStage(
+        context,
+        requestBody,
+        failures,
+        onProgress,
+        signal,
+        createStreamRelay({ providerLabel: "OpenCode" }),
+      ),
+    },
+    {
+      name: "codebuddy",
+      run: ({ failures }) => runCodeBuddyStage(
+        context,
+        requestBody,
+        failures,
+        onProgress,
+        signal,
+        createStreamRelay(),
+      ),
+    },
+    {
       name: "devin-free",
       run: ({ failures }) => {
         runtime.terminalFallbacks += 1;
@@ -2422,18 +2524,9 @@ async function executeAuto(context, requestBody, onSpawn, onProgress, signal, cr
         );
       },
     },
-    {
-      name: "codebuddy",
-      run: ({ failures }) => runCodeBuddyStage(
-        context,
-        requestBody,
-        failures,
-        onProgress,
-        signal,
-        createStreamRelay(),
-      ),
-    },
   ];
+  const stageByName = new Map(availableStages.map((stage) => [stage.name, stage]));
+  const stages = route.autoProviderOrder.map((provider) => stageByName.get(provider));
   let chain;
   try {
     chain = await runOrderedProviderChain({
@@ -2990,6 +3083,7 @@ function health(requestedRoute = "auto") {
       antigravity: ANTIGRAVITY_REQUIRED_AUTH_SOURCE,
       devin: auth.source,
       ollama: OLLAMA_AUTH_SOURCE,
+      opencode: OPENCODE_REQUIRED_AUTH_SOURCE,
       codebuddy: CODEBUDDY_REQUIRED_AUTH_SOURCE,
     },
     inputModalities: route.inputModalities,
@@ -3019,6 +3113,15 @@ function health(requestedRoute = "auto") {
         maxConcurrency: route.ollamaMaxConcurrency,
         toolServing: "Provider-native file/shell tools plus two-tool lazy RzMCP proxy in one retained CLI session per Codex turn",
       },
+      opencode: {
+        provider: "opencode",
+        uid: route.openCodeResponseModel,
+        configuredUid: route.openCodeModel,
+        effort: route.openCodeEffort,
+        authSource: OPENCODE_REQUIRED_AUTH_SOURCE,
+        endpoint: OPENCODE_BRIDGE_ENDPOINT,
+        toolServing: "Provider-native file/shell tools plus two-tool lazy RzMCP proxy in one retained CLI session per Codex turn",
+      },
       terminalFallback: {
         provider: "devin",
         uid: models.terminal.model_uid,
@@ -3038,7 +3141,7 @@ function health(requestedRoute = "auto") {
         route: route.nativeFallbackRoute,
         activation: "Codex in-process provider switch after every external stage fails before committed work",
       },
-      orderedPolicy: "antigravity_primary_then_antigravity_quota_fallback_then_devin_primary_then_ollama_then_devin_free_then_codebuddy_then_native_openai",
+      orderedPolicy: "antigravity_primary_then_antigravity_quota_fallback_then_devin_primary_then_ollama_then_opencode_then_codebuddy_then_devin_free_then_native_openai",
       configuredProviderOrder: route.autoProviderOrder,
       capacityPolicy: {
         autoWhenSaturated: "continue_to_next_provider",
@@ -3157,6 +3260,8 @@ async function selfTest() {
     route.antigravityProvider !== "antigravity"
     || route.antigravityModels.length !== 2
     || route.autoProviderOrder.join(",") !== REQUIRED_AUTO_PROVIDER_ORDER.join(",")
+    || route.openCodeEffort !== OPENCODE_REQUIRED_EFFORT
+    || route.openCodeResponseModel !== `opencode/${route.openCodeModel}`
     || route.ollamaEffort !== OLLAMA_REQUIRED_EFFORT
     || route.ollamaMaxConcurrency !== OLLAMA_CLOUD_CONCURRENCY
     || !route.ollamaResponseModels.includes(route.ollamaModel)
@@ -3176,13 +3281,22 @@ async function selfTest() {
     route.ollamaEffort,
     process.cwd(),
   );
+  const forwardedOpenCodeFixture = fallbackForwardBody(
+    autoEffortFixture,
+    autoEffortFixture.model,
+    route.openCodeEffort,
+    process.cwd(),
+  );
   if (
     autoEffortFixture.reasoning.effort !== REQUIRED_EFFORT
     || forwardedOllamaFixture.reasoning.effort !== OLLAMA_REQUIRED_EFFORT
     || forwardedOllamaFixture.model !== MODEL_ALIAS
     || forwardedOllamaFixture.client_metadata?.cwd !== process.cwd()
+    || forwardedOpenCodeFixture.reasoning.effort !== OPENCODE_REQUIRED_EFFORT
+    || forwardedOpenCodeFixture.model !== MODEL_ALIAS
+    || forwardedOpenCodeFixture.client_metadata?.cwd !== process.cwd()
   ) {
-    throw new Error("auto route did not translate the Ollama stage to its required effort");
+    throw new Error("auto route did not translate provider stages to their required efforts");
   }
   if (!LEGACY_REQUEST_EFFORTS.has("max") || LEGACY_REQUEST_EFFORTS.has("xhigh")) throw new Error("legacy effort compatibility failed");
   const isolatedEnvironment = sanitizedEnvironment({

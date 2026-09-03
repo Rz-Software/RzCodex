@@ -357,6 +357,8 @@ test("ordered routing stops after the first successful provider", async () => {
 test("ordered routing reaches each later provider exactly once after uncommitted failures", async () => {
   const antigravityFailure = new Error("antigravity quota");
   const devinFailure = new Error("devin quota");
+  const ollamaFailure = new Error("ollama quota");
+  const openCodeFailure = new Error("opencode quota");
   const observed = [];
   const calls = [];
   const result = await runOrderedProviderChain({
@@ -373,22 +375,45 @@ test("ordered routing reaches each later provider exactly once after uncommitted
           { stage: "antigravity", error: antigravityFailure },
           { stage: "devin", error: devinFailure },
         ]);
-        return "glm-5.3-flash";
+        throw ollamaFailure;
+      } },
+      { name: "opencode", run: async ({ failures }) => {
+        calls.push("opencode");
+        assert.deepEqual(failures, [
+          { stage: "antigravity", error: antigravityFailure },
+          { stage: "devin", error: devinFailure },
+          { stage: "ollama", error: ollamaFailure },
+        ]);
+        throw openCodeFailure;
+      } },
+      { name: "codebuddy", run: async ({ failures }) => {
+        calls.push("codebuddy");
+        assert.deepEqual(failures, [
+          { stage: "antigravity", error: antigravityFailure },
+          { stage: "devin", error: devinFailure },
+          { stage: "ollama", error: ollamaFailure },
+          { stage: "opencode", error: openCodeFailure },
+        ]);
+        return "hy4";
       } },
       { name: "devin-free", run: async () => { calls.push("devin-free"); return "glm-5.2"; } },
     ],
     onStageFailure: (stage, error) => observed.push({ stage, error }),
   });
-  assert.equal(result.stage, "ollama");
-  assert.equal(result.value, "glm-5.3-flash");
+  assert.equal(result.stage, "codebuddy");
+  assert.equal(result.value, "hy4");
   assert.deepEqual(result.failures, [
     { stage: "antigravity", error: antigravityFailure },
     { stage: "devin", error: devinFailure },
+    { stage: "ollama", error: ollamaFailure },
+    { stage: "opencode", error: openCodeFailure },
   ]);
-  assert.deepEqual(calls, ["antigravity", "devin", "ollama"]);
+  assert.deepEqual(calls, ["antigravity", "devin", "ollama", "opencode", "codebuddy"]);
   assert.deepEqual(observed, [
     { stage: "antigravity", error: antigravityFailure },
     { stage: "devin", error: devinFailure },
+    { stage: "ollama", error: ollamaFailure },
+    { stage: "opencode", error: openCodeFailure },
   ]);
 });
 

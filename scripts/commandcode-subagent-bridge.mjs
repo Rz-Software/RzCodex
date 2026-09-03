@@ -32,6 +32,7 @@ const OPENCODE_CHAT_COMPLETIONS_URL = "https://opencode.ai/zen/v1/chat/completio
 const SUBAGENT_MODEL_ALIAS = "@preset/codex-subagents";
 const COMMANDCODE_REQUIRED_EFFORT = "max";
 const OPENCODE_REQUIRED_EFFORT = "xhigh";
+const OPENCODE_AUTH_SOURCE = "OpenCode locally authenticated session";
 const MAX_ACTIVE_TASK_CHARS = 40_000;
 const NATIVE_DELEGATION_CONTRACT = "[Native delegation contract]\nWork as the bounded native sub-agent in the current workspace. Honor project AGENTS.md ownership boundaries exactly; when builds, tests, editor control, PIE, runtime validation, or RzMCP execution are reserved to the parent, do not invoke them and instead report the exact checks the parent should run. On Windows, use PowerShell-native commands, single-quote ripgrep patterns containing |, and never assume Unix-only commands such as head are installed. Complete only the assigned scope and return a concise result or concrete blocker.";
 const SUBAGENT_MODEL_ROUTES_FILE = join(
@@ -3039,6 +3040,7 @@ async function handleNativeCliResponses(request, response, provider) {
           actual_provider: provider,
           actual_model: result.model,
           actual_reasoning_effort: requiredEffort,
+          ...(provider === "opencode" ? { auth_source: OPENCODE_AUTH_SOURCE } : {}),
           native_cli_single_execution: result.executionCount === 1,
           native_cli_execution_count: result.executionCount,
           native_cli_same_session_continuations: result.sameSessionContinuations,
