@@ -343,6 +343,15 @@ fn managed_preset_uses_lazy_tool_discovery_with_direct_tools() {
 }
 
 #[test]
+fn managed_main_preset_retains_main_agent_extensions() {
+    let model = model_info_from_slug("@preset/rzcodex-main-devin-free");
+
+    assert!(!model.include_skills_usage_instructions);
+    assert!(model.include_plugin_usage_instructions);
+    assert!(model.include_apps_usage_instructions);
+}
+
+#[test]
 fn configured_input_modalities_override_managed_preset_defaults() {
     let model = model_info_from_slug("@preset/subagents");
     let config = ModelsManagerConfig {

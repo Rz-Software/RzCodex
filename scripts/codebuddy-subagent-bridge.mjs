@@ -1440,6 +1440,8 @@ function managedModelsResponse() {
         description: "CodeBuddy Hy4 Preview as the primary main-agent provider",
         base_instructions: "You are the primary coding agent. Follow the supplied RzCodex and project instructions, use the available tools, verify your work, and complete the current request.",
         visibility: "visible",
+        include_plugin_usage_instructions: true,
+        include_apps_usage_instructions: true,
       },
     ],
   };

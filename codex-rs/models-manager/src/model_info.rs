@@ -148,6 +148,7 @@ fn is_h1_heading(line: &str) -> bool {
 pub fn model_info_from_slug(slug: &str) -> ModelInfo {
     warn!("Unknown model {slug} is used. This will use fallback model metadata.");
     let is_managed_preset = slug.starts_with("@preset/");
+    let is_managed_main_preset = slug.starts_with("@preset/rzcodex-main");
     ModelInfo {
         slug: slug.to_string(),
         display_name: slug.to_string(),
@@ -165,8 +166,8 @@ pub fn model_info_from_slug(slug: &str) -> ModelInfo {
         upgrade: None,
         model_messages: Some(local_model_messages_for_slug(slug)),
         include_skills_usage_instructions: false,
-        include_plugin_usage_instructions: false,
-        include_apps_usage_instructions: false,
+        include_plugin_usage_instructions: is_managed_main_preset,
+        include_apps_usage_instructions: is_managed_main_preset,
         supports_reasoning_summary_parameter: true,
         default_reasoning_summary: ReasoningSummary::Auto,
         support_verbosity: false,

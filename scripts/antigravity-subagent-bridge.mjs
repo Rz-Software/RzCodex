@@ -1629,6 +1629,8 @@ function managedModelsResponse() {
       description: "Antigravity Claude Opus / Gemini as the primary main-agent provider",
       base_instructions: "You are the primary coding agent. Follow the supplied RzCodex and project instructions, use local tools, and complete the current request.",
       visibility: "visible",
+      include_plugin_usage_instructions: true,
+      include_apps_usage_instructions: true,
     },
   ] };
 }
