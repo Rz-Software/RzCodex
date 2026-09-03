@@ -1515,6 +1515,7 @@ async fn older_pagination_reconciles_review_prompts_across_page_boundaries() -> 
             phase: None,
             memory_citation: None,
             delivery: None,
+            questions: None,
         })
     }));
     items.extend([
@@ -1704,6 +1705,7 @@ async fn transcript_home_loads_every_older_history_page() -> Result<()> {
                 phase: None,
                 memory_citation: None,
                 delivery: None,
+                questions: None,
             }),
             started_at_ms: None,
             completed_at_ms: 0,
@@ -2102,6 +2104,7 @@ async fn underfilled_scrollback_fetches_older_pages_without_opening_the_transcri
                 phase: None,
                 memory_citation: None,
                 delivery: None,
+                questions: None,
             }),
             started_at_ms: None,
             completed_at_ms: 0,
@@ -3065,7 +3068,7 @@ fn fresh_session_applies_requested_name() -> Result<()> {
 
 #[test]
 fn session_lifecycle_avoids_redundant_subagent_metadata_reads() -> Result<()> {
-    const TEST_STACK_SIZE_BYTES: usize = 8 * 1024 * 1024;
+    const TEST_STACK_SIZE_BYTES: usize = 16 * 1024 * 1024;
 
     std::thread::Builder::new()
         .name("tui-session-lifecycle-requests".to_string())

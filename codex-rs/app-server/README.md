@@ -339,14 +339,28 @@ sources before returning; ordinary listing schedules the same work in the backgr
 Remote catalog settings and feature gating remain request-wide rather than being
 selected from the requested repos. Search continues to report `enabled: false`.
 
-Marketplace definitions can come from system configuration, but configured Git
-marketplaces currently require an existing downloaded snapshot.
+Marketplace definitions can come from system configuration. Startup synchronization
+and `marketplace/upgrade` download or update configured Git marketplaces using the
+merged source, ref, and sparse-path settings. Snapshot metadata stays with the
+downloaded files; configuration is not copied into the user layer. Pure catalog
+listing does not wait for missing snapshots to download.
+Activation reloads configuration with the operation's original load settings and
+rolls back if the marketplace definition changed or the reload fails. User files
+ignored at startup remain ignored during this check.
 
 `marketplace/remove` rejects removal when the marketplace name is defined in another
 enabled layer of the operation's loaded config stack. Otherwise it removes the
 snapshot and any base-user entry; a base-user entry is not required for cleanup.
 
 ### Example: Start or resume a thread
+
+The shared `Thread` object includes nullable `model` and `reasoningEffort` fields,
+including in `thread/read`, `thread/list`, and `thread/started`. Loaded threads report
+their current configured settings; unloaded threads report the latest persisted
+values. Unavailable legacy or filesystem-only values remain `null`, and an unset
+reasoning effort is also `null`. These fields are not per-turn execution telemetry.
+Use `thread/read` or `thread/list` to inspect them without resuming a thread,
+subscribing to it, or dispatching queued work or goal continuations.
 
 Start a fresh thread when you need a new Codex conversation.
 
@@ -1810,7 +1824,7 @@ The app-server streams JSON-RPC notifications while a turn is running. Each turn
 
 - `userMessage` — `{id, clientId, content}` where `clientId` is the optional `clientUserMessageId` supplied to `turn/start` or `turn/steer`, and `content` is a list of user inputs (`text`, `image`, `localImage`, `audio`, or `localAudio`).
 - `functionCallOutput` — `{id, name, namespace, output}` for a standalone function-call output without a `call_id`. `namespace` is nullable, and `output` is either a string or structured content items. Clients decide whether to render these tool-authority items; ordinary paired function-call outputs are not emitted separately.
-- `agentMessage` — `{id, text, phase, memoryCitation, delivery}` containing the accumulated agent reply. `delivery: "async"` identifies a user-visible message sent without ending the current turn; ordinary agent messages have `delivery: null`.
+- `agentMessage` — `{id, text, phase, memoryCitation, delivery, questions}` containing the accumulated agent reply. `delivery: "async"` identifies a user-visible message sent without ending the current turn. Async user-input requests also provide `questions`, an ordered array of `{title, options}`; `options: null` means free text only. `text` remains a readable fallback. Replies arrive as ordinary user messages. Ordinary agent messages have `delivery: null` and `questions: null`.
 - `plan` — `{id, text}` emitted for plan-mode turns; plan text can stream via `item/plan/delta` (experimental).
 - `reasoning` — `{id, summary, content}` where `summary` holds streamed reasoning summaries (applicable for most OpenAI models) and `content` holds raw reasoning blocks (applicable for e.g. open source models).
 - `commandExecution` — `{id, pluginId?, scriptPath?, command, cwd, status, commandActions, aggregatedOutput?, exitCode?, durationMs?}` for sandboxed commands; `pluginId` is present only for commands attributed to a trusted first-party plugin, newly attributed items also include `scriptPath` as a safe `/`-separated path relative to the trusted plugin root, older history may omit `scriptPath`, and `status` is `inProgress`, `completed`, `failed`, or `declined`. Ordinary execution items and their replay expose `command` and `commandActions` as redacted display values, not executable commands.
@@ -1908,6 +1922,11 @@ explanation. Misalignment explanation and steering details are delivered live bu
 persisted rollout errors, so unavailable details after a restart remain a terminal block.
 
 ## Approvals
+
+In User approval mode (`approvalsReviewer: "user"`), async Guardian scoring and
+prewarming are skipped, and ordinary `node_repl.js` execution confirmations are
+accepted automatically. Separate sensitive-action checks and requests for user
+input keep their existing behavior. Approve for me and Full Access are unchanged.
 
 Full Access (`approvalPolicy: "never"` with unrestricted selected environments)
 skips Guardian, including background scoring. Confirmation-only MCP approvals,

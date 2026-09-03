@@ -149,6 +149,82 @@ function Test-MergeInProgress {
     }
 }
 
+function Resolve-ReleaseVersionConflict {
+    param(
+        [Parameter(Mandatory)]
+        [string]$BaseVersion
+    )
+
+    $unmergedPaths = @(& git -C $RepoRoot diff --name-only --diff-filter=U)
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not inspect conflicts from the upstream release merge."
+    }
+    $expectedPath = "codex-rs/Cargo.toml"
+    if ($unmergedPaths.Count -ne 1 -or $unmergedPaths[0] -ne $expectedPath) {
+        $summary = if ($unmergedPaths.Count -eq 0) { "none" } else { $unmergedPaths -join ", " }
+        throw "Upstream release merge has unsupported conflicts: $summary"
+    }
+
+    $cargoTomlPath = Join-Path $RepoRoot "codex-rs\Cargo.toml"
+    $cargoToml = [System.IO.File]::ReadAllText($cargoTomlPath)
+    $conflictPattern = '(?m)^<<<<<<< HEAD\r?\nversion = "(?<Current>\d+\.\d+\.\d+)"\r?\n=======\r?\nversion = "(?<Incoming>\d+\.\d+\.\d+)"\r?\n>>>>>>> [^\r\n]+\r?\n'
+    $matches = [regex]::Matches($cargoToml, $conflictPattern)
+    $markerCount = [regex]::Matches($cargoToml, '(?m)^<<<<<<< |^=======\r?$|^>>>>>>> ').Count
+    if (
+        $matches.Count -ne 1 -or
+        $markerCount -ne 3 -or
+        $matches[0].Groups["Incoming"].Value -ne $BaseVersion
+    ) {
+        throw "The Cargo workspace version conflict was not the exact supported release-version shape."
+    }
+
+    $newline = if ($matches[0].Value.Contains("`r`n")) { "`r`n" } else { "`n" }
+    $resolvedCargoToml = [regex]::new($conflictPattern).Replace(
+        $cargoToml,
+        "version = `"$BaseVersion`"$newline",
+        1
+    )
+    [System.IO.File]::WriteAllText($cargoTomlPath, $resolvedCargoToml)
+
+    Push-Location -LiteralPath $CodexRustRoot
+    try {
+        & cargo metadata --format-version 1 --no-deps *> $null
+        if ($LASTEXITCODE -ne 0) {
+            throw "Cargo could not refresh the workspace package versions after resolving the release conflict."
+        }
+    }
+    finally {
+        Pop-Location
+    }
+    Invoke-NativeCommand -FilePath "git" -ArgumentList @(
+        "add",
+        "--",
+        $expectedPath,
+        "codex-rs/Cargo.lock"
+    ) -WorkingDirectory $RepoRoot
+
+    $remainingConflicts = @(& git -C $RepoRoot diff --name-only --diff-filter=U)
+    if ($LASTEXITCODE -ne 0 -or $remainingConflicts.Count -ne 0) {
+        throw "The supported Cargo workspace version conflict did not resolve cleanly."
+    }
+    Write-Output "Resolved the upstream Cargo workspace version to $BaseVersion."
+}
+
+function Assert-NoUnstagedTrackedChanges {
+    & git -C $RepoRoot diff --quiet
+    $diffExitCode = $LASTEXITCODE
+    if ($diffExitCode -eq 0) {
+        return
+    }
+    if ($diffExitCode -ne 1) {
+        throw "Could not verify the RzCodex working tree after the update build."
+    }
+
+    $paths = @(& git -C $RepoRoot diff --name-only)
+    $summary = if ($paths.Count -eq 0) { "unknown" } else { $paths -join ", " }
+    throw "Update commands left unstaged tracked changes: $summary"
+}
+
 function Initialize-WindowsBuildEnvironment {
     $logicalProcessorCount = [System.Environment]::ProcessorCount
     if ($logicalProcessorCount -lt 1) {
@@ -393,7 +469,11 @@ try {
 
     if ($updateAvailable) {
         $mergeStarted = $true
-        Invoke-NativeCommand -FilePath "git" -ArgumentList @("merge", "--no-commit", "--no-ff", $releaseTag) -WorkingDirectory $RepoRoot
+        & git -C $RepoRoot merge --no-commit --no-ff $releaseTag
+        $mergeExitCode = $LASTEXITCODE
+        if ($mergeExitCode -ne 0) {
+            Resolve-ReleaseVersionConflict -BaseVersion $baseVersion
+        }
     }
 
     Invoke-NativeCommand -FilePath "just" -ArgumentList @("fmt-check") -WorkingDirectory $CodexRustRoot
@@ -425,6 +505,7 @@ try {
         "--bin", "codex-windows-sandbox-setup",
         "--bin", "codex-command-runner"
     ) -WorkingDirectory $CodexRustRoot
+    Assert-NoUnstagedTrackedChanges
 
     if ($mergeStarted) {
         Invoke-NativeCommand -FilePath "git" -ArgumentList @("commit", "-m", "Merge upstream release $releaseTag into rz-main") -WorkingDirectory $RepoRoot
