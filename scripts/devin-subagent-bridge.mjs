@@ -620,6 +620,17 @@ function pinProviderTask(context, stage) {
   return changed;
 }
 
+function shouldPreserveProviderTaskPin(context, result) {
+  return context.requestedRoute === "auto"
+    && typeof result?.autoStage === "string"
+    && result.autoStage.length > 0
+    && (
+      context.taskState?.checkpointRequested === true
+      || result.preserveProviderPin === true
+      || result.providerMetadata?.provider_checkpoint === true
+    );
+}
+
 function preserveProviderPinForAbortedTurn(context, error, signal) {
   if (!signal?.aborted) return null;
   const stage = providerTaskPins.get(context.threadId, ownershipTaskHash(context));
@@ -2935,11 +2946,7 @@ async function handleResponses(request, response) {
       taskHash,
       routeRetentionCount,
     )) runtime.quotaPinsReleased += 1;
-    if (
-      context.requestedRoute === "auto"
-      && result.autoStage
-      && (routeRetentionCount > 0 || result.preserveProviderPin === true)
-    ) {
+    if (shouldPreserveProviderTaskPin(context, result)) {
       pinProviderTask(context, result.autoStage);
     } else if (providerTaskPins.releaseAfterFinalResponse(
       context.threadId,
@@ -4460,6 +4467,24 @@ async function selfTest() {
     || !pinnedContinuationResult.text.includes("remains pinned to the same provider")
   ) {
     throw new Error("active provider continuation checkpoint lost its provider pin");
+  }
+  const providerPinFixtureContext = {
+    requestedRoute: "auto",
+    taskState: { checkpointRequested: false },
+  };
+  if (
+    shouldPreserveProviderTaskPin(providerPinFixtureContext, {
+      autoStage: "ollama",
+      toolCalls: [{ name: "read" }],
+      providerMetadata: {},
+    })
+    || !shouldPreserveProviderTaskPin(providerPinFixtureContext, committedCheckpointResult)
+    || !shouldPreserveProviderTaskPin(
+      { ...providerPinFixtureContext, taskState: { checkpointRequested: true } },
+      { autoStage: "ollama", providerMetadata: {} },
+    )
+  ) {
+    throw new Error("provider task pin terminal/checkpoint classification failed");
   }
   const abortedProviderContext = {
     requestedRoute: "auto",
