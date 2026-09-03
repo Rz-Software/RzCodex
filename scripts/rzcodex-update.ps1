@@ -505,6 +505,17 @@ try {
         "--bin", "codex-windows-sandbox-setup",
         "--bin", "codex-command-runner"
     ) -WorkingDirectory $CodexRustRoot
+    if ($mergeStarted) {
+        # A full release build can normalize workspace-only entries that `cargo metadata
+        # --no-deps` did not touch while resolving the version conflict. Keep that generated
+        # lockfile in the release merge, while the cleanliness guard below still rejects any
+        # other unexpected build-time source mutation.
+        Invoke-NativeCommand -FilePath "git" -ArgumentList @(
+            "add",
+            "--",
+            "codex-rs/Cargo.lock"
+        ) -WorkingDirectory $RepoRoot
+    }
     Assert-NoUnstagedTrackedChanges
 
     if ($mergeStarted) {
