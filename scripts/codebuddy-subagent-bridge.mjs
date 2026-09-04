@@ -33,6 +33,7 @@ import {
   taskStateFromInput,
 } from "./codebuddy-subagent-task-state.mjs";
 import { projectInstructionsPromptSection } from "./native-project-instructions.mjs";
+import { providerFailureDiagnostics } from "./native-subagent-provider-router.mjs";
 
 const PROVIDER_ID = "codebuddy";
 const MODEL_ALIAS = "@preset/codex-subagents";
@@ -1758,6 +1759,7 @@ async function handleResponses(request, response) {
           code: providerResponseErrorCode(error),
           type: "bridge_error",
           message: redactSecrets(error.message),
+          provider_diagnostics: providerFailureDiagnostics(error),
         },
       },
     });

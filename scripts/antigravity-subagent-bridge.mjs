@@ -19,6 +19,7 @@ import {
   taskStateFromInput,
 } from "./codebuddy-subagent-task-state.mjs";
 import { projectInstructionsPromptSection } from "./native-project-instructions.mjs";
+import { providerFailureDiagnostics } from "./native-subagent-provider-router.mjs";
 
 const PROVIDER_ID = "antigravity";
 const MODEL_ALIAS = "@preset/codex-subagents";
@@ -717,6 +718,30 @@ function applyInterruptedProgress(target, progress) {
   return target;
 }
 
+function preserveInterruptedOwnership(target, progress) {
+  applyInterruptedProgress(target, progress);
+  const committed = target.routeCommitted === true
+    || target.toolCalls > 0
+    || target.mutationToolCalls > 0
+    || target.rzMcpTools.length > 0
+    || target.subagentActivity === true
+    || Boolean(target.forbiddenToolName);
+  if (committed) {
+    target.routeCommitted = true;
+    target.safeToRetry = false;
+  }
+  return target;
+}
+
+function interruptedRecoveryDeadlineError(message, status, progress) {
+  const error = preserveInterruptedOwnership(new BridgeError(message, status), progress);
+  if (error.routeCommitted !== true) {
+    error.routeCommitted = false;
+    error.safeToRetry = true;
+  }
+  return error;
+}
+
 function interruptedStreamContinuationPrompt(session) {
   return `[Native Antigravity stream recovery]\nThe upstream stream was interrupted. Continue the same retained task and conversation from its current state. Task hash: ${session.activeTaskHash || "none"}. Do not repeat completed tool calls or file edits. Return when complete or concretely blocked.`;
 }
@@ -748,8 +773,9 @@ async function runWithInterruptedStreamRecovery(
     const activeDeadline = recoveryDeadline || requestDeadline;
     const remainingMs = activeDeadline - now();
     if (remainingMs <= 0) {
-      const error = applyInterruptedProgress(
-        new BridgeError("Antigravity interrupted-stream recovery exceeded the request deadline", 504),
+      const error = interruptedRecoveryDeadlineError(
+        "Antigravity interrupted-stream recovery exceeded the request deadline",
+        504,
         progress,
       );
       session.close?.();
@@ -785,26 +811,15 @@ async function runWithInterruptedStreamRecovery(
       return combined;
     } catch (error) {
       if (error?.sameSessionContinuation !== true) {
-        throw applyInterruptedProgress(error, progress);
+        throw preserveInterruptedOwnership(error, progress);
       }
       accumulateInterruptedProgress(progress, error);
       progress.streamContinuations += 1;
-      if (attempt >= 1) {
-        const exhaustedError = applyInterruptedProgress(
-          new BridgeError("Antigravity remained stream-interrupted after one same-session continuation", 502),
-          progress,
-        );
-        const committed = exhaustedError.toolCalls > 0 || exhaustedError.rzMcpTools.length > 0;
-        exhaustedError.safeToRetry = !committed;
-        exhaustedError.routeCommitted = committed;
-        session.close?.();
-        throw exhaustedError;
-      }
       if (recoveryDeadline === null) {
         recoveryDeadline = Math.min(requestDeadline, now() + recoveryBudgetMs);
       }
       if (session.closed || (session.init?.conversationId || null) !== conversationId) {
-        throw applyInterruptedProgress(
+        throw preserveInterruptedOwnership(
           new BridgeError("Antigravity lost the retained conversation after a stream interruption", 502),
           progress,
         );
@@ -812,8 +827,9 @@ async function runWithInterruptedStreamRecovery(
       attempt += 1;
       const backoffMs = streamContinuationBackoffMs(attempt);
       if (now() + backoffMs >= recoveryDeadline) {
-        const deadlineError = applyInterruptedProgress(
-          new BridgeError("Antigravity remained stream-interrupted until the request deadline", 504),
+        const deadlineError = interruptedRecoveryDeadlineError(
+          "Antigravity remained stream-interrupted until the recovery deadline",
+          504,
           progress,
         );
         session.close?.();
@@ -823,7 +839,7 @@ async function runWithInterruptedStreamRecovery(
       try {
         await delay(backoffMs, signal);
       } catch (delayError) {
-        const error = applyInterruptedProgress(delayError, progress);
+        const error = preserveInterruptedOwnership(delayError, progress);
         if (error.status === 499) session.close?.();
         throw error;
       }
@@ -1574,6 +1590,7 @@ async function handleResponses(request, response) {
         error: {
           code: error?.code || (error?.routeCommitted === true ? "provider_state_changed" : "external_provider_error"),
           message: runtime.lastError,
+          provider_diagnostics: providerFailureDiagnostics(error),
         },
       },
     });
@@ -2035,6 +2052,7 @@ async function selfTest() {
     throw new Error("post-tool Antigravity stream interruption did not resume the retained session once");
   }
   let exhaustedCommittedRuns = 0;
+  let exhaustedCommittedNow = 1_000;
   let exhaustedCommittedFailure;
   try {
     await runWithInterruptedStreamRecovery(
@@ -2052,20 +2070,25 @@ async function selfTest() {
       undefined,
       undefined,
       undefined,
-      { now: () => 1_000, deadline: 100_000, delay: async () => {} },
+      {
+        now: () => exhaustedCommittedNow,
+        deadline: 100_000,
+        recoveryBudgetMs: 3_500,
+        delay: async (milliseconds) => { exhaustedCommittedNow += milliseconds; },
+      },
     );
   } catch (error) {
     exhaustedCommittedFailure = error;
   }
   if (
-    exhaustedCommittedRuns !== 2
-    || exhaustedCommittedFailure?.streamContinuations !== 2
-    || exhaustedCommittedFailure?.toolCalls !== 2
-    || exhaustedCommittedFailure?.mutationToolCalls !== 2
+    exhaustedCommittedRuns !== 3
+    || exhaustedCommittedFailure?.streamContinuations !== 3
+    || exhaustedCommittedFailure?.toolCalls !== 3
+    || exhaustedCommittedFailure?.mutationToolCalls !== 3
     || exhaustedCommittedFailure?.routeCommitted !== true
     || exhaustedCommittedFailure?.safeToRetry !== false
   ) {
-    throw new Error("exhausted post-tool Antigravity recovery lost committed provider ownership");
+    throw new Error("deadline-bounded post-tool Antigravity recovery lost committed provider ownership");
   }
   let terminalRecoveryRun = 0;
   let terminalRecoveryFailure;

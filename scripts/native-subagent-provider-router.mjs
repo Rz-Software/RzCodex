@@ -1,5 +1,7 @@
 const DEFAULT_MAX_RESPONSE_BYTES = 32 * 1024 * 1024;
 const MAX_RECOVERED_PARTIAL_TEXT_CHARS = 64 * 1024;
+const MAX_PROVIDER_DIAGNOSTIC_NAMES = 512;
+const MAX_PROVIDER_DIAGNOSTIC_NAME_CHARS = 160;
 
 export class ProviderRouteError extends Error {
   constructor(message, status = 502, options) {
@@ -184,6 +186,117 @@ function requireObject(value, label) {
   return value;
 }
 
+function providerDiagnosticNames(...values) {
+  const names = [];
+  const seen = new Set();
+  for (const value of values) {
+    if (!Array.isArray(value)) continue;
+    for (const entry of value) {
+      if (typeof entry !== "string") continue;
+      const name = entry.trim().slice(0, MAX_PROVIDER_DIAGNOSTIC_NAME_CHARS);
+      if (!name || seen.has(name)) continue;
+      seen.add(name);
+      names.push(name);
+      if (names.length >= MAX_PROVIDER_DIAGNOSTIC_NAMES) return names;
+    }
+  }
+  return names;
+}
+
+function providerDiagnosticCount(...values) {
+  let count = 0;
+  for (const value of values) {
+    const number = Number(value);
+    if (Number.isFinite(number) && number >= 0) count = Math.max(count, Math.trunc(number));
+  }
+  return count;
+}
+
+function providerDiagnosticNameCount(...values) {
+  let count = 0;
+  for (const value of values) {
+    if (!Array.isArray(value)) continue;
+    count = Math.max(
+      count,
+      value.filter((entry) => typeof entry === "string" && entry.trim().length > 0).length,
+    );
+  }
+  return count;
+}
+
+function providerLastDiagnosticName(explicitName, ...values) {
+  if (typeof explicitName === "string" && explicitName.trim()) {
+    return explicitName.trim().slice(0, MAX_PROVIDER_DIAGNOSTIC_NAME_CHARS);
+  }
+  for (const value of values) {
+    if (!Array.isArray(value)) continue;
+    for (let index = value.length - 1; index >= 0; index -= 1) {
+      const entry = value[index];
+      if (typeof entry === "string" && entry.trim()) {
+        return entry.trim().slice(0, MAX_PROVIDER_DIAGNOSTIC_NAME_CHARS);
+      }
+    }
+  }
+  return null;
+}
+
+// Failure payloads cross a loopback Responses/SSE boundary before the central router sees them.
+// Preserve only bounded, non-content diagnostics: never prompts, tool arguments, output, or secrets.
+export function providerFailureDiagnostics(error) {
+  const nativeToolNames = providerDiagnosticNames(error?.nativeToolNames, error?.toolNames);
+  const rzmcpTools = providerDiagnosticNames(error?.nativeRzMcpTools, error?.rzMcpTools);
+  const nativeToolCalls = Math.max(
+    providerDiagnosticNameCount(error?.nativeToolNames, error?.toolNames),
+    providerDiagnosticCount(error?.toolCalls, error?.nativeToolCalls),
+  );
+  const mutationToolCalls = providerDiagnosticCount(
+    error?.providerMutationCount,
+    error?.mutationToolCalls,
+  );
+  return {
+    native_tool_calls: nativeToolCalls,
+    native_tool_names: nativeToolNames,
+    last_completed_tool: providerLastDiagnosticName(
+      error?.lastCompletedTool,
+      error?.nativeToolNames,
+      error?.toolNames,
+    ),
+    mutation_tool_calls: mutationToolCalls,
+    rzmcp_tools_called: rzmcpTools,
+    interrupted_stream_continuations: providerDiagnosticCount(error?.streamContinuations),
+    peak_turn_context_tokens: providerDiagnosticCount(error?.peakContextTokens),
+    provider_task_pin_preserved: error?.providerTaskPinPreserved === true,
+    route_committed: error?.routeCommitted === true || nativeToolCalls > 0 || mutationToolCalls > 0,
+  };
+}
+
+function attachProviderFailureDiagnostics(failure, error) {
+  const diagnostics = error?.provider_diagnostics;
+  if (!diagnostics || typeof diagnostics !== "object" || Array.isArray(diagnostics)) return failure;
+  const toolNames = providerDiagnosticNames(diagnostics.native_tool_names);
+  const rzmcpTools = providerDiagnosticNames(diagnostics.rzmcp_tools_called);
+  failure.toolCalls = Math.max(
+    toolNames.length,
+    providerDiagnosticCount(diagnostics.native_tool_calls),
+  );
+  failure.nativeToolNames = toolNames;
+  failure.toolNames = toolNames;
+  failure.lastCompletedTool = providerLastDiagnosticName(diagnostics.last_completed_tool);
+  failure.mutationToolCalls = providerDiagnosticCount(diagnostics.mutation_tool_calls);
+  failure.providerMutationCount = failure.mutationToolCalls;
+  failure.nativeRzMcpTools = rzmcpTools;
+  failure.rzMcpTools = rzmcpTools;
+  failure.streamContinuations = providerDiagnosticCount(diagnostics.interrupted_stream_continuations);
+  failure.peakContextTokens = providerDiagnosticCount(diagnostics.peak_turn_context_tokens);
+  if (diagnostics.provider_task_pin_preserved === true) failure.providerTaskPinPreserved = true;
+  if (
+    diagnostics.route_committed === true
+    || failure.toolCalls > 0
+    || failure.mutationToolCalls > 0
+  ) failure.routeCommitted = true;
+  return failure;
+}
+
 export function fallbackForwardBody(body, modelAlias, effort, workingDirectory) {
   requireObject(body, "request body");
   const forwarded = {
@@ -288,7 +401,7 @@ function providerFailure(error) {
     `Fallback bridge failed: ${error?.message || error?.type || "unknown provider failure"}`,
   );
   if (error?.code === "provider_state_changed") failure.routeCommitted = true;
-  return failure;
+  return attachProviderFailureDiagnostics(failure, error);
 }
 
 export function completedResponseFromSse(raw) {

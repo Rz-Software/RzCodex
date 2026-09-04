@@ -8,6 +8,7 @@ import {
   fallbackForwardBody,
   completedResponseFromSse,
   parseResponsesSse,
+  providerFailureDiagnostics,
   runOrderedProviderChain,
   runResponsesBridge,
   validateOAuthFallbackCompletion,
@@ -122,6 +123,76 @@ test("SSE parsing preserves completed tool-call output after heartbeats", () => 
   ].join("");
   assert.equal(parseResponsesSse(raw).length, 4);
   assert.deepEqual(completedResponseFromSse(raw), completed);
+});
+
+test("provider failure diagnostics contain bounded progress but no task or tool content", () => {
+  const diagnostics = providerFailureDiagnostics({
+    toolCalls: 47,
+    toolNames: ["view_file", "replace_file_content", "view_file"],
+    mutationToolCalls: 8,
+    rzMcpTools: ["inspect_graph_by_path"],
+    streamContinuations: 2,
+    peakContextTokens: 31_250,
+    routeCommitted: true,
+    prompt: "must never cross the bridge",
+    toolArguments: { secret: "must never cross the bridge" },
+  });
+  assert.deepEqual(diagnostics, {
+    native_tool_calls: 47,
+    native_tool_names: ["view_file", "replace_file_content"],
+    last_completed_tool: "view_file",
+    mutation_tool_calls: 8,
+    rzmcp_tools_called: ["inspect_graph_by_path"],
+    interrupted_stream_continuations: 2,
+    peak_turn_context_tokens: 31_250,
+    provider_task_pin_preserved: false,
+    route_committed: true,
+  });
+  assert.equal(JSON.stringify(diagnostics).includes("must never cross"), false);
+  assert.equal(providerFailureDiagnostics({
+    nativeToolNames: ["view_file", "view_file", "replace_file_content"],
+  }).native_tool_calls, 3);
+});
+
+test("loopback provider failures retain authoritative tool and mutation progress", async () => {
+  await withServer((_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.end(sse("response.failed", {
+      response: {
+        error: {
+          code: "provider_state_changed",
+          message: "stream interrupted after provider work",
+          provider_diagnostics: {
+            native_tool_calls: 47,
+            native_tool_names: ["view_file", "replace_file_content", "run_command"],
+            last_completed_tool: "run_command",
+            mutation_tool_calls: 8,
+            rzmcp_tools_called: ["inspect_graph_by_path"],
+            interrupted_stream_continuations: 2,
+            peak_turn_context_tokens: 31_250,
+            provider_task_pin_preserved: true,
+            route_committed: true,
+          },
+        },
+      },
+    }));
+  }, async (endpoint) => {
+    await assert.rejects(
+      runResponsesBridge({ endpoint, body: {} }),
+      (error) => (
+        error.routeCommitted === true
+        && error.providerTaskPinPreserved === true
+        && error.toolCalls === 47
+        && error.nativeToolNames.join(",") === "view_file,replace_file_content,run_command"
+        && error.lastCompletedTool === "run_command"
+        && error.mutationToolCalls === 8
+        && error.providerMutationCount === 8
+        && error.rzMcpTools.join(",") === "inspect_graph_by_path"
+        && error.streamContinuations === 2
+        && error.peakContextTokens === 31_250
+      ),
+    );
+  });
 });
 
 test("the loopback Responses client accepts a chunked fallback completion", async () => {

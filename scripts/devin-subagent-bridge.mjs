@@ -1071,7 +1071,7 @@ function committedProviderResult(context, error) {
     `Provider tool calls completed: ${Number(error?.toolCalls || toolNames.length)}`,
     `Provider mutation calls observed: ${mutationCount}`,
     `Tool names: ${toolNames.join(", ") || "not reported"}`,
-    `Last completed tool: ${toolNames.at(-1) || "not reported"}`,
+    `Last completed tool: ${error?.lastCompletedTool || toolNames.at(-1) || "not reported"}`,
     pinnedContinuationFailure
       ? "Concrete blocker: the provider continuation stopped before completing the already-owned active task."
       : "Concrete blocker: the provider stopped after beginning tool work and did not return a terminal response.",
@@ -4551,6 +4551,29 @@ async function selfTest() {
     || committedCheckpointResult.toolSchemaBytesIgnored !== 123
   ) {
     throw new Error("read-only provider checkpoint classification failed");
+  }
+  const nestedFailureCheckpoint = committedProviderResult(
+    { taskDiagnostics: recoveryContext.taskDiagnostics, toolSchemaBytes: 456 },
+    Object.assign(new Error("nested stream interruption"), {
+      failedStage: "antigravity",
+      routeCommitted: true,
+      toolCalls: 47,
+      nativeToolNames: ["view_file", "replace_file_content", "run_command"],
+      providerMutationCount: 8,
+      nativeRzMcpTools: ["inspect_graph_by_path"],
+      streamContinuations: 2,
+      peakContextTokens: 31_250,
+    }),
+  );
+  if (
+    !nestedFailureCheckpoint.text.includes("Provider tool calls completed: 47")
+    || !nestedFailureCheckpoint.text.includes("Provider mutation calls observed: 8")
+    || nestedFailureCheckpoint.nativeToolNames.join(",") !== "view_file,replace_file_content,run_command"
+    || nestedFailureCheckpoint.rzMcpTools.join(",") !== "inspect_graph_by_path"
+    || nestedFailureCheckpoint.peakTurnContextTokens !== 31_250
+    || nestedFailureCheckpoint.toolSchemaBytesIgnored !== 456
+  ) {
+    throw new Error("nested provider checkpoint lost authoritative failure progress");
   }
   const pinnedContinuationResult = committedProviderResult(
     { taskDiagnostics: recoveryContext.taskDiagnostics, toolSchemaBytes: 123 },

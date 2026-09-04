@@ -24,6 +24,7 @@ import {
   runCommandCodeNativeAgent,
   runOpenCodeNativeAgent,
 } from "./native-cli-agent-runner.mjs";
+import { providerFailureDiagnostics } from "./native-subagent-provider-router.mjs";
 
 const COMMAND_CODE_PACKAGE_NAME = "command-code";
 const MINIMUM_COMMAND_CODE_VERSION = "1.33.0";
@@ -1674,6 +1675,7 @@ async function handleCursorResponses(request, response) {
           code: cursorResponseErrorCode(error),
           type: "bridge_error",
           message: redactSecrets(error.message),
+          provider_diagnostics: providerFailureDiagnostics(error),
         },
       },
     });
@@ -1789,7 +1791,11 @@ async function handleLegacyCommandCodeResponses(request, response, parsedBody = 
           id: responseId,
           object: "response",
           status: "failed",
-          error: { type: "bridge_error", message: redactSecrets(message) },
+          error: {
+            type: "bridge_error",
+            message: redactSecrets(message),
+            provider_diagnostics: providerFailureDiagnostics(error),
+          },
         },
       });
       response.end();
@@ -2899,7 +2905,11 @@ async function handleLegacyOpenCodeResponses(request, response, parsedBody = nul
           object: "response",
           model: translated.body.model,
           status: "failed",
-          error: { type: "bridge_error", message: redactSecrets(error instanceof BridgeError ? error.message : `Bridge error: ${error.message}`) },
+          error: {
+            type: "bridge_error",
+            message: redactSecrets(error instanceof BridgeError ? error.message : `Bridge error: ${error.message}`),
+            provider_diagnostics: providerFailureDiagnostics(error),
+          },
         },
       });
       response.end();
@@ -3113,6 +3123,7 @@ async function handleNativeCliResponses(request, response, provider, parsedBody 
           code: nativeCliResponseErrorCode(error),
           type: "bridge_error",
           message,
+          provider_diagnostics: providerFailureDiagnostics(error),
         },
       },
     });
