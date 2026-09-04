@@ -77,7 +77,8 @@ const OLLAMA_AUTH_SOURCE = "Ollama local signed-in session";
 const OLLAMA_CONTEXT_WINDOW = 1_048_576;
 const OPENCODE_BRIDGE_ENDPOINT = "http://127.0.0.1:54545/opencode/v1/responses";
 const OPENCODE_REQUIRED_AUTH_SOURCE = "OpenCode locally authenticated session";
-const OPENCODE_REQUIRED_EFFORT = "xhigh";
+const OPENCODE_REQUIRED_EFFORT = "high";
+const OPENCODE_FALLBACK_REQUIRED_EFFORT = "xhigh";
 const CODEBUDDY_BRIDGE_ENDPOINT = "http://127.0.0.1:54547/v1/responses";
 const CODEBUDDY_REQUIRED_AUTH_SOURCE = "www.codebuddy.ai";
 const CODEBUDDY_REQUIRED_EFFORT = "max";
@@ -122,6 +123,15 @@ function assertObject(value, label) {
 function requireString(value, label) {
   if (typeof value !== "string" || value.length === 0) throw new BridgeError(`${label} must be a non-empty string`);
   return value;
+}
+
+function requireQualifiedModel(value, label) {
+  const model = requireString(value, label);
+  const separator = model.indexOf("/");
+  if (separator <= 0 || separator === model.length - 1) {
+    throw new BridgeError(`${label} must use the provider/model form, got ${json(model)}`, 500);
+  }
+  return model;
 }
 
 function quotaKindFromFailure(cliResult) {
@@ -441,7 +451,18 @@ function centralRoute() {
   if (openCodeEffort !== OPENCODE_REQUIRED_EFFORT) {
     throw new BridgeError(`OpenCode managed route must use ${OPENCODE_REQUIRED_EFFORT} reasoning`, 500);
   }
-  const openCodeModel = requireString(parsed.opencode, "opencode");
+  const openCodeFallbackEffort = requireString(
+    openCodeRoute.fallbackReasoningEffort,
+    "routes.opencode.fallbackReasoningEffort",
+  );
+  if (openCodeFallbackEffort !== OPENCODE_FALLBACK_REQUIRED_EFFORT) {
+    throw new BridgeError(
+      `OpenCode quota fallback must use ${OPENCODE_FALLBACK_REQUIRED_EFFORT} reasoning`,
+      500,
+    );
+  }
+  const openCodeModel = requireQualifiedModel(parsed.opencode, "opencode");
+  const openCodeFallbackModel = requireQualifiedModel(parsed.opencodeFallback, "opencodeFallback");
   const nativeFallbackRoute = requireString(autoRoute.nativeFallbackRoute, "routes.auto.nativeFallbackRoute");
   const nativeRoute = assertObject(parsed.routes?.[nativeFallbackRoute], `central managed route ${nativeFallbackRoute}`);
   if (nativeFallbackRoute === "auto" || nativeRoute.modelProvider !== "openai") {
@@ -458,8 +479,11 @@ function centralRoute() {
     codeBuddyModel: requireString(codeBuddyRoute.model, "codebuddy.model"),
     nativeFallbackRoute,
     openCodeModel,
-    openCodeResponseModel: `opencode/${openCodeModel}`,
+    openCodeResponseModel: openCodeModel,
     openCodeEffort,
+    openCodeFallbackModel,
+    openCodeFallbackEffort,
+    openCodeResponseModels: [openCodeModel, openCodeFallbackModel],
     openCodeInputModalities,
     ollamaModel: requireString(ollamaRoute.model, "ollama.model"),
     ollamaLabel: requireString(ollamaRoute.label, "ollama.label"),
@@ -2232,11 +2256,21 @@ async function runOpenCodeStage(context, requestBody, failures, onProgress, sign
     });
     validateOAuthFallbackCompletion(completion, {
       provider: "opencode",
-      models: [route.openCodeResponseModel],
+      models: route.openCodeResponseModels,
       authSource: OPENCODE_REQUIRED_AUTH_SOURCE,
       lazyRzMcpProxyTools: context.executionPolicy.rzMcpMode === "disabled" ? 0 : 2,
     });
     const providerMetadata = completion.metadata || {};
+    const expectedEffort = providerMetadata.actual_model === route.openCodeFallbackModel
+      ? route.openCodeFallbackEffort
+      : route.openCodeEffort;
+    if (providerMetadata.actual_reasoning_effort !== expectedEffort) {
+      throw new BridgeError(
+        `OpenCode bridge used unexpected reasoning effort ${json(providerMetadata.actual_reasoning_effort)} `
+        + `for ${json(providerMetadata.actual_model)}`,
+        502,
+      );
+    }
     const selected = {
       ...openCodeSelection("auto_opencode_after_prior_provider_failure"),
       model: {
@@ -3193,9 +3227,15 @@ function health(requestedRoute = "auto") {
       },
       opencode: {
         provider: "opencode",
-        uid: route.openCodeResponseModel,
-        configuredUid: route.openCodeModel,
-        effort: route.openCodeEffort,
+        primary: {
+          uid: route.openCodeResponseModel,
+          effort: route.openCodeEffort,
+        },
+        quotaFallback: {
+          uid: route.openCodeFallbackModel,
+          effort: route.openCodeFallbackEffort,
+        },
+        acceptedResponseModels: route.openCodeResponseModels,
         authSource: OPENCODE_REQUIRED_AUTH_SOURCE,
         endpoint: OPENCODE_BRIDGE_ENDPOINT,
         toolServing: "Provider-native file/shell tools plus two-tool lazy RzMCP proxy in one retained CLI session per Codex turn",
@@ -3339,7 +3379,10 @@ async function selfTest() {
     || route.antigravityModels.length !== 2
     || route.autoProviderOrder.join(",") !== REQUIRED_AUTO_PROVIDER_ORDER.join(",")
     || route.openCodeEffort !== OPENCODE_REQUIRED_EFFORT
-    || route.openCodeResponseModel !== `opencode/${route.openCodeModel}`
+    || route.openCodeFallbackEffort !== OPENCODE_FALLBACK_REQUIRED_EFFORT
+    || route.openCodeResponseModel !== route.openCodeModel
+    || route.openCodeResponseModels.join(",")
+      !== [route.openCodeModel, route.openCodeFallbackModel].join(",")
     || route.ollamaEffort !== OLLAMA_REQUIRED_EFFORT
     || route.ollamaMaxConcurrency !== OLLAMA_CLOUD_CONCURRENCY
     || !route.ollamaResponseModels.includes(route.ollamaModel)

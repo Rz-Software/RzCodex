@@ -5,6 +5,7 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
+  renameSync,
   statSync,
   unlinkSync,
   writeFileSync,
@@ -69,10 +70,114 @@ const LAZY_RZMCP_CALL_TOOL = /(?:^|[_:.-])call_rzmcp_tool$/i;
 const NATIVE_MCP_CALL_TOOL = /^mcp_call_tool$/i;
 const READ_ONLY_RZMCP_TOOL_NAME = /^(?:analyze|check|count|describe|discover|does|enumerate|find|get|has|inspect|is|list|locate|query|read|resolve|search|validate)_/i;
 const OLLAMA_USAGE_LIMIT = /providerID=ollama[\s\S]{0,2000}(?:reached|exceeded)[\s\S]{0,120}(?:session\s+)?usage limit|providerID=ollama[\s\S]{0,2000}\b429\b[\s\S]{0,120}(?:quota|usage|limit)/i;
+const OPENCODE_GO_QUOTA_LIMIT = /\b(?:monthly|weekly|daily|5[- ]?hour|five[- ]?hour)\s+(?:usage\s+)?limit\b|\busage\s+limit\s+(?:reached|exceeded|exhausted)\b|\b(?:insufficient balance|creditserror|not enough credits?|credits? exhausted)\b/i;
+const OPENCODE_TRANSIENT_RATE_LIMIT = /\bAI_APICallError:\s*Rate limit exceeded\b/i;
 const retainedOpenCodeStates = new Set();
 const retainedOpenCodeProgress = new Map();
 const retainedCommandCodeSessions = new Set();
 const nativeStateTails = new Map();
+const OPENCODE_GO_QUOTA_STATE_FILE = join(OPENCODE_STATE_DIRECTORY, "opencode-go-quota-state.json");
+const QUOTA_RECOVERY_PROBE_MS = 30 * 60 * 1000;
+const RECOVERY_PROBE_STATE_VERSION = 1;
+
+export class RecoveryProbeState {
+  constructor(statePath, now = () => Date.now()) {
+    this.statePath = statePath;
+    this.now = now;
+    this.state = null;
+    this.load();
+  }
+
+  load() {
+    if (!this.statePath || !existsSync(this.statePath)) return;
+    try {
+      const parsed = JSON.parse(readFileSync(this.statePath, "utf8"));
+      if (
+        parsed.version !== RECOVERY_PROBE_STATE_VERSION
+        || typeof parsed.reason !== "string"
+        || parsed.reason.length === 0
+        || !Number.isFinite(parsed.confirmedAt)
+        || !Number.isFinite(parsed.nextProbeAt)
+        || parsed.nextProbeAt <= parsed.confirmedAt
+      ) {
+        throw new Error("invalid schema");
+      }
+      this.state = {
+        reason: parsed.reason,
+        confirmedAt: parsed.confirmedAt,
+        nextProbeAt: parsed.nextProbeAt,
+      };
+    } catch (error) {
+      throw new Error(`Cannot read persisted OpenCode Go quota state: ${error.message}`);
+    }
+  }
+
+  isActive() {
+    return this.state !== null;
+  }
+
+  record(reason, nowMs = this.now()) {
+    this.state = {
+      reason,
+      confirmedAt: nowMs,
+      nextProbeAt: nowMs + QUOTA_RECOVERY_PROBE_MS,
+    };
+    this.persist();
+    return true;
+  }
+
+  claimRecoveryProbe(nowMs = this.now()) {
+    if (!this.state || this.state.nextProbeAt > nowMs) return false;
+    this.state.nextProbeAt = nowMs + QUOTA_RECOVERY_PROBE_MS;
+    this.persist();
+    return true;
+  }
+
+  clear() {
+    const changed = this.state !== null || Boolean(this.statePath && existsSync(this.statePath));
+    this.state = null;
+    if (!this.statePath) return changed;
+    try {
+      unlinkSync(this.statePath);
+    } catch (error) {
+      if (error?.code !== "ENOENT") {
+        throw new Error(`Cannot clear persisted OpenCode Go quota state: ${error.message}`);
+      }
+    }
+    return changed;
+  }
+
+  persist() {
+    if (!this.statePath) return;
+    const temporaryPath = `${this.statePath}.${process.pid}.tmp`;
+    try {
+      writeFileSync(
+        temporaryPath,
+        `${JSON.stringify({ version: RECOVERY_PROBE_STATE_VERSION, ...this.state }, null, 2)}\n`,
+        "utf8",
+      );
+      renameSync(temporaryPath, this.statePath);
+    } catch (error) {
+      try { unlinkSync(temporaryPath); } catch (cleanupError) {
+        if (cleanupError?.code !== "ENOENT") {
+          throw new Error(
+            `Cannot persist OpenCode Go quota state and clean its temporary file: ${cleanupError.message}`,
+          );
+        }
+      }
+      throw new Error(`Cannot persist OpenCode Go quota state: ${error.message}`);
+    }
+  }
+
+  snapshot() {
+    return this.state
+      ? { active: true, ...this.state }
+      : { active: false, reason: null, confirmedAt: null, nextProbeAt: null };
+  }
+}
+
+mkdirSync(OPENCODE_STATE_DIRECTORY, { recursive: true });
+export const openCodeGoQuotaState = new RecoveryProbeState(OPENCODE_GO_QUOTA_STATE_FILE);
 
 function commandCodeReasoningArgs(model, effort) {
   return COMMANDCODE_FIXED_REASONING_MODELS.has(model) ? [] : ["--effort", effort];
@@ -460,7 +565,10 @@ function retainedNativeStatePath(context, providerKind) {
   }
   const threadHash = createHash("sha256").update(context.threadId).digest("hex").slice(0, 20);
   const taskHash = createHash("sha256").update(ownershipHash).digest("hex").slice(0, 20);
-  return join(OPENCODE_STATE_DIRECTORY, `${providerKind}-${threadHash}-${taskHash}.db`);
+  const rawModel = context.model ?? "";
+  const modelSlug = rawModel ? rawModel.replace(/[^a-zA-Z0-9._-]/g, "_") : "";
+  const prefix = modelSlug ? `${providerKind}-${modelSlug}` : providerKind;
+  return join(OPENCODE_STATE_DIRECTORY, `${prefix}-${threadHash}-${taskHash}.db`);
 }
 
 function commandCodeSessionName(context) {
@@ -831,7 +939,20 @@ function openCodeConfig(context, providerKind) {
   return json(config);
 }
 
-function openCodeParser(event, state, executionPolicy) {
+function openCodeQuotaError(event, providerKind) {
+  if (providerKind !== "opencode-go") return false;
+  const error = event?.error || {};
+  const evidence = [
+    error.name,
+    error.data?.message,
+    typeof error.data?.responseBody === "string"
+      ? error.data.responseBody
+      : JSON.stringify(error.data?.responseBody || {}),
+  ].filter((value) => typeof value === "string").join("\n");
+  return OPENCODE_GO_QUOTA_LIMIT.test(evidence);
+}
+
+function openCodeParser(event, state, executionPolicy, providerKind = null) {
   state.finalText ||= "";
   state.toolNames ||= [];
   state.toolInputs ||= [];
@@ -843,7 +964,13 @@ function openCodeParser(event, state, executionPolicy) {
   state.eventSequence = Number(state.eventSequence || 0) + 1;
   if (event.type === "error") {
     const errorName = typeof event.error?.name === "string" ? event.error.name : "provider error";
-    throw new NativeCliAgentError(`OpenCode reported ${errorName}`, 502);
+    const dataMessage = typeof event.error?.data?.message === "string" ? event.error.data.message : "";
+    const detail = dataMessage ? `: ${dataMessage}` : "";
+    const error = new NativeCliAgentError(`OpenCode reported ${errorName}${detail}`, 502);
+    error.openCodeErrorName = errorName;
+    error.openCodeErrorDataMessage = dataMessage;
+    error.openCodeQuotaError = openCodeQuotaError(event, providerKind);
+    throw error;
   }
   if (
     ["step_start", "step-start"].includes(event.type)
@@ -890,7 +1017,7 @@ function openCodeRunArgs(
   agent = OPENCODE_PRIMARY_AGENT,
 ) {
   const args = ["run", "--pure", "--auto", "--format", "json"];
-  if (providerKind === "ollama") args.push("--print-logs", "--log-level", "ERROR");
+  args.push("--print-logs", "--log-level", "ERROR");
   if (continueSession) args.push("--continue");
   else args.push("--title", "RzCodex native subagent");
   args.push(
@@ -904,13 +1031,33 @@ function openCodeRunArgs(
 }
 
 function inspectOpenCodeStderr(providerKind, stderr) {
-  if (providerKind !== "ollama" || !OLLAMA_USAGE_LIMIT.test(stderr)) return;
-  const error = new NativeCliAgentError(
-    "Ollama cloud usage limit is currently exhausted",
-    503,
-  );
-  error.quotaFailure = true;
-  throw error;
+  if (providerKind === "ollama" && OLLAMA_USAGE_LIMIT.test(stderr)) {
+    const error = new NativeCliAgentError(
+      "Ollama cloud usage limit is currently exhausted",
+      503,
+    );
+    error.quotaFailure = true;
+    throw error;
+  }
+  if (providerKind === "opencode-go" && OPENCODE_GO_QUOTA_LIMIT.test(stderr)) {
+    const error = new NativeCliAgentError(
+      "OpenCode Go usage quota or credits are currently exhausted",
+      503,
+    );
+    error.openCodeQuotaError = true;
+    throw error;
+  }
+  if (
+    (providerKind === "opencode" || providerKind === "opencode-go")
+    && OPENCODE_TRANSIENT_RATE_LIMIT.test(stderr)
+  ) {
+    const error = new NativeCliAgentError(
+      `${providerKind} is currently rate limited`,
+      503,
+    );
+    error.transientProviderFailure = true;
+    throw error;
+  }
 }
 
 function routeOwnershipTimeout(continueSession, requestTimeoutMs) {
@@ -973,7 +1120,7 @@ export async function runOpenCodeNativeAgent(context, {
       env,
       signal,
       onEvent,
-      parseLine: (event, state) => openCodeParser(event, state, parserPolicy),
+      parseLine: (event, state) => openCodeParser(event, state, parserPolicy, providerKind),
       inspectStderr: (stderr) => inspectOpenCodeStderr(providerKind, stderr),
       label: `${context.provider} native OpenCode agent`,
       requestTimeoutMs: timeoutMs,
@@ -1003,6 +1150,7 @@ export async function runOpenCodeNativeAgent(context, {
     }
     return {
       ...result,
+      actualReasoningEffort: context.requiredEffort,
       resumedProviderSession: resumeRetainedSession,
     };
   } catch (error) {
@@ -1590,7 +1738,8 @@ export async function nativeCliAgentRunnerSelfTest() {
     || !recoveryArgs.includes("--continue")
     || recoveryArgs.includes("--title")
     || recoveryArgs[recoveryArgs.indexOf("--agent") + 1] !== OPENCODE_TERMINAL_AGENT
-    || nonOllamaArgs.includes("--print-logs")
+    || !nonOllamaArgs.includes("--print-logs")
+    || !nonOllamaArgs.includes("ERROR")
     || routeOwnershipTimeout(false, 120_000) !== ROUTE_OWNERSHIP_TIMEOUT_MS
     || routeOwnershipTimeout(true, 120_000) !== 120_000
   ) {
@@ -1790,6 +1939,32 @@ export async function nativeCliAgentRunnerSelfTest() {
     throw new Error("native Ollama stderr inspection rejected a non-quota message");
   }
 
+  let transientOpenCodeRateLimit = null;
+  try {
+    inspectOpenCodeStderr(
+      "opencode",
+      "level=ERROR providerID=opencode error.error=\"AI_APICallError: Rate limit exceeded. Please try again later.\"",
+    );
+  } catch (error) {
+    transientOpenCodeRateLimit = error;
+  }
+  let openCodeGoQuotaStderr = null;
+  try {
+    inspectOpenCodeStderr(
+      "opencode-go",
+      "level=ERROR providerID=opencode-go error.error=\"AI_APICallError: Monthly usage limit reached.\"",
+    );
+  } catch (error) {
+    openCodeGoQuotaStderr = error;
+  }
+  if (
+    transientOpenCodeRateLimit?.transientProviderFailure !== true
+    || transientOpenCodeRateLimit?.openCodeQuotaError === true
+    || openCodeGoQuotaStderr?.openCodeQuotaError !== true
+  ) {
+    throw new Error("native OpenCode stderr failures did not distinguish transient throttling from Go quota exhaustion");
+  }
+
   let providerEventError = null;
   try {
     openCodeParser({ type: "error", error: { name: "UnknownError" } }, {}, { rzMcpMode: "disabled" });
@@ -1798,6 +1973,72 @@ export async function nativeCliAgentRunnerSelfTest() {
   }
   if (providerEventError?.message !== "OpenCode reported UnknownError") {
     throw new Error("native OpenCode terminal error event was silently ignored");
+  }
+
+  let openCodeGoQuotaError = null;
+  try {
+    openCodeParser({
+      type: "error",
+      error: { name: "APIError", data: { message: "Monthly usage limit reached." } },
+    }, {}, { rzMcpMode: "disabled" }, "opencode-go");
+  } catch (error) {
+    openCodeGoQuotaError = error;
+  }
+  let ordinaryRateLimit = null;
+  try {
+    openCodeParser({
+      type: "error",
+      error: { name: "APIError", data: { message: "Rate limit exceeded; retry shortly." } },
+    }, {}, { rzMcpMode: "disabled" }, "opencode-go");
+  } catch (error) {
+    ordinaryRateLimit = error;
+  }
+  let freeModelCreditError = null;
+  try {
+    openCodeParser({
+      type: "error",
+      error: { name: "APIError", data: { responseBody: { type: "CreditsError" } } },
+    }, {}, { rzMcpMode: "disabled" }, "opencode");
+  } catch (error) {
+    freeModelCreditError = error;
+  }
+  if (
+    openCodeGoQuotaError?.openCodeQuotaError !== true
+    || ordinaryRateLimit?.openCodeQuotaError !== false
+    || freeModelCreditError?.openCodeQuotaError !== false
+  ) {
+    throw new Error("OpenCode Go quota classification confused exhaustion, transient throttling, or the free provider");
+  }
+
+  mkdirSync(OPENCODE_STATE_DIRECTORY, { recursive: true });
+  const openCodeQuotaFixturePath = join(
+    OPENCODE_STATE_DIRECTORY,
+    `opencode-go-quota-self-test-${process.pid}.json`,
+  );
+  let quotaNow = 1_000;
+  try {
+    const quotaState = new RecoveryProbeState(openCodeQuotaFixturePath, () => quotaNow);
+    quotaState.record("quota_fixture");
+    const reloadedQuotaState = new RecoveryProbeState(openCodeQuotaFixturePath, () => quotaNow);
+    if (
+      !reloadedQuotaState.isActive()
+      || reloadedQuotaState.claimRecoveryProbe()
+      || reloadedQuotaState.snapshot().reason !== "quota_fixture"
+    ) {
+      throw new Error("OpenCode Go quota state did not suppress premature probes");
+    }
+    quotaNow += QUOTA_RECOVERY_PROBE_MS;
+    if (
+      !reloadedQuotaState.claimRecoveryProbe()
+      || reloadedQuotaState.claimRecoveryProbe()
+      || !reloadedQuotaState.clear()
+      || reloadedQuotaState.isActive()
+    ) {
+      throw new Error("OpenCode Go quota state did not provide one bounded recovery probe");
+    }
+  } finally {
+    try { unlinkSync(openCodeQuotaFixturePath); } catch (error) { if (error?.code !== "ENOENT") throw error; }
+    try { unlinkSync(`${openCodeQuotaFixturePath}.${process.pid}.tmp`); } catch (error) { if (error?.code !== "ENOENT") throw error; }
   }
 
   let preToolTimeout = null;

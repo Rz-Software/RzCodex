@@ -21,6 +21,7 @@ import {
   NativeCliAgentError,
   nativeCliAgentContext,
   nativeCliUsage,
+  openCodeGoQuotaState,
   runCommandCodeNativeAgent,
   runOpenCodeNativeAgent,
 } from "./native-cli-agent-runner.mjs";
@@ -35,7 +36,8 @@ const OPENCODE_CHAT_COMPLETIONS_URL = "https://opencode.ai/zen/v1/chat/completio
 const SUBAGENT_MODEL_ALIAS = "@preset/codex-subagents";
 const MAIN_AGENT_MODEL_ALIAS = "@preset/rzcodex-main";
 const COMMANDCODE_REQUIRED_EFFORT = "max";
-const OPENCODE_REQUIRED_EFFORT = "xhigh";
+const OPENCODE_REQUIRED_EFFORT = "high";
+const OPENCODE_FALLBACK_REQUIRED_EFFORT = "xhigh";
 const OPENCODE_AUTH_SOURCE = "OpenCode locally authenticated session";
 const MAX_ACTIVE_TASK_CHARS = 40_000;
 const NATIVE_DELEGATION_CONTRACT = "[Native delegation contract]\nWork as the bounded native sub-agent in the current workspace. Honor project AGENTS.md ownership boundaries exactly; when builds, tests, editor control, PIE, runtime validation, or RzMCP execution are reserved to the parent, do not invoke them and instead report the exact checks the parent should run. On Windows, use PowerShell-native commands, single-quote ripgrep patterns containing |, and never assume Unix-only commands such as head are installed. Complete only the assigned scope and return a concise result or concrete blocker.";
@@ -153,6 +155,7 @@ const cursorRuntime = {
 };
 const retainedCursorChats = new Map();
 const cursorTurnTails = new Map();
+const retainedOpenCodeRouteSelections = new Map();
 
 function cursorStateKey(context) {
   const taskHash = taskOwnershipHash(context.taskState);
@@ -197,7 +200,7 @@ function validateCommandCodeVersion(value) {
   }
 }
 
-function subagentModelRoute(provider) {
+function subagentRoutesConfig() {
   let routes;
   try {
     routes = JSON.parse(readFileSync(SUBAGENT_MODEL_ROUTES_FILE, "utf8"));
@@ -207,13 +210,67 @@ function subagentModelRoute(provider) {
   if (!routes || typeof routes !== "object" || Array.isArray(routes)) {
     throw new Error(`Subagent model routes at ${SUBAGENT_MODEL_ROUTES_FILE} must be a JSON object`);
   }
+  return routes;
+}
+
+function subagentModelRoute(provider) {
+  const routes = subagentRoutesConfig();
   return requireString(routes[provider], `subagent model route ${JSON.stringify(provider)}`);
+}
+
+function qualifiedOpenCodeTarget(value, effort, label) {
+  const qualifiedModel = requireString(value, `${label}.model`);
+  const separator = qualifiedModel.indexOf("/");
+  if (separator <= 0 || separator === qualifiedModel.length - 1) {
+    throw new Error(`${label}.model must use the provider/model form, got ${JSON.stringify(qualifiedModel)}`);
+  }
+  return {
+    providerKind: qualifiedModel.slice(0, separator),
+    model: qualifiedModel.slice(separator + 1),
+    qualifiedModel,
+    effort: requireString(effort, `${label}.reasoningEffort`),
+  };
+}
+
+function openCodeManagedRoute() {
+  const routes = subagentRoutesConfig();
+  const managed = assertObject(routes.routes?.opencode, "managed OpenCode route");
+  const primary = qualifiedOpenCodeTarget(
+    routes.opencode,
+    managed.reasoningEffort,
+    "managed OpenCode primary",
+  );
+  const quotaFallback = qualifiedOpenCodeTarget(
+    routes.opencodeFallback,
+    managed.fallbackReasoningEffort,
+    "managed OpenCode quota fallback",
+  );
+  if (primary.providerKind !== "opencode-go") {
+    throw new Error(`managed OpenCode primary must use opencode-go, got ${JSON.stringify(primary.providerKind)}`);
+  }
+  if (quotaFallback.providerKind !== "opencode") {
+    throw new Error(`managed OpenCode quota fallback must use opencode, got ${JSON.stringify(quotaFallback.providerKind)}`);
+  }
+  if (primary.effort !== OPENCODE_REQUIRED_EFFORT) {
+    throw new Error(`managed OpenCode primary must use ${OPENCODE_REQUIRED_EFFORT} reasoning`);
+  }
+  if (quotaFallback.effort !== OPENCODE_FALLBACK_REQUIRED_EFFORT) {
+    throw new Error(`managed OpenCode quota fallback must use ${OPENCODE_FALLBACK_REQUIRED_EFFORT} reasoning`);
+  }
+  if (primary.qualifiedModel === quotaFallback.qualifiedModel) {
+    throw new Error("managed OpenCode primary and quota fallback must be distinct models");
+  }
+  return { primary, quotaFallback };
 }
 
 function resolveSubagentModelAlias(model, provider) {
   return model === SUBAGENT_MODEL_ALIAS || model === MAIN_AGENT_MODEL_ALIAS
     ? subagentModelRoute(provider)
     : model;
+}
+
+function isManagedModelAlias(model) {
+  return model === SUBAGENT_MODEL_ALIAS || model === MAIN_AGENT_MODEL_ALIAS;
 }
 
 function exitWhenParentStops() {
@@ -2983,14 +3040,89 @@ function nativeCliToolEvent(event, state) {
   return null;
 }
 
+function openCodeTaskRouteKey(context) {
+  const ownershipHash = taskOwnershipHash(context.taskState);
+  return context.threadId && ownershipHash ? `${context.threadId}:${ownershipHash}` : null;
+}
+
+function nativeProviderWorkCommitted(error) {
+  return error?.routeCommitted === true
+    || Number(error?.providerMutationCount || 0) > 0
+    || (Array.isArray(error?.nativeToolNames) && error.nativeToolNames.length > 0);
+}
+
+async function runManagedOpenCodeNativeAgent(context, route, {
+  signal,
+  onEvent,
+  onRecovery,
+  onRouteSelection,
+  quotaState = openCodeGoQuotaState,
+  routeSelections = retainedOpenCodeRouteSelections,
+  runAgent = runOpenCodeNativeAgent,
+}) {
+  const taskRouteKey = openCodeTaskRouteKey(context);
+  const pinnedRoute = taskRouteKey ? routeSelections.get(taskRouteKey) : null;
+  let selectedKey = pinnedRoute;
+  if (!selectedKey && quotaState.isActive()) {
+    selectedKey = quotaState.claimRecoveryProbe() ? "primary" : "quotaFallback";
+  }
+  selectedKey ||= "primary";
+
+  const runSelection = async (key) => {
+    const selected = route[key];
+    const attemptContext = {
+      ...context,
+      model: selected.model,
+      requiredEffort: selected.effort,
+    };
+    onRouteSelection?.({ key, selected, pinned: pinnedRoute === key });
+    try {
+      const result = await runAgent(attemptContext, {
+        providerKind: selected.providerKind,
+        signal,
+        onEvent,
+        onRecovery,
+      });
+      if (key === "primary") quotaState.clear();
+      if (taskRouteKey) {
+        if (context.taskState.checkpointRequested) routeSelections.set(taskRouteKey, key);
+        else routeSelections.delete(taskRouteKey);
+      }
+      return { ...result, openCodeRoute: key };
+    } catch (error) {
+      if (taskRouteKey && nativeProviderWorkCommitted(error)) {
+        routeSelections.set(taskRouteKey, key);
+      }
+      throw error;
+    }
+  };
+
+  if (selectedKey === "quotaFallback") return runSelection("quotaFallback");
+  try {
+    return await runSelection("primary");
+  } catch (error) {
+    if (!error?.openCodeQuotaError || nativeProviderWorkCommitted(error)) throw error;
+    quotaState.record("opencode_go_quota_or_credit_exhausted");
+    return runSelection("quotaFallback");
+  }
+}
+
 async function handleNativeCliResponses(request, response, provider, parsedBody = null) {
   const body = parsedBody ?? await readJsonRequest(request);
   const commandCode = provider === "commandcode";
-  const requiredEffort = commandCode ? COMMANDCODE_REQUIRED_EFFORT : OPENCODE_REQUIRED_EFFORT;
-  const model = resolveSubagentModelAlias(body.model, provider);
+  const openCodeRoute = commandCode ? null : openCodeManagedRoute();
+  const requiredEffort = commandCode ? COMMANDCODE_REQUIRED_EFFORT : openCodeRoute.primary.effort;
+  const model = commandCode
+    ? resolveSubagentModelAlias(body.model, provider)
+    : openCodeRoute.primary.model;
   let context;
   try {
-    context = nativeCliAgentContext(body, { provider, model, requiredEffort });
+    context = nativeCliAgentContext(body, {
+      provider,
+      model,
+      requiredEffort,
+      mainAgent: body.model === MAIN_AGENT_MODEL_ALIAS,
+    });
   } catch (error) {
     if (error instanceof NativeCliAgentError) throw new BridgeError(error.message, error.status);
     throw error;
@@ -3035,11 +3167,16 @@ async function handleNativeCliResponses(request, response, provider, parsedBody 
   try {
     const result = commandCode
       ? await runCommandCodeNativeAgent(context, { signal: abortController.signal, onEvent })
-      : await runOpenCodeNativeAgent(context, {
-          providerKind: "opencode",
+      : await runManagedOpenCodeNativeAgent(context, openCodeRoute, {
           signal: abortController.signal,
           onEvent,
           onRecovery: () => progress.emit("opencode resumed the same retained native session after a missing terminal response.\n"),
+          onRouteSelection: ({ key, selected, pinned }) => {
+            if (key === "quotaFallback") {
+              const reason = pinned ? "retained task ownership" : "OpenCode Go quota cooldown";
+              progress.emit(`${reason} selected ${selected.qualifiedModel} at ${selected.effort} reasoning.\n`);
+            }
+          },
         });
     if (clientGone) return;
     const output = [];
@@ -3091,6 +3228,7 @@ async function handleNativeCliResponses(request, response, provider, parsedBody 
           actual_model: result.model,
           actual_reasoning_effort: result.actualReasoningEffort || requiredEffort,
           ...(provider === "opencode" ? { auth_source: OPENCODE_AUTH_SOURCE } : {}),
+          ...(provider === "opencode" ? { managed_opencode_route: result.openCodeRoute } : {}),
           native_cli_single_execution: result.executionCount === 1,
           native_cli_execution_count: result.executionCount,
           native_cli_same_session_continuations: result.sameSessionContinuations,
@@ -3142,12 +3280,12 @@ async function handleResponses(request, response) {
 
 async function handleOpenCodeResponses(request, response) {
   const body = await readJsonRequest(request);
-  return body.model === SUBAGENT_MODEL_ALIAS
+  return isManagedModelAlias(body.model)
     ? handleNativeCliResponses(request, response, "opencode", body)
     : handleLegacyOpenCodeResponses(request, response, body);
 }
 
-function selfTest() {
+async function selfTest() {
   readCommandCodeInstallation();
   if (
     nativeCliToolEvent({ type: "event", event: { type: "tool_running", toolCallId: "call-1", toolName: "read" } }) !== null
@@ -3264,21 +3402,105 @@ function selfTest() {
   ) {
     throw new Error("self-test failed: CommandCode main-agent alias must preserve the full tool protocol");
   }
-  const openCodeMain = normalizeOpenCodeRequest({
+  const managedOpenCode = openCodeManagedRoute();
+  const openCodeMain = nativeCliAgentContext({
     model: MAIN_AGENT_MODEL_ALIAS,
+    reasoning: { effort: managedOpenCode.primary.effort },
     instructions: "MAIN_AGENT_INSTRUCTIONS",
     input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "MAIN_AGENT_REQUEST" }] }],
     tools: [{ type: "function", name: "echo", parameters: { type: "object", properties: {} } }],
     stream: true,
-    client_metadata: { cwd: homedir() },
+    client_metadata: { cwd: homedir(), thread_id: "opencode-main-fixture" },
+  }, {
+    provider: "opencode",
+    model: managedOpenCode.primary.model,
+    requiredEffort: managedOpenCode.primary.effort,
+    mainAgent: true,
   });
   if (
-    openCodeMain.body.model !== subagentModelRoute("opencode")
-    || !openCodeMain.body.instructions.includes(MAIN_AGENT_CONTRACT)
-    || !openCodeMain.body.instructions.includes("MAIN_AGENT_INSTRUCTIONS")
-    || openCodeMain.responseTools.size !== 1
+    !isManagedModelAlias(MAIN_AGENT_MODEL_ALIAS)
+    || !isManagedModelAlias(SUBAGENT_MODEL_ALIAS)
+    || managedOpenCode.primary.qualifiedModel !== subagentModelRoute("opencode")
+    || managedOpenCode.primary.providerKind !== "opencode-go"
+    || managedOpenCode.primary.effort !== OPENCODE_REQUIRED_EFFORT
+    || managedOpenCode.quotaFallback.providerKind !== "opencode"
+    || managedOpenCode.quotaFallback.effort !== OPENCODE_FALLBACK_REQUIRED_EFFORT
+    || !openCodeMain.mainAgent
+    || openCodeMain.model !== managedOpenCode.primary.model
+    || !openCodeMain.prompt.includes("[RzCodex main-agent contract]")
+    || !openCodeMain.prompt.includes("MAIN_AGENT_INSTRUCTIONS")
+    || !openCodeMain.prompt.includes("MAIN_AGENT_REQUEST")
   ) {
-    throw new Error("self-test failed: OpenCode main-agent alias must preserve the full tool protocol");
+    throw new Error("self-test failed: managed OpenCode main-agent route configuration");
+  }
+
+  const openCodeRouteContext = {
+    ...nativeContext,
+    provider: "opencode",
+    model: managedOpenCode.primary.model,
+    requiredEffort: managedOpenCode.primary.effort,
+    threadId: "opencode-route-fixture",
+  };
+  const quotaFixture = {
+    active: false,
+    records: 0,
+    clears: 0,
+    isActive() { return this.active; },
+    claimRecoveryProbe() { return false; },
+    record() { this.active = true; this.records += 1; },
+    clear() { this.active = false; this.clears += 1; },
+  };
+  const fallbackCalls = [];
+  const quotaFailure = new NativeCliAgentError("OpenCode Go quota fixture", 503);
+  quotaFailure.openCodeQuotaError = true;
+  quotaFailure.nativeToolNames = [];
+  quotaFailure.providerMutationCount = 0;
+  const fallbackResult = await runManagedOpenCodeNativeAgent(openCodeRouteContext, managedOpenCode, {
+    quotaState: quotaFixture,
+    routeSelections: new Map(),
+    runAgent: async (attemptContext, { providerKind }) => {
+      fallbackCalls.push({
+        providerKind,
+        model: attemptContext.model,
+        effort: attemptContext.requiredEffort,
+      });
+      if (fallbackCalls.length === 1) throw quotaFailure;
+      return { finalText: "fallback complete", model: `${providerKind}/${attemptContext.model}` };
+    },
+  });
+  if (
+    fallbackCalls.length !== 2
+    || fallbackCalls[0].providerKind !== managedOpenCode.primary.providerKind
+    || fallbackCalls[0].model !== managedOpenCode.primary.model
+    || fallbackCalls[0].effort !== managedOpenCode.primary.effort
+    || fallbackCalls[1].providerKind !== managedOpenCode.quotaFallback.providerKind
+    || fallbackCalls[1].model !== managedOpenCode.quotaFallback.model
+    || fallbackCalls[1].effort !== managedOpenCode.quotaFallback.effort
+    || fallbackResult.openCodeRoute !== "quotaFallback"
+    || quotaFixture.records !== 1
+  ) {
+    throw new Error("self-test failed: OpenCode Go quota fallback routing");
+  }
+
+  const committedFailure = new NativeCliAgentError("fixture failed after native work", 502);
+  committedFailure.openCodeQuotaError = true;
+  committedFailure.nativeToolNames = ["read"];
+  const committedCalls = [];
+  let committedObserved = null;
+  try {
+    await runManagedOpenCodeNativeAgent(openCodeRouteContext, managedOpenCode, {
+      quotaState: { ...quotaFixture, active: false },
+      routeSelections: new Map(),
+      runAgent: async (attemptContext, { providerKind }) => {
+        committedCalls.push({ attemptContext, providerKind });
+        throw committedFailure;
+      },
+    });
+  } catch (error) {
+    committedObserved = error;
+  }
+  if (committedObserved !== committedFailure || committedCalls.length !== 1) {
+    throw new Error("self-test failed: OpenCode route switched after committed provider work");
   }
   const cursorMain = cursorPromptFrom({
     model: MAIN_AGENT_MODEL_ALIAS,
@@ -4697,10 +4919,29 @@ function start() {
   const server = createServer(async (request, response) => {
     try {
       if (request.method === "GET" && request.url === "/health") {
+        const managedOpenCode = openCodeManagedRoute();
+        const openCodeQuota = openCodeGoQuotaState.snapshot();
         jsonResponse(response, 200, {
           ok: true,
           commandCodeVersion: installation.version,
           openCodeSchemaAdapter: true,
+          openCodeManagedRoute: {
+            primary: {
+              model: managedOpenCode.primary.qualifiedModel,
+              effort: managedOpenCode.primary.effort,
+            },
+            quotaFallback: {
+              model: managedOpenCode.quotaFallback.qualifiedModel,
+              effort: managedOpenCode.quotaFallback.effort,
+            },
+            selectedModel: openCodeQuota.active
+              ? managedOpenCode.quotaFallback.qualifiedModel
+              : managedOpenCode.primary.qualifiedModel,
+            selectedEffort: openCodeQuota.active
+              ? managedOpenCode.quotaFallback.effort
+              : managedOpenCode.primary.effort,
+            quotaState: openCodeQuota,
+          },
           cursorAgentAdapter: true,
           cursorRuntime,
           port,
@@ -4743,7 +4984,7 @@ function start() {
 }
 
 try {
-  if (process.argv.includes("--self-test")) selfTest();
+  if (process.argv.includes("--self-test")) await selfTest();
   else {
     exitWhenParentStops();
     start();
