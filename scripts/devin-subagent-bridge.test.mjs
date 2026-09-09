@@ -394,3 +394,140 @@ test("cancellation during recovery backoff preserves committed conversation owne
     },
   );
 });
+
+test("runCliWithProviderRecovery gives a same-session continuation the overall remaining deadline, not the 45s recovery budget", async () => {
+  const context = { requestId: "continuation-deadline", taskDiagnostics: { taskHash: "continuation-deadline-task" }, executionPolicy: { permissionMode: "dangerous" } };
+  const selectedModel = { model_uid: "glm-5-3-flash-max" };
+  const session = { id: "long-turn-session", model: selectedModel.model_uid, toolCalls: [], compactionNodeId: 0, terminalText: null };
+  const recoveryBudgetMs = 45_000;
+  const deadline = 300_000;
+  let now = 1_000;
+  let sessionReads = 0;
+  const timeouts = [];
+  const resumeIds = [];
+  const result = await runCliWithProviderRecovery(
+    context,
+    selectedModel,
+    () => {},
+    () => {},
+    null,
+    deadline,
+    {
+      now: () => now,
+      delay: async (milliseconds) => { now += milliseconds; },
+      waitForSession: async () => {
+        sessionReads += 1;
+        return sessionReads === 1 ? session : { ...session, terminalText: "continued result" };
+      },
+      waitForTerminalSession: async (_requestId, leased) => leased,
+      removeSession: () => { assert.fail("retained session must not be deleted"); },
+      runCli: async (_context, _model, _onSpawn, _onProgress, timeoutMs, options) => {
+        timeouts.push(timeoutMs);
+        resumeIds.push(options?.resumeSessionId ?? null);
+        if (timeouts.length === 1) {
+          now += 40_000;
+          return { code: 1, stdout: "", stderr: "stream interrupted" };
+        }
+        now += 200_000;
+        return { code: 0, stdout: "continued result", stderr: "" };
+      },
+    },
+  );
+  assert.deepEqual(timeouts, [299_000, 258_000]);
+  assert.ok(timeouts[1] > recoveryBudgetMs);
+  assert.deepEqual(resumeIds, [null, session.id]);
+  assert.equal(result.cliResult.code, 0);
+  assert.equal(result.session.terminalText, "continued result");
+});
+
+test("a failed same-session continuation reports the actual run error instead of the generic stream failure", async () => {
+  const context = { requestId: "run-error-reason", taskDiagnostics: { taskHash: "run-error-reason-task" }, executionPolicy: { permissionMode: "dangerous" } };
+  const selectedModel = { model_uid: "glm-5-3-flash-max" };
+  const session = { id: "run-error-session", model: selectedModel.model_uid, toolCalls: [{ id: "edit-1", name: "edit" }], compactionNodeId: 0, terminalText: null };
+  const runError = new Error("provider run timed out after 180000 ms");
+  const progress = [];
+  let runCalls = 0;
+  const failure = await runCliWithProviderRecovery(
+    context,
+    selectedModel,
+    () => {},
+    (item) => progress.push(item),
+    null,
+    100_000,
+    {
+      now: () => 1_000,
+      delay: async () => {},
+      waitForSession: async () => session,
+      waitForTerminalSession: async (_requestId, leased) => leased,
+      removeSession: () => { assert.fail("committed session must not be deleted"); },
+      runCli: async () => {
+        runCalls += 1;
+        throw runError;
+      },
+    },
+  ).catch((error) => error);
+  assert.equal(runCalls, 2);
+  assert.equal(failure.status, 502);
+  assert.equal(failure.routeCommitted, true);
+  assert.equal(failure.retainedProviderSession, session);
+  assert.match(failure.message, /the provider run failed: provider run timed out after 180000 ms/);
+  assert.doesNotMatch(failure.message, /stream ended before a terminal response/);
+  assert.match(failure.message, /One bounded same-session continuation/);
+  assert.equal(progress.length, 1);
+  assert.equal(progress[0]?.kind, "recovery");
+  assert.match(progress[0]?.reason, /the provider run failed: provider run timed out after 180000 ms/);
+  assert.doesNotMatch(progress[0]?.reason, /stream ended before a terminal response/);
+});
+
+test("compaction continuation preserves the active task and allows further tools before the terminal result", async () => {
+  const context = {
+    requestId: "compaction-continuation-test",
+    taskDiagnostics: { taskHash: "compaction-continuation-task" },
+    taskState: { activeTask: { id: "compaction-task", name: "/root/compaction_continuation_fixture", hash: "compaction-continuation-task", text: "Finish the bounded fixture without restarting the investigation." } },
+    executionPolicy: { permissionMode: "dangerous" },
+  };
+  const selectedModel = { model_uid: "glm-5-3-flash-max" };
+  const session = { id: "compaction-continuation-session", model: selectedModel.model_uid, toolCalls: [{ id: "exec-before-compaction", name: "exec" }], compactionNodeId: 0, terminalText: null };
+  const continuedSession = {
+    ...session,
+    toolCalls: [...session.toolCalls, { id: "edit-after-compaction", name: "edit" }],
+    terminalText: "Finished after compaction continuation.",
+  };
+  const calls = [];
+  let sessionReads = 0;
+  const result = await runCliWithProviderRecovery(
+    context,
+    selectedModel,
+    () => {},
+    () => {},
+    null,
+    100_000,
+    {
+      now: () => 1_000,
+      delay: async () => {},
+      waitForSession: async () => {
+        sessionReads += 1;
+        return sessionReads === 1 ? session : continuedSession;
+      },
+      waitForTerminalSession: async (_requestId, leased) => leased,
+      removeSession: () => { assert.fail("compaction continuation must retain the session"); },
+      runCli: async (_context, _model, _onSpawn, _onProgress, _timeoutMs, options) => {
+        calls.push(options);
+        return calls.length === 1
+          ? { code: 1, stdout: "", stderr: "Devin provider context compacted at node 12" }
+          : { code: 0, stdout: continuedSession.terminalText, stderr: "" };
+      },
+    },
+  );
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0], undefined);
+  assert.equal(calls[1]?.resumeSessionId, session.id);
+  assert.match(calls[1]?.prompt, /Native Devin compaction recovery/);
+  assert.ok(calls[1]?.prompt.includes(context.taskState.activeTask.text));
+  assert.equal(calls[1]?.compactionBaseline, 0);
+  assert.deepEqual(calls[1]?.toolCallBaseline, [{ id: "exec-before-compaction", name: "exec" }]);
+  assert.equal(result.cliResult.code, 0);
+  assert.equal(result.session, continuedSession);
+  assert.deepEqual(result.session.toolCalls.at(-1), { id: "edit-after-compaction", name: "edit" });
+  assert.equal(result.session.terminalText, "Finished after compaction continuation.");
+});

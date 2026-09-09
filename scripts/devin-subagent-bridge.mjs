@@ -608,7 +608,7 @@ const runtime = {
   supersededTurns: 0, clientCancelledRequests: 0,
   lastClientCancellationReason: null,
   resourceRetries: 0, providerContinuations: 0, nativeTerminalContinuations: 0,
-  streamContinuations: 0, compactionCheckpoints: 0,
+  streamContinuations: 0, compactionContinuations: 0,
   permissionCheckpoints: 0, activeResourceBackoffs: 0,
   sessionCleanupFailures: 0, lastSessionCleanupError: null,
   lastResourceModel: null, lastResourceRetryAttempt: 0,
@@ -1776,8 +1776,8 @@ function devinIncompleteTurnPrompt(context) {
   return `[Native Devin terminal-message recovery]\nThe retained provider conversation ended after native tool execution without a terminal assistant message. Continue the same active task and return its actual completion report or concrete blocker now. Task hash: ${context.taskDiagnostics.taskHash}. Do not restart the investigation or repeat completed tool calls or file edits.`;
 }
 
-function devinCompactionCheckpointPrompt(context) {
-  return `[Native Devin compaction checkpoint]\nYour provider context compacted during the bounded delegated task. Do not call tools, edit files, build, test, control the editor, or invoke RzMCP. Re-anchor on the complete active task below, then immediately return a concise checkpoint containing only: work actually completed, mutations actually made and their paths, the current concrete blocker or uncertainty, and the exact next step the parent should assign. Do not continue implementation in this turn.\n\n${activeTaskPromptSection(context.taskState)}`;
+function devinCompactionContinuationPrompt(context) {
+  return `[Native Devin compaction recovery]\nYour provider context compacted during the bounded delegated task. Continue the same retained conversation and active task. Task hash: ${context.taskDiagnostics.taskHash}. Do not restart the investigation or repeat completed tool calls or file edits. Return the next required tool call or the concise final result.\n\n${activeTaskPromptSection(context.taskState)}`;
 }
 
 function devinPermissionCheckpointPrompt(context) {
@@ -1881,9 +1881,10 @@ export function devinPostToolQuotaFailure(session, executionPolicy) {
   );
 }
 
-function providerCheckpointReason({ resourceFailure, streamFailure, compactionFailure, permissionFailure, incompleteTurn, outputTokenLimit }) {
+function providerCheckpointReason({ resourceFailure, outputTokenLimit, runError, streamFailure, compactionFailure, permissionFailure, incompleteTurn }) {
   if (resourceFailure) return "the provider reported a transient resource failure";
   if (outputTokenLimit) return "the provider response was truncated by the output token limit";
+  if (runError) return `the provider run failed: ${sanitizedProviderFailure(runError)}`;
   if (streamFailure) return "the provider stream ended before a terminal response";
   if (compactionFailure) return "the provider compacted its context before a terminal response";
   if (permissionFailure) return "an enforced provider permission rejected a required operation";
@@ -1943,8 +1944,10 @@ export async function runCliWithProviderRecovery(
         throw preserveProviderSession(error, resumeSession, context.executionPolicy);
       }
     }
-    const activeDeadline = recoveryDeadline || deadline;
-    const remainingMs = activeDeadline - now();
+    // The overall task deadline owns each provider run: a same-session continuation is a
+    // full inference turn (observed 280-383s) and must never be capped by the 45s
+    // recovery-scheduling budget, which killed active generations mid-turn.
+    const remainingMs = deadline - now();
     if (remainingMs <= 0) throw new BridgeError("Devin provider recovery deadline exceeded", 504);
     const iterationCompactionBaseline = Number(resumeSession?.compactionNodeId || 0);
     let cliResult;
@@ -1963,7 +1966,7 @@ export async function runCliWithProviderRecovery(
               prompt: recoveryKind === "parent_control"
                 ? context.prompt
                 : recoveryKind === "compaction"
-                ? devinCompactionCheckpointPrompt(context)
+                ? devinCompactionContinuationPrompt(context)
                 : recoveryKind === "permission"
                   ? devinPermissionCheckpointPrompt(context)
                   : recoveryKind === "incomplete"
@@ -2030,6 +2033,7 @@ export async function runCliWithProviderRecovery(
       permissionFailure,
       incompleteTurn,
       outputTokenLimit,
+      runError,
     };
     if (providerContinuationUsed && session) {
       if (providerToolCalls(session).length > 0) {
@@ -2089,7 +2093,7 @@ export async function runCliWithProviderRecovery(
       providerContinuationUsed = true;
       runtime.providerContinuations += 1;
     }
-    if (compactionFailure) runtime.compactionCheckpoints += 1;
+    if (compactionFailure) runtime.compactionContinuations += 1;
     if (permissionFailure) runtime.permissionCheckpoints += 1;
     runtime.lastResourceModel = selectedModel.model_uid;
     runtime.lastResourceRetryAttempt = attempt;
@@ -3930,7 +3934,7 @@ async function selfTest() {
     || recoveryCalls[0].options !== undefined
     || recoveryCalls[1].options?.resumeSessionId !== preWorkRecoverySession.id
     || !recoveryCalls[1].options?.prompt.includes(recoveryContext.taskDiagnostics.taskHash)
-    || recoveryCalls.map(({ timeoutMs }) => timeoutMs).join(",") !== "99000,44000"
+    || recoveryCalls.map(({ timeoutMs }) => timeoutMs).join(",") !== "99000,98000"
     || recoveryDelays.join(",") !== "1000"
   ) {
     throw new Error("same-session Devin stream recovery failed");
@@ -4061,7 +4065,7 @@ async function selfTest() {
         return compactionSessionReads === 1 ? compactionSession : completedCompactionSession;
       },
       waitForTerminalSession: async (_requestId, session) => session,
-      removeSession: () => { throw new Error("compaction checkpoint session was removed"); },
+      removeSession: () => { throw new Error("compaction continuation session was removed"); },
       runCli: async (_context, _model, _onSpawn, _onProgress, timeoutMs, options) => {
         compactionCalls.push({ timeoutMs, options });
         return compactionCalls.length === 1
@@ -4076,7 +4080,7 @@ async function selfTest() {
     || compactionCalls[0].options !== undefined
     || compactionCalls[1].options?.resumeSessionId !== compactionSession.id
     || compactionCalls[1].options?.toolCallBaseline?.length !== 1
-    || !compactionCalls[1].options?.prompt.includes("Native Devin compaction checkpoint")
+    || !compactionCalls[1].options?.prompt.includes("Native Devin compaction recovery")
     || !compactionCalls[1].options?.prompt.includes(recoveryContext.taskState.activeTask.text)
     || compactionDelays.join(",") !== "1000"
   ) {
