@@ -16,7 +16,6 @@ import { fileURLToPath } from "node:url";
 import {
   TaskStateError,
   activeTaskPromptSection,
-  isExplicitReadOnlyTask,
   referencedPriorTaskPromptSection,
   rzMcpModeForTask,
   taskControlPromptSections,
@@ -26,7 +25,6 @@ import {
 } from "./codebuddy-subagent-task-state.mjs";
 import { projectInstructionsPromptSection } from "./native-project-instructions.mjs";
 import {
-  assertProviderBoundaryEnforceable,
   executionPolicy as checkedExecutionPolicy,
   sanitizeChildEnvironment,
 } from "./bridge-security.mjs";
@@ -671,12 +669,8 @@ function retainedContinuation(context, retainedSession) {
 }
 
 export function nativeExecutionPolicyFromTaskState(taskState) {
-  const task = taskState.activeTask?.text || "";
-  const readOnly = taskState.activeTask?.intent === "analysis" || isExplicitReadOnlyTask(task);
   return checkedExecutionPolicy({
-    readOnly,
-    validationRestricted: true,
-    rzMcpMode: rzMcpModeForTask(task, readOnly),
+    rzMcpMode: rzMcpModeForTask(taskState.activeTask?.text || ""),
   });
 }
 
@@ -702,16 +696,16 @@ export function nativeCliAgentContext(body, { provider, model, requiredEffort, m
   }
   const workingDirectory = workingDirectoryFrom(body, input);
   const executionPolicy = mainAgent
-    ? checkedExecutionPolicy({ readOnly: false, validationRestricted: false, rzMcpMode: "full" })
+    ? checkedExecutionPolicy({ rzMcpMode: "full" })
     : nativeExecutionPolicyFromTaskState(taskState);
   const turnContract = mainAgent
     ? "[RzCodex main-agent contract]\nAct as the primary coding agent for this conversation. Use your local file, search, edit, shell, and lazy RzMCP tools directly. Follow the supplied RzCodex and project instructions, preserve unrelated work, and complete the current user request before returning unless a concrete blocker requires user input."
-    : executionPolicy.readOnly
-      ? "[Single native-agent turn contract]\nComplete this delegated task within this one Codex subagent turn using local file read and search tools only. File writes, shell execution, builds, compilation, tests, editor control, PIE/SIE, runtime validation, and final integration are disabled and reserved to the parent. Never delegate or request that the parent perform an ordinary read/search operation. Return only when the bounded analysis is complete or a concrete blocker requires parent input."
-      : "[Single native-agent turn contract]\nComplete this delegated task within this one Codex subagent turn using local file read, search, and edit tools directly. Shell execution, builds, compilation, tests, editor control, PIE/SIE, runtime validation, and final integration are disabled and reserved to the parent. Never delegate or request that the parent perform an ordinary file operation. Implement and statically review the bounded change, then report the exact focused validation the parent should run.";
+    : taskState.activeTask?.intent === "analysis"
+      ? "[Single native-agent turn contract]\nComplete this delegated task within this one Codex subagent turn using local file read, search, and edit tools directly. Builds, compilation, tests, editor control, PIE/SIE, runtime validation, and final integration are disabled and reserved to the parent. Never delegate or request that the parent perform an ordinary read/search operation. Return the bounded analysis with concrete evidence, then state any residual uncertainty."
+      : "[Single native-agent turn contract]\nComplete this delegated task within this one Codex subagent turn using local file read, search, and edit tools directly. Builds, compilation, tests, editor control, PIE/SIE, runtime validation, and final integration are disabled and reserved to the parent. Never delegate or request that the parent perform an ordinary file operation. Implement and statically review the bounded change, then report the exact focused validation the parent should run.";
   const platformBoundary = mainAgent
     ? "The host shell is PowerShell on Windows."
-    : "This delegated provider boundary does not expose shell or validation/editor tools.";
+    : "Local file, search, edit, and shell tools are exposed in this turn; the host shell is PowerShell on Windows. Builds, tests, editor control, PIE/SIE, and runtime validation remain reserved to the parent.";
   const sections = [
     turnContract,
     `[Native tool boundary]\n${platformBoundary} Never read, grep, decode, strings-scan, hex-dump, or otherwise inspect Unreal .uasset or .umap bytes through file or shell tools. When the task authorizes RzMCP, it is exposed lazily as exactly search_rzmcp_tools and call_rzmcp_tool: search for a focused schema first, then call only a discovered tool. Never enumerate or request the full RzMCP catalog. If those tools are disabled, unavailable, or semantically insufficient, return that concrete blocker; do not approximate asset semantics from binary bytes or repeat equivalent offset/chunk probes. Never read secret environment files.`,
@@ -1152,14 +1146,6 @@ function openCodeConfig(context, providerKind) {
         : { enabled: false },
     },
   };
-  if (context.executionPolicy.readOnly) {
-    config.permission.edit = "deny";
-    config.permission.write = "deny";
-    config.permission.patch = "deny";
-  }
-  if (context.executionPolicy.readOnly || context.executionPolicy.validationRestricted) {
-    config.permission.bash = "deny";
-  }
   if (providerKind === "ollama") {
     config.provider = {
       ollama: {
@@ -1332,18 +1318,6 @@ export async function runOpenCodeNativeAgent(context, {
   onRecovery,
   onSessionStart,
 }) {
-  assertProviderBoundaryEnforceable(context.provider, {
-    fileWrites: context.executionPolicy.readOnly ? "disabled" : "unrestricted",
-    shell: context.executionPolicy.readOnly || context.executionPolicy.validationRestricted
-      ? "disabled"
-      : "unrestricted",
-    validationTools: context.executionPolicy.readOnly || context.executionPolicy.validationRestricted
-      ? "disabled"
-      : "unrestricted",
-    editorControl: context.executionPolicy.readOnly || context.executionPolicy.validationRestricted
-      ? "disabled"
-      : "unrestricted",
-  }, context.executionPolicy);
   if (!existsSync(OPENCODE_EXE)) throw new NativeCliAgentError(`OpenCode CLI is missing at ${OPENCODE_EXE}`);
   if (!existsSync(LAZY_RZMCP_PROXY)) throw new NativeCliAgentError(`Lazy RzMCP proxy is missing at ${LAZY_RZMCP_PROXY}`);
   mkdirSync(OPENCODE_STATE_DIRECTORY, { recursive: true });
@@ -1549,23 +1523,7 @@ function commandCodeParser(event, state, executionPolicy) {
   }
 }
 
-function assertCommandCodeExecutionPolicy(executionPolicy) {
-  if (executionPolicy.readOnly || executionPolicy.validationRestricted) {
-    throw new NativeCliAgentError(
-      "CommandCode cannot enforce this task before work: its headless CLI has no provider boundary that disables all file writes, shell, and validation tools",
-      400,
-    );
-  }
-}
-
 export async function runCommandCodeNativeAgent(context, { signal, onEvent }) {
-  assertCommandCodeExecutionPolicy(context.executionPolicy);
-  assertProviderBoundaryEnforceable(context.provider, {
-    fileWrites: "unrestricted",
-    shell: "unrestricted",
-    validationTools: "unrestricted",
-    editorControl: "unrestricted",
-  }, context.executionPolicy);
   const commandCodeEntry = join(commandCodePackageDirectory(), "dist", "index.mjs");
   if (!existsSync(commandCodeEntry)) {
     throw new NativeCliAgentError(`CommandCode CLI is missing at ${commandCodeEntry}`);
@@ -1706,21 +1664,6 @@ export async function runCommandCodeNativeAgent(context, { signal, onEvent }) {
 
 export async function nativeCliAgentRunnerSelfTest() {
   const authoritativeWorkspace = join(import.meta.dirname, "..");
-  for (const executionPolicy of [
-    checkedExecutionPolicy({ readOnly: true }),
-    checkedExecutionPolicy({ validationRestricted: true }),
-  ]) {
-    let boundaryError = null;
-    try {
-      assertCommandCodeExecutionPolicy(executionPolicy);
-    } catch (error) {
-      boundaryError = error;
-    }
-    if (boundaryError?.status !== 400 || !boundaryError.message.includes("cannot enforce this task before work")) {
-      throw new Error("CommandCode restricted work did not fail before provider execution");
-    }
-  }
-  assertCommandCodeExecutionPolicy(checkedExecutionPolicy());
   const exactPromptBudgetFixture = "x".repeat(MAX_MAIN_PROMPT_CHARS);
   if (validateFinalNativePrompt(exactPromptBudgetFixture) !== exactPromptBudgetFixture) {
     throw new Error("native prompt budget rejected an exact-limit prompt");
@@ -2061,19 +2004,15 @@ export async function nativeCliAgentRunnerSelfTest() {
     model: "fixture-model",
     requiredEffort: "max",
   }).executionPolicy;
-  const explicitReadOnlyRzMcp = policyContext(
-    "Read-only inspection. No edits/build/tests/editor control/assets saves/staging. Use RzDirectMCP semantic/read-only APIs only (never binary grep).",
-  );
   const explicitRzMcpBan = policyContext(
-    "Read-only inspection. Use repository text tools, but do not use or invoke RzDirectMCP.",
+    "Review the bounded diff. Do not use or invoke RzDirectMCP.",
   );
-  const genericEditorBan = policyContext(
-    "Read-only inspection. No edits/build/tests/editor/PIE/staging.",
+  const genericEditorRestriction = policyContext(
+    "Review the bounded diff. No editor/PIE use.",
   );
   if (
-    explicitReadOnlyRzMcp.rzMcpMode !== "read-only"
+    genericEditorRestriction.rzMcpMode !== "full"
     || explicitRzMcpBan.rzMcpMode !== "disabled"
-    || genericEditorBan.rzMcpMode !== "disabled"
   ) {
     throw new Error("native CLI RzMCP task capability classification failed");
   }
@@ -2097,13 +2036,11 @@ export async function nativeCliAgentRunnerSelfTest() {
   });
   if (
     ordinaryMutationContext.taskDiagnostics.taskIntent !== "mutation"
-    || ordinaryMutationContext.executionPolicy.readOnly
-    || !ordinaryMutationContext.executionPolicy.validationRestricted
-    || ordinaryMutationContext.executionPolicy.rzMcpMode !== "no-validation"
-    || !ordinaryMutationContext.prompt.includes("Shell execution, builds, compilation, tests, editor control")
-    || ordinaryMutationContext.prompt.includes("edit, and shell tools directly")
+    || ordinaryMutationContext.executionPolicy.rzMcpMode !== "full"
+    || !ordinaryMutationContext.prompt.includes("Builds, compilation, tests, editor control")
+    || !ordinaryMutationContext.prompt.includes("Implement and statically review the bounded change")
   ) {
-    throw new Error("native mutation task without prohibition words escaped the parent-owned validation boundary");
+    throw new Error("native mutation task without prohibition words lost its native delegated contract");
   }
   const priorTaskText = "Message Type: NEW_TASK\nTask name: /root/resume_fixture\nPayload:\nInspect the exact bounded source and report the original evidence.";
   const intermediateResumeTaskText = "Message Type: NEW_TASK\nTask name: /root/resume_fixture\nPayload:\nBridge repaired. Resume the same bounded task from its original scope and preserve the focused ownership.";

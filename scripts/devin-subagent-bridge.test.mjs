@@ -8,11 +8,11 @@ import test from "node:test";
 import { ActiveTaskProviderPins } from "./native-subagent-provider-router.mjs";
 import {
   RetainedProviderSessions,
-  assertDevinTaskBoundary,
   devinPostToolQuotaFailure,
   executionPolicyFromTaskState,
   finalizeDevinResult,
   reconcileProviderPinAfterAbort,
+  runCliWithProviderRecovery,
   withRecoveryProbeAfterCapacity,
   withRetainedProviderSession,
 } from "./devin-subagent-bridge.mjs";
@@ -27,7 +27,7 @@ function devinFixture() {
     toolCalls: [{ name: "apply_patch", args: {}, result: "Done" }],
   };
   return {
-    context: { executionPolicy: { rzMcpMode: "disabled" } },
+    context: { executionPolicy: { permissionMode: "dangerous", rzMcpMode: "disabled" } },
     selected: { key: "primary", model: { model_uid: "fixture-model" } },
     routeResult: { cliResult: { code: 0, stdout: session.terminalText, stderr: "" }, session },
     fallbackState: {
@@ -140,28 +140,18 @@ test("a zero-work provisional provider pin is released on parent abort", () => {
   assert.equal(error.routeCommitted, undefined);
 });
 
-test("Devin is rejected before work when its CLI cannot enforce delegated restrictions", () => {
+test("Devin delegated policy resolves the RzMCP mode without restricting native tools", () => {
   const ordinaryDelegatedPolicy = executionPolicyFromTaskState({
     activeTask: { text: "Fix the bounded source defect." },
   });
-  assert.equal(ordinaryDelegatedPolicy.readOnly, false);
-  assert.equal(ordinaryDelegatedPolicy.validationRestricted, true);
-  assert.equal(ordinaryDelegatedPolicy.rzMcpMode, "no-validation");
-  assert.throws(
-    () => assertDevinTaskBoundary({ readOnly: true, validationRestricted: false, rzMcpMode: "read-only" }),
-    /fileWrites must be disabled/,
-  );
-  assert.throws(
-    () => assertDevinTaskBoundary({ readOnly: false, validationRestricted: true, rzMcpMode: "no-validation" }),
-    /shell must be disabled/,
-  );
-  assert.throws(
-    () => assertDevinTaskBoundary(ordinaryDelegatedPolicy),
-    /shell must be disabled/,
-  );
-  assert.doesNotThrow(
-    () => assertDevinTaskBoundary({ readOnly: false, validationRestricted: false, rzMcpMode: "full" }),
-  );
+  assert.deepEqual(ordinaryDelegatedPolicy, {
+    rzMcpMode: "full",
+    permissionMode: "dangerous",
+  });
+  const rzMcpBanPolicy = executionPolicyFromTaskState({
+    activeTask: { text: "Review the bounded diff. Do not use or invoke RzDirectMCP." },
+  });
+  assert.equal(rzMcpBanPolicy.rzMcpMode, "disabled");
 });
 
 test("a saturated route does not consume its recovery probe", async () => {
@@ -223,4 +213,184 @@ test("importing the bridge has no configuration, pruning, auth, or server side e
   } finally {
     rmSync(fixtureRoot, { recursive: true, force: true });
   }
+});
+
+test("finalizeDevinResult rejects a mismatched model while preserving committed ownership", () => {
+  const fixture = devinFixture();
+  fixture.session.model = "swe-1-7-medium";
+  fixture.selected.model = { model_uid: "glm-5-3-flash-max", label: "GLM-5.3 Flash Max" };
+  let removeCalls = 0;
+  assert.throws(
+    () => finalizeDevinResult(
+      fixture.context,
+      fixture.selected,
+      fixture.routeResult,
+      fixture.fallbackState,
+      false,
+      { remove: () => { removeCalls += 1; } },
+    ),
+    (error) => (
+      error.status === 502
+      && /unexpected model/.test(error.message)
+      && error.retainedProviderSession === fixture.session
+      && error.routeCommitted === true
+      && error.toolCalls === 1
+    ),
+  );
+  assert.equal(removeCalls, 0);
+});
+
+test("runCliWithProviderRecovery refuses an already-wrong-model resume session without deleting it", async () => {
+  const context = { requestId: "stale-resume-test", executionPolicy: { permissionMode: "dangerous" } };
+  const selectedModel = { model_uid: "glm-5-3-flash-max" };
+  const resumedSession = { id: "stale-session", model: "swe-1-7-medium", terminalText: "stale", toolCalls: [{ name: "write" }] };
+  let removeCalls = 0;
+  let runCalls = 0;
+  await assert.rejects(
+    () => runCliWithProviderRecovery(
+      context,
+      selectedModel,
+      () => {},
+      () => {},
+      null,
+      Date.now() + 5000,
+      {
+        runCli: () => {
+          runCalls += 1;
+          return Promise.resolve({ code: 0, stdout: "fresh result", stderr: "" });
+        },
+        waitForSession: () => resumedSession,
+        waitForTerminalSession: () => resumedSession,
+        removeSession: () => { removeCalls += 1; },
+        initialResumeSession: resumedSession,
+        delay: () => Promise.resolve(),
+        now: Date.now,
+      },
+    ),
+    (error) => (
+      error.status === 502
+      && /already bound to unexpected model/.test(error.message)
+      && error.retainedProviderSession === resumedSession
+      && error.routeCommitted === true
+    ),
+  );
+  assert.equal(removeCalls, 0);
+  assert.equal(runCalls, 0);
+});
+
+test("runCliWithProviderRecovery resumes a blank-DB session because the per-model config default binds it", async () => {
+  const context = { requestId: "blank-resume-test", executionPolicy: { permissionMode: "dangerous" } };
+  const selectedModel = { model_uid: "glm-5-3-flash-max", label: "GLM-5.3 Flash Max" };
+  const resumedSession = { id: "blank-session", model: "", terminalText: null };
+  const finalSession = { id: "blank-session", model: "glm-5-3-flash-max", terminalText: "resumed result" };
+  let runCalls = 0;
+  let lastResumeSessionId = null;
+  const result = await runCliWithProviderRecovery(
+    context,
+    selectedModel,
+    () => {},
+    () => {},
+    null,
+    Date.now() + 5000,
+    {
+      runCli: (ctx, model, onSpawn, onProgress, timeout, options = {}) => {
+        runCalls += 1;
+        lastResumeSessionId = options?.resumeSessionId || null;
+        return Promise.resolve({ code: 0, stdout: "resumed result", stderr: "" });
+      },
+      waitForSession: () => finalSession,
+      waitForTerminalSession: () => finalSession,
+      initialResumeSession: resumedSession,
+      delay: () => Promise.resolve(),
+      now: Date.now,
+    },
+  );
+  assert.equal(runCalls, 1);
+  assert.equal(lastResumeSessionId, "blank-session");
+  assert.equal(result.cliResult.code, 0);
+});
+
+test("runCliWithProviderRecovery resumes an output-truncated turn once with the same session", async () => {
+  const context = { requestId: "output-limit-test", taskDiagnostics: { taskHash: "output-limit-task" }, executionPolicy: { permissionMode: "dangerous" } };
+  const selectedModel = { model_uid: "swe-1-7-medium" };
+  const session = { id: "limit-session", model: "swe-1-7-medium", terminalText: null, toolCalls: [{ name: "read" }] };
+  let runCalls = 0;
+  const result = await runCliWithProviderRecovery(
+    context,
+    selectedModel,
+    () => {},
+    () => {},
+    null,
+    Date.now() + 5000,
+    {
+      runCli: () => {
+        runCalls += 1;
+        return Promise.resolve({
+          code: runCalls === 1 ? 1 : 0,
+          stdout: runCalls === 1
+            ? "Response truncated: model hit max output token limit. The output above is incomplete."
+            : "concise result",
+          stderr: "",
+        });
+      },
+      waitForSession: () => session,
+      waitForTerminalSession: () => ({ ...session, terminalText: "concise result" }),
+      delay: () => Promise.resolve(),
+      now: Date.now,
+    },
+  );
+  assert.equal(runCalls, 2);
+  assert.equal(result.cliResult.code, 0);
+  assert.equal(result.session.terminalText, "concise result");
+});
+
+test("repeated output truncation fails explicitly and retains the committed session", async () => {
+  const context = { requestId: "output-limit-failed", taskDiagnostics: { taskHash: "output-limit-task" }, executionPolicy: { permissionMode: "dangerous" } };
+  const selectedModel = { model_uid: "glm-5-3-flash-max" };
+  const session = { id: "committed-limit-session", model: selectedModel.model_uid, terminalText: null, toolCalls: [{ id: "write-once", name: "write" }] };
+  const calls = [];
+  await assert.rejects(
+    runCliWithProviderRecovery(context, selectedModel, () => {}, () => {}, null, 100_000, {
+      runCli: async (_context, _model, _spawn, _progress, _timeout, options) => {
+        calls.push(options?.resumeSessionId ?? null);
+        return { code: 1, stdout: "", stderr: "Response truncated: model hit max output token limit. The output above is incomplete." };
+      },
+      waitForSession: async () => session,
+      removeSession: () => { assert.fail("committed session must not be deleted"); },
+      delay: async () => {},
+      now: () => 1_000,
+    }),
+    (error) => {
+      assert.equal(error.status, 502);
+      assert.equal(error.routeCommitted, true);
+      assert.equal(error.retainedProviderSession, session);
+      assert.equal(error.mutationToolCalls, 1);
+      assert.match(error.message, /output token limit/);
+      return true;
+    },
+  );
+  assert.deepEqual(calls, [null, session.id]);
+  assert.equal(session.terminalText, null);
+});
+
+test("cancellation during recovery backoff preserves committed conversation ownership", async () => {
+  const context = { requestId: "backoff-abort", taskDiagnostics: { taskHash: "backoff-task" }, executionPolicy: { permissionMode: "dangerous" } };
+  const selectedModel = { model_uid: "glm-5-3-flash-max" };
+  const session = { id: "backoff-session", model: selectedModel.model_uid, terminalText: null, toolCalls: [{ name: "edit" }] };
+  const aborted = Object.assign(new Error("parent cancelled during backoff"), { status: 499 });
+  await assert.rejects(
+    runCliWithProviderRecovery(context, selectedModel, () => {}, () => {}, null, 100_000, {
+      runCli: async () => ({ code: 1, stdout: "", stderr: "stream interrupted" }),
+      waitForSession: async () => session,
+      removeSession: () => { assert.fail("committed session must not be deleted"); },
+      delay: async () => { throw aborted; },
+      now: () => 1_000,
+    }),
+    (error) => {
+      assert.equal(error, aborted);
+      assert.equal(error.routeCommitted, true);
+      assert.equal(error.retainedProviderSession, session);
+      return true;
+    },
+  );
 });

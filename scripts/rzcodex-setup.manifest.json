@@ -14,6 +14,7 @@
   "stableLauncherFiles": [
     "bridge-security.mjs",
     "rzcodex-bridge-auth-token.mjs",
+    "rzcodex-bridge-launcher.cs",
     "rzcodex-launch.ps1",
     "rzcodex.ps1",
     "rzcodex.cmd",
@@ -45,6 +46,7 @@
     ],
     "javascript": [
       ["--test", "scripts/native-project-instructions.test.mjs"],
+      ["--test", "scripts/codebuddy-subagent-task-state.test.mjs"],
       ["--test", "scripts/native-subagent-provider-router.test.mjs"],
       ["--test", "scripts/bridge-security.test.mjs"],
       ["--test", "scripts/devin-subagent-bridge.test.mjs"],
@@ -71,6 +73,7 @@
     "scripts/native-subagent-provider-router.mjs",
     "scripts/rzcodex-bridge-supervisor.ps1",
     "scripts/rzcodex-bridge-auth-token.mjs",
+    "scripts/rzcodex-bridge-launcher.cs",
     "scripts/rzcodex-config-migrate.mjs",
     "scripts/rzcodex-deployment.psm1",
     "scripts/rzcodex-deployment.test.mjs",

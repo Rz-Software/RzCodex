@@ -120,7 +120,7 @@ test("manifest file references are complete and remain inside scripts", () => {
   }
 });
 
-test("bridge tasks use direct hidden PowerShell actions with parent-bound bridge processes", () => {
+test("bridge tasks use a compiled winexe bootstrap that spawns PowerShell without a visible console", () => {
   const setupSource = readFileSync(setupPath, "utf8");
   const taskRegistrationStart = setupSource.indexOf("$currentUser =");
   const taskRegistrationEnd = setupSource.indexOf("$deploymentState =", taskRegistrationStart);
@@ -130,25 +130,47 @@ test("bridge tasks use direct hidden PowerShell actions with parent-bound bridge
     /wscript|\.vbs/i,
     "new scheduled-task actions must not restore the legacy VBS launch path",
   );
+  assert.doesNotMatch(
+    setupSource,
+    /-WindowStyle Hidden/,
+    "scheduled tasks must no longer rely on post-start window hiding",
+  );
+  assert.doesNotMatch(
+    setupSource.slice(taskRegistrationStart, taskRegistrationEnd),
+    /New-ScheduledTaskAction[\s\S]{0,300}-Execute \$taskPowerShellPath/,
+    "scheduled tasks must not launch pwsh directly",
+  );
   assert.match(
     setupSource,
     /\$taskPowerShellPath\s*=\s*\(Get-Command pwsh\b/,
-    "scheduled actions must resolve pwsh directly",
+    "scheduled actions must still resolve the pwsh path for the bootstrap",
   );
   assert.match(
     setupSource,
-    /\$launcherArguments\s*=\s*"[^"]*-WindowStyle Hidden[^"]*-File[^\r\n]*-Bridge/,
-    "bridge task actions must launch the stable PowerShell launcher hidden",
+    /\$bridgeLauncherPath\s*=\s*Join-Path\s+\$launcherRoot\s+"codex-bridge-launcher\.exe"/,
+    "setup must resolve the compiled bridge launcher path",
   );
   assert.match(
     setupSource,
-    /-Argument\s+"[^"]*-WindowStyle Hidden[^"]*-File[^\r\n]*-Update/,
-    "the updater task action must launch the stable PowerShell launcher hidden",
+    /New-ScheduledTaskAction[\s\S]{0,300}-Execute \$bridgeLauncherPath/,
+    "bridge and updater tasks must execute the compiled bridge launcher",
   );
-  const directActionMatches = setupSource.match(
-    /New-ScheduledTaskAction[\s\S]{0,300}-Execute \$taskPowerShellPath/g,
-  ) ?? [];
-  assert.equal(directActionMatches.length, 2, "bridge and updater tasks must both execute pwsh directly");
+  assert.match(
+    setupSource,
+    /\/target:winexe/,
+    "setup must compile the bridge launcher as a Windows-subsystem (winexe) executable",
+  );
+
+  assert.equal(
+    manifest.stableLauncherFiles.includes("rzcodex-bridge-launcher.cs"),
+    true,
+    "bridge launcher source must be versioned in the stable launcher",
+  );
+  assert.equal(
+    manifest.deploymentFiles.includes("scripts/rzcodex-bridge-launcher.cs"),
+    true,
+    "bridge launcher source must be versioned in the deployment manifest",
+  );
 
   const manifestFiles = [...manifest.stableLauncherFiles, ...manifest.deploymentFiles];
   assert.equal(
@@ -162,6 +184,29 @@ test("bridge tasks use direct hidden PowerShell actions with parent-bound bridge
       ["--exit-with-parent"],
       `${bridgeName} must terminate when its task-owned PowerShell parent stops`,
     );
+  }
+});
+
+test("bridge launcher compiles and forwards child exit codes", { skip: process.platform !== "win32" }, () => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "rzcodex-bridge-launcher-"));
+  try {
+    const cscPath = "C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\csc.exe";
+    const sourcePath = join(scriptsRoot, "rzcodex-bridge-launcher.cs");
+    const exePath = join(fixtureRoot, "codex-bridge-launcher.exe");
+    const csc = spawnSync(cscPath, ["/nologo", "/target:winexe", `/out:${exePath}`, sourcePath], { encoding: "utf8", windowsHide: true });
+    assert.equal(csc.status, 0, csc.stderr || csc.stdout);
+
+    const noArgs = spawnSync(exePath, [], { windowsHide: true });
+    assert.equal(noArgs.status, 3, "no arguments must exit 3");
+
+    const cmdPath = process.env.ComSpec || "C:\\Windows\\System32\\cmd.exe";
+    const child = spawnSync(exePath, [cmdPath, "/c", "exit 23"], { windowsHide: true });
+    assert.equal(child.status, 23, "child exit code must be forwarded");
+
+    const missing = spawnSync(exePath, ["C:\\No\\Such\\Executable.exe"], { windowsHide: true });
+    assert.equal(missing.status, 5, "missing child executable must exit 5");
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
   }
 });
 

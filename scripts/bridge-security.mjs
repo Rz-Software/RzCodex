@@ -246,41 +246,10 @@ export function sanitizeChildEnvironment(
   return env;
 }
 
-export function executionPolicy({ readOnly = false, validationRestricted = false, rzMcpMode } = {}) {
-  if (typeof readOnly !== "boolean" || typeof validationRestricted !== "boolean") {
-    throw new BridgePolicyError("Execution-policy restrictions must be booleans");
-  }
-  const mode = rzMcpMode ?? (readOnly ? "read-only" : validationRestricted ? "no-validation" : "full");
+export function executionPolicy({ rzMcpMode } = {}) {
+  const mode = rzMcpMode ?? "full";
   if (!VALID_RZMCP_MODES.has(mode)) throw new BridgePolicyError(`Unknown RzMCP mode ${JSON.stringify(mode)}`);
-  if (readOnly && !new Set(["read-only", "disabled"]).has(mode)) {
-    throw new BridgePolicyError(`Read-only work cannot use RzMCP mode ${JSON.stringify(mode)}`);
-  }
-  if (validationRestricted && mode === "full") {
-    throw new BridgePolicyError("Validation-restricted work cannot use full RzMCP mode");
-  }
-  return Object.freeze({ readOnly, validationRestricted, rzMcpMode: mode });
-}
-
-export function providerBoundaryRequirements(policy) {
-  const normalized = executionPolicy(policy);
-  return Object.freeze({
-    fileWrites: normalized.readOnly ? "disabled" : "unrestricted",
-    shell: normalized.readOnly || normalized.validationRestricted ? "disabled" : "unrestricted",
-    validationTools: normalized.readOnly || normalized.validationRestricted ? "disabled" : "unrestricted",
-    editorControl: normalized.readOnly || normalized.validationRestricted ? "disabled" : "unrestricted",
-  });
-}
-
-export function assertProviderBoundaryEnforceable(provider, actualBoundary, policy) {
-  const requirements = providerBoundaryRequirements(policy);
-  for (const [capability, requirement] of Object.entries(requirements)) {
-    if (requirement === "disabled" && actualBoundary?.[capability] !== "disabled") {
-      throw new BridgePolicyError(
-        `${provider || "Provider"} cannot enforce this task: ${capability} must be disabled at the provider tool boundary`,
-      );
-    }
-  }
-  return executionPolicy(policy);
+  return Object.freeze({ rzMcpMode: mode });
 }
 
 function executionMetadata(tool) {
@@ -379,10 +348,10 @@ export function toolEffects(tool, args = {}) {
 }
 
 function effectsAllowed(policy, effects) {
-  if (policy.readOnly || policy.rzMcpMode === "read-only") {
+  if (policy.rzMcpMode === "read-only") {
     return effects.every((effect) => effect === "read");
   }
-  if (policy.validationRestricted || policy.rzMcpMode === "no-validation") {
+  if (policy.rzMcpMode === "no-validation") {
     return effects.every((effect) => effect !== "validation" && effect !== "editor-control");
   }
   return true;

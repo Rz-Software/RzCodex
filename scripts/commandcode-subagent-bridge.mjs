@@ -1423,7 +1423,7 @@ function cursorPromptFrom(body) {
     workingDirectory,
     taskState,
     executionPolicy: mainAgent
-      ? checkedExecutionPolicy({ readOnly: false, validationRestricted: false, rzMcpMode: "full" })
+      ? checkedExecutionPolicy({ rzMcpMode: "full" })
       : nativeExecutionPolicyFromTaskState(taskState),
     threadId: typeof body.client_metadata?.thread_id === "string"
       ? body.client_metadata.thread_id
@@ -1475,12 +1475,6 @@ function cursorToolKey(part) {
 }
 
 function runCursorAgent(context, onSpawn, onProgress, { resumeChatId = null, onToolStart } = {}) {
-  if (context.executionPolicy.readOnly || context.executionPolicy.validationRestricted) {
-    throw new BridgeError(
-      "Cursor Agent cannot enforce this restricted task before work: its headless CLI does not provide an isolated no-shell boundary",
-      400,
-    );
-  }
   const entrypoint = cursorAgentEntrypoint();
   const args = [
     entrypoint.script,

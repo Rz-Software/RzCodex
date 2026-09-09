@@ -25,19 +25,10 @@ const RZMCP_EXPLICIT_PROHIBITION = [
   new RegExp(String.raw`\bno\s+(?:use|access|calls?|queries?)\s+(?:(?:of|to)\s+)?(?:the\s+)?${RZMCP_NAME}\b`, "i"),
   new RegExp(String.raw`\b(?:ne\s+(?:pas|jamais)|sans|aucun(?:e)?|interdiction\s+d['’])\b[^\n.;]{0,80}\b(?:utiliser|invoquer|appeler|acc[eé]der)\b[^\n.;]{0,60}\b${RZMCP_NAME}\b`, "i"),
 ];
-const RZMCP_EXPLICIT_REQUIREMENT = [
-  new RegExp(String.raw`\b(?:use|invoke|call|access|query)\b[^\n.;]{0,120}\b${RZMCP_NAME}\b`, "i"),
-  new RegExp(String.raw`\b(?:using|via|through|with)\s+(?:the\s+)?${RZMCP_NAME}\b`, "i"),
-  new RegExp(String.raw`\b${RZMCP_NAME}\b\s+(?:semantic\s+|read[- ]only\s+|native\s+|tool\s+){0,3}(?:calls?|queries?|inspections?|operations?)\b`, "i"),
-  new RegExp(String.raw`\b(?:utiliser|utilisez|utilise|invoquer|invoquez|appeler|appelez|acc[eé]der)\b[^\n.;]{0,120}\b${RZMCP_NAME}\b`, "i"),
-  /\bmcp__rzmcp__[a-z0-9_]+\b/i,
-  /\b(?:search_rzmcp_tools|call_rzmcp_tool)\b/i,
-];
-const GENERIC_EDITOR_RESTRICTION = /\b(?:do not|must not|never)[^.\n]{0,160}\b(?:use|invoke|control|call)\s+(?:any\s+|the\s+)?editor\b|\bno\s+[^.\n]{0,120}\b(?:editor|pie|sie)\b|\b(?:aucun(?:e)?|sans|interdiction\s+d['’](?:ex[eé]cuter|utiliser))[^.\n]{0,160}\b(?:editor|[eé]diteur|pie|sie)\b/i;
 const PRIOR_TASK_REFERENCE = [
   /^\s*(?:resume|continue|proceed|carry on|pick up)(?:\s+(?:the|this|that|same|previous|prior|original|interrupted|preserved)\s+(?:task|work|scope|ownership|implementation|review|audit))?\s*[.!]?\s*$/i,
-  /\b(?:resume|continue|proceed|carry on|pick up)\b[\s\S]{0,240}\b(?:same|previous|prior|original|interrupted|preserved|where you (?:left off|were))\b/i,
-  /\b(?:reprends?|reprendre|continue[rz]?|poursuis|poursuivre)\b[\s\S]{0,240}\b(?:m[eê]me|pr[eé]c[eé]dent|initial|original|interrompu|conserv[eé]|l[aà]\s+o[uù]\s+tu)\b/i,
+  /^\s*(?:please\s+)?(?:resume|continue|proceed|carry on|pick up)\b[^\n.!?]{0,240}\b(?:same|previous|prior|original|interrupted|preserved|where you (?:left off|were))\b/i,
+  /^\s*(?:reprends?|reprendre|continue[rz]?|poursuis|poursuivre)\b[^\n.!?]{0,240}\b(?:m[eê]me|pr[eé]c[eé]dent|initial|original|interrompu|conserv[eé]|l[aà]\s+o[uù]\s+tu)\b/i,
 ];
 
 export class TaskStateError extends Error {
@@ -170,13 +161,12 @@ function payloadFrom(text) {
   return match ? text.slice(match.index + match[0].length) : text;
 }
 
-export function rzMcpModeForTask(text, readOnly) {
+export function rzMcpModeForTask(text) {
   const payload = payloadFrom(text);
-  const explicitlyProhibited = RZMCP_EXPLICIT_PROHIBITION.some((pattern) => pattern.test(payload));
-  if (explicitlyProhibited) return "disabled";
-  const explicitlyRequired = RZMCP_EXPLICIT_REQUIREMENT.some((pattern) => pattern.test(payload));
-  if (!explicitlyRequired && GENERIC_EDITOR_RESTRICTION.test(payload)) return "disabled";
-  return readOnly ? "read-only" : "no-validation";
+  // Only an explicit caller prohibition changes the lazy RzMCP surface. An ordinary delegated
+  // task keeps the full proxy surface; its ownership boundaries stay in the task text itself.
+  if (RZMCP_EXPLICIT_PROHIBITION.some((pattern) => pattern.test(payload))) return "disabled";
+  return "full";
 }
 
 function leadingDirectiveFrom(text) {
@@ -277,8 +267,8 @@ function enrichedTask(message) {
 }
 
 function referencesPriorTask(text) {
-  const payload = payloadFrom(text);
-  return PRIOR_TASK_REFERENCE.some((pattern) => pattern.test(payload));
+  const directives = payloadFrom(text).split(/(?:[.!?]\s+|\r?\n)/);
+  return directives.some((directive) => PRIOR_TASK_REFERENCE.some((pattern) => pattern.test(directive)));
 }
 
 function resumedTaskIntent(text, priorIntent, currentIntent) {

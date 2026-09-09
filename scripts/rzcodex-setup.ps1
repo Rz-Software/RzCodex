@@ -255,6 +255,10 @@ if ($InstallTasks) {
         }
     }
     $taskPowerShellPath = (Get-Command pwsh -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+    $cscPath = "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+    if (-not (Test-Path -LiteralPath $cscPath -PathType Leaf)) {
+        throw "RzCodex scheduled-task setup requires the .NET Framework 64-bit csc.exe compiler: $cscPath"
+    }
 }
 
 $routeOriginallyExists = Test-Path -LiteralPath $routePath -PathType Leaf
@@ -353,10 +357,24 @@ try {
         Copy-Item -LiteralPath (Join-Path $versionedScriptsRoot $fileName) -Destination (Join-Path $stagedLauncherRoot $fileName)
     }
 
+    $stagedBridgeLauncher = Join-Path $stagedLauncherRoot "codex-bridge-launcher.exe"
+    $bridgeLauncherSource = Join-Path $stagedLauncherRoot "rzcodex-bridge-launcher.cs"
+    $existingBridgeLauncher = Join-Path $launcherRoot "codex-bridge-launcher.exe"
     if ($InstallTasks) {
+        if (-not (Test-Path -LiteralPath $bridgeLauncherSource -PathType Leaf)) {
+            throw "RzCodex bridge launcher source is missing: $bridgeLauncherSource"
+        }
+        & $cscPath /nologo /target:winexe /platform:anycpu /out:"$stagedBridgeLauncher" "$bridgeLauncherSource"
+        if ($LASTEXITCODE -ne 0) {
+            throw "Could not compile the RzCodex bridge launcher."
+        }
         $tasksMutated = $true
         Suspend-RzCodexScheduledTasks -TaskBackups $taskBackups
         Stop-RzCodexLegacyBridgeLaunchers -LauncherRoot $launcherRoot
+    } elseif (Test-Path -LiteralPath $existingBridgeLauncher -PathType Leaf) {
+        # Preserve the compiled bootstrap across non-task setup so existing
+        # scheduled actions are not left pointing at a missing executable.
+        Copy-Item -LiteralPath $existingBridgeLauncher -Destination $stagedBridgeLauncher
     }
 
     try {
@@ -446,12 +464,13 @@ try {
             -RestartInterval (New-TimeSpan -Minutes 1) `
             -ExecutionTimeLimit ([TimeSpan]::Zero) `
             -StartWhenAvailable
+        $bridgeLauncherPath = Join-Path $launcherRoot "codex-bridge-launcher.exe"
+        $launcherPath = Join-Path $launcherRoot "rzcodex-launch.ps1"
         foreach ($bridgeProperty in $manifest.bridges.PSObject.Properties) {
             $bridgeName = $bridgeProperty.Name
             $bridge = $bridgeProperty.Value
-            $launcherPath = Join-Path $launcherRoot "rzcodex-launch.ps1"
-            $launcherArguments = "-NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$launcherPath`" -Bridge `"$bridgeName`""
-            $action = New-ScheduledTaskAction -Execute $taskPowerShellPath -Argument $launcherArguments -WorkingDirectory $launcherRoot
+            $bridgeTaskArguments = "`"$taskPowerShellPath`" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$launcherPath`" -Bridge `"$bridgeName`""
+            $action = New-ScheduledTaskAction -Execute $bridgeLauncherPath -Argument $bridgeTaskArguments -WorkingDirectory $launcherRoot
             $trigger = New-ScheduledTaskTrigger -AtLogOn -User $currentUser
             Register-ScheduledTask -TaskName $bridge.taskName -Action $action -Trigger $trigger -Settings $bridgeSettings -Principal $principal -Force | Out-Null
             $priorTask = $taskBackups | Where-Object { $_.Name -eq $bridge.taskName }
@@ -462,9 +481,10 @@ try {
 
         $timeParts = $manifest.updaterTask.dailyAt.Split(":")
         $updateAt = [DateTime]::Today.AddHours([int]$timeParts[0]).AddMinutes([int]$timeParts[1])
+        $updateTaskArguments = "`"$taskPowerShellPath`" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$launcherPath`" -Update"
         $updateAction = New-ScheduledTaskAction `
-            -Execute $taskPowerShellPath `
-            -Argument "-NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$(Join-Path $launcherRoot 'rzcodex-launch.ps1')`" -Update" `
+            -Execute $bridgeLauncherPath `
+            -Argument $updateTaskArguments `
             -WorkingDirectory $launcherRoot
         $updateTrigger = New-ScheduledTaskTrigger -Daily -At $updateAt
         $updateSettings = New-ScheduledTaskSettingsSet `

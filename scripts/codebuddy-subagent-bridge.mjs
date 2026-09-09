@@ -22,7 +22,6 @@ import {
   changedPathsFromApplyPatch,
   formatNativeToolProgress,
   isBridgeProgressReasoning,
-  isExplicitReadOnlyTask,
   normalizeAgentMessageContent,
   referencedPriorTaskPromptSection,
   rzMcpToolNameFromNativeProgress,
@@ -36,7 +35,6 @@ import { projectInstructionsPromptSection } from "./native-project-instructions.
 import { providerFailureDiagnostics } from "./native-subagent-provider-router.mjs";
 import { exitWhenParentStops } from "./bridge-lifecycle.mjs";
 import {
-  assertProviderBoundaryEnforceable,
   codexHome,
   createAuthenticatedBridgeServer,
   executionPolicy as createExecutionPolicy,
@@ -85,12 +83,8 @@ class BridgeError extends Error {
 }
 
 function executionPolicyForTask(taskState) {
-  const task = taskState.activeTask?.text || "";
-  const readOnly = taskState.activeTask?.intent === "analysis" || isExplicitReadOnlyTask(task);
   return createExecutionPolicy({
-    readOnly,
-    validationRestricted: !readOnly,
-    rzMcpMode: rzMcpModeForTask(task, readOnly),
+    rzMcpMode: rzMcpModeForTask(taskState.activeTask?.text || ""),
   });
 }
 
@@ -1248,22 +1242,11 @@ function providerToolCallKey(call) {
 
 function codeBuddyToolPolicy(context) {
   const policy = context.executionPolicy;
-  const tools = ["Read", "Glob", "Grep", "ToolSearch"];
-  if (!policy.readOnly) tools.push("Write", "Edit");
-  if (!policy.validationRestricted && !policy.readOnly) tools.push("Bash");
+  const tools = ["Read", "Glob", "Grep", "ToolSearch", "Write", "Edit", "Bash"];
   if (policy.rzMcpMode !== "disabled") tools.push("DeferExecuteTool");
   if (context.toolInfo.hosted.has("web_search")) tools.push("WebSearch");
   const disallowed = ["Agent", "Task", "TaskCreate", "TaskUpdate", "TaskList", "SendMessage"];
-  if (!tools.includes("Bash")) disallowed.push("Bash");
-  if (!tools.includes("Write")) disallowed.push("Write", "Edit", "NotebookEdit");
-  const boundary = {
-    fileWrites: tools.includes("Write") || tools.includes("Edit") ? "unrestricted" : "disabled",
-    shell: tools.includes("Bash") ? "unrestricted" : "disabled",
-    validationTools: tools.includes("Bash") ? "unrestricted" : "disabled",
-    editorControl: tools.includes("Bash") ? "unrestricted" : "disabled",
-  };
-  assertProviderBoundaryEnforceable("CodeBuddy", boundary, policy);
-  return { tools, disallowed, boundary };
+  return { tools, disallowed };
 }
 
 function codeBuddyArguments(context, mcpConfig) {
@@ -2055,8 +2038,7 @@ function selfTest() {
     throw new Error("self-test failed: CodeBuddy lazy RzMCP mutation accounting");
   }
   const mutationTracker = createNativeMutationTracker(createExecutionPolicy({
-    validationRestricted: true,
-    rzMcpMode: "no-validation",
+    rzMcpMode: "full",
   }));
   mutationTracker.observeUse("edit-failed", "Edit", { file_path: "failed.cpp" });
   if (mutationTracker.snapshot().started !== 1 || mutationTracker.snapshot().successful !== 0) {
@@ -2251,26 +2233,16 @@ function selfTest() {
       text: `Message Type: NEW_TASK\nTask name: /root/rzmcp_policy\nPayload:\n${payload}`,
     }],
   }]);
-  const explicitReadOnlyRzMcp = rzMcpPolicyTask(
-    "self-test-rzmcp-required",
-    "Read-only inspection. No edits/build/tests/editor control/assets saves/staging. Use RzDirectMCP semantic/read-only APIs only (never binary grep).",
-  );
   const explicitRzMcpBan = rzMcpPolicyTask(
     "self-test-rzmcp-forbidden",
-    "Read-only inspection. Use repository text tools, but do not use or invoke RzDirectMCP.",
+    "Review the bounded diff. Do not use or invoke RzDirectMCP.",
   );
   const explicitLazyProxyRequirement = rzMcpPolicyTask(
     "self-test-rzmcp-lazy-proxy-required",
-    "Read-only inspection. Do not control the editor. Use search_rzmcp_tools before call_rzmcp_tool. Never request the full RzMCP catalog.",
-  );
-  const naturalReadOnlyRzMcp = rzMcpPolicyTask(
-    "self-test-rzmcp-natural-required",
-    "Make at least twelve useful rg/file-read calls plus exactly two read-only RzMCP calls. Do not use any other RzMCP calls. Never edit, build, test, or start PIE.",
+    "Use search_rzmcp_tools before call_rzmcp_tool. Never request the full RzMCP catalog.",
   );
   if (
-    explicitReadOnlyRzMcp.executionPolicy.rzMcpMode !== "read-only"
-    || explicitLazyProxyRequirement.executionPolicy.rzMcpMode !== "read-only"
-    || naturalReadOnlyRzMcp.executionPolicy.rzMcpMode !== "read-only"
+    explicitLazyProxyRequirement.executionPolicy.rzMcpMode !== "full"
     || explicitRzMcpBan.executionPolicy.rzMcpMode !== "disabled"
   ) {
     throw new Error("self-test failed: CodeBuddy RzMCP task capability classification");
@@ -2295,13 +2267,14 @@ function selfTest() {
   }
   const readOnlyTools = codeBuddyArguments(readOnlyTask, "mcp-config.json");
   const mutationTools = codeBuddyArguments(boundedMutationTask, "mcp-config.json");
+  const delegatedToolsList = readOnlyTools[readOnlyTools.indexOf("--tools") + 1];
   if (
-    readOnlyTools[readOnlyTools.indexOf("--tools") + 1].includes("Write")
-    || readOnlyTools[readOnlyTools.indexOf("--tools") + 1].includes("Bash")
-    || !mutationTools[mutationTools.indexOf("--tools") + 1].includes("Write")
-    || mutationTools[mutationTools.indexOf("--tools") + 1].includes("Bash")
+    !delegatedToolsList.includes("Write")
+    || !delegatedToolsList.includes("Edit")
+    || !delegatedToolsList.includes("Bash")
+    || mutationTools[mutationTools.indexOf("--tools") + 1] !== delegatedToolsList
   ) {
-    throw new Error("self-test failed: CodeBuddy provider tool boundary did not enforce task policy");
+    throw new Error("self-test failed: CodeBuddy delegated tool surface did not keep the unrestricted native surface");
   }
   if (
     !readOnlyTask.prompt.includes("[Analysis convergence contract]")
@@ -2966,7 +2939,7 @@ function selfTest() {
   if (
     !longPromptArgs.includes("--input-format") ||
     !longPromptArgs.includes("stream-json") ||
-    longPromptArgs[longPromptArgs.indexOf("--tools") + 1] !== "Read,Glob,Grep,ToolSearch,DeferExecuteTool,WebSearch" ||
+    longPromptArgs[longPromptArgs.indexOf("--tools") + 1] !== "Read,Glob,Grep,ToolSearch,Write,Edit,Bash,DeferExecuteTool,WebSearch" ||
     !longPromptArgs.includes("Agent") ||
     longPromptArgs.some((argument) => argument.includes(longPrompt)) ||
     longPromptInput.message?.content?.[0]?.text !== longPrompt

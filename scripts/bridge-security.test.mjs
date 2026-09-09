@@ -7,7 +7,6 @@ import test from "node:test";
 
 import {
   BridgePolicyError,
-  assertProviderBoundaryEnforceable,
   assertToolCallAllowed,
   bridgeAuthorizationHeaders,
   bridgeBearerTokenPath,
@@ -15,7 +14,6 @@ import {
   createAuthenticatedBridgeServer,
   executionPolicy,
   loadBridgeBearerToken,
-  providerBoundaryRequirements,
   sanitizeChildEnvironment,
   setupBridgeBearerToken,
   toolEffects,
@@ -173,36 +171,12 @@ test("child environments retain only the selected provider credentials and never
   });
 });
 
-test("provider boundaries fail unless restricted capabilities are actually disabled", () => {
-  const readOnly = executionPolicy({ readOnly: true, rzMcpMode: "disabled" });
-  assert.deepEqual(providerBoundaryRequirements(readOnly), {
-    fileWrites: "disabled",
-    shell: "disabled",
-    validationTools: "disabled",
-    editorControl: "disabled",
-  });
-  assert.deepEqual(
-    assertProviderBoundaryEnforceable("fixture", {
-      fileWrites: "disabled",
-      shell: "disabled",
-      validationTools: "disabled",
-      editorControl: "disabled",
-    }, readOnly),
-    readOnly,
-  );
+test("execution policy resolves RzMCP modes without task-level permission gates", () => {
+  assert.deepEqual(executionPolicy(), { rzMcpMode: "full" });
+  assert.deepEqual(executionPolicy({ rzMcpMode: "no-validation" }), { rzMcpMode: "no-validation" });
   assert.throws(
-    () => assertProviderBoundaryEnforceable("fixture", { fileWrites: "disabled" }, readOnly),
-    (error) => error instanceof BridgePolicyError && /shell must be disabled/.test(error.message),
-  );
-  const noValidation = executionPolicy({ validationRestricted: true, rzMcpMode: "no-validation" });
-  assert.throws(
-    () => assertProviderBoundaryEnforceable("fixture", {
-      fileWrites: "unrestricted",
-      shell: "unrestricted",
-      validationTools: "disabled",
-      editorControl: "disabled",
-    }, noValidation),
-    /shell must be disabled/,
+    () => executionPolicy({ rzMcpMode: "fixture" }),
+    (error) => error instanceof BridgePolicyError && /Unknown RzMCP mode/.test(error.message),
   );
 });
 
@@ -255,8 +229,8 @@ test("direct and nested tool effects are resolved only from authoritative metada
 });
 
 test("restricted tool policy gates actual nested calls while full mode remains unchanged", () => {
-  const readOnly = executionPolicy({ readOnly: true });
-  const noValidation = executionPolicy({ validationRestricted: true });
+  const readOnly = executionPolicy({ rzMcpMode: "read-only" });
+  const noValidation = executionPolicy({ rzMcpMode: "no-validation" });
   const full = executionPolicy();
   const manage = tool("manage_asset", {
     defaultEffects: ["write", "validation", "editor-control"],

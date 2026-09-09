@@ -11,7 +11,6 @@ import {
   activeTaskPromptSection,
   formatNativeToolProgress,
   isBridgeProgressReasoning,
-  isExplicitReadOnlyTask,
   normalizeAgentMessageContent,
   referencedPriorTaskPromptSection,
   taskControlPromptSections,
@@ -24,7 +23,6 @@ import { projectInstructionsPromptSection } from "./native-project-instructions.
 import { providerFailureDiagnostics } from "./native-subagent-provider-router.mjs";
 import { exitWhenParentStops } from "./bridge-lifecycle.mjs";
 import {
-  assertProviderBoundaryEnforceable,
   codexHome,
   createAuthenticatedBridgeServer,
   executionPolicy as createExecutionPolicy,
@@ -39,7 +37,7 @@ const REQUIRED_EFFORT = "high";
 const DEFAULT_PORT = 54549;
 const MAX_REQUEST_BYTES = 32 * 1024 * 1024;
 const MAX_PROMPT_CHARS = 64_000;
-const MAX_RESUME_PROMPT_CHARS = 16_000;
+const MAX_RESUME_HISTORY_CHARS = 16_000;
 const MAX_ACTIVE_TASK_CHARS = 40_000;
 const MAX_HISTORY_ENTRY_CHARS = 8_000;
 const MAX_ROLE_INSTRUCTIONS_CHARS = 8_000;
@@ -71,12 +69,12 @@ const MCP_CONFIG = join(ISOLATED_CONFIG_DIRECTORY, "mcp_config.json");
 const LAZY_MCP_SERVER = "rzcodex-lazy";
 const AGENT_IDS = Object.freeze({
   main: "rzcodex-main",
-  readOnly: "rzcodex-native-readonly",
-  noValidation: "rzcodex-native-no-validation",
+  worker: "rzcodex-native",
 });
 const READ_TOOLS = Object.freeze(["view_file", "list_dir", "find_by_name", "grep_search", "search_web", "read_url_content"]);
 const WRITE_TOOLS = Object.freeze(["write_to_file", "replace_file_content"]);
 const MAIN_TOOLS = Object.freeze([...READ_TOOLS, "run_command", "manage_task", ...WRITE_TOOLS]);
+const WORKER_TOOLS = Object.freeze([...READ_TOOLS, "run_command", ...WRITE_TOOLS]);
 const AGENT_PREAMBLE = "You are a bounded native agent. Never delegate or invoke another agent. Honor the supplied workspace and task policy exactly. Keep each reasoning/tool cycle focused and return promptly when complete or concretely blocked.";
 
 function agentDefinition(id, description, tools) {
@@ -85,8 +83,7 @@ function agentDefinition(id, description, tools) {
 
 const AGENT_DEFINITIONS = new Map([
   [AGENT_IDS.main, agentDefinition(AGENT_IDS.main, "RzCodex primary agent.", MAIN_TOOLS)],
-  [AGENT_IDS.readOnly, agentDefinition(AGENT_IDS.readOnly, "Read-only RzCodex native worker.", READ_TOOLS)],
-  [AGENT_IDS.noValidation, agentDefinition(AGENT_IDS.noValidation, "File-editing RzCodex worker without shell or validation tools.", [...READ_TOOLS, ...WRITE_TOOLS])],
+  [AGENT_IDS.worker, agentDefinition(AGENT_IDS.worker, "RzCodex native worker.", WORKER_TOOLS)],
 ]);
 const MUTATION_TOOLS = new Set(["multi_replace_file_content", "replace_file_content", "sed_file", "write_to_file"]);
 const BOUNDED_WAIT_TOOL = "schedule";
@@ -185,28 +182,17 @@ function ensureIsolatedRuntimeFiles() {
 
 function executionPolicyForContext(mainAgent, taskState) {
   if (mainAgent) return createExecutionPolicy();
-  const task = taskState.activeTask?.text || "";
-  const readOnly = taskState.activeTask?.intent === "analysis" || isExplicitReadOnlyTask(task);
   return createExecutionPolicy({
-    readOnly,
-    validationRestricted: !readOnly,
-    rzMcpMode: rzMcpModeForTask(task, readOnly),
+    rzMcpMode: rzMcpModeForTask(taskState.activeTask?.text || ""),
   });
 }
 
-function agentProfileFor(mainAgent, policy) {
+function agentProfileFor(mainAgent) {
   const id = mainAgent
     ? AGENT_IDS.main
-    : policy.readOnly ? AGENT_IDS.readOnly : AGENT_IDS.noValidation;
-  const tools = mainAgent ? MAIN_TOOLS : policy.readOnly ? READ_TOOLS : [...READ_TOOLS, ...WRITE_TOOLS];
-  const boundary = {
-    fileWrites: tools.some((tool) => WRITE_TOOLS.includes(tool)) ? "unrestricted" : "disabled",
-    shell: tools.includes("run_command") ? "unrestricted" : "disabled",
-    validationTools: tools.includes("run_command") ? "unrestricted" : "disabled",
-    editorControl: tools.includes("run_command") ? "unrestricted" : "disabled",
-  };
-  assertProviderBoundaryEnforceable("Antigravity", boundary, policy);
-  return Object.freeze({ id, tools, boundary, mode: policy.readOnly ? "plan" : "accept-edits" });
+    : AGENT_IDS.worker;
+  const tools = mainAgent ? MAIN_TOOLS : WORKER_TOOLS;
+  return Object.freeze({ id, tools, mode: "accept-edits" });
 }
 
 function providerFailureDetail(result, stderr) {
@@ -507,10 +493,7 @@ function workingDirectoryFrom(body, input) {
 }
 
 function delegationContract(requestId, workingDirectory, policy) {
-  const localTools = policy.readOnly
-    ? "Use only Antigravity's read-only file/search tools; shell and file writes are disabled."
-    : "Use Antigravity's file read/search/edit tools; shell, builds, tests, and editor control are disabled.";
-  return `[Native Antigravity delegation contract]\nRzCodex request ID: ${requestId}\nWork directly in the supplied workspace as the bounded native sub-agent. ${localTools} Do not emit Codex tool calls and do not invoke Antigravity subagents. Every file-tool path must be absolute. For Unreal/RzMCP work, use only MCP server ${LAZY_MCP_SERVER}: discover a small focused schema with search_rzmcp_tools, then call only a discovered tool through call_rzmcp_tool. Never request or enumerate the full RzMCP catalog. Return concise evidence as soon as the bounded task is complete or genuinely blocked.\nAuthoritative workspace: ${workingDirectory}`;
+  return `[Native Antigravity delegation contract]\nRzCodex request ID: ${requestId}\nWork directly in the supplied workspace as the bounded native sub-agent. Use Antigravity's local file read/search/edit tools directly; shell tool use must honor the parent task boundaries. Do not emit Codex tool calls and do not invoke Antigravity subagents. Every file-tool path must be absolute. For Unreal/RzMCP work, use only MCP server ${LAZY_MCP_SERVER} in ${policy.rzMcpMode} mode: discover a small focused schema with search_rzmcp_tools, then call only a discovered tool through call_rzmcp_tool. Never request or enumerate the full RzMCP catalog. Return concise evidence as soon as the bounded task is complete or genuinely blocked.\nAuthoritative workspace: ${workingDirectory}`;
 }
 
 function mainAgentContract(requestId, workingDirectory) {
@@ -571,13 +554,7 @@ function historyEntries(input, taskState) {
     } else {
       throw new BridgeError(`input[${index}] has unsupported type ${json(item.type)}`);
     }
-    if (text.length > MAX_HISTORY_ENTRY_CHARS) {
-      if (control) {
-        throw new BridgeError(
-          `Antigravity current control entry input[${index}] is ${text.length} characters; maximum is ${MAX_HISTORY_ENTRY_CHARS}`,
-          400,
-        );
-      }
+    if (!control && text.length > MAX_HISTORY_ENTRY_CHARS) {
       text = `${text.slice(0, MAX_HISTORY_ENTRY_CHARS - 24)}\n[history entry truncated]`;
     }
     entries.push({ index, checkpoint, control, text, key: messageKey(item, text) });
@@ -586,25 +563,28 @@ function historyEntries(input, taskState) {
 }
 
 function boundedEntries(entries, budget, activeTaskText, entrySeparatorChars = 0) {
-  const retained = [];
-  let remaining = Math.max(0, budget);
-  for (let index = entries.length - 1; index >= 0; index -= 1) {
-    let text = entries[index].text;
-    if (activeTaskText) text = text.split(activeTaskText).join("[duplicate active task omitted]");
-    const textBudget = remaining - entrySeparatorChars;
-    if (text.length > textBudget) {
-      if (entries[index].control) {
-        throw new BridgeError(
-          `Antigravity current control entry requires ${text.length} characters but only ${Math.max(0, textBudget)} remain`,
-          400,
-        );
-      }
-      continue;
-    }
-    retained.unshift({ ...entries[index], text });
-    remaining -= text.length + entrySeparatorChars;
+  const normalized = entries.map((entry) => ({
+    ...entry,
+    text: activeTaskText ? entry.text.split(activeTaskText).join("[duplicate active task omitted]") : entry.text,
+  }));
+  const retained = normalized.filter((entry) => entry.control);
+  const controlChars = retained.reduce((sum, entry) => sum + entry.text.length + entrySeparatorChars, 0);
+  if (controlChars > budget) {
+    throw new BridgeError(
+      `Antigravity current controls require ${controlChars} characters but only ${Math.max(0, budget)} remain`,
+      400,
+    );
   }
-  return retained;
+  let remaining = budget - controlChars;
+  for (let index = normalized.length - 1; index >= 0; index -= 1) {
+    const entry = normalized[index];
+    if (entry.control) continue;
+    const chars = entry.text.length + entrySeparatorChars;
+    if (chars > remaining) continue;
+    retained.push(entry);
+    remaining -= chars;
+  }
+  return retained.sort((left, right) => left.index - right.index);
 }
 
 function requestContext(body) {
@@ -641,7 +621,7 @@ function requestContext(body) {
     : null;
   const conversationKey = threadId || taskState.activeTask?.name || null;
   const policy = executionPolicyForContext(mainAgent, taskState);
-  const agentProfile = agentProfileFor(mainAgent, policy);
+  const agentProfile = agentProfileFor(mainAgent);
   const workspaceKey = process.platform === "win32" ? workingDirectory.toLowerCase() : workingDirectory;
   const compatibilityKey = sha256(json({ workspaceKey, mainAgent, policy }));
   const sessionKey = conversationKey
@@ -719,31 +699,39 @@ function resumePrompt(context, session) {
     && context.taskState.activeTask
     && context.taskState.activeTask.hash !== session.lastDeliveredTaskHash;
   const activeTask = activeTaskNeedsDelivery ? activeTaskPromptSection(context.taskState) : "";
-  const mandatorySections = [activeTask, ...taskControlSections].filter(Boolean);
-  const controlChars = mandatorySections.reduce((sum, section) => sum + section.length + 2, 0);
-  if (controlChars > MAX_RESUME_PROMPT_CHARS) {
-    throw new BridgeError("Antigravity current task controls exceeded the resume prompt limit", 400);
-  }
-  const retained = boundedEntries(
-    unseen,
-    MAX_RESUME_PROMPT_CHARS - controlChars,
-    context.taskState.activeTask?.text,
-  );
   const resumeHeader = context.mainAgent
     ? `[RzCodex main-agent continuation]\nContinue this conversation as the primary coding agent in ${context.workingDirectory}. Use your local tools directly and return only when the current user request is complete or concretely blocked.`
     : `[Native Antigravity resume]\nContinue the retained active task in ${context.workingDirectory}. Task hash: ${context.taskState.activeTask?.hash || "none"}. The original task remains authoritative; do not restart the investigation.`;
-  const sections = [
+  const headerSections = [
     resumeHeader,
     ...(session.providerWorkStarted
       ? ["[Retained provider ownership - authoritative]\nProvider tool work already started in this exact Antigravity conversation. Continue from retained state and do not replay completed work."]
       : []),
+  ];
+  const currentControls = unseen.filter((entry) => entry.control);
+  const mandatorySections = [...headerSections, ...currentControls.map((entry) => entry.text), activeTask, ...taskControlSections].filter(Boolean);
+  const mandatoryChars = mandatorySections.reduce((sum, section) => sum + section.length + 2, 0);
+  if (mandatoryChars > MAX_PROMPT_CHARS) {
+    throw new BridgeError(`Antigravity current task controls require ${mandatoryChars} characters; prompt maximum is ${MAX_PROMPT_CHARS}`, 400);
+  }
+  const history = boundedEntries(
+    unseen.filter((entry) => !entry.control),
+    Math.min(MAX_RESUME_HISTORY_CHARS, MAX_PROMPT_CHARS - mandatoryChars),
+    context.taskState.activeTask?.text,
+    2,
+  );
+  const retained = [...history, ...currentControls].sort((left, right) => left.index - right.index);
+  const sections = [
+    ...headerSections,
     ...retained.filter((entry) => !entry.checkpoint).map((entry) => entry.text),
     ...retained.filter((entry) => entry.checkpoint).map((entry) => entry.text),
     ...(activeTask ? [activeTask] : []),
     ...taskControlSections,
   ];
   if (retained.length === 0 && !activeTask) sections.push("Continue from the retained provider state and return when complete or concretely blocked.");
-  return sections.join("\n\n");
+  const prompt = sections.join("\n\n");
+  if (prompt.length > MAX_PROMPT_CHARS) throw new BridgeError("Antigravity retained prompt exceeded its hard limit", 400);
+  return prompt;
 }
 
 function subtractUsage(current, previous) {
@@ -973,7 +961,6 @@ function sessionArguments(selectedModel, agentProfile, conversationId = null) {
     ...(selectedModel.effort ? ["--effort", selectedModel.effort] : []),
     ...(conversationId ? ["--conversation", conversationId] : []),
     "--dangerously-skip-permissions", "--disable-slash-commands",
-    ...(agentProfile.boundary.shell === "disabled" ? ["--sandbox"] : []),
     "--print-timeout", "30m",
   ];
 }
@@ -1919,8 +1906,7 @@ function health() {
       definitionHashes: agentDefinitionHashes,
       declarativeToolAllowlists: Object.fromEntries([
         [AGENT_IDS.main, MAIN_TOOLS],
-        [AGENT_IDS.readOnly, READ_TOOLS],
-        [AGENT_IDS.noValidation, [...READ_TOOLS, ...WRITE_TOOLS]],
+        [AGENT_IDS.worker, WORKER_TOOLS],
       ]),
       forceDisableFundamentalComponents: true,
       forbiddenToolPolicy: "terminate_committed_turn",
@@ -1969,7 +1955,7 @@ function health() {
 
 async function selfTest() {
   const testPolicy = createExecutionPolicy();
-  const testProfile = agentProfileFor(true, testPolicy);
+  const testProfile = agentProfileFor(true);
   const workStartedMetadata = providerWorkStartedMetadata("replace_file_content");
   if (
     workStartedMetadata.provider_work_started !== true
@@ -1981,7 +1967,7 @@ async function selfTest() {
   const primaryArgs = sessionArguments(models.primary, testProfile);
   const fallbackArgs = sessionArguments(models.fallback, testProfile);
   if (primaryArgs[primaryArgs.indexOf("--agent") + 1] !== AGENT_IDS.main) {
-    throw new Error("restricted Antigravity agent was not selected");
+    throw new Error("main Antigravity agent was not selected");
   }
   if (primaryArgs.includes("--effort")) throw new Error("Opus Thinking received an unsupported effort flag");
   if (fallbackArgs[fallbackArgs.indexOf("--effort") + 1] !== REQUIRED_EFFORT) {
@@ -2095,13 +2081,13 @@ async function selfTest() {
     return rejected;
   };
   const safeQuotaFailure = quotaFailureFor([], 100);
-  const readOnlyQuotaFailure = quotaFailureFor(["view_file", "grep_search", "run_command", "manage_task"]);
+  const observedQuotaFailure = quotaFailureFor(["view_file", "grep_search", "run_command", "manage_task"]);
   const committedQuotaFailure = quotaFailureFor(["write_to_file"]);
   if (!safeQuotaFailure?.modelQuotaFailure || !safeQuotaFailure.safeToRetry || safeQuotaFailure.routeCommitted) {
     throw new Error("safe model-quota retry classification failed");
   }
-  if (!readOnlyQuotaFailure?.modelQuotaFailure || readOnlyQuotaFailure.safeToRetry || !readOnlyQuotaFailure.routeCommitted) {
-    throw new Error("read-only provider work was incorrectly eligible for cross-provider replay");
+  if (!observedQuotaFailure?.modelQuotaFailure || observedQuotaFailure.safeToRetry || !observedQuotaFailure.routeCommitted) {
+    throw new Error("observed provider work was incorrectly eligible for cross-provider replay");
   }
   if (!committedQuotaFailure?.modelQuotaFailure || committedQuotaFailure.safeToRetry || !committedQuotaFailure.routeCommitted) {
     throw new Error("committed model-quota failure classification failed");
@@ -2692,6 +2678,49 @@ async function selfTest() {
   if (!resumedDiagnostics.completeTaskDelivered || resumed.includes(task)) {
     throw new Error("provider-session task retention failed");
   }
+  const longControl = `[Updated project instructions]\n${"instruction ".repeat(1_895)}`;
+  const longControlContext = requestContext({
+    ...fixture,
+    input: [...fixture.input, { type: "message", role: "user", content: longControl }],
+  });
+  const longControlFirst = fullPrompt(longControlContext);
+  const longControlResume = resumePrompt(longControlContext, retainedSession);
+  if (
+    !longControlFirst.includes(longControl)
+    || taskDeliveryDiagnostics(longControlContext.taskState, longControlFirst).completeTaskOccurrences !== 1
+    || longControlFirst.length > MAX_PROMPT_CHARS
+    || !longControlResume.includes(longControl)
+    || longControlResume.includes(task)
+    || longControlResume.length > MAX_PROMPT_CHARS
+  ) {
+    throw new Error("long authoritative current control was lost or confused with bounded history");
+  }
+  const alreadyDeliveredControl = resumePrompt(longControlContext, {
+    ...retainedSession,
+    seenMessageKeys: new Set(longControlContext.messageKeys),
+  });
+  if (alreadyDeliveredControl.includes(longControl)) {
+    throw new Error("retained authoritative control was delivered twice");
+  }
+  const controlsBeforeHistory = boundedEntries([
+    { index: 0, control: true, text: "authoritative" },
+    { index: 1, control: false, text: "lossy history occupying the available budget" },
+  ], 20);
+  if (controlsBeforeHistory.length !== 1 || !controlsBeforeHistory[0].control) {
+    throw new Error("lossy history displaced an authoritative control");
+  }
+  const oversizedControlContext = requestContext({
+    ...fixture,
+    input: [fixture.input.at(-1), { type: "message", role: "user", content: "x".repeat(MAX_PROMPT_CHARS) }],
+  });
+  for (const makePrompt of [
+    () => fullPrompt(oversizedControlContext),
+    () => resumePrompt(oversizedControlContext, retainedSession),
+  ]) {
+    let failure;
+    try { makePrompt(); } catch (error) { failure = error; }
+    if (failure?.status !== 400) throw new Error("oversized authoritative control escaped the final prompt cap");
+  }
   const analysisTask = "Message Type: NEW_TASK\nTask name: /root/agy_analysis\nPayload:\nInspect the bounded evidence and report only when complete.";
   const immediateMessage = "Message Type: MESSAGE\nTask name: /root/agy_analysis\nPayload:\nStop further investigation and immediately return your current verdict.";
   const analysisContext = requestContext({
@@ -2713,8 +2742,8 @@ async function selfTest() {
     ||
     !analysisFirst.includes("[Analysis convergence contract]")
     || analysisFirst.includes("[Immediate terminal report required]")
-    || analysisContext.agentProfile.id !== AGENT_IDS.readOnly
-    || analysisContext.agentProfile.tools.some((tool) => WRITE_TOOLS.includes(tool) || tool === "run_command")
+    || analysisContext.agentProfile.id !== AGENT_IDS.worker
+    || !analysisContext.agentProfile.tools.includes("replace_file_content")
   ) {
     throw new Error("Antigravity analysis convergence control failed");
   }
@@ -2732,11 +2761,12 @@ async function selfTest() {
     }],
   });
   if (
-    mutationPolicyContext.agentProfile.id !== AGENT_IDS.noValidation
+    mutationPolicyContext.agentProfile.id !== AGENT_IDS.worker
     || !mutationPolicyContext.agentProfile.tools.includes("replace_file_content")
-    || mutationPolicyContext.agentProfile.tools.includes("run_command")
+    || !mutationPolicyContext.agentProfile.tools.includes("run_command")
+    || mutationPolicyContext.policy.rzMcpMode !== "full"
   ) {
-    throw new Error("Antigravity mutation policy did not enforce the no-validation provider boundary");
+    throw new Error("Antigravity mutation policy did not resolve its RzMCP mode without restricting the native surface");
   }
   const priorResumeTaskText = "Message Type: NEW_TASK\nTask name: /root/agy_resume\nPayload:\nInspect the original bounded fixture under its exact ownership constraints.";
   const activeResumeTaskText = "Message Type: NEW_TASK\nTask name: /root/agy_resume\nPayload:\nBridge repaired. Resume the same bounded audit from your preserved state; keep the original scope and finish.";

@@ -12,7 +12,6 @@ import {
   TaskStateError,
   activeTaskPromptSection,
   formatNativeToolProgress,
-  isExplicitReadOnlyTask,
   isBridgeProgressReasoning,
   normalizeAgentMessageContent,
   referencedPriorTaskPromptSection,
@@ -24,12 +23,10 @@ import {
 } from "./codebuddy-subagent-task-state.mjs";
 import { projectInstructionsPromptSection } from "./native-project-instructions.mjs";
 import {
-  assertProviderBoundaryEnforceable,
   bridgeAuthorizationHeaders,
   createAuthenticatedBridgeServer,
   executionPolicy as sharedExecutionPolicy,
   loadBridgeBearerToken,
-  providerBoundaryRequirements,
   sanitizeChildEnvironment,
 } from "./bridge-security.mjs";
 import {
@@ -110,14 +107,9 @@ const INTERRUPTED_STREAM = /stream (?:was )?interrupted|stream disconnected|conn
 const PROVIDER_COMPACTION = /provider context compacted/i;
 const READ_ONLY_RZMCP_TOOL_NAME = /^(?:analyze|check|count|describe|discover|does|enumerate|find|get|has|inspect|is|list|locate|query|read|resolve|search|validate)_/i;
 const PERMISSION_REJECTION = /rejected a tool call that requires confirmation|permission (?:was )?denied|requires (?:user )?confirmation/i;
+const OUTPUT_TOKEN_LIMIT = /model hit(?: the)? max output token limit|Response truncated:\s*model hit max output token limit|output token limit reached|the output above is incomplete/i;
 const QUOTA_STATE_VERSION = 2;
 const RECOVERY_PROBE_STATE_VERSION = 1;
-const DEVIN_PROVIDER_BOUNDARY = Object.freeze({
-  fileWrites: "unrestricted",
-  shell: "unrestricted",
-  validationTools: "unrestricted",
-  editorControl: "unrestricted",
-});
 
 class BridgeError extends Error {
   constructor(message, status = 400) {
@@ -380,22 +372,8 @@ function sanitizedEnvironment(source = process.env) {
 }
 
 export function executionPolicyFromTaskState(taskState) {
-  const taskText = taskState?.activeTask?.text || "";
-  const readOnly = taskState?.activeTask?.intent === "analysis" || isExplicitReadOnlyTask(taskText);
-  const validationRestricted = !readOnly;
-  const requestedRzMcpMode = rzMcpModeForTask(taskText, readOnly);
-  const rzMcpMode = validationRestricted && requestedRzMcpMode === "full"
-    ? "no-validation"
-    : requestedRzMcpMode;
   return {
-    ...sharedExecutionPolicy({
-      readOnly,
-      validationRestricted,
-      rzMcpMode,
-    }),
-    // Devin's non-interactive restricted modes do not provide a proven independent file/shell
-    // boundary. Unrestricted work uses its full native surface; restricted work is rejected before
-    // session lease or provider spawn by assertDevinTaskBoundary.
+    ...sharedExecutionPolicy({ rzMcpMode: rzMcpModeForTask(taskState?.activeTask?.text || "") }),
     permissionMode: "dangerous",
   };
 }
@@ -405,21 +383,6 @@ function providerEnvironment(executionPolicy) {
     ...sanitizedEnvironment(),
     RZCODEX_SUBAGENT_RZMCP_MODE: executionPolicy.rzMcpMode,
   };
-}
-
-function providerBoundaryPrompt(policy) {
-  const requirements = providerBoundaryRequirements(policy);
-  return `[Enforced provider boundary]\nFile writes: ${requirements.fileWrites}. Shell: ${requirements.shell}. Validation tools: ${requirements.validationTools}. Editor control: ${requirements.editorControl}. RzMCP mode: ${policy.rzMcpMode}. A provider that cannot enforce every disabled capability must reject this task before work.`;
-}
-
-export function assertDevinTaskBoundary(policy) {
-  try {
-    assertProviderBoundaryEnforceable("Devin CLI", DEVIN_PROVIDER_BOUNDARY, policy);
-  } catch (error) {
-    const rejection = new BridgeError(error.message, 422);
-    rejection.routeSkipped = true;
-    throw rejection;
-  }
 }
 
 function centralRoute() {
@@ -552,23 +515,29 @@ function authStatus() {
   };
 }
 
-function ensureRuntimeConfig() {
+function ensureRuntimeConfig(selectedModel = null) {
   const source = JSON.parse(readFileSync(USER_DEVIN_CONFIG, "utf8"));
   const orgId = requireString(source.devin?.org_id, "Devin org_id");
   mkdirSync(DEVIN_HOME, { recursive: true });
   mkdirSync(REQUEST_DIRECTORY, { recursive: true });
-  for (const name of readdirSync(REQUEST_DIRECTORY)) {
-    if (!/^[0-9a-f-]{36}(?:-[0-9a-f-]{36})?\.txt$/i.test(name)) continue;
-    const path = join(REQUEST_DIRECTORY, name);
-    try {
-      if (Date.now() - statSync(path).mtimeMs >= STALE_REQUEST_FILE_AGE_MS) unlinkSync(path);
-    } catch (error) {
-      if (error?.code !== "ENOENT") {
-        process.stderr.write(`[RzCodex] Deferred stale Devin prompt cleanup for ${name}: ${error?.code || error?.name || "unknown_error"}\n`);
+  if (!selectedModel) {
+    for (const name of readdirSync(REQUEST_DIRECTORY)) {
+      if (!/^[0-9a-f-]{36}(?:-[0-9a-f-]{36})?\.txt$/i.test(name)) continue;
+      const path = join(REQUEST_DIRECTORY, name);
+      try {
+        if (Date.now() - statSync(path).mtimeMs >= STALE_REQUEST_FILE_AGE_MS) unlinkSync(path);
+      } catch (error) {
+        if (error?.code !== "ENOENT") {
+          process.stderr.write(`[RzCodex] Deferred stale Devin prompt cleanup for ${name}: ${error?.code || error?.name || "unknown_error"}\n`);
+        }
       }
     }
   }
-  writeFileSync(ISOLATED_CONFIG, `${json({
+  const configPath = selectedModel
+    ? join(DEVIN_HOME, "configs", String(selectedModel.model_uid).replace(/[^a-zA-Z0-9_-]/g, "-"), "config.json")
+    : ISOLATED_CONFIG;
+  mkdirSync(dirname(configPath), { recursive: true });
+  const config = {
     version: 1,
     devin: { org_id: orgId },
     shell: { setup_complete: true },
@@ -584,7 +553,14 @@ function ensureRuntimeConfig() {
       opencode: false,
       zed: false,
     },
-  })}\n`, "utf8");
+  };
+  if (selectedModel) {
+    config.agent = { model: selectedModel.model_uid };
+  }
+  const temporaryPath = `${configPath}.${process.pid}.tmp`;
+  writeFileSync(temporaryPath, `${json(config)}\n`, "utf8");
+  renameSync(temporaryPath, configPath);
+  return configPath;
 }
 
 let calendarQuotaState = null;
@@ -633,7 +609,6 @@ const runtime = {
   lastClientCancellationReason: null,
   resourceRetries: 0, providerContinuations: 0, nativeTerminalContinuations: 0,
   streamContinuations: 0, compactionCheckpoints: 0,
-  providerCheckpoints: 0,
   permissionCheckpoints: 0, activeResourceBackoffs: 0,
   sessionCleanupFailures: 0, lastSessionCleanupError: null,
   lastResourceModel: null, lastResourceRetryAttempt: 0,
@@ -1057,7 +1032,7 @@ function promptFrom(body) {
       : `[Native delegated coding contract]\nRzCodex request ID: ${requestId}\nWork directly in the supplied workspace as the bounded native sub-agent. Use the file and command tools available in this turn. Do not spawn provider-side subagents. Honor project AGENTS.md ownership boundaries exactly; when builds, tests, editor control, PIE, runtime validation, or RzMCP execution are reserved to the parent, do not invoke them and instead report the exact checks the parent should run. For Unreal/RzMCP work that is within your assigned ownership, use only the lazy RzMCP proxy surface: search with an exact or focused query, then call only a discovered tool. Never use or request the full RzMCP catalog. On Windows, use PowerShell-native commands, single-quote ripgrep patterns containing |, and never assume Unix-only commands such as head are installed. Return concise evidence as soon as the bounded task is complete or genuinely blocked.\nAuthoritative workspace: ${workingDirectory}`,
     mainAgent
       ? `[Provider permissions]\nNon-interactive native file, shell, and full lazy RzMCP access are enabled for the main agent. These capabilities do not expand the user request or project instructions.`
-      : providerBoundaryPrompt(executionPolicy),
+      : `[RzMCP mode]\nRzMCP mode: ${executionPolicy.rzMcpMode}. Use only the lazy RzMCP proxy surface; RzMCP mode does not expand the user request or project instructions.`,
     projectInstructionsPromptSection(workingDirectory),
   ];
   if (mainAgent && typeof body.instructions === "string" && body.instructions.trim()) {
@@ -1217,72 +1192,6 @@ function openCodeSelection(reason) {
     provider: "opencode",
     model: { model_uid: route.openCodeResponseModel, label: route.openCodeModel },
     reason,
-  };
-}
-
-function selectionForFailedStage(stage) {
-  if (stage === "antigravity") return antigravitySelection("provider_checkpoint");
-  if (stage === "ollama") return ollamaSelection("provider_checkpoint");
-  if (stage === "opencode") return openCodeSelection("provider_checkpoint");
-  if (stage === "devin-free") return terminalSelection("provider_checkpoint");
-  if (stage === "codebuddy") return codeBuddySelection("provider_checkpoint");
-  if (stage === "devin") {
-    return { key: "primary", provider: "devin", model: models.primary, reason: "provider_checkpoint" };
-  }
-  return { key: stage || "external", provider: stage || "external", model: { model_uid: "unknown", label: "unknown" }, reason: "provider_checkpoint" };
-}
-
-function committedProviderResult(context, error) {
-  const selected = selectionForFailedStage(error?.failedStage);
-  const toolNames = [...new Set([
-    ...(Array.isArray(error?.nativeToolNames) ? error.nativeToolNames : []),
-    ...(Array.isArray(error?.toolNames) ? error.toolNames : []),
-  ].filter((name) => typeof name === "string" && name))];
-  const mutationCount = Math.max(
-    Number(error?.providerMutationCount || 0),
-    Number(error?.mutationToolCalls || 0),
-  );
-  const pinnedContinuationFailure = error?.providerTaskPinPreserved === true;
-  const text = [
-    "[Authoritative native-provider checkpoint]",
-    `Task hash: ${context.taskDiagnostics.taskHash}`,
-    `Provider: ${selected.provider}`,
-    `Provider tool calls completed: ${Number(error?.toolCalls || toolNames.length)}`,
-    `Provider mutation calls observed: ${mutationCount}`,
-    `Tool names: ${toolNames.join(", ") || "not reported"}`,
-    `Last completed tool: ${error?.lastCompletedTool || toolNames.at(-1) || "not reported"}`,
-    pinnedContinuationFailure
-      ? "Concrete blocker: the provider continuation stopped before completing the already-owned active task."
-      : "Concrete blocker: the provider stopped after beginning tool work and did not return a terminal response.",
-    pinnedContinuationFailure
-      ? "The active task remains pinned to the same provider. No later provider was started and no committed context was replayed across providers; the parent can resume this same subagent."
-      : "The provider turn was not replayed and no later provider was started. The delegated task may be incomplete; the parent should inspect the preserved work and decide whether to resume or reassign it.",
-  ].join("\n");
-  return {
-    text,
-    selected,
-    providerMetadata: { provider_checkpoint: true },
-    quotaFallback: false,
-    terminalFallback: selected.key === "terminal",
-    fallbackReason: null,
-    fallbackFailure: null,
-    creditCost: 0,
-    acuCost: 0,
-    inputTokens: 0,
-    cachedTokens: 0,
-    outputTokens: 0,
-    peakTurnContextTokens: Number(error?.peakContextTokens || 0),
-    outputTokensPerSecond: null,
-    toolCalls: [],
-    nativeToolNames: toolNames,
-    rzMcpTools: [...new Set([
-      ...(Array.isArray(error?.nativeRzMcpTools) ? error.nativeRzMcpTools : []),
-      ...(Array.isArray(error?.rzMcpTools) ? error.rzMcpTools : []),
-    ])],
-    toolSchemaBytesIgnored: context.toolSchemaBytes,
-    toolSchemaBytesForwarded: 0,
-    autoStage: error?.failedStage || null,
-    preserveProviderPin: pinnedContinuationFailure,
   };
 }
 
@@ -1621,6 +1530,8 @@ function terminalAssistantFromRows(conversationRows) {
   for (const row of conversationRows) {
     const message = typeof row.chat_message === "string" ? JSON.parse(row.chat_message) : row.chat_message;
     if (message.role === "user") {
+      terminalNodeId = -1;
+      terminalText = null;
       const content = typeof message.content === "string" ? message.content.trimStart() : "";
       awaitingCompactionSummary = content.startsWith("Conversation to summarize:")
         || content.startsWith("Now summarize the conversation above");
@@ -1744,10 +1655,11 @@ function runCli(
     toolCallBaseline = [],
   } = {},
 ) {
+  const configPath = ensureRuntimeConfig(selectedModel);
   const promptPath = join(REQUEST_DIRECTORY, `${context.requestId}-${randomUUID()}.txt`);
   writeFileSync(promptPath, prompt, { encoding: "utf8", flag: "wx" });
   const args = [
-    "--config", ISOLATED_CONFIG, "--model", selectedModel.model_uid,
+    "--config", configPath, "--model", selectedModel.model_uid,
     "--permission-mode", context.executionPolicy.permissionMode,
     "--respect-workspace-trust", "false",
     ...(resumeSessionId ? ["--resume", resumeSessionId] : []),
@@ -1852,6 +1764,10 @@ function isPermissionRejection(cliResult) {
   return cliFailed(cliResult) && PERMISSION_REJECTION.test(`${cliResult.stdout}\n${cliResult.stderr}`);
 }
 
+function isOutputTokenLimitFailure(cliResult) {
+  return cliFailed(cliResult) && OUTPUT_TOKEN_LIMIT.test(`${cliResult.stdout}\n${cliResult.stderr}`);
+}
+
 function devinStreamContinuationPrompt(context) {
   return `[Native Devin stream recovery]\nContinue the same retained conversation and active task after the interrupted provider stream. Task hash: ${context.taskDiagnostics.taskHash}. Do not restart the investigation or repeat completed tool calls or file edits. Return the next required tool call or the concise final result.`;
 }
@@ -1913,6 +1829,7 @@ function mutationToolCalls(toolCalls, executionPolicy) {
       "apply_patch",
       "edit",
       "edit_file",
+      "write",
       "write_file",
       "create_file",
       "delete_file",
@@ -1964,8 +1881,9 @@ export function devinPostToolQuotaFailure(session, executionPolicy) {
   );
 }
 
-function providerCheckpointReason({ resourceFailure, streamFailure, compactionFailure, permissionFailure, incompleteTurn }) {
+function providerCheckpointReason({ resourceFailure, streamFailure, compactionFailure, permissionFailure, incompleteTurn, outputTokenLimit }) {
   if (resourceFailure) return "the provider reported a transient resource failure";
+  if (outputTokenLimit) return "the provider response was truncated by the output token limit";
   if (streamFailure) return "the provider stream ended before a terminal response";
   if (compactionFailure) return "the provider compacted its context before a terminal response";
   if (permissionFailure) return "an enforced provider permission rejected a required operation";
@@ -1973,12 +1891,13 @@ function providerCheckpointReason({ resourceFailure, streamFailure, compactionFa
   return "the provider stopped before a terminal response";
 }
 
-function completedProviderCheckpoint(context, session, failureState) {
+function providerRecoveryError(context, session, failureState) {
   const toolCalls = providerCompletedToolCalls(session);
   const toolNames = [...new Set(toolCalls.map((call) => String(call.name)))];
   const mutations = providerCompletedMutationToolCalls(session, context.executionPolicy).length;
   const text = [
-    "[Authoritative native-provider checkpoint]",
+    "Devin provider recovery failed; the delegated task is incomplete.",
+    `Session: ${session.id}`,
     `Task hash: ${context.taskDiagnostics.taskHash}`,
     `Provider tool calls completed: ${toolCalls.length}`,
     `Provider mutation calls observed: ${mutations}`,
@@ -1989,15 +1908,10 @@ function completedProviderCheckpoint(context, session, failureState) {
       ? "One bounded same-session continuation was attempted without replaying the task, and no later provider was started. The delegated task may be incomplete; the parent should inspect the preserved work and decide whether to resume or reassign it."
       : "No later provider was started after committed work. The delegated task may be incomplete; the parent should inspect the preserved work and decide whether to resume or reassign it.",
   ].join("\n");
-  runtime.providerCheckpoints += 1;
-  return {
-    cliResult: { code: 0, stdout: text, stderr: "" },
-    session: { ...session, terminalText: text },
-    preserveProviderSession: true,
-  };
+  return preserveProviderSession(new BridgeError(text, 502), session, context.executionPolicy);
 }
 
-async function runCliWithProviderRecovery(
+export async function runCliWithProviderRecovery(
   context,
   selectedModel,
   onSpawn,
@@ -2019,6 +1933,16 @@ async function runCliWithProviderRecovery(
   let providerContinuationUsed = false;
   while (true) {
     throwIfAborted(signal);
+    if (resumeSession) {
+      const actual = resumeSession.model;
+      if (actual && actual !== selectedModel.model_uid) {
+        const error = new BridgeError(
+          `Resumed Devin session ${resumeSession.id} is already bound to unexpected model ${json(actual)} (expected ${json(selectedModel.model_uid)}); refusing to replay it`,
+          502,
+        );
+        throw preserveProviderSession(error, resumeSession, context.executionPolicy);
+      }
+    }
     const activeDeadline = recoveryDeadline || deadline;
     const remainingMs = activeDeadline - now();
     if (remainingMs <= 0) throw new BridgeError("Devin provider recovery deadline exceeded", 504);
@@ -2084,7 +2008,8 @@ async function runCliWithProviderRecovery(
       session = await findTerminalSession(context.requestId, session) || session;
     }
     const resourceFailure = isRetryableResourceFailure(cliResult);
-    const streamFailure = Boolean(runError) || isInterruptedStreamFailure(cliResult);
+    const outputTokenLimit = isOutputTokenLimitFailure(cliResult);
+    const streamFailure = Boolean(runError) || isInterruptedStreamFailure(cliResult) || outputTokenLimit;
     const compactionAdvanced = Number(session?.compactionNodeId || 0) > iterationCompactionBaseline;
     const compactionFailure = isProviderCompactionFailure(cliResult)
       || (compactionAdvanced && !session?.terminalText);
@@ -2104,10 +2029,11 @@ async function runCliWithProviderRecovery(
       compactionFailure,
       permissionFailure,
       incompleteTurn,
+      outputTokenLimit,
     };
     if (providerContinuationUsed && session) {
       if (providerToolCalls(session).length > 0) {
-        return completedProviderCheckpoint(context, session, {
+        throw providerRecoveryError(context, session, {
           ...failureState,
           continuationAttempted: true,
         });
@@ -2127,7 +2053,7 @@ async function runCliWithProviderRecovery(
     const backoffMs = resourceFailure ? resourceBackoffMs(attempt) : PROVIDER_RECOVERY_BACKOFF_MS;
     if (now() + backoffMs >= recoveryDeadline) {
       if (providerToolCalls(session).length > 0) {
-        return completedProviderCheckpoint(context, session, {
+        throw providerRecoveryError(context, session, {
           ...failureState,
           continuationAttempted: providerContinuationUsed,
         });
@@ -2178,6 +2104,8 @@ async function runCliWithProviderRecovery(
     runtime.activeResourceBackoffs += 1;
     try {
       await delay(backoffMs, signal);
+    } catch (error) {
+      throw preserveProviderSession(error, session, context.executionPolicy);
     } finally {
       runtime.activeResourceBackoffs = Math.max(0, runtime.activeResourceBackoffs - 1);
     }
@@ -2255,7 +2183,7 @@ export function finalizeDevinResult(
       throw new BridgeError(`Devin failed: ${cliResult.stderr || cliResult.stdout || `exit ${cliResult.code}`}`, 502);
     }
     if (session.model !== selected.model.model_uid) {
-      throw new BridgeError(`Devin used unexpected model ${json(session.model)}`, 502);
+      throw new BridgeError(`Devin session ${session.id} used unexpected model ${json(session.model)}; expected ${json(selected.model.model_uid)}`, 502);
     }
     if (!session.terminalText) {
       throw new BridgeError("Devin completed without a terminal assistant message after its native tools", 502);
@@ -2658,7 +2586,6 @@ async function runDevinStage(
   terminalFallback,
   capacityOptions,
 ) {
-  assertDevinTaskBoundary(context.executionPolicy);
   const freeModel = selected.key === "terminal";
   const providerKey = freeModel ? "devinFree" : "devin";
   const stage = terminalFallback ? "devin-free" : "devin";
@@ -2914,33 +2841,26 @@ async function executeAuto(context, requestBody, onSpawn, onProgress, signal, cr
 
 async function execute(context, requestBody, initialRoute, onSpawn, onProgress, signal, createStreamRelay) {
   runtime.lastProviderSequence = [];
-  try {
-    if (initialRoute.key === "terminal") {
-      return await runDevinStage(context, initialRoute, [], onSpawn, onProgress, signal, false);
-    }
-    if (initialRoute.key === "ollama") {
-      try {
-        return await runOllamaStage(
-          context,
-          requestBody,
-          [],
-          onProgress,
-          signal,
-          createStreamRelay({ forwardReasoningSummaries: true, providerLabel: "Ollama" }),
-        );
-      } catch (error) {
-        error.failedStage ||= "ollama";
-        throw error;
-      }
-    }
-    runtime.fallbackAttempts += 1;
-    return await executeAuto(context, requestBody, onSpawn, onProgress, signal, createStreamRelay);
-  } catch (error) {
-    if (error?.routeCommitted === true && !signal?.aborted) {
-      return committedProviderResult(context, error);
-    }
-    throw error;
+  if (initialRoute.key === "terminal") {
+    return runDevinStage(context, initialRoute, [], onSpawn, onProgress, signal, false);
   }
+  if (initialRoute.key === "ollama") {
+    try {
+      return await runOllamaStage(
+        context,
+        requestBody,
+        [],
+        onProgress,
+        signal,
+        createStreamRelay({ forwardReasoningSummaries: true, providerLabel: "Ollama" }),
+      );
+    } catch (error) {
+      error.failedStage ||= "ollama";
+      throw error;
+    }
+  }
+  runtime.fallbackAttempts += 1;
+  return executeAuto(context, requestBody, onSpawn, onProgress, signal, createStreamRelay);
 }
 
 function usageFrom(result) {
@@ -3014,8 +2934,9 @@ function writeSse(response, type, payload) {
 }
 
 function providerResponseErrorCode(error) {
+  if (error?.routeCommitted === true) return "provider_state_changed";
   if (typeof error?.nativeFallbackRoute === "string") return "native_subagent_fallback";
-  return error?.routeCommitted === true ? "provider_state_changed" : "external_provider_error";
+  return "external_provider_error";
 }
 
 function writeSseHeartbeat(response, responseId, modelAlias = MODEL_ALIAS) {
@@ -3259,7 +3180,7 @@ async function handleResponses(request, response) {
     if (
       context.requestedRoute === "auto"
       && result.autoStage
-      && (routeRetentionCount > 0 || result.preserveProviderPin === true)
+      && routeRetentionCount > 0
     ) {
       pinProviderTask(context, result.autoStage);
     } else if (providerTaskPins.releaseAfterFinalResponse(
@@ -3749,7 +3670,7 @@ async function selfTest() {
   }
   if (isolatedEnvironment.RETAINED_TEST_VALUE !== "retained") throw new Error("environment isolation removed unrelated values");
   const readOnlyPolicy = executionPolicyFromTaskState({
-    activeTask: { text: "Independent read-only review. Do not edit, build, test, or use Editor/PIE." },
+    activeTask: { text: "Independent review. Do not edit, build, test, or use Editor/PIE." },
   });
   const boundedMutationPolicy = executionPolicyFromTaskState({
     activeTask: { text: "Implement the bounded source fix. Do not build or run tests." },
@@ -3772,42 +3693,29 @@ async function selfTest() {
       text: "Audit statique borne, aucun edit sauf correction chirurgicale, aucun build/test/editor/PIE/stage/commit.",
     },
   });
-  const explicitReadOnlyRzMcpPolicy = executionPolicyFromTaskState({
-    activeTask: {
-      text: "Read-only inspection. No edits/build/tests/editor control/assets saves/staging. Use RzDirectMCP semantic/read-only APIs only (never binary grep).",
-    },
-  });
   const explicitRzMcpBanPolicy = executionPolicyFromTaskState({
-    activeTask: { text: "Read-only inspection. Use repository text tools, but do not use or invoke RzDirectMCP." },
+    activeTask: { text: "Review the bounded diff. Do not use or invoke RzDirectMCP." },
   });
   const explicitLazyProxyPolicy = executionPolicyFromTaskState({
-    activeTask: { text: "Read-only inspection. Do not control the editor. Use search_rzmcp_tools before call_rzmcp_tool. Never request the full RzMCP catalog." },
-  });
-  const scopedRzMcpLimitPolicy = executionPolicyFromTaskState({
-    activeTask: { text: "Make exactly two read-only RzMCP calls. Do not use any other RzMCP calls. Never edit, build, test, control the editor, or start PIE." },
+    activeTask: { text: "Use search_rzmcp_tools before call_rzmcp_tool. Never request the full RzMCP catalog." },
   });
   if (
     readOnlyPolicy.permissionMode !== "dangerous"
-    || readOnlyPolicy.rzMcpMode !== "disabled"
+    || readOnlyPolicy.rzMcpMode !== "full"
     || boundedMutationPolicy.permissionMode !== "dangerous"
-    || boundedMutationPolicy.rzMcpMode !== "no-validation"
+    || boundedMutationPolicy.rzMcpMode !== "full"
     || ordinaryMutationPolicy.permissionMode !== "dangerous"
-    || ordinaryMutationPolicy.validationRestricted !== true
-    || ordinaryMutationPolicy.rzMcpMode !== "no-validation"
+    || ordinaryMutationPolicy.rzMcpMode !== "full"
     || scopedMutationPolicy.permissionMode !== "dangerous"
-    || scopedMutationPolicy.rzMcpMode !== "no-validation"
+    || scopedMutationPolicy.rzMcpMode !== "full"
     || shorthandMutationPolicy.permissionMode !== "dangerous"
-    || shorthandMutationPolicy.rzMcpMode !== "disabled"
+    || shorthandMutationPolicy.rzMcpMode !== "full"
     || shorthandReadOnlyPolicy.permissionMode !== "dangerous"
-    || shorthandReadOnlyPolicy.rzMcpMode !== "disabled"
+    || shorthandReadOnlyPolicy.rzMcpMode !== "full"
     || frenchBoundedReviewPolicy.permissionMode !== "dangerous"
-    || frenchBoundedReviewPolicy.rzMcpMode !== "disabled"
-    || explicitReadOnlyRzMcpPolicy.permissionMode !== "dangerous"
-    || explicitReadOnlyRzMcpPolicy.rzMcpMode !== "read-only"
+    || frenchBoundedReviewPolicy.rzMcpMode !== "full"
     || explicitLazyProxyPolicy.permissionMode !== "dangerous"
-    || explicitLazyProxyPolicy.rzMcpMode !== "read-only"
-    || scopedRzMcpLimitPolicy.permissionMode !== "dangerous"
-    || scopedRzMcpLimitPolicy.rzMcpMode !== "read-only"
+    || explicitLazyProxyPolicy.rzMcpMode !== "full"
     || explicitRzMcpBanPolicy.permissionMode !== "dangerous"
     || explicitRzMcpBanPolicy.rzMcpMode !== "disabled"
   ) {
@@ -3815,7 +3723,7 @@ async function selfTest() {
   }
   const readOnlyEnvironment = providerEnvironment(readOnlyPolicy);
   if (
-    readOnlyEnvironment.RZCODEX_SUBAGENT_RZMCP_MODE !== "disabled"
+    readOnlyEnvironment.RZCODEX_SUBAGENT_RZMCP_MODE !== "full"
     || "OPENAI_API_KEY" in readOnlyEnvironment
   ) {
     throw new Error("task execution environment isolation failed");
@@ -3877,6 +3785,10 @@ async function selfTest() {
     { node_id: 3, chat_message: { role: "user", content: "Continue the retained task." } },
     { node_id: 4, chat_message: { role: "assistant", content: "Actual final report.", tool_calls: [] } },
   ]);
+  const pendingParentControlTopology = terminalAssistantFromRows([
+    { node_id: 1, chat_message: { role: "assistant", content: "Prior checkpoint.", tool_calls: [] } },
+    { node_id: 2, chat_message: { role: "user", content: "Apply the correction and finish." } },
+  ]);
   if (
     incompleteTopology.terminalText !== null
     || incompleteTopology.lastToolNodeId !== 2
@@ -3884,6 +3796,7 @@ async function selfTest() {
     || completedTopology.terminalNodeId !== 3
     || compactedTopology.terminalText !== null
     || completedAfterCompactionTopology.terminalText !== "Actual final report."
+    || pendingParentControlTopology.terminalText !== null
   ) {
     throw new Error("Devin terminal assistant topology detection failed");
   }
@@ -3963,6 +3876,11 @@ async function selfTest() {
         text: "Message Type: NEW_TASK\nTask name: /root/devin_recovery_fixture\nPayload:\nInspect the bounded fixture.",
       },
     },
+    executionPolicy: executionPolicyFromTaskState({
+      activeTask: {
+        text: "Message Type: NEW_TASK\nTask name: /root/devin_recovery_fixture\nPayload:\nInspect the bounded fixture.",
+      },
+    }),
   };
   const recoveryModel = { model_uid: "recovery-model" };
   const preWorkRecoverySession = {
@@ -4076,7 +3994,7 @@ async function selfTest() {
   const terminalFailureCalls = [];
   const terminalFailureDelays = [];
   let terminalFailureNow = 1_000;
-  const committedCheckpoint = await runCliWithProviderRecovery(
+  const committedFailure = await runCliWithProviderRecovery(
     recoveryContext,
     recoveryModel,
     () => {},
@@ -4097,15 +4015,16 @@ async function selfTest() {
         return interruptedStreamFailure;
       },
     },
-  );
+  ).catch((error) => error);
   if (
     terminalFailureCalls.length !== 2
     || terminalFailureDelays.join(",") !== "1000"
-    || committedCheckpoint.preserveProviderSession !== true
-    || !committedCheckpoint.session.terminalText.includes("Authoritative native-provider checkpoint")
-    || !committedCheckpoint.session.terminalText.includes("Provider tool calls completed: 2")
-    || !committedCheckpoint.session.terminalText.includes("Provider mutation calls observed: 1")
-    || !committedCheckpoint.session.terminalText.includes("One bounded same-session continuation")
+    || committedFailure.status !== 502
+    || committedFailure.retainedProviderSession !== committedSession
+    || providerResponseErrorCode(committedFailure) !== "provider_state_changed"
+    || !committedFailure.message.includes("Provider tool calls completed: 2")
+    || !committedFailure.message.includes("Provider mutation calls observed: 1")
+    || !committedFailure.message.includes("One bounded same-session continuation")
   ) {
     throw new Error("Devin post-tool continuation bound failed");
   }
@@ -4878,6 +4797,7 @@ async function selfTest() {
   }
   if (
     providerResponseErrorCode({ routeCommitted: true }) !== "provider_state_changed"
+    || providerResponseErrorCode({ routeCommitted: true, nativeFallbackRoute: "native" }) !== "provider_state_changed"
     || providerResponseErrorCode({ nativeFallbackRoute: "native" }) !== "native_subagent_fallback"
     || providerResponseErrorCode(new Error("transient")) !== "external_provider_error"
   ) {
@@ -4885,69 +4805,13 @@ async function selfTest() {
   }
   const committedError = preserveProviderCommit(new Error("fixture"), {
     toolCalls: [{ name: "apply_patch" }, { name: "apply_patch" }, { name: "view_file" }],
-  });
+  }, recoveryContext.executionPolicy);
   if (
     committedError.routeCommitted !== true
     || committedError.toolCalls !== 3
     || committedError.toolNames.join(",") !== "apply_patch,view_file"
   ) {
     throw new Error("Devin native-tool commitment classification failed");
-  }
-  const readOnlyCommittedError = preserveProviderCommit(new Error("fixture"), {
-    toolCalls: [{ name: "read" }],
-  });
-  readOnlyCommittedError.failedStage = "ollama";
-  readOnlyCommittedError.nativeRzMcpTools = ["inspect_graph_by_path"];
-  const committedCheckpointResult = committedProviderResult(
-    { taskDiagnostics: recoveryContext.taskDiagnostics, toolSchemaBytes: 123 },
-    readOnlyCommittedError,
-  );
-  if (
-    readOnlyCommittedError.routeCommitted !== true
-    || committedCheckpointResult.selected.provider !== "ollama"
-    || committedCheckpointResult.nativeToolNames.join(",") !== "read"
-    || committedCheckpointResult.rzMcpTools.join(",") !== "inspect_graph_by_path"
-    || !committedCheckpointResult.text.includes("was not replayed")
-    || committedCheckpointResult.toolSchemaBytesIgnored !== 123
-  ) {
-    throw new Error("read-only provider checkpoint classification failed");
-  }
-  const nestedFailureCheckpoint = committedProviderResult(
-    { taskDiagnostics: recoveryContext.taskDiagnostics, toolSchemaBytes: 456 },
-    Object.assign(new Error("nested stream interruption"), {
-      failedStage: "antigravity",
-      routeCommitted: true,
-      toolCalls: 47,
-      nativeToolNames: ["view_file", "replace_file_content", "run_command"],
-      providerMutationCount: 8,
-      nativeRzMcpTools: ["inspect_graph_by_path"],
-      streamContinuations: 2,
-      peakContextTokens: 31_250,
-    }),
-  );
-  if (
-    !nestedFailureCheckpoint.text.includes("Provider tool calls completed: 47")
-    || !nestedFailureCheckpoint.text.includes("Provider mutation calls observed: 8")
-    || nestedFailureCheckpoint.nativeToolNames.join(",") !== "view_file,replace_file_content,run_command"
-    || nestedFailureCheckpoint.rzMcpTools.join(",") !== "inspect_graph_by_path"
-    || nestedFailureCheckpoint.peakTurnContextTokens !== 31_250
-    || nestedFailureCheckpoint.toolSchemaBytesIgnored !== 456
-  ) {
-    throw new Error("nested provider checkpoint lost authoritative failure progress");
-  }
-  const pinnedContinuationResult = committedProviderResult(
-    { taskDiagnostics: recoveryContext.taskDiagnostics, toolSchemaBytes: 123 },
-    Object.assign(new Error("fixture"), {
-      failedStage: "ollama",
-      providerTaskPinPreserved: true,
-    }),
-  );
-  if (
-    pinnedContinuationResult.autoStage !== "ollama"
-    || pinnedContinuationResult.preserveProviderPin !== true
-    || !pinnedContinuationResult.text.includes("remains pinned to the same provider")
-  ) {
-    throw new Error("active provider continuation checkpoint lost its provider pin");
   }
   const abortedProviderContext = {
     requestedRoute: "auto",
