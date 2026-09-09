@@ -276,16 +276,33 @@ impl ChatWidget {
     }
 
     /// Set the provider used by the active thread and refresh provider-dependent UI state.
-    pub(crate) fn set_model_provider(&mut self, model_provider: &str) -> bool {
-        let Some(provider) = self.config.model_providers.get(model_provider).cloned() else {
-            tracing::warn!(model_provider, "thread selected an unknown model provider");
-            return false;
+    pub(crate) fn set_model_provider(&mut self, model_provider: &str) {
+        let provider = match self.config.model_providers.get(model_provider) {
+            Some(provider) => provider.clone(),
+            None => {
+                tracing::warn!(
+                    model_provider,
+                    "thread selected a provider unknown to this TUI client"
+                );
+                codex_model_provider_info::ModelProviderInfo {
+                    name: model_provider.to_string(),
+                    ..Default::default()
+                }
+            }
         };
         self.config.model_provider_id = model_provider.to_string();
         self.runtime_model_provider_base_url = provider.base_url.clone();
         self.config.model_provider = provider;
         self.refresh_model_dependent_surfaces();
-        true
+    }
+
+    /// Replace the active provider route's explicit input-capability override.
+    pub(crate) fn set_model_input_modalities(
+        &mut self,
+        input_modalities: Option<Vec<InputModality>>,
+    ) {
+        self.config.model_input_modalities = input_modalities;
+        self.sync_image_paste_enabled();
     }
 
     pub(crate) fn current_model(&self) -> &str {
@@ -337,6 +354,9 @@ impl ChatWidget {
     /// We intentionally default to `true` when model metadata cannot be read so transient catalog
     /// failures do not hard-block user input in the UI.
     pub(super) fn current_model_supports_images(&self) -> bool {
+        if let Some(input_modalities) = self.config.model_input_modalities.as_ref() {
+            return input_modalities.contains(&InputModality::Image);
+        }
         let model = self.current_model();
         self.model_catalog
             .try_list_models()
@@ -471,6 +491,7 @@ impl ChatWidget {
         let cwd_changed = self.config.cwd != settings.cwd;
         self.apply_thread_settings_cwd(settings.cwd.clone());
         self.set_model_provider(&settings.model_provider);
+        self.set_model_input_modalities(settings.model_input_modalities.clone());
         self.set_service_tier(settings.service_tier.clone());
         self.set_approval_policy(settings.approval_policy);
         self.set_approvals_reviewer(settings.approvals_reviewer.to_core());

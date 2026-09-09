@@ -7,9 +7,9 @@ use super::make_test_app;
 use super::start_config_write_test_app_server;
 use crate::bottom_pane::SelectionItem;
 use crate::bottom_pane::SelectionViewParams;
+use crate::chatwidget::tests::helpers::normalize_snapshot_paths;
 use crate::chatwidget::tests::helpers::render_bottom_popup;
 use crate::keymap::KeymapContext;
-use crate::test_support::test_path_display;
 use crate::tui::Tui;
 use codex_app_server_protocol::ToolRequestUserInputOption;
 use codex_app_server_protocol::ToolRequestUserInputParams;
@@ -100,8 +100,7 @@ async fn completed_global_chord_reuses_the_existing_action_handler() -> Result<(
     assert!(app.key_chord_matcher.is_pending());
     assert!(app.overlay.is_none());
     insta::assert_snapshot!(
-        render_bottom_popup(&app.chat_widget, /*width*/ 80)
-            .replace(&test_path_display("/tmp/project"), "/tmp/project"),
+        normalize_snapshot_paths(render_bottom_popup(&app.chat_widget, /*width*/ 80)),
         @r"
         › Ask Codex to do anything
 

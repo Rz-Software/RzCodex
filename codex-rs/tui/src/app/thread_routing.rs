@@ -1168,6 +1168,7 @@ impl App {
         session.thread_id = thread_id;
         session.thread_name = notification.thread.name.clone();
         session.model_provider_id = notification.thread.model_provider.clone();
+        session.model_input_modalities = None;
         session
             .set_cwd_retargeting_implicit_runtime_workspace_root(notification.thread.cwd.clone());
         let rollout_path = notification.thread.path.clone();

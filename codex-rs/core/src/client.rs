@@ -488,7 +488,46 @@ impl ModelClient {
         attestation_provider: Option<Arc<dyn AttestationProvider>>,
         http_client_factory: HttpClientFactory,
     ) -> Self {
-        let model_provider = create_model_provider(provider_info, auth_manager);
+        Self::new_with_provider(
+            agent_identity_policy,
+            thread_id,
+            create_model_provider(provider_info, auth_manager),
+            session_source,
+            originator,
+            model_verbosity,
+            content_item_kinds_enabled,
+            enable_request_compression,
+            include_timing_metrics,
+            beta_features_header,
+            concurrent_reasoning_summaries_enabled,
+            attestation_provider,
+            http_client_factory,
+        )
+    }
+
+    /// Creates a session-scoped client from the provider instance owned by the
+    /// surrounding session configuration.
+    ///
+    /// Turn contexts retain that same provider instance. Keeping the identity
+    /// shared lets ordinary turns reuse the client-owned WebSocket and its
+    /// session-scoped transport fallback state; a genuinely different provider
+    /// still receives a separate client through `new_session_for_provider`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_provider(
+        agent_identity_policy: AgentIdentityAuthPolicy,
+        thread_id: ThreadId,
+        model_provider: SharedModelProvider,
+        session_source: SessionSource,
+        originator: String,
+        model_verbosity: Option<VerbosityConfig>,
+        content_item_kinds_enabled: bool,
+        enable_request_compression: bool,
+        include_timing_metrics: bool,
+        beta_features_header: Option<String>,
+        concurrent_reasoning_summaries_enabled: bool,
+        attestation_provider: Option<Arc<dyn AttestationProvider>>,
+        http_client_factory: HttpClientFactory,
+    ) -> Self {
         let codex_api_key_env_enabled = model_provider
             .auth_manager()
             .as_ref()
@@ -570,6 +609,10 @@ impl ModelClient {
         &self,
         provider: SharedModelProvider,
     ) -> ModelClientSession {
+        if Arc::ptr_eq(&self.state.provider, &provider) {
+            return self.new_session();
+        }
+
         let codex_api_key_env_enabled = provider
             .auth_manager()
             .as_ref()

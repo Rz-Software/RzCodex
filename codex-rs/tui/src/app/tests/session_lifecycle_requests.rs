@@ -131,8 +131,22 @@ async fn start_recording_app_server_with_history(
         let mut reject_detach = false;
         let mut reject_thread_list = history_capabilities == HistoryCapabilities::ThreadListFails;
         while let Some(frame) = websocket.next().await {
-            let Message::Text(text) = frame? else {
-                continue;
+            let frame = match frame {
+                Ok(frame) => frame,
+                Err(tokio_tungstenite::tungstenite::Error::Io(error))
+                    if error.kind() == std::io::ErrorKind::ConnectionReset =>
+                {
+                    // A remote app-server client may drop its TCP half immediately after
+                    // sending the WebSocket close frame. Treat that platform-specific teardown
+                    // as EOF so reconnect tests can assert the replacement connection.
+                    break;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let text = match frame {
+                Message::Text(text) => text,
+                Message::Close(_) => break,
+                _ => continue,
             };
             let message = serde_json::from_str::<JSONRPCMessage>(&text)?;
             match message {
@@ -3274,11 +3288,10 @@ fn session_lifecycle_avoids_redundant_subagent_metadata_reads() -> Result<()> {
                         .replace(&root_thread_id.to_string(), "[root]")
                         .replace(&child_thread_id.to_string(), "[child]"),
                     @r###"
-                      Subagents
-                      Select an agent to watch. ⌥ + ← previous, ⌥ + → next.
+                      [Active (1)]  History (1)
 
-                    › 1. • Main [default] (current)  [root]
-                      2. • /root/worker              [child]
+
+                    › • Main [default] (current)  [root]
 
                       Press enter to confirm or esc to go back
                     "###
@@ -3299,7 +3312,7 @@ fn session_lifecycle_avoids_redundant_subagent_metadata_reads() -> Result<()> {
                     1
                 );
                 app.chat_widget
-                    .handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+                    .handle_key_event(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
                 app.chat_widget.handle_server_request(
                     exec_approval_request(
                         root_thread_id,
@@ -3349,10 +3362,16 @@ fn session_lifecycle_avoids_redundant_subagent_metadata_reads() -> Result<()> {
                 );
                 assert!(!app.agent_navigation.is_parent_owned(discovered_thread_id));
                 assert_eq!(
+                    app.chat_widget.active_tab_id_for_present_view(
+                        super::super::agent_picker::AGENT_PICKER_VIEW_ID
+                    ),
+                    Some("history")
+                );
+                assert_eq!(
                     app.chat_widget.selected_index_for_present_view(
                         super::super::agent_picker::AGENT_PICKER_VIEW_ID
                     ),
-                    Some(1)
+                    Some(0)
                 );
                 assert!(render_bottom_popup(&app.chat_widget, /*width*/ 80).contains("echo hello"));
                 assert!(

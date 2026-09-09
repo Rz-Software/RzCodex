@@ -88,19 +88,32 @@ fn personal_access_token_exec_command(server: &MockServer, home: &TempDir) -> Co
     cmd
 }
 
-struct ChildProcessCleanupGuard(u32);
+struct ChildProcessCleanupGuard {
+    pid: u32,
+    armed: bool,
+}
+
+impl ChildProcessCleanupGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
 
 impl Drop for ChildProcessCleanupGuard {
     fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+
         #[cfg(unix)]
         {
-            let _ = codex_utils_pty::process_group::kill_process_group(self.0);
+            let _ = codex_utils_pty::process_group::kill_process_group(self.pid);
         }
 
         #[cfg(windows)]
         {
             let _ = Command::new("taskkill")
-                .args(["/PID", &self.0.to_string(), "/T", "/F"])
+                .args(["/PID", &self.pid.to_string(), "/T", "/F"])
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -109,7 +122,7 @@ impl Drop for ChildProcessCleanupGuard {
 
         #[cfg(not(any(unix, windows)))]
         {
-            let _ = self.0;
+            let _ = self.pid;
         }
     }
 }
@@ -127,18 +140,33 @@ fn run_cli_command(command: &mut Command) -> io::Result<Output> {
         .stderr(Stdio::piped());
 
     let child = command.spawn()?;
-    let _cleanup = ChildProcessCleanupGuard(child.id());
+    let mut cleanup = ChildProcessCleanupGuard {
+        pid: child.id(),
+        armed: true,
+    };
     let (sender, receiver) = mpsc::sync_channel(1);
-    let _waiter = thread::spawn(move || {
+    let waiter = thread::spawn(move || {
         let _ = sender.send(child.wait_with_output());
     });
 
     match receiver.recv_timeout(CLI_TIMEOUT) {
-        Ok(output) => output,
+        Ok(output) => {
+            // The waiter owns the child until wait_with_output has completed. Join it before
+            // disarming cleanup so a successful run cannot leave a test-owned thread behind.
+            let _ = waiter.join();
+            cleanup.disarm();
+            output
+        }
         Err(mpsc::RecvTimeoutError::Timeout) => {
+            // Kill the process tree before joining the waiter; wait_with_output cannot finish
+            // until its child and all inherited output handles have been closed.
+            drop(cleanup);
+            let _ = waiter.join();
             Err(io::Error::new(io::ErrorKind::TimedOut, "process timed out"))
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => {
+            drop(cleanup);
+            let _ = waiter.join();
             Err(io::Error::other("process output reader thread exited"))
         }
     }

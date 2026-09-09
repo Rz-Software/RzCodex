@@ -195,7 +195,7 @@ impl App {
         let (items, tabs, initial_tab_id, subtitle) = if has_history {
             let active_tab_selected = self
                 .chat_widget
-                .active_tab_id_for_active_view(AGENT_PICKER_VIEW_ID)
+                .active_tab_id_for_present_view(AGENT_PICKER_VIEW_ID)
                 .map(ToOwned::to_owned)
                 .filter(|tab_id| matches!(tab_id.as_str(), ACTIVE_TAB_ID | HISTORY_TAB_ID))
                 .or_else(|| {
@@ -235,6 +235,23 @@ impl App {
                 AgentNavigationState::picker_subtitle(),
             )
         };
+        let current_index = initial_tab_id.as_deref().map_or_else(
+            || {
+                active_threads
+                    .iter()
+                    .position(|(thread_id, _)| self.active_thread_id == Some(*thread_id))
+            },
+            |tab_id| {
+                let threads = if tab_id == HISTORY_TAB_ID {
+                    &history_threads
+                } else {
+                    &active_threads
+                };
+                threads
+                    .iter()
+                    .position(|(thread_id, _)| self.active_thread_id == Some(*thread_id))
+            },
+        );
 
         SelectionViewParams {
             view_id: Some(AGENT_PICKER_VIEW_ID),
@@ -244,7 +261,7 @@ impl App {
             items,
             tabs,
             initial_tab_id,
-            initial_selected_idx: selected,
+            initial_selected_idx: selected.or(current_index),
             is_searchable: has_history,
             ..Default::default()
         }

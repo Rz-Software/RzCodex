@@ -85,11 +85,11 @@ install:
 # there should be no need to add `--all-features`.
 [unix]
 test *args:
-    RUST_MIN_STACK={{ rust_min_stack }} NEXTEST_PROFILE=local cargo nextest run --no-fail-fast "$@"
+    test_codex_home="$(mktemp -d "${TMPDIR:-/tmp}/codex-tests-XXXXXX")" || exit; trap 'rm -rf "$test_codex_home"' EXIT; export CODEX_HOME="$test_codex_home"; unset CODEX_SQLITE_HOME CODEX_SESSION_ID CODEX_THREAD_ID RZCODEX_MANAGED_LAUNCH RZCODEX_SEPARATE_AGENT_ROLES; RUST_MIN_STACK={{ rust_min_stack }} NEXTEST_PROFILE=local cargo build -p codex-code-mode-host -p codex-rmcp-client --bin codex-code-mode-host --bin test_stdio_server && RUST_MIN_STACK={{ rust_min_stack }} NEXTEST_PROFILE=local cargo nextest run --no-fail-fast "$@"
 
 [windows]
 test *args:
-    $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; cargo nextest run --no-fail-fast @($args | Select-Object -Skip 1)
+    $testCodexHome = Join-Path ([IO.Path]::GetTempPath()) ("codex-tests-" + [Guid]::NewGuid().ToString("N")); New-Item -ItemType Directory -Path $testCodexHome -ErrorAction Stop | Out-Null; $testExitCode = 1; try { $env:CODEX_HOME = $testCodexHome; Remove-Item Env:CODEX_SQLITE_HOME, Env:CODEX_SESSION_ID, Env:CODEX_THREAD_ID, Env:RZCODEX_MANAGED_LAUNCH, Env:RZCODEX_SEPARATE_AGENT_ROLES -ErrorAction SilentlyContinue; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; cargo build -p codex-code-mode-host -p codex-rmcp-client --bin codex-code-mode-host --bin test_stdio_server; if ($LASTEXITCODE -eq 0) { cargo nextest run --no-fail-fast @($args | Select-Object -Skip 1); if ($null -ne $LASTEXITCODE) { $testExitCode = $LASTEXITCODE } } else { $testExitCode = $LASTEXITCODE } } finally { Remove-Item -LiteralPath $testCodexHome -Recurse -Force -ErrorAction SilentlyContinue }; exit $testExitCode
 
 # Run from the repository root so scripts that resolve paths from `cwd` see
 # the same layout they use in GitHub Actions.
@@ -179,7 +179,7 @@ write-config-schema:
 
 # Regenerate vendored app-server protocol schema artifacts.
 write-app-server-schema *args:
-    cargo run -p codex-app-server-protocol --bin write_schema_fixtures -- {args}
+    {{ python }} app-server-protocol/scripts/write_schema_fixtures.py {args}
 
 [no-cd]
 write-hooks-schema:

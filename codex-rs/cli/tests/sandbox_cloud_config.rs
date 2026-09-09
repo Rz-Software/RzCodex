@@ -1,4 +1,5 @@
 use std::process::Command;
+use std::process::Stdio;
 
 use anyhow::Context;
 use anyhow::Result;
@@ -98,11 +99,19 @@ async fn sandbox_fetches_and_enforces_cloud_managed_permission_profile() -> Resu
         .mount(&server)
         .await;
 
+    // The sandbox registers the TEMP/TMP dirs as writable roots and walks them during
+    // setup, so the spawned sandbox must not inherit the shared user temp tree.
+    let sandbox_temp = codex_home.path().join("sandbox-temp");
+    std::fs::create_dir_all(&sandbox_temp)?;
+
     let codex = codex_utils_cargo_bin::cargo_bin("codex")?;
     let chatgpt_base_url_override = format!("chatgpt_base_url=\"{chatgpt_base_url}\"");
     let output = Command::new(&codex)
+        .stdin(Stdio::null())
         .current_dir(codex_home.path())
         .env("CODEX_HOME", codex_home.path())
+        .env("TEMP", &sandbox_temp)
+        .env("TMP", &sandbox_temp)
         .env("NO_PROXY", "127.0.0.1,localhost")
         .env("no_proxy", "127.0.0.1,localhost")
         .env_remove("CODEX_ACCESS_TOKEN")
@@ -139,9 +148,11 @@ async fn sandbox_fetches_and_enforces_cloud_managed_permission_profile() -> Resu
         stderr,
     );
     if !nested_macos_sandbox_unavailable {
+        let stdout = String::from_utf8(output.stdout)?;
         assert!(
-            String::from_utf8(output.stdout)?.starts_with("codex"),
-            "expected the sandboxed Codex version command to run",
+            stdout.starts_with(codex_build_info::PRODUCT_NAME),
+            "expected the sandboxed {} version command to run; stdout={stdout:?}",
+            codex_build_info::PRODUCT_NAME,
         );
     }
 

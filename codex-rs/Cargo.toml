@@ -578,14 +578,21 @@ debug = "none"
 strip = "symbols"
 
 [profile.release]
-lto = false
+lto = "thin"
 debug = "line-tables-only"
 split-debuginfo = "off"
 # Keep release binaries symbolicateable until packaging has archived the
 # sidecar symbols and stripped the binaries.
 strip = false
 
-# Favor fast, highly parallel local rebuilds for the continuously updated fork.
+# Balance parallel release code generation against binary size and runtime speed.
+codegen-units = 4
+
+# Keep the fork's fast local iteration policy explicit instead of weakening the
+# binaries installed for day-to-day use.
+[profile.rzcodex-fast]
+inherits = "release"
+lto = false
 codegen-units = 32
 incremental = true
 

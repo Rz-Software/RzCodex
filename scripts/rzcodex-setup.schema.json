@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "sharedCodexHome", "stateRoot", "installRoot", "separateAgentRoles", "routing", "validation", "stableLauncherFiles", "deploymentFiles", "binaries", "bridges", "supervisor", "updaterTask"],
+  "properties": {
+    "$schema": { "type": "string" },
+    "schemaVersion": { "const": 1 },
+    "sharedCodexHome": { "type": "string", "minLength": 1 },
+    "stateRoot": { "type": "string", "minLength": 1 },
+    "installRoot": { "type": "string", "minLength": 1 },
+    "separateAgentRoles": { "const": true },
+    "routing": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["relativePath", "schemaFile", "defaultFile", "preserveExisting"],
+      "properties": {
+        "relativePath": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$" },
+        "schemaFile": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$" },
+        "defaultFile": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$" },
+        "preserveExisting": { "const": true }
+      }
+    },
+    "validation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rustPackages", "javascript"],
+      "properties": {
+        "rustPackages": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string", "minLength": 1 } },
+        "javascript": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "array", "minItems": 1, "items": { "type": "string" } }
+        }
+      }
+    },
+    "stableLauncherFiles": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$" } },
+    "deploymentFiles": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string", "pattern": "^scripts/[A-Za-z0-9][A-Za-z0-9._-]*$" } },
+    "binaries": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string", "pattern": "^[^/\\\\]+\\.exe$" } },
+    "bridges": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["taskName", "script", "arguments", "restartPolicy"],
+        "properties": {
+          "taskName": { "type": "string", "minLength": 1 },
+          "script": { "type": "string", "pattern": "^[^/\\\\]+\\.mjs$" },
+          "arguments": { "type": "array", "items": { "type": "string" } },
+          "restartPolicy": { "enum": ["always", "on-failure", "never"] }
+        }
+      }
+    },
+    "supervisor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["initialRestartDelaySeconds", "maximumRestartDelaySeconds", "stableRuntimeSeconds", "maximumLogBytes", "retainedLogs"],
+      "properties": {
+        "initialRestartDelaySeconds": { "type": "integer", "minimum": 1 },
+        "maximumRestartDelaySeconds": { "type": "integer", "minimum": 1 },
+        "stableRuntimeSeconds": { "type": "integer", "minimum": 1 },
+        "maximumLogBytes": { "type": "integer", "minimum": 1048576 },
+        "retainedLogs": { "type": "integer", "minimum": 1, "maximum": 20 }
+      }
+    },
+    "updaterTask": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["taskName", "dailyAt", "executionTimeLimitHours"],
+      "properties": {
+        "taskName": { "type": "string", "minLength": 1 },
+        "dailyAt": { "type": "string", "pattern": "^(?:[01]\\d|2[0-3]):[0-5]\\d$" },
+        "executionTimeLimitHours": { "type": "integer", "minimum": 1, "maximum": 24 }
+      }
+    }
+  }
+}

@@ -12,5 +12,7 @@ expression: "render_bottom_popup(&chat, 100)"
   5. openai.gpt-5.5                Frontier model for complex coding, research, and real-world
                                    work.
   6. openai.gpt-5.4                Strong model for everyday coding.
+  7. Provider routes…              Use Native OpenAI or a configured external provider as the main
+                                   agent
 
   Press enter to confirm or esc to go back

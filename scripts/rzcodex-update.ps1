@@ -1,67 +1,226 @@
 [CmdletBinding()]
 param(
+    [ValidateSet("ScheduledUpdate", "LocalInstall", "ValidateOnly")]
+    [string]$Mode = "ScheduledUpdate",
+    [switch]$Publish,
     [switch]$ForceBuild,
-    [switch]$RunTests,
-    [string]$InvocationId = ""
+    [string[]]$OwnedPath = @(),
+    [string]$InvocationId = "",
+    [string]$RepoRoot = (Split-Path -Parent $PSScriptRoot),
+    [switch]$CleanupBuildCache,
+    [switch]$FullWorkspaceTests
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$RepoRoot = Split-Path -Parent $PSScriptRoot
+$RepoRoot = [IO.Path]::GetFullPath($RepoRoot)
+$ManifestPath = Join-Path $PSScriptRoot "rzcodex-setup.manifest.json"
+$ManifestSchemaPath = Join-Path $PSScriptRoot "rzcodex-setup.schema.json"
+$DeploymentModulePath = Join-Path $PSScriptRoot "rzcodex-deployment.psm1"
+foreach ($requiredPath in @($ManifestPath, $ManifestSchemaPath, $DeploymentModulePath)) {
+    if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) {
+        throw "Required versioned updater input is missing: $requiredPath"
+    }
+}
+$ManifestJson = Get-Content -LiteralPath $ManifestPath -Raw
+if (-not ($ManifestJson | Test-Json -SchemaFile $ManifestSchemaPath)) {
+    throw "The versioned RzCodex deployment manifest failed schema validation."
+}
+$Manifest = $ManifestJson | ConvertFrom-Json
+Import-Module $DeploymentModulePath -Force
 $CodexRustRoot = Join-Path $RepoRoot "codex-rs"
-$InstallRoot = Join-Path $env:USERPROFILE ".codex\forked-bin"
+$InstallRoot = [IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables($Manifest.installRoot))
 $PointerPath = Join-Path $InstallRoot "current.txt"
-$BuildMetadataFilename = "rzcodex-build.json"
-$StateRoot = Join-Path $env:LOCALAPPDATA "RzCodex"
-$LogRoot = Join-Path $StateRoot "Logs"
+$StateRoot = [IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables($Manifest.stateRoot))
+$LogRoot = Join-Path $StateRoot "Logs\Updates"
+$SnapshotParent = [IO.Path]::GetFullPath($env:USERPROFILE)
+$SnapshotRoot = [IO.Path]::GetFullPath((Join-Path $SnapshotParent "rzc"))
+$SharedTargetRoot = Join-Path $CodexRustRoot "target"
 $StatusPath = Join-Path $StateRoot "last-update.json"
 $BranchName = "rz-main"
-$MutexName = "Local\RzCodexAutoUpdate"
+$LockPath = Join-Path $StateRoot "update.lock"
+$BuildMetadataFilename = "rzcodex-build.json"
 
-function Invoke-NativeCommand {
-    param(
-        [Parameter(Mandatory)]
-        [string]$FilePath,
+function Assert-ChildPath {
+    param([string]$Parent, [string]$Child, [string]$Description)
+    $prefix = [IO.Path]::GetFullPath($Parent).TrimEnd("\", "/") + [IO.Path]::DirectorySeparatorChar
+    if (-not [IO.Path]::GetFullPath($Child).StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "$Description is outside its managed root."
+    }
+}
 
-        [Parameter(Mandatory)]
-        [string[]]$ArgumentList,
+Assert-ChildPath -Parent ([IO.Path]::GetFullPath($env:USERPROFILE)) -Child $InstallRoot -Description "The install root"
+Assert-ChildPath -Parent ([IO.Path]::GetFullPath($env:LOCALAPPDATA)) -Child $StateRoot -Description "The deployment state root"
+Assert-ChildPath -Parent $SnapshotParent -Child $SnapshotRoot -Description "The source snapshot root"
+if (-not (Test-Path -LiteralPath $RepoRoot -PathType Container)) {
+    throw "RzCodex repository root is missing: $RepoRoot"
+}
 
-        [Parameter(Mandatory)]
-        [string]$WorkingDirectory
-    )
+# Start-Process opens the redirect target ReadWrite + Inheritable and hands that
+# handle to the whole child tree, so a surviving descendant can still hold the
+# temp file open after the direct child exited. Readers must share with that
+# writer (FileShare ReadWrite) or the read races the surviving descendant.
+function Read-NativeOutputText {
+    param([Parameter(Mandatory)][string]$Path)
 
-    Push-Location -LiteralPath $WorkingDirectory
+    $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
     try {
-        & $FilePath @ArgumentList
-        if ($LASTEXITCODE -ne 0) {
-            throw "Command failed with exit code ${LASTEXITCODE}: $FilePath $($ArgumentList -join ' ')"
+        $reader = [IO.StreamReader]::new($stream)
+        try {
+            return $reader.ReadToEnd()
+        }
+        finally {
+            $reader.Dispose()
         }
     }
     finally {
+        $stream.Dispose()
+    }
+}
+
+function Invoke-NativeCommand {
+    param(
+        [Parameter(Mandatory)][string]$FilePath,
+        [Parameter(Mandatory)][string[]]$ArgumentList,
+        [Parameter(Mandatory)][string]$WorkingDirectory,
+        # Validation children may outlive their direct test runner; inherited
+        # updater pipes must not keep the failure path open.
+        [switch]$IsolateOutputPipes
+    )
+
+    Push-Location -LiteralPath $WorkingDirectory
+    $stdoutPath = $null
+    $stderrPath = $null
+    try {
+        if ($IsolateOutputPipes) {
+            $stdoutPath = [IO.Path]::GetTempFileName()
+            $stderrPath = [IO.Path]::GetTempFileName()
+            $process = Start-Process -FilePath $FilePath `
+                -ArgumentList $ArgumentList `
+                -WorkingDirectory $WorkingDirectory `
+                -RedirectStandardOutput $stdoutPath `
+                -RedirectStandardError $stderrPath `
+                -NoNewWindow `
+                -PassThru
+            try {
+                $process.WaitForExit()
+                $exitCode = $process.ExitCode
+            }
+            finally {
+                $process.Dispose()
+            }
+            if (Test-Path -LiteralPath $stdoutPath -PathType Leaf) {
+                $stdout = Read-NativeOutputText -Path $stdoutPath
+                if ($stdout) {
+                    Write-Output -NoEnumerate $stdout
+                }
+            }
+            if (Test-Path -LiteralPath $stderrPath -PathType Leaf) {
+                $stderr = Read-NativeOutputText -Path $stderrPath
+                if ($stderr) {
+                    [Console]::Error.Write($stderr)
+                }
+            }
+        }
+        else {
+            & $FilePath @ArgumentList
+            $exitCode = $LASTEXITCODE
+        }
+        if ($exitCode -ne 0) {
+            throw "Command failed with exit code ${exitCode}: $FilePath $($ArgumentList -join ' ')"
+        }
+    }
+    finally {
+        if ($stdoutPath) {
+            Remove-Item -LiteralPath $stdoutPath -Force -ErrorAction SilentlyContinue
+        }
+        if ($stderrPath) {
+            Remove-Item -LiteralPath $stderrPath -Force -ErrorAction SilentlyContinue
+        }
         Pop-Location
     }
 }
 
-function Write-UpdateStatus {
+function Get-GitText {
     param(
-        [Parameter(Mandatory)]
-        [string]$Result,
-
-        [Parameter(Mandatory)]
-        [string]$Message,
-
-        [string]$Commit = ""
+        [Parameter(Mandatory)][string]$WorkingDirectory,
+        [Parameter(Mandatory)][string[]]$ArgumentList
     )
 
-    $status = [ordered]@{
-        timestamp = (Get-Date).ToString("o")
-        result = $Result
-        message = $Message
-        commit = $Commit
-        invocationId = $InvocationId
+    $gitArguments = @("-c", "core.longpaths=true") + @($ArgumentList)
+    $output = (& git -C $WorkingDirectory @gitArguments | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0) {
+        throw "Git command failed: git -C $WorkingDirectory $($ArgumentList -join ' ')"
     }
-    $status | ConvertTo-Json | Set-Content -LiteralPath $StatusPath -Encoding utf8
+    Write-Output -NoEnumerate ([string]$output)
+}
+
+function Get-StringHash {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Value)
+
+    $bytes = [Text.Encoding]::UTF8.GetBytes($Value)
+    $hash = [Security.Cryptography.SHA256]::HashData($bytes)
+    return [Convert]::ToHexString($hash).ToLowerInvariant()
+}
+
+function Write-AtomicJson {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][object]$Value
+    )
+
+    $temporaryPath = "$Path.$PID.$([Guid]::NewGuid().ToString('N')).tmp"
+    $json = ($Value | ConvertTo-Json -Depth 12) + [Environment]::NewLine
+    [IO.File]::WriteAllText($temporaryPath, $json, [Text.UTF8Encoding]::new($false))
+    Move-Item -LiteralPath $temporaryPath -Destination $Path -Force
+}
+
+$script:UpdateStatus = [ordered]@{
+    schemaVersion = 2
+    invocationId = $InvocationId
+    mode = $Mode
+    result = "running"
+    message = "RzCodex update started."
+    sourceId = ""
+    installedBuildId = ""
+    previousBinaryPath = ""
+    timestamp = (Get-Date).ToString("o")
+    phases = [ordered]@{
+        snapshot = "not_started"
+        validation = "not_started"
+        build = "not_started"
+        publish = "not_started"
+        activation = "not_started"
+        cleanup = "not_started"
+    }
+}
+
+function Set-UpdatePhase {
+    param(
+        [Parameter(Mandatory)][ValidateSet("snapshot", "validation", "build", "publish", "activation", "cleanup")][string]$Phase,
+        [Parameter(Mandatory)][ValidateSet("running", "succeeded", "failed", "skipped", "warning")][string]$State,
+        [string]$Message = ""
+    )
+
+    $script:UpdateStatus.phases[$Phase] = $State
+    $script:UpdateStatus.timestamp = (Get-Date).ToString("o")
+    if ($Message) {
+        $script:UpdateStatus.message = $Message
+    }
+    Write-AtomicJson -Path $StatusPath -Value $script:UpdateStatus
+}
+
+function Complete-UpdateStatus {
+    param(
+        [Parameter(Mandatory)][string]$Result,
+        [Parameter(Mandatory)][string]$Message
+    )
+
+    $script:UpdateStatus.result = $Result
+    $script:UpdateStatus.message = $Message
+    $script:UpdateStatus.timestamp = (Get-Date).ToString("o")
+    Write-AtomicJson -Path $StatusPath -Value $script:UpdateStatus
 }
 
 function Resolve-UpstreamRelease {
@@ -77,17 +236,12 @@ function Resolve-UpstreamRelease {
     catch {
         throw "Could not resolve the latest published upstream Codex release: $($_.Exception.Message)"
     }
-    $tagName = $release.tag_name
-    if ($tagName -isnot [string] -or $tagName -notmatch '^rust-v(?<Version>\d+\.\d+\.\d+)$') {
-        throw "The latest published upstream Codex release has an unsupported tag: $tagName"
-    }
-    $parsedVersion = $null
-    if (-not [System.Version]::TryParse($Matches.Version, [ref]$parsedVersion)) {
-        throw "The latest published upstream Codex release has an invalid version: $($Matches.Version)"
+    if ($release.tag_name -isnot [string] -or $release.tag_name -notmatch '^rust-v(?<Version>\d+\.\d+\.\d+)$') {
+        throw "The latest published upstream Codex release has an unsupported tag: $($release.tag_name)"
     }
     return [pscustomobject]@{
-        Tag = $tagName
-        Version = $parsedVersion.ToString(3)
+        Tag = $release.tag_name
+        Version = $Matches.Version
     }
 }
 
@@ -95,170 +249,217 @@ function Get-InstalledBuildMetadata {
     if (-not (Test-Path -LiteralPath $PointerPath -PathType Leaf)) {
         return $null
     }
+    $expectedFiles = @($Manifest.binaries) + @($Manifest.deploymentFiles)
+    return (Resolve-RzCodexManagedBuild -InstallRoot $InstallRoot -PointerPath $PointerPath -ExpectedRelativePaths $expectedFiles).Metadata
+}
 
-    try {
-        $installedBinary = [System.IO.File]::ReadAllText($PointerPath).Trim()
-        if (-not (Test-Path -LiteralPath $installedBinary -PathType Leaf)) {
-            return $null
-        }
-        $metadataPath = Join-Path (Split-Path -Parent $installedBinary) $BuildMetadataFilename
-        if (-not (Test-Path -LiteralPath $metadataPath -PathType Leaf)) {
-            return $null
-        }
-        $metadata = Get-Content -LiteralPath $metadataPath -Raw | ConvertFrom-Json
-        if ($metadata.commit -isnot [string] -or $metadata.baseVersion -isnot [string]) {
-            return $null
-        }
-        return $metadata
+function Assert-CleanScheduledCheckout {
+    $branch = Get-GitText -WorkingDirectory $RepoRoot -ArgumentList @("branch", "--show-current")
+    if ($branch -ne $BranchName) {
+        throw "Scheduled RzCodex update requires branch '$BranchName'; current branch is '$branch'."
     }
-    catch {
-        return $null
+    $changes = Get-GitText -WorkingDirectory $RepoRoot -ArgumentList @("status", "--porcelain=v1", "--untracked-files=all")
+    if ($changes) {
+        throw "Scheduled RzCodex update refused because the checkout has tracked, staged, or untracked changes."
     }
 }
 
-function Test-BinaryInputsChanged {
+function Resolve-OwnedFiles {
+    if ($OwnedPath.Count -eq 0) {
+        if ($Mode -eq "LocalInstall") {
+            throw "LocalInstall requires at least one explicit -OwnedPath file."
+        }
+        return @()
+    }
+
+    $repoPrefix = $RepoRoot.TrimEnd("\", "/") + [IO.Path]::DirectorySeparatorChar
+    $resolved = foreach ($path in $OwnedPath) {
+        $absolutePath = if ([IO.Path]::IsPathRooted($path)) {
+            [IO.Path]::GetFullPath($path)
+        } else {
+            [IO.Path]::GetFullPath((Join-Path $RepoRoot $path))
+        }
+        if (-not $absolutePath.StartsWith($repoPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Owned path is outside the RzCodex repository: $path"
+        }
+        if (Test-Path -LiteralPath $absolutePath -PathType Container) {
+            throw "Owned paths must name individual files, not directories: $path"
+        }
+        $relativePath = [IO.Path]::GetRelativePath($RepoRoot, $absolutePath).Replace("\", "/")
+        if ($relativePath -eq ".git" -or $relativePath.StartsWith(".git/") -or $relativePath.StartsWith("codex-rs/target/")) {
+            throw "Owned path is not a source input: $relativePath"
+        }
+        & git -C $RepoRoot cat-file -e "HEAD:$relativePath" 2>$null
+        $trackedAtHead = $LASTEXITCODE -eq 0
+        if (-not $trackedAtHead -and -not (Test-Path -LiteralPath $absolutePath -PathType Leaf)) {
+            throw "Owned path is neither a current file nor a file tracked at HEAD: $relativePath"
+        }
+        [pscustomobject]@{
+            RelativePath = $relativePath
+            AbsolutePath = $absolutePath
+        }
+    }
+    return @($resolved | Sort-Object RelativePath -Unique)
+}
+
+function Get-OwnedFileState {
+    param([Parameter(Mandatory)][object[]]$Files)
+
+    $entries = @(foreach ($file in $Files) {
+        if (Test-Path -LiteralPath $file.AbsolutePath -PathType Leaf) {
+            $item = Get-Item -LiteralPath $file.AbsolutePath
+            [ordered]@{
+                path = $file.RelativePath
+                state = "file"
+                size = $item.Length
+                sha256 = (Get-FileHash -LiteralPath $file.AbsolutePath -Algorithm SHA256).Hash.ToLowerInvariant()
+            }
+        } else {
+            [ordered]@{
+                path = $file.RelativePath
+                state = "deleted"
+                size = 0
+                sha256 = ""
+            }
+        }
+    })
+    $json = ConvertTo-Json -InputObject $entries -Depth 4 -Compress
+    return [pscustomobject]@{
+        Entries = @($entries)
+        Json = $json
+        Hash = Get-StringHash $json
+    }
+}
+
+function New-DetachedSnapshot {
+    param([Parameter(Mandatory)][string]$Commit)
+
+    $path = [IO.Path]::GetFullPath((Join-Path $SnapshotRoot "worktree"))
+    if (Test-Path -LiteralPath $path) {
+        throw "Managed source snapshot path already exists; refusing to reuse a stale worktree: $path"
+    }
+    $registeredPaths = @(Get-GitText -WorkingDirectory $RepoRoot -ArgumentList @("worktree", "list", "--porcelain") |
+        Where-Object { $_ -like "worktree *" } |
+        ForEach-Object { [IO.Path]::GetFullPath($_.Substring(9).Trim()) })
+    if (@($registeredPaths | Where-Object { $_ -eq $path }).Count -ne 0) {
+        throw "Managed source snapshot path is already registered with Git; refusing to reuse it: $path"
+    }
+    $null = Invoke-NativeCommand -FilePath "git" -ArgumentList @(
+        "-c", "core.longpaths=true",
+        "worktree", "add", "--detach", $path, $Commit
+    ) -WorkingDirectory $RepoRoot
+    return $path
+}
+
+function Copy-OwnedFilesToSnapshot {
     param(
-        [Parameter(Mandatory)]
-        [object]$InstalledMetadata
+        [Parameter(Mandatory)][object[]]$Files,
+        [Parameter(Mandatory)][string]$SnapshotPath
     )
 
-    $installedCommit = $InstalledMetadata.commit
-    & git -C $RepoRoot rev-parse --verify --quiet "${installedCommit}^{commit}" *> $null
-    if ($LASTEXITCODE -ne 0) {
-        return $true
+    foreach ($file in $Files) {
+        $destination = Join-Path $SnapshotPath $file.RelativePath
+        if (Test-Path -LiteralPath $file.AbsolutePath -PathType Leaf) {
+            $parent = Split-Path -Parent $destination
+            New-Item -ItemType Directory -Path $parent -Force | Out-Null
+            Copy-Item -LiteralPath $file.AbsolutePath -Destination $destination -Force
+        } elseif (Test-Path -LiteralPath $destination -PathType Leaf) {
+            Remove-Item -LiteralPath $destination -Force
+        }
     }
-
-    & git -C $RepoRoot diff --quiet "$installedCommit..HEAD" -- codex-rs
-    if ($LASTEXITCODE -eq 0) {
-        return $false
-    }
-    if ($LASTEXITCODE -eq 1) {
-        return $true
-    }
-    throw "Could not compare current Rust binary inputs with installed commit $installedCommit."
 }
 
-function Test-MergeInProgress {
-    Push-Location -LiteralPath $RepoRoot
+function Get-SnapshotFingerprint {
+    param(
+        [Parameter(Mandatory)][string]$SnapshotPath,
+        [Parameter(Mandatory)][string]$BaseCommit
+    )
+
+    $patchPath = Join-Path $StateRoot ("snapshot-{0}-{1}.patch" -f $PID, [Guid]::NewGuid().ToString("N"))
     try {
-        & git rev-parse --verify --quiet MERGE_HEAD *> $null
-        return $LASTEXITCODE -eq 0
+        $null = Invoke-NativeCommand -FilePath "git" -ArgumentList @(
+            "-c", "core.longpaths=true",
+            "diff", "--binary", "--no-ext-diff", "--output=$patchPath", $BaseCommit, "--"
+        ) -WorkingDirectory $SnapshotPath
+        $patchHash = (Get-FileHash -LiteralPath $patchPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        $untrackedText = Get-GitText -WorkingDirectory $SnapshotPath -ArgumentList @(
+            "-c", "core.quotePath=false", "ls-files", "--others", "--exclude-standard"
+        )
+        $untracked = @($untrackedText -split "`r?`n" | Where-Object { $_ })
+        $untrackedEntries = foreach ($relativePath in ($untracked | Sort-Object)) {
+            $path = Join-Path $SnapshotPath $relativePath
+            [ordered]@{
+                path = $relativePath
+                size = (Get-Item -LiteralPath $path).Length
+                sha256 = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+            }
+        }
+        $description = [ordered]@{
+            baseCommit = $BaseCommit
+            patchSha256 = $patchHash
+            untracked = @($untrackedEntries)
+        } | ConvertTo-Json -Depth 5 -Compress
+        return Get-StringHash $description
     }
     finally {
-        Pop-Location
+        Remove-Item -LiteralPath $patchPath -Force -ErrorAction SilentlyContinue
     }
 }
 
 function Resolve-ReleaseVersionConflict {
     param(
-        [Parameter(Mandatory)]
-        [string]$BaseVersion
+        [Parameter(Mandatory)][string]$SnapshotPath,
+        [Parameter(Mandatory)][string]$BaseVersion
     )
 
-    $unmergedPaths = @(& git -C $RepoRoot diff --name-only --diff-filter=U)
-    if ($LASTEXITCODE -ne 0) {
-        throw "Could not inspect conflicts from the upstream release merge."
+    $unmergedText = Get-GitText -WorkingDirectory $SnapshotPath -ArgumentList @("diff", "--name-only", "--diff-filter=U")
+    $unmergedPaths = @($unmergedText -split "`r?`n" | Where-Object { $_ })
+    if ($unmergedPaths.Count -ne 1 -or $unmergedPaths[0] -ne "codex-rs/Cargo.toml") {
+        throw "Upstream release merge has unsupported conflicts: $($unmergedPaths -join ', ')"
     }
-    $expectedPath = "codex-rs/Cargo.toml"
-    if ($unmergedPaths.Count -ne 1 -or $unmergedPaths[0] -ne $expectedPath) {
-        $summary = if ($unmergedPaths.Count -eq 0) { "none" } else { $unmergedPaths -join ", " }
-        throw "Upstream release merge has unsupported conflicts: $summary"
-    }
-
-    $cargoTomlPath = Join-Path $RepoRoot "codex-rs\Cargo.toml"
-    $cargoToml = [System.IO.File]::ReadAllText($cargoTomlPath)
-    $conflictPattern = '(?m)^<<<<<<< HEAD\r?\nversion = "(?<Current>\d+\.\d+\.\d+)"\r?\n=======\r?\nversion = "(?<Incoming>\d+\.\d+\.\d+)"\r?\n>>>>>>> [^\r\n]+\r?\n'
-    $matches = [regex]::Matches($cargoToml, $conflictPattern)
+    $cargoTomlPath = Join-Path $SnapshotPath "codex-rs\Cargo.toml"
+    $cargoToml = [IO.File]::ReadAllText($cargoTomlPath)
+    $pattern = '(?m)^<<<<<<< HEAD\r?\nversion = "(?<Current>\d+\.\d+\.\d+)"\r?\n=======\r?\nversion = "(?<Incoming>\d+\.\d+\.\d+)"\r?\n>>>>>>> [^\r\n]+\r?\n'
+    $matches = [regex]::Matches($cargoToml, $pattern)
     $markerCount = [regex]::Matches($cargoToml, '(?m)^<<<<<<< |^=======\r?$|^>>>>>>> ').Count
-    if (
-        $matches.Count -ne 1 -or
-        $markerCount -ne 3 -or
-        $matches[0].Groups["Incoming"].Value -ne $BaseVersion
-    ) {
-        throw "The Cargo workspace version conflict was not the exact supported release-version shape."
+    if ($matches.Count -ne 1 -or $markerCount -ne 3 -or $matches[0].Groups["Incoming"].Value -ne $BaseVersion) {
+        throw "Cargo.toml did not contain the exact supported release-version conflict."
     }
-
     $newline = if ($matches[0].Value.Contains("`r`n")) { "`r`n" } else { "`n" }
-    $resolvedCargoToml = [regex]::new($conflictPattern).Replace(
-        $cargoToml,
-        "version = `"$BaseVersion`"$newline",
-        1
-    )
-    [System.IO.File]::WriteAllText($cargoTomlPath, $resolvedCargoToml)
-
-    Push-Location -LiteralPath $CodexRustRoot
-    try {
-        & cargo metadata --format-version 1 --no-deps *> $null
-        if ($LASTEXITCODE -ne 0) {
-            throw "Cargo could not refresh the workspace package versions after resolving the release conflict."
-        }
-    }
-    finally {
-        Pop-Location
-    }
-    Invoke-NativeCommand -FilePath "git" -ArgumentList @(
-        "add",
-        "--",
-        $expectedPath,
-        "codex-rs/Cargo.lock"
-    ) -WorkingDirectory $RepoRoot
-
-    $remainingConflicts = @(& git -C $RepoRoot diff --name-only --diff-filter=U)
-    if ($LASTEXITCODE -ne 0 -or $remainingConflicts.Count -ne 0) {
-        throw "The supported Cargo workspace version conflict did not resolve cleanly."
-    }
-    Write-Output "Resolved the upstream Cargo workspace version to $BaseVersion."
-}
-
-function Assert-NoUnstagedTrackedChanges {
-    & git -C $RepoRoot diff --quiet
-    $diffExitCode = $LASTEXITCODE
-    if ($diffExitCode -eq 0) {
-        return
-    }
-    if ($diffExitCode -ne 1) {
-        throw "Could not verify the RzCodex working tree after the update build."
-    }
-
-    $paths = @(& git -C $RepoRoot diff --name-only)
-    $summary = if ($paths.Count -eq 0) { "unknown" } else { $paths -join ", " }
-    throw "Update commands left unstaged tracked changes: $summary"
+    $resolved = [regex]::new($pattern).Replace($cargoToml, "version = `"$BaseVersion`"$newline", 1)
+    [IO.File]::WriteAllText($cargoTomlPath, $resolved)
+    Invoke-NativeCommand -FilePath "cargo" -ArgumentList @("metadata", "--format-version", "1", "--no-deps") -WorkingDirectory (Join-Path $SnapshotPath "codex-rs")
+    Invoke-NativeCommand -FilePath "git" -ArgumentList @("add", "--", "codex-rs/Cargo.toml", "codex-rs/Cargo.lock") -WorkingDirectory $SnapshotPath
 }
 
 function Initialize-WindowsBuildEnvironment {
-    $logicalProcessorCount = [System.Environment]::ProcessorCount
-    if ($logicalProcessorCount -lt 1) {
+    $processorCount = [Environment]::ProcessorCount
+    if ($processorCount -lt 1) {
         throw "Could not determine the logical processor count."
     }
-    $env:CARGO_BUILD_JOBS = $logicalProcessorCount.ToString()
-
+    $env:CARGO_BUILD_JOBS = $processorCount.ToString()
     $rustSysroot = (& rustc --print sysroot).Trim()
-    if ($LASTEXITCODE -ne 0 -or -not $rustSysroot) {
-        throw "Could not resolve the active Rust sysroot."
-    }
     $hostTriple = (& rustc --print host-tuple).Trim()
-    if ($LASTEXITCODE -ne 0 -or -not $hostTriple) {
-        throw "Could not resolve the active Rust host triple."
+    if ($LASTEXITCODE -ne 0 -or -not $rustSysroot -or -not $hostTriple) {
+        throw "Could not resolve the active Rust toolchain."
     }
     $rustLld = Join-Path $rustSysroot "lib\rustlib\$hostTriple\bin\rust-lld.exe"
     if (-not (Test-Path -LiteralPath $rustLld -PathType Leaf)) {
         throw "Rust's bundled linker was not found: $rustLld"
     }
     $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER = $rustLld
+    $env:CARGO_TARGET_DIR = $SharedTargetRoot
 }
 
 function Initialize-RustyV8Artifacts {
-    $cargoLockPath = Join-Path $CodexRustRoot "Cargo.lock"
-    $cargoLock = [System.IO.File]::ReadAllText($cargoLockPath)
-    $versionMatches = [regex]::Matches(
-        $cargoLock,
-        '(?ms)^\[\[package\]\]\r?\nname = "v8"\r?\nversion = "([^"]+)"'
-    )
-    $versions = @($versionMatches | ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique)
+    param([Parameter(Mandatory)][string]$SnapshotPath)
+
+    $cargoLock = [IO.File]::ReadAllText((Join-Path $SnapshotPath "codex-rs\Cargo.lock"))
+    $matches = [regex]::Matches($cargoLock, '(?ms)^\[\[package\]\]\r?\nname = "v8"\r?\nversion = "([^"]+)"')
+    $versions = @($matches | ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique)
     if ($versions.Count -ne 1) {
         throw "Expected exactly one v8 crate version in Cargo.lock; found $($versions.Count)."
     }
-
     $target = "x86_64-pc-windows-msvc"
     $profile = "ptrcomp_sandbox_release"
     $version = $versions[0]
@@ -268,235 +469,387 @@ function Initialize-RustyV8Artifacts {
     $archiveName = "rusty_v8_${profile}_${target}.lib.gz"
     $bindingName = "src_binding_${profile}_${target}.rs"
     $checksumsName = "rusty_v8_${profile}_${target}.sha256"
-    $checksumsPath = Join-Path $artifactRoot $checksumsName
     New-Item -ItemType Directory -Path $artifactRoot -Force | Out-Null
 
+    $checksumsPath = Join-Path $artifactRoot $checksumsName
     $temporaryChecksumsPath = "$checksumsPath.$PID.tmp"
     Invoke-WebRequest -Uri "$baseUrl/$checksumsName" -OutFile $temporaryChecksumsPath
     Move-Item -LiteralPath $temporaryChecksumsPath -Destination $checksumsPath -Force
-
     $checksumEntries = @{}
-    foreach ($line in [System.IO.File]::ReadAllLines($checksumsPath)) {
+    foreach ($line in [IO.File]::ReadAllLines($checksumsPath)) {
         if ($line -notmatch '^([0-9a-fA-F]{64})\s+\*?(.+)$') {
-            throw "Invalid rusty_v8 checksum entry: $line"
+            throw "Invalid rusty_v8 checksum entry."
         }
         $checksumEntries[$Matches[2].Trim()] = $Matches[1].ToLowerInvariant()
     }
-    if ($checksumEntries.Count -ne 2 -or
-        -not $checksumEntries.ContainsKey($archiveName) -or
-        -not $checksumEntries.ContainsKey($bindingName)) {
-        throw "The rusty_v8 checksum manifest must contain exactly the expected archive and binding."
+    if ($checksumEntries.Count -ne 2 -or -not $checksumEntries.ContainsKey($archiveName) -or -not $checksumEntries.ContainsKey($bindingName)) {
+        throw "The rusty_v8 checksum manifest does not contain exactly the expected artifacts."
     }
-
     foreach ($fileName in @($archiveName, $bindingName)) {
         $artifactPath = Join-Path $artifactRoot $fileName
         $expectedHash = $checksumEntries[$fileName]
-        $artifactValid = (Test-Path -LiteralPath $artifactPath -PathType Leaf) -and
+        $valid = (Test-Path -LiteralPath $artifactPath -PathType Leaf) -and
             ((Get-FileHash -LiteralPath $artifactPath -Algorithm SHA256).Hash.ToLowerInvariant() -eq $expectedHash)
-        if (-not $artifactValid) {
-            $temporaryArtifactPath = "$artifactPath.$PID.tmp"
-            Invoke-WebRequest -Uri "$baseUrl/$fileName" -OutFile $temporaryArtifactPath
-            $downloadedHash = (Get-FileHash -LiteralPath $temporaryArtifactPath -Algorithm SHA256).Hash.ToLowerInvariant()
-            if ($downloadedHash -ne $expectedHash) {
+        if (-not $valid) {
+            $temporaryPath = "$artifactPath.$PID.tmp"
+            Invoke-WebRequest -Uri "$baseUrl/$fileName" -OutFile $temporaryPath
+            $actualHash = (Get-FileHash -LiteralPath $temporaryPath -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actualHash -ne $expectedHash) {
                 throw "Checksum mismatch for downloaded rusty_v8 artifact: $fileName"
             }
-            Move-Item -LiteralPath $temporaryArtifactPath -Destination $artifactPath -Force
+            Move-Item -LiteralPath $temporaryPath -Destination $artifactPath -Force
         }
     }
-
     $env:RUSTY_V8_ARCHIVE = Join-Path $artifactRoot $archiveName
     $env:RUSTY_V8_SRC_BINDING_PATH = Join-Path $artifactRoot $bindingName
 }
 
-function Install-CodexBinary {
+function Invoke-ValidationGate {
     param(
-        [Parameter(Mandatory)]
-        [string]$Commit,
-
-        [Parameter(Mandatory)]
-        [string]$BaseVersion
+        [Parameter(Mandatory)][string]$SnapshotPath,
+        [Parameter(Mandatory)][bool]$RunFullWorkspaceTests
     )
 
-    $releaseRoot = Join-Path $CodexRustRoot "target\release"
-    $requiredBinaries = @(
-        "codex.exe",
-        "codex-code-mode-host.exe",
-        "codex-command-runner.exe",
-        "codex-windows-sandbox-setup.exe"
+    $snapshotRustRoot = Join-Path $SnapshotPath "codex-rs"
+    Invoke-NativeCommand -FilePath "just" -ArgumentList @("fmt-check") -WorkingDirectory $snapshotRustRoot -IsolateOutputPipes
+    $rustArguments = @("test", "--profile", "validation")
+    if ($RunFullWorkspaceTests) {
+        Invoke-NativeCommand -FilePath "just" -ArgumentList $rustArguments -WorkingDirectory $snapshotRustRoot -IsolateOutputPipes
+    } else {
+        foreach ($package in @($Manifest.validation.rustPackages)) {
+            $rustArguments += @("-p", $package)
+        }
+        Invoke-NativeCommand -FilePath "just" -ArgumentList $rustArguments -WorkingDirectory $snapshotRustRoot -IsolateOutputPipes
+    }
+    foreach ($arguments in @($Manifest.validation.javascript)) {
+        Invoke-NativeCommand -FilePath "node" -ArgumentList @($arguments) -WorkingDirectory $SnapshotPath -IsolateOutputPipes
+    }
+}
+
+function Test-InstalledBuildDirectory {
+    param(
+        [Parameter(Mandatory)][string]$BuildRoot,
+        [Parameter(Mandatory)][string]$SourceId,
+        [Parameter(Mandatory)][string]$AggregateHash
     )
-    foreach ($binaryName in $requiredBinaries) {
-        $sourceBinary = Join-Path $releaseRoot $binaryName
-        if (-not (Test-Path -LiteralPath $sourceBinary -PathType Leaf)) {
-            throw "Built Codex binary was not found: $sourceBinary"
+
+    try {
+        $metadata = Get-Content -LiteralPath (Join-Path $BuildRoot $BuildMetadataFilename) -Raw | ConvertFrom-Json
+        if ($metadata.activationState -ne "complete" -or $metadata.sourceId -ne $SourceId -or $metadata.aggregateSha256 -ne $AggregateHash) {
+            return $false
         }
+        foreach ($record in @($metadata.files)) {
+            $path = Join-Path $BuildRoot $record.path
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+                return $false
+            }
+            if ((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant() -ne $record.sha256) {
+                return $false
+            }
+        }
+        return $true
     }
-
-    $versionRoot = Join-Path $InstallRoot $Commit
-    $destinationBinary = Join-Path $versionRoot "codex.exe"
-    New-Item -ItemType Directory -Path $versionRoot -Force | Out-Null
-
-    foreach ($binaryName in $requiredBinaries) {
-        $sourceBinary = Join-Path $releaseRoot $binaryName
-        $installedBinary = Join-Path $versionRoot $binaryName
-        $temporaryBinary = "$installedBinary.$PID.tmp"
-        Copy-Item -LiteralPath $sourceBinary -Destination $temporaryBinary -Force
-        Move-Item -LiteralPath $temporaryBinary -Destination $installedBinary -Force
+    catch {
+        return $false
     }
+}
 
-    $reportedVersion = (& $destinationBinary --version | Out-String).Trim()
-    if ($LASTEXITCODE -ne 0 -or $reportedVersion -ne "RzCodex $BaseVersion") {
-        throw "The newly built RzCodex binary reported '$reportedVersion'; expected 'RzCodex $BaseVersion'."
-    }
-
-    $buildMetadata = [ordered]@{
-        product = "RzCodex"
-        baseVersion = $BaseVersion
-        commit = $Commit
-    }
-    $metadataPath = Join-Path $versionRoot $BuildMetadataFilename
-    $temporaryMetadataPath = "$metadataPath.$PID.tmp"
-    [System.IO.File]::WriteAllText(
-        $temporaryMetadataPath,
-        (($buildMetadata | ConvertTo-Json) + [Environment]::NewLine)
+function Install-CodexBuild {
+    param(
+        [Parameter(Mandatory)][string]$SnapshotPath,
+        [Parameter(Mandatory)][string]$SourceId,
+        [Parameter(Mandatory)][string]$SourceCommit,
+        [Parameter(Mandatory)][string]$SourceTreeHash,
+        [Parameter(Mandatory)][string]$BaseVersion,
+        [Parameter(Mandatory)][bool]$DirtySnapshot
     )
-    Move-Item -LiteralPath $temporaryMetadataPath -Destination $metadataPath -Force
 
-    $temporaryPointer = "$PointerPath.$PID.tmp"
-    [System.IO.File]::WriteAllText($temporaryPointer, $destinationBinary)
-    Move-Item -LiteralPath $temporaryPointer -Destination $PointerPath -Force
-
-    $installRootFull = [System.IO.Path]::GetFullPath($InstallRoot).TrimEnd("\") + "\"
-    $obsoleteVersions = Get-ChildItem -LiteralPath $InstallRoot -Directory |
-        Where-Object { $_.Name -match "^[0-9a-f]{12}$" -and $_.Name -ne $Commit } |
-        Sort-Object LastWriteTime -Descending |
-        Select-Object -Skip 2
-
-    foreach ($obsoleteVersion in $obsoleteVersions) {
-        $obsoletePath = [System.IO.Path]::GetFullPath($obsoleteVersion.FullName)
-        if (-not $obsoletePath.StartsWith($installRootFull, [System.StringComparison]::OrdinalIgnoreCase)) {
-            throw "Refusing to remove a Codex build outside the install root: $obsoletePath"
+    $releaseRoot = Join-Path $SharedTargetRoot "release"
+    $stageRoot = Join-Path $InstallRoot (".staging-{0}-{1}" -f $PID, [Guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $stageRoot -Force | Out-Null
+    try {
+        $records = @()
+        foreach ($binaryName in @($Manifest.binaries)) {
+            $source = Join-Path $releaseRoot $binaryName
+            if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+                throw "Built RzCodex binary was not found: $source"
+            }
+            $destination = Join-Path $stageRoot $binaryName
+            Copy-Item -LiteralPath $source -Destination $destination
+            $records += [pscustomobject][ordered]@{
+                path = $binaryName
+                size = (Get-Item -LiteralPath $destination).Length
+                sha256 = (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash.ToLowerInvariant()
+            }
         }
-        try {
-            Remove-Item -LiteralPath $obsoletePath -Recurse -Force -ErrorAction Stop
+        foreach ($relativePath in @($Manifest.deploymentFiles)) {
+            $source = Join-Path $SnapshotPath $relativePath
+            Assert-ChildPath -Parent $SnapshotPath -Child $source -Description "Deployment source '$relativePath'"
+            if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+                throw "Versioned deployment input was not found in the immutable snapshot: $relativePath"
+            }
+            $destination = Join-Path $stageRoot $relativePath
+            Assert-ChildPath -Parent $stageRoot -Child $destination -Description "Deployment destination '$relativePath'"
+            New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
+            Copy-Item -LiteralPath $source -Destination $destination
+            $records += [pscustomobject][ordered]@{
+                path = $relativePath
+                size = (Get-Item -LiteralPath $destination).Length
+                sha256 = (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash.ToLowerInvariant()
+            }
         }
-        catch {
-            Write-Warning "Could not remove inactive Codex build '$obsoletePath': $($_.Exception.Message)"
+        $records = @($records | Sort-Object path)
+        $aggregateHash = Get-StringHash ($records | ConvertTo-Json -Depth 4 -Compress)
+        $buildId = "$SourceId-$($aggregateHash.Substring(0, 12))"
+        $finalRoot = Join-Path (Join-Path $InstallRoot "builds") $buildId
+
+        $reportedVersion = (& (Join-Path $stageRoot "codex.exe") --version | Out-String).Trim()
+        if ($LASTEXITCODE -ne 0 -or $reportedVersion -ne "RzCodex $BaseVersion") {
+            throw "The staged RzCodex binary reported '$reportedVersion'; expected 'RzCodex $BaseVersion'."
+        }
+        $metadata = [ordered]@{
+            schemaVersion = 2
+            product = "RzCodex"
+            baseVersion = $BaseVersion
+            sourceId = $SourceId
+            sourceCommit = $SourceCommit
+            sourceTreeSha256 = $SourceTreeHash
+            dirtySnapshot = $DirtySnapshot
+            aggregateSha256 = $aggregateHash
+            buildId = $buildId
+            builtAt = (Get-Date).ToString("o")
+            activationState = "complete"
+            files = $records
+        }
+        Write-AtomicJson -Path (Join-Path $stageRoot $BuildMetadataFilename) -Value $metadata
+
+        New-Item -ItemType Directory -Path (Split-Path -Parent $finalRoot) -Force | Out-Null
+        if (Test-Path -LiteralPath $finalRoot -PathType Container) {
+            if (-not (Test-InstalledBuildDirectory -BuildRoot $finalRoot -SourceId $SourceId -AggregateHash $aggregateHash)) {
+                throw "An existing versioned build has the same identity but different contents: $finalRoot"
+            }
+        } else {
+            Move-Item -LiteralPath $stageRoot -Destination $finalRoot
+            $stageRoot = $null
+        }
+
+        $destinationBinary = Join-Path $finalRoot "codex.exe"
+        $pointerResult = Switch-RzCodexCurrentPointer `
+            -PointerPath $PointerPath `
+            -NewBinaryPath $destinationBinary `
+            -PostActivationCheck {
+                param($ActivePointerPath, $ExpectedBinaryPath)
+                $activeBinaryPath = [IO.Path]::GetFullPath([IO.File]::ReadAllText($ActivePointerPath).Trim())
+                if ($activeBinaryPath -ne [IO.Path]::GetFullPath($ExpectedBinaryPath)) {
+                    throw "The active pointer does not resolve to the newly installed binary."
+                }
+                $activeBuild = Resolve-RzCodexManagedBuild -InstallRoot $InstallRoot -PointerPath $ActivePointerPath
+                $activeVersion = (& $activeBuild.BinaryPath --version | Out-String).Trim()
+                if ($LASTEXITCODE -ne 0 -or $activeVersion -ne "RzCodex $BaseVersion") {
+                    throw "The active RzCodex binary reported '$activeVersion'; expected 'RzCodex $BaseVersion'."
+                }
+                $doctorStartInfo = [Diagnostics.ProcessStartInfo]::new()
+                $doctorStartInfo.FileName = $activeBuild.BinaryPath
+                $doctorStartInfo.UseShellExecute = $false
+                $doctorStartInfo.CreateNoWindow = $true
+                $doctorStartInfo.RedirectStandardOutput = $true
+                $doctorStartInfo.RedirectStandardError = $true
+                $doctorStartInfo.ArgumentList.Add("doctor")
+                $doctorStartInfo.ArgumentList.Add("--json")
+                $doctorProcess = [Diagnostics.Process]::new()
+                $doctorProcess.StartInfo = $doctorStartInfo
+                if (-not $doctorProcess.Start()) {
+                    throw "The active RzCodex doctor process could not start."
+                }
+                $doctorStdout = $doctorProcess.StandardOutput.ReadToEndAsync()
+                $doctorStderr = $doctorProcess.StandardError.ReadToEndAsync()
+                $doctorProcess.WaitForExit()
+                $doctorJson = $doctorStdout.GetAwaiter().GetResult()
+                $null = $doctorStderr.GetAwaiter().GetResult()
+                $doctorProcess.Dispose()
+                $doctor = $doctorJson | ConvertFrom-Json
+                if ($doctor.schemaVersion -ne 1 -or $doctor.codexVersion -ne $BaseVersion) {
+                    throw "The active RzCodex doctor report has unexpected provenance: $($doctor.codexVersion)"
+                }
+            }
+        return [pscustomobject]@{
+            BuildId = $buildId
+            BuildRoot = $finalRoot
+            BinaryPath = $destinationBinary
+            PreviousBinaryPath = $pointerResult.PreviousBinaryPath
+        }
+    }
+    finally {
+        if ($stageRoot -and (Test-Path -LiteralPath $stageRoot -PathType Container)) {
+            $stagePrefix = $InstallRoot.TrimEnd("\", "/") + [IO.Path]::DirectorySeparatorChar + ".staging-"
+            $resolvedStage = [IO.Path]::GetFullPath($stageRoot)
+            if (-not $resolvedStage.StartsWith($stagePrefix, [StringComparison]::OrdinalIgnoreCase)) {
+                throw "Refusing to clean a staging directory outside the managed install root."
+            }
+            Remove-Item -LiteralPath $resolvedStage -Recurse -Force
         }
     }
 }
 
-New-Item -ItemType Directory -Path $InstallRoot -Force | Out-Null
-New-Item -ItemType Directory -Path $LogRoot -Force | Out-Null
-$logPath = Join-Path $LogRoot ("update-{0}.log" -f (Get-Date -Format "yyyyMMdd-HHmmss"))
-$mutex = [System.Threading.Mutex]::new($false, $MutexName)
-$lockAcquired = $false
-$mergeStarted = $false
+function Remove-DetachedSnapshot {
+    param([Parameter(Mandatory)][string]$SnapshotPath)
+
+    $expectedPath = [IO.Path]::GetFullPath((Join-Path $SnapshotRoot "worktree"))
+    $resolved = [IO.Path]::GetFullPath($SnapshotPath)
+    if (-not [String]::Equals($resolved, $expectedPath, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Refusing to remove a source snapshot outside the managed worktree path: $resolved"
+    }
+    $null = Invoke-NativeCommand -FilePath "git" -ArgumentList @(
+        "-c", "core.longpaths=true",
+        "worktree", "remove", "--force", $resolved
+    ) -WorkingDirectory $RepoRoot
+}
+
+function Invoke-ExplicitBuildCacheCleanup {
+    $packages = @($Manifest.validation.rustPackages | Sort-Object -Unique)
+    foreach ($package in $packages) {
+        Invoke-NativeCommand -FilePath "cargo" -ArgumentList @("clean", "--release", "-p", $package) -WorkingDirectory $CodexRustRoot
+    }
+}
+
+New-Item -ItemType Directory -Path $StateRoot -Force | Out-Null
+$deploymentLock = $null
+try {
+    $deploymentLock = Open-RzCodexDeploymentLock -Path $LockPath
+}
+catch {
+    Write-Output "Another RzCodex deployment is already running; this invocation was skipped."
+    exit 0
+}
+New-Item -ItemType Directory -Path $InstallRoot, $LogRoot, $SnapshotRoot -Force | Out-Null
+$logPath = Join-Path $LogRoot ("update-{0}-{1}.log" -f (Get-Date -Format "yyyyMMdd-HHmmss"), $PID)
 $transcriptStarted = $false
+$snapshotPath = $null
+$currentPhase = "snapshot"
+$activationSucceeded = $false
+$cleanupWarnings = @()
 
 try {
-    $lockAcquired = $mutex.WaitOne(0)
-    if (-not $lockAcquired) {
-        Write-UpdateStatus -Result "skipped" -Message "Another RzCodex update is already running."
-        exit 0
-    }
-
     Start-Transcript -LiteralPath $logPath | Out-Null
     $transcriptStarted = $true
 
-    foreach ($requiredCommand in @("git", "cargo", "just", "rustc")) {
+    foreach ($requiredCommand in @("git", "cargo", "just", "rustc", "node")) {
         if (-not (Get-Command $requiredCommand -ErrorAction SilentlyContinue)) {
             throw "Required command is unavailable: $requiredCommand"
         }
     }
-
-    $currentBranch = (& git -C $RepoRoot branch --show-current).Trim()
-    if ($LASTEXITCODE -ne 0 -or $currentBranch -ne $BranchName) {
-        throw "RzCodex must be on branch '$BranchName'; current branch is '$currentBranch'."
+    if ($Mode -eq "ScheduledUpdate" -and -not $Publish) {
+        throw "ScheduledUpdate requires explicit -Publish authorization."
     }
-
-    $workingTreeChanges = @(& git -C $RepoRoot status --porcelain)
-    if ($LASTEXITCODE -ne 0) {
-        throw "Could not inspect the RzCodex working tree."
+    if ($Mode -ne "ScheduledUpdate" -and $Publish) {
+        throw "-Publish is valid only with ScheduledUpdate."
     }
-    if ($workingTreeChanges.Count -ne 0) {
-        throw "RzCodex has working-tree changes; automatic update refused."
+    if ($Mode -eq "ScheduledUpdate" -and $FullWorkspaceTests) {
+        throw "-FullWorkspaceTests is valid only with LocalInstall or ValidateOnly."
     }
 
     Initialize-WindowsBuildEnvironment
+    $startCommit = Get-GitText -WorkingDirectory $RepoRoot -ArgumentList @("rev-parse", "HEAD")
+    $baseVersion = ""
+    $releaseTag = ""
+    $updateAvailable = $false
 
-    $upstreamRelease = Resolve-UpstreamRelease
-    $releaseTag = $upstreamRelease.Tag
-    Invoke-NativeCommand -FilePath "git" -ArgumentList @(
-        "fetch",
-        "--force",
-        "upstream",
-        "refs/tags/${releaseTag}:refs/tags/${releaseTag}"
-    ) -WorkingDirectory $RepoRoot
-    $releaseCommit = (& git -C $RepoRoot rev-list -n 1 $releaseTag).Trim()
-    if ($LASTEXITCODE -ne 0 -or -not $releaseCommit) {
-        throw "Could not resolve upstream Codex release tag $releaseTag."
-    }
-
-    & git -C $RepoRoot merge-base --is-ancestor $releaseCommit HEAD
-    $ancestorExitCode = $LASTEXITCODE
-    if ($ancestorExitCode -notin @(0, 1)) {
-        throw "Could not compare rz-main with upstream release $releaseTag."
-    }
-    $updateAvailable = $ancestorExitCode -eq 1
-    $baseVersion = $upstreamRelease.Version
-    $currentCommit = (& git -C $RepoRoot rev-parse --short=12 HEAD).Trim()
-    if ($LASTEXITCODE -ne 0 -or -not $currentCommit) {
-        throw "Could not resolve the current RzCodex commit."
-    }
-    $installedMetadata = Get-InstalledBuildMetadata
-    $binaryInputsChanged = $null -eq $installedMetadata -or
-        $installedMetadata.baseVersion -ne $baseVersion -or
-        (Test-BinaryInputsChanged -InstalledMetadata $installedMetadata)
-    $buildRequired = $ForceBuild -or
-        $updateAvailable -or
-        $binaryInputsChanged
-
-    if (-not $buildRequired) {
-        $message = if ($installedMetadata.commit -eq $currentCommit) {
-            "RzCodex $baseVersion already contains upstream release $releaseTag."
+    if ($Mode -eq "ScheduledUpdate") {
+        Assert-CleanScheduledCheckout
+        $release = Resolve-UpstreamRelease
+        $releaseTag = $release.Tag
+        $baseVersion = $release.Version
+        Invoke-NativeCommand -FilePath "git" -ArgumentList @("fetch", "--force", "upstream", "refs/tags/${releaseTag}:refs/tags/${releaseTag}") -WorkingDirectory $RepoRoot
+        Invoke-NativeCommand -FilePath "git" -ArgumentList @("fetch", "origin", $BranchName) -WorkingDirectory $RepoRoot
+        $releaseCommit = Get-GitText -WorkingDirectory $RepoRoot -ArgumentList @("rev-list", "-n", "1", $releaseTag)
+        & git -C $RepoRoot merge-base --is-ancestor $releaseCommit $startCommit
+        if ($LASTEXITCODE -notin @(0, 1)) {
+            throw "Could not compare $BranchName with upstream release $releaseTag."
         }
-        else {
-            "RzCodex $baseVersion already contains upstream release $releaseTag; Rust binary inputs are unchanged since installed commit $($installedMetadata.commit)."
+        $updateAvailable = $LASTEXITCODE -eq 1
+        $installed = Get-InstalledBuildMetadata
+        $alreadyCurrent = -not $updateAvailable -and -not $ForceBuild -and
+            $null -ne $installed -and $installed.sourceCommit -eq $startCommit -and
+            $installed.baseVersion -eq $baseVersion -and -not $installed.dirtySnapshot
+        if ($alreadyCurrent) {
+            foreach ($phase in @("snapshot", "validation", "build", "publish", "activation", "cleanup")) {
+                Set-UpdatePhase -Phase $phase -State "skipped"
+            }
+            Complete-UpdateStatus -Result "current" -Message "RzCodex $baseVersion already contains upstream release $releaseTag."
+            exit 0
         }
-        Write-UpdateStatus -Result "current" -Message $message -Commit $currentCommit
+    }
+
+    Set-UpdatePhase -Phase "snapshot" -State "running" -Message "Creating an immutable RzCodex source snapshot."
+    $snapshotPath = New-DetachedSnapshot -Commit $startCommit
+    $sourceCommit = $startCommit
+    $dirtySnapshot = $false
+
+    if ($Mode -eq "ScheduledUpdate" -and $updateAvailable) {
+        Push-Location -LiteralPath $snapshotPath
+        try {
+            & git merge --no-commit --no-ff $releaseTag
+            if ($LASTEXITCODE -ne 0) {
+                Resolve-ReleaseVersionConflict -SnapshotPath $snapshotPath -BaseVersion $baseVersion
+            }
+            Invoke-NativeCommand -FilePath "git" -ArgumentList @("commit", "-m", "Merge upstream release $releaseTag into rz-main") -WorkingDirectory $snapshotPath
+        }
+        finally {
+            Pop-Location
+        }
+        $sourceCommit = Get-GitText -WorkingDirectory $snapshotPath -ArgumentList @("rev-parse", "HEAD")
+    } elseif ($Mode -ne "ScheduledUpdate") {
+        $ownedFiles = Resolve-OwnedFiles
+        $beforeState = Get-OwnedFileState -Files $ownedFiles
+        Copy-OwnedFilesToSnapshot -Files $ownedFiles -SnapshotPath $snapshotPath
+        $afterState = Get-OwnedFileState -Files $ownedFiles
+        if ($beforeState.Hash -ne $afterState.Hash -or $beforeState.Json -ne $afterState.Json) {
+            throw "An explicitly owned source file changed while the immutable snapshot was being created."
+        }
+        $dirtySnapshot = $ownedFiles.Count -gt 0
+        $cargoToml = [IO.File]::ReadAllText((Join-Path $snapshotPath "codex-rs\Cargo.toml"))
+        if ($cargoToml -notmatch '(?m)^version = "(?<Version>\d+\.\d+\.\d+)"\r?$') {
+            throw "Could not resolve the RzCodex workspace version from the source snapshot."
+        }
+        $baseVersion = $Matches.Version
+    }
+
+    $sourceTreeHash = Get-SnapshotFingerprint -SnapshotPath $snapshotPath -BaseCommit $sourceCommit
+    $sourceId = if ($dirtySnapshot) {
+        "$($sourceCommit.Substring(0, 12))-local-$($sourceTreeHash.Substring(0, 12))"
+    } else {
+        $sourceCommit.Substring(0, 12)
+    }
+    $script:UpdateStatus.sourceId = $sourceId
+    Set-UpdatePhase -Phase "snapshot" -State "succeeded" -Message "Immutable source snapshot $sourceId created."
+
+    $currentPhase = "validation"
+    Set-UpdatePhase -Phase "validation" -State "running" -Message "Running the mandatory RzCodex validation gate."
+    $env:CARGO_TARGET_DIR = $SharedTargetRoot
+    Initialize-RustyV8Artifacts -SnapshotPath $snapshotPath
+    Invoke-ValidationGate -SnapshotPath $snapshotPath -RunFullWorkspaceTests $FullWorkspaceTests.IsPresent
+    if ((Get-SnapshotFingerprint -SnapshotPath $snapshotPath -BaseCommit $sourceCommit) -ne $sourceTreeHash) {
+        throw "Validation mutated the immutable source snapshot."
+    }
+    Set-UpdatePhase -Phase "validation" -State "succeeded" -Message "Mandatory validation gate passed."
+
+    if ($Mode -eq "ValidateOnly") {
+        foreach ($phase in @("build", "publish", "activation")) {
+            Set-UpdatePhase -Phase $phase -State "skipped"
+        }
+        Complete-UpdateStatus -Result "validated" -Message "RzCodex source snapshot $sourceId passed the mandatory validation gate."
         exit 0
     }
 
-    if ($updateAvailable) {
-        $mergeStarted = $true
-        & git -C $RepoRoot merge --no-commit --no-ff $releaseTag
-        $mergeExitCode = $LASTEXITCODE
-        if ($mergeExitCode -ne 0) {
-            Resolve-ReleaseVersionConflict -BaseVersion $baseVersion
-        }
-    }
-
-    Invoke-NativeCommand -FilePath "just" -ArgumentList @("fmt-check") -WorkingDirectory $CodexRustRoot
-    if ($RunTests) {
-        Invoke-NativeCommand -FilePath "just" -ArgumentList @("test", "-p", "codex-core", "agent::role::tests") -WorkingDirectory $CodexRustRoot
-        Invoke-NativeCommand -FilePath "just" -ArgumentList @("test", "-p", "codex-config", "subagent_routes") -WorkingDirectory $CodexRustRoot
-        Invoke-NativeCommand -FilePath "just" -ArgumentList @("test", "-p", "codex-core", "managed_subagent_route_overrides_role_model_provider_and_reasoning") -WorkingDirectory $CodexRustRoot
-        Invoke-NativeCommand -FilePath "just" -ArgumentList @("test", "-p", "codex-cli", "subagents_cmd::tests::parses_route_selection") -WorkingDirectory $CodexRustRoot
-        Invoke-NativeCommand -FilePath "just" -ArgumentList @("test", "-p", "codex-tui", "route_picker_description_snapshot") -WorkingDirectory $CodexRustRoot
-        Invoke-NativeCommand -FilePath "just" -ArgumentList @("test", "-p", "codex-core", "collaboration_calls_without_encrypted_arguments_use_plaintext_messages") -WorkingDirectory $CodexRustRoot
-        Invoke-NativeCommand -FilePath "just" -ArgumentList @("test", "-p", "codex-models-manager", "managed_preset_uses_lazy_tool_discovery_with_direct_tools") -WorkingDirectory $CodexRustRoot
-        Invoke-NativeCommand -FilePath "just" -ArgumentList @("test", "-p", "codex-tui", "chatwidget::tests::exec_flow::exec_history_extends_previous_when_consecutive") -WorkingDirectory $CodexRustRoot
-        Invoke-NativeCommand -FilePath "just" -ArgumentList @("test", "-p", "codex-tui", "history_cell::tests::coalesces_reads_across_multiple_calls") -WorkingDirectory $CodexRustRoot
-    }
-    Initialize-RustyV8Artifacts
-    # These values are compile-time metadata for the installed release binary. Setting them
-    # before the debug test suite changes Cargo's build fingerprint and recompiles the entire
-    # workspace once per update even when the ordinary test artifacts are already current.
+    $currentPhase = "build"
+    Set-UpdatePhase -Phase "build" -State "running" -Message "Building optimized RzCodex release binaries."
     $env:RZCODEX_BASE_VERSION = $baseVersion
     $env:RZCODEX_REPO_ROOT = $RepoRoot
+    $env:RZCODEX_BUILD_SOURCE_ID = $sourceId
+    $env:RZCODEX_SOURCE_COMMIT = $sourceCommit
+    $env:RZCODEX_SOURCE_TREE_HASH = $sourceTreeHash
     Invoke-NativeCommand -FilePath "cargo" -ArgumentList @(
-        "build",
-        "--release",
+        "build", "--release",
         "-p", "codex-cli",
         "-p", "codex-code-mode-host",
         "-p", "codex-windows-sandbox",
@@ -504,49 +857,89 @@ try {
         "--bin", "codex-code-mode-host",
         "--bin", "codex-windows-sandbox-setup",
         "--bin", "codex-command-runner"
-    ) -WorkingDirectory $CodexRustRoot
-    if ($mergeStarted) {
-        # A full release build can normalize workspace-only entries that `cargo metadata
-        # --no-deps` did not touch while resolving the version conflict. Keep that generated
-        # lockfile in the release merge, while the cleanliness guard below still rejects any
-        # other unexpected build-time source mutation.
-        Invoke-NativeCommand -FilePath "git" -ArgumentList @(
-            "add",
-            "--",
-            "codex-rs/Cargo.lock"
-        ) -WorkingDirectory $RepoRoot
+    ) -WorkingDirectory (Join-Path $snapshotPath "codex-rs")
+    if ((Get-SnapshotFingerprint -SnapshotPath $snapshotPath -BaseCommit $sourceCommit) -ne $sourceTreeHash) {
+        throw "The release build mutated the immutable source snapshot."
     }
-    Assert-NoUnstagedTrackedChanges
+    Set-UpdatePhase -Phase "build" -State "succeeded" -Message "Optimized RzCodex release binaries built successfully."
 
-    if ($mergeStarted) {
-        Invoke-NativeCommand -FilePath "git" -ArgumentList @("commit", "-m", "Merge upstream release $releaseTag into rz-main") -WorkingDirectory $RepoRoot
-        $mergeStarted = $false
+    $currentPhase = "publish"
+    if ($Mode -eq "ScheduledUpdate" -and $updateAvailable) {
+        Set-UpdatePhase -Phase "publish" -State "running" -Message "Publishing the validated upstream merge."
+        Assert-CleanScheduledCheckout
+        $currentCommit = Get-GitText -WorkingDirectory $RepoRoot -ArgumentList @("rev-parse", "HEAD")
+        if ($currentCommit -ne $startCommit) {
+            throw "The RzCodex checkout advanced while its immutable build was running; refusing to publish."
+        }
+        Invoke-NativeCommand -FilePath "git" -ArgumentList @("push", "origin", "${sourceCommit}:refs/heads/${BranchName}") -WorkingDirectory $RepoRoot
+        try {
+            Invoke-NativeCommand -FilePath "git" -ArgumentList @("merge", "--ff-only", $sourceCommit) -WorkingDirectory $RepoRoot
+            Set-UpdatePhase -Phase "publish" -State "succeeded" -Message "Validated merge published and local branch fast-forwarded."
+        }
+        catch {
+            $cleanupWarnings += "Validated merge was pushed, but the local checkout could not fast-forward: $($_.Exception.Message)"
+            Set-UpdatePhase -Phase "publish" -State "warning" -Message $cleanupWarnings[-1]
+        }
+    } else {
+        Set-UpdatePhase -Phase "publish" -State "skipped" -Message "No commit or push was requested for this source snapshot."
     }
 
-    Invoke-NativeCommand -FilePath "git" -ArgumentList @("push", "origin", $BranchName) -WorkingDirectory $RepoRoot
-    $installedCommit = (& git -C $RepoRoot rev-parse --short=12 HEAD).Trim()
-    if ($LASTEXITCODE -ne 0) {
-        throw "Could not resolve the installed RzCodex commit."
+    $currentPhase = "activation"
+    Set-UpdatePhase -Phase "activation" -State "running" -Message "Installing and atomically activating the versioned RzCodex build."
+    $installedBuild = Install-CodexBuild `
+        -SnapshotPath $snapshotPath `
+        -SourceId $sourceId `
+        -SourceCommit $sourceCommit `
+        -SourceTreeHash $sourceTreeHash `
+        -BaseVersion $baseVersion `
+        -DirtySnapshot $dirtySnapshot
+    $activationSucceeded = $true
+    $script:UpdateStatus.installedBuildId = $installedBuild.BuildId
+    $script:UpdateStatus.previousBinaryPath = $installedBuild.PreviousBinaryPath
+    Set-UpdatePhase -Phase "activation" -State "succeeded" -Message "Versioned build $($installedBuild.BuildId) is active."
+
+    $currentPhase = "cleanup"
+    Set-UpdatePhase -Phase "cleanup" -State "running" -Message "Running explicit post-activation cleanup."
+    if ($CleanupBuildCache) {
+        try {
+            Invoke-ExplicitBuildCacheCleanup
+        }
+        catch {
+            $cleanupWarnings += "Scoped Cargo cache cleanup failed: $($_.Exception.Message)"
+        }
     }
-    Install-CodexBinary -Commit $installedCommit -BaseVersion $baseVersion
-    # The installed binaries are versioned outside Cargo's target tree. Drop the disposable
-    # compilation cache after a successful install so stable updates do not consume the C: drive.
-    Invoke-NativeCommand -FilePath "cargo" -ArgumentList @("clean") -WorkingDirectory $CodexRustRoot
-    Write-UpdateStatus -Result "updated" -Message "RzCodex $baseVersion built, pushed, and installed successfully." -Commit $installedCommit
+    if ($cleanupWarnings.Count -eq 0) {
+        Set-UpdatePhase -Phase "cleanup" -State "succeeded" -Message "Post-activation cleanup completed."
+        Complete-UpdateStatus -Result "installed" -Message "RzCodex $baseVersion build $($installedBuild.BuildId) validated, built, and installed successfully."
+    } else {
+        Set-UpdatePhase -Phase "cleanup" -State "warning" -Message ($cleanupWarnings -join " ")
+        Complete-UpdateStatus -Result "installed_with_warnings" -Message "RzCodex $baseVersion build $($installedBuild.BuildId) is installed; cleanup or local synchronization reported warnings."
+    }
 }
 catch {
-    if ($mergeStarted -or (Test-MergeInProgress)) {
-        & git -C $RepoRoot merge --abort
+    if ($script:UpdateStatus.phases[$currentPhase] -eq "running") {
+        Set-UpdatePhase -Phase $currentPhase -State "failed" -Message $_.Exception.Message
     }
-    Write-UpdateStatus -Result "failed" -Message $_.Exception.Message
+    if ($activationSucceeded) {
+        Complete-UpdateStatus -Result "installed_with_warnings" -Message "The RzCodex build is active, but a later operation failed: $($_.Exception.Message)"
+    } else {
+        Complete-UpdateStatus -Result "failed" -Message $_.Exception.Message
+    }
     throw
 }
 finally {
+    if ($snapshotPath) {
+        try {
+            Remove-DetachedSnapshot -SnapshotPath $snapshotPath
+        }
+        catch {
+            Write-Warning "Could not remove immutable source snapshot '$snapshotPath': $($_.Exception.Message)"
+        }
+    }
     if ($transcriptStarted) {
         Stop-Transcript | Out-Null
     }
-    if ($lockAcquired) {
-        $mutex.ReleaseMutex()
+    if ($null -ne $deploymentLock) {
+        $deploymentLock.Dispose()
     }
-    $mutex.Dispose()
 }

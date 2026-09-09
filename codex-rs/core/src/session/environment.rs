@@ -128,7 +128,14 @@ impl Session {
         }
 
         let mut next = current.apply(updates, &current_environments)?;
-        if let Some(model_provider) = updates.model_provider.as_deref() {
+        let mut config = (*next.original_config_do_not_use).clone();
+        let provider_changed = updates
+            .model_provider
+            .as_deref()
+            .is_some_and(|model_provider| {
+                current.original_config_do_not_use.model_provider_id != model_provider
+            });
+        if provider_changed && let Some(model_provider) = updates.model_provider.as_deref() {
             let provider_info = current
                 .original_config_do_not_use
                 .model_providers
@@ -144,11 +151,27 @@ impl Session {
                 provider_info.clone(),
                 Some(self.services.auth_manager.clone()),
             );
-            let mut config = (*next.original_config_do_not_use).clone();
+            next.models_manager = next.provider.models_manager(
+                config.codex_home.to_path_buf(),
+                config.model_catalog.clone(),
+            );
             config.model_provider_id = model_provider.to_string();
             config.model_provider = provider_info;
-            next.original_config_do_not_use = std::sync::Arc::new(config);
         }
+        config.model = Some(next.step_settings.collaboration_mode.model().to_string());
+        config.model_reasoning_effort = next
+            .step_settings
+            .collaboration_mode
+            .settings
+            .reasoning_effort
+            .clone();
+        if let Some(model_input_modalities) = &updates.step_settings.model_input_modalities {
+            config
+                .model_input_modalities
+                .clone_from(model_input_modalities);
+        }
+        next.model_info_overrides = config.to_models_manager_config().into();
+        next.original_config_do_not_use = std::sync::Arc::new(config);
         Ok(next)
     }
 

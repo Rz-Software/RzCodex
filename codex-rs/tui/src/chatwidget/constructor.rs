@@ -121,6 +121,8 @@ impl ChatWidget {
             model_catalog,
             model_popup_request_id: None,
             model_popup_model_ids: Vec::new(),
+            main_route_health_request_id: None,
+            subagent_route_health_request_id: None,
             session_telemetry,
             session_header: SessionHeader::new(header_model),
             initial_user_message,

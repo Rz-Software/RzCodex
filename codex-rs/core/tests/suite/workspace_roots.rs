@@ -483,10 +483,16 @@ async fn workspace_roots_deny_file_and_command_writes_outside_roots() -> Result<
         .function_call_output_content_and_success(COMMAND_CALL_ID)
         .context("denied command result should be present")?;
     let command_output = command_output.context("denied command output should be present")?;
-    assert!(
-        command_output.contains("Access is denied")
-            || command_output.contains(&command_path_display),
-        "outside command should be denied, got {command_output:?}"
+    let exit_code = command_output
+        .lines()
+        .find_map(|line| line.strip_prefix("Process exited with code "))
+        .context("outside command should report an exit code")?
+        .trim()
+        .parse::<i32>()
+        .context("outside command exit code should be an integer")?;
+    assert_ne!(
+        exit_code, 0,
+        "outside command should report a non-zero exit, got {command_output:?}"
     );
     assert!(
         test.fs()

@@ -1,5 +1,8 @@
 //! Test-only helpers shared across the TUI crate.
 
+use std::fs;
+use std::io;
+use std::path::Path;
 use std::sync::LazyLock;
 
 use codex_models_manager::bundled_models_response;
@@ -8,6 +11,19 @@ pub(crate) use codex_utils_absolute_path::test_support::PathBufExt;
 pub(crate) use codex_utils_absolute_path::test_support::test_path_buf;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+
+/// Marks rollout retention as recently completed for an embedded test server.
+///
+/// TUI fixtures intentionally use historical rollout timestamps. The production
+/// startup task must keep its normal retention policy, so only the test harness
+/// writes this marker before it creates the local thread store.
+pub(crate) fn mark_rollout_retention_ran_for_tests(codex_home: &Path) -> io::Result<()> {
+    let marker = codex_home.join(".tmp").join("rollout-retention.last-run");
+    if let Some(parent) = marker.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(marker, b"test fixture setup\n")
+}
 
 pub(crate) static TEST_MODEL_PRESETS: LazyLock<Vec<ModelPreset>> = LazyLock::new(|| {
     let mut response = bundled_models_response()

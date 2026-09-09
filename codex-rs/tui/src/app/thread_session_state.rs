@@ -94,6 +94,7 @@ impl App {
                 thread_name: None,
                 model: self.chat_widget.current_model().to_string(),
                 model_provider_id: self.config.model_provider_id.clone(),
+                model_input_modalities: self.config.model_input_modalities.clone(),
                 service_tier: self.chat_widget.current_service_tier().map(str::to_string),
                 approval_policy: AskForApproval::from(
                     self.config.permissions.approval_policy.value(),
@@ -112,9 +113,14 @@ impl App {
                 rollout_path: thread.path.clone(),
             }
         };
+        let route_identity_changed =
+            session.thread_id != thread_id || session.model_provider_id != thread.model_provider;
         session.thread_id = thread_id;
         session.thread_name = thread.name.clone();
         session.model_provider_id = thread.model_provider.clone();
+        if route_identity_changed {
+            session.model_input_modalities = None;
+        }
         session.set_cwd_retargeting_implicit_runtime_workspace_root(thread.cwd.clone());
         session.permission_profile = permission_profile;
         session.active_permission_profile = active_permission_profile;
@@ -178,6 +184,7 @@ mod tests {
             thread_name: None,
             model: "gpt-test".to_string(),
             model_provider_id: "test-provider".to_string(),
+            model_input_modalities: None,
             service_tier: None,
             approval_policy: AskForApproval::Never,
             approvals_reviewer: ApprovalsReviewer::User,
@@ -407,6 +414,7 @@ mod tests {
             ThreadId::from_string("00000000-0000-0000-0000-000000000405").expect("valid thread");
         let primary_session = ThreadSessionState {
             permission_profile: PermissionProfile::workspace_write(),
+            model_input_modalities: Some(vec![codex_protocol::openai_models::InputModality::Text]),
             ..test_thread_session(primary_thread_id, test_path_buf("/tmp/primary"))
         };
         let read_thread = Thread {
@@ -455,6 +463,7 @@ mod tests {
             .permission_profile()
             .clone();
         assert_eq!(session.permission_profile, expected_permission_profile);
+        assert_eq!(session.model_input_modalities, None);
         assert_ne!(
             session.permission_profile,
             app.config.permissions.permission_profile().clone(),

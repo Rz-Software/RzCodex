@@ -646,6 +646,7 @@ mod tests {
                 thread_settings: ThreadSettingsSnapshot {
                     model: "gpt-5.2-codex".to_string(),
                     model_provider_id: "updated-provider".to_string(),
+                    model_input_modalities: None,
                     service_tier: None,
                     approval_policy: AskForApproval::Never,
                     approvals_reviewer: ApprovalsReviewer::User,

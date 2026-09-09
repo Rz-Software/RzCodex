@@ -10,7 +10,12 @@ use uuid::Uuid;
 
 use super::RETENTION_AGE;
 use super::prune_expired_rollouts_at;
+use crate::ResumeThreadParams;
+use crate::ThreadMetadataPatch;
+use crate::ThreadPersistenceMetadata;
+use crate::ThreadStore;
 use crate::ThreadStoreError;
+use crate::UpdateThreadMetadataParams;
 use crate::local::LocalThreadStore;
 use crate::local::test_support::test_config;
 use crate::local::test_support::write_archived_session_file;
@@ -49,6 +54,90 @@ async fn retention_deletes_expired_active_and_archived_threads() {
     assert!(!compressed_sibling.exists());
     assert!(!old_archived.exists());
     assert!(fresh.exists());
+}
+
+#[tokio::test]
+async fn retention_deletes_expired_thread_state() {
+    let home = TempDir::new().expect("temp dir");
+    let store = test_store(&home).await;
+    let now = SystemTime::now();
+    let uuid = Uuid::from_u128(407);
+    let thread_id = thread_id(uuid);
+    let rollout =
+        write_session_file(home.path(), "2025-01-03T12-00-00", uuid).expect("old rollout");
+    store
+        .update_thread_metadata(UpdateThreadMetadataParams {
+            thread_id,
+            include_archived: false,
+            patch: ThreadMetadataPatch {
+                rollout_path: Some(rollout.clone()),
+                title: Some("expired thread".to_string()),
+                ..Default::default()
+            },
+        })
+        .await
+        .expect("index rollout");
+    let state_db = store.state_db().await.expect("state database");
+    assert!(
+        state_db
+            .get_thread(thread_id)
+            .await
+            .expect("read indexed thread")
+            .is_some()
+    );
+    set_age(&rollout, now, RETENTION_AGE + Duration::from_secs(1));
+
+    let stats = prune_expired_rollouts_at(&store, now)
+        .await
+        .expect("prune expired rollout and state");
+
+    assert_eq!(stats.deleted_threads, 1);
+    assert!(!rollout.exists());
+    assert!(
+        state_db
+            .get_thread(thread_id)
+            .await
+            .expect("read deleted thread")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn retention_keeps_expired_live_thread() {
+    let home = TempDir::new().expect("temp dir");
+    let store = test_store(&home).await;
+    let now = SystemTime::now();
+    let uuid = Uuid::from_u128(408);
+    let thread_id = thread_id(uuid);
+    let rollout =
+        write_session_file(home.path(), "2025-01-03T12-00-00", uuid).expect("old rollout");
+    store
+        .resume_thread(ResumeThreadParams {
+            thread_id,
+            rollout_path: Some(rollout.clone()),
+            history: None,
+            include_archived: false,
+            metadata: ThreadPersistenceMetadata {
+                cwd: Some(home.path().to_path_buf()),
+                model_provider: "test-provider".to_string(),
+                memory_mode: codex_protocol::protocol::ThreadMemoryMode::Enabled,
+            },
+        })
+        .await
+        .expect("resume rollout");
+    set_age(&rollout, now, RETENTION_AGE + Duration::from_secs(1));
+
+    let stats = prune_expired_rollouts_at(&store, now)
+        .await
+        .expect("inspect expired live rollout");
+
+    assert_eq!(stats.deleted_threads, 0);
+    assert_eq!(stats.skipped_active_threads, 1);
+    assert!(rollout.exists());
+    store
+        .discard_thread(thread_id)
+        .await
+        .expect("discard test writer");
 }
 
 #[tokio::test]

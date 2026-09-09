@@ -54,6 +54,38 @@ pub struct CodexHarnessMetadata {
     /// Measured in tokens, with any tool-specific allowance already included.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_token_limit_override: Option<usize>,
+
+    /// Whether inline images in this envelope already appeared in a persisted compaction.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub inline_images_persisted: bool,
+}
+
+/// Marks inline images after their first complete compacted checkpoint has been captured.
+///
+/// A later checkpoint can omit those payloads without conflating them with images introduced in
+/// the current context window.
+pub fn mark_inline_images_persisted(items: &mut [ResponseItemEnvelope]) {
+    for envelope in items {
+        if rollout_payload::has_inline_base64_images(&envelope.item) {
+            envelope
+                .metadata
+                .get_or_insert_default()
+                .inline_images_persisted = true;
+        }
+    }
+}
+
+/// Clears inherited image durability before a checkpoint is copied to new storage.
+///
+/// The new owner must persist the complete image payload once before later checkpoints may omit it.
+pub fn reset_inline_images_persisted(items: &mut [ResponseItemEnvelope]) {
+    for envelope in items {
+        if rollout_payload::has_inline_base64_images(&envelope.item)
+            && let Some(metadata) = envelope.metadata.as_mut()
+        {
+            metadata.inline_images_persisted = false;
+        }
+    }
 }
 
 impl ResponseItemEnvelope {

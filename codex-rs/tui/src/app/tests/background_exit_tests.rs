@@ -83,10 +83,12 @@ fn prepare_local_daemon_thread(app: &mut App) -> Result<ThreadId> {
     };
     let thread_id = ThreadId::new();
     app.active_thread_id = Some(thread_id);
-    app.chat_widget.handle_thread_session(test_thread_session(
-        thread_id,
-        test_path_buf("/tmp/project"),
-    ));
+    let mut session = test_thread_session(thread_id, test_path_buf("/tmp/project"));
+    // This fixture starts another embedded thread after attaching the synthetic daemon thread.
+    // Keep the synthetic session on the configured provider so that attachment does not make the
+    // subsequent thread/start request target an intentionally unknown test-only provider.
+    session.model_provider_id = app.config.model_provider_id.clone();
+    app.chat_widget.handle_thread_session(session);
     Ok(thread_id)
 }
 

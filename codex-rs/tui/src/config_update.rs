@@ -22,6 +22,7 @@ use codex_exec_server::LOCAL_ENVIRONMENT_ID;
 use codex_features::FEATURES;
 use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
 use codex_protocol::config_types::TrustLevel;
+use codex_protocol::openai_models::InputModality;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::LegacyAppPathString;
 use color_eyre::eyre::Result;
@@ -92,8 +93,21 @@ pub(crate) fn build_model_provider_selection_edits(
     model_provider: &str,
     model: &str,
     effort: Option<impl ToString>,
+    input_modalities: Option<&[InputModality]>,
 ) -> Vec<ConfigEdit> {
     let mut edits = build_model_selection_edits(model, effort);
+    edits.insert(
+        0,
+        input_modalities.map_or_else(
+            || clear_config_value("model_input_modalities"),
+            |input_modalities| {
+                replace_config_value(
+                    "model_input_modalities",
+                    serde_json::json!(input_modalities),
+                )
+            },
+        ),
+    );
     edits.insert(
         0,
         replace_config_value("model_provider", serde_json::json!(model_provider)),

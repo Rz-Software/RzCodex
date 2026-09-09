@@ -8,7 +8,6 @@ use crate::agent::role::DEFAULT_ROLE_NAME;
 use crate::agent::role::resolve_role_config;
 use crate::agent::status::is_final;
 use crate::agent_communication::AgentCommunicationContext;
-use crate::agent_communication::AgentCommunicationKind;
 use crate::codex_thread::ThreadConfigSnapshot;
 use crate::config::Config;
 use crate::config::RolloutBudgetConfig;
@@ -17,7 +16,6 @@ use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::rollout_budget::RolloutBudget;
 use crate::session::emit_subagent_session_started;
 use crate::session::multi_agents::ResolvedMultiAgentV2UsageHints;
-use crate::session_prefix::format_inter_agent_completion_message;
 use crate::session_prefix::format_subagent_context_line;
 use crate::thread_manager::ResumeThreadWithHistoryOptions;
 use crate::thread_manager::ThreadIdGenerator;
@@ -619,40 +617,8 @@ impl AgentControl {
                 None => true,
             };
             if child_agent_path.is_some() && child_uses_multi_agent_v2 {
-                let Some(child_agent_path) = child_agent_path.clone() else {
-                    return;
-                };
-                let Some(parent_agent_path) = child_agent_path
-                    .as_str()
-                    .rsplit_once('/')
-                    .and_then(|(parent, _)| AgentPath::try_from(parent).ok())
-                else {
-                    return;
-                };
-                let Some(message) = format_inter_agent_completion_message(
-                    parent_agent_path.clone(),
-                    child_agent_path.clone(),
-                    &status,
-                ) else {
-                    return;
-                };
-                let communication = InterAgentCommunication::new(
-                    child_agent_path,
-                    parent_agent_path,
-                    Vec::new(),
-                    message,
-                    /*trigger_turn*/ false,
-                );
-                let context =
-                    AgentCommunicationContext::new(AgentCommunicationKind::Result, child_thread_id);
-                let _ = control
-                    .send_inter_agent_communication(
-                        parent_thread_id,
-                        communication,
-                        context,
-                        TurnStartOptions::default(),
-                    )
-                    .await;
+                // The child session publishes the canonical terminal status and owns V2 parent
+                // notification. This watcher remains the compatibility owner for V1 children.
                 return;
             }
             let Ok(parent_thread) = state.get_thread(parent_thread_id).await else {

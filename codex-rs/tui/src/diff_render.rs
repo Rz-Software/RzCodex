@@ -215,6 +215,11 @@ fn resolve_diff_backgrounds(
 /// palette stays consistent within a frame even if the user swaps themes
 /// mid-render (theme picker live preview).
 pub(crate) fn current_diff_render_style_context() -> DiffRenderStyleContext {
+    #[cfg(test)]
+    if let Some(context) = tests::test_diff_render_style_context() {
+        return context;
+    }
+
     let theme = diff_theme();
     let color_level = diff_color_level();
     let diff_backgrounds = resolve_diff_backgrounds(theme, color_level);
@@ -1317,7 +1322,7 @@ fn style_gutter_dim() -> Style {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use insta::assert_debug_snapshot;
     use insta::assert_snapshot;
@@ -1327,6 +1332,41 @@ mod tests {
     use ratatui::text::Text;
     use ratatui::widgets::Paragraph;
     use ratatui::widgets::Wrap;
+
+    thread_local! {
+        static TEST_DIFF_RENDER_STYLE_CONTEXT: std::cell::Cell<Option<DiffRenderStyleContext>> = const {
+            std::cell::Cell::new(None)
+        };
+    }
+
+    pub(super) fn test_diff_render_style_context() -> Option<DiffRenderStyleContext> {
+        TEST_DIFF_RENDER_STYLE_CONTEXT.with(std::cell::Cell::get)
+    }
+
+    struct RestoreTestDiffRenderStyleContext {
+        previous: Option<DiffRenderStyleContext>,
+    }
+
+    impl Drop for RestoreTestDiffRenderStyleContext {
+        fn drop(&mut self) {
+            TEST_DIFF_RENDER_STYLE_CONTEXT.with(|context| {
+                context.set(self.previous.take());
+            });
+        }
+    }
+
+    /// Scope the deterministic terminal style used by tests that snapshot a real diff buffer.
+    pub(crate) fn with_test_dark_ansi16_diff_render_context<T>(render: impl FnOnce() -> T) -> T {
+        let _restore =
+            TEST_DIFF_RENDER_STYLE_CONTEXT.with(|context| RestoreTestDiffRenderStyleContext {
+                previous: context.replace(Some(DiffRenderStyleContext {
+                    theme: DiffTheme::Dark,
+                    color_level: DiffColorLevel::Ansi16,
+                    diff_backgrounds: ResolvedDiffBackgrounds::default(),
+                })),
+            });
+        render()
+    }
 
     #[test]
     fn ansi16_add_style_uses_foreground_only() {

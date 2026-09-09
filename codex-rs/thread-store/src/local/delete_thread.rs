@@ -1,8 +1,10 @@
 //! Local hard-delete support for persisted threads.
 //!
 //! Existing rollout files are deleted before this operation reports success. A rollout file that
-//! vanishes after discovery counts as already deleted. The app-server deletes main state DB rows
-//! after every associated rollout is removed; this module deletes local history projection rows.
+//! vanishes after discovery counts as already deleted. Interactive deletion leaves main state DB
+//! cleanup to the app-server after every associated rollout is removed. Retention has no external
+//! coordinator, so it deletes main state first after acquiring the same reference and writer locks;
+//! a remaining rollout then keeps a failed cleanup discoverable for the next retention pass.
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -29,6 +31,12 @@ struct ThreadRollouts {
     thread_id: codex_protocol::ThreadId,
     rollout_ids: HashSet<codex_protocol::ThreadId>,
     paths: Vec<PathBuf>,
+}
+
+#[derive(Clone, Copy)]
+enum MainStateCleanup {
+    CallerOwned,
+    BeforeRollouts,
 }
 
 impl ThreadRollouts {
@@ -69,15 +77,31 @@ pub(super) async fn delete_thread(
     let _lifecycle_guard = store.live_writer_locks.lock_lifecycle(thread_id).await;
     let _live_writer_guard = store.live_writer_locks.lock(thread_id).await;
     let reference_index = scan_reference_index(store).await?;
-    let thread_rollouts = ThreadRollouts::from_index(&reference_index, thread_id);
+    let mut thread_rollouts = ThreadRollouts::from_index(&reference_index, thread_id);
     ensure_no_external_references(&reference_index, std::slice::from_ref(&thread_rollouts))?;
     let mut writer_guards = store.acquire_writer_locks(&[thread_id]).await?;
-    delete_thread_after_reference_check(store, thread_rollouts, &mut writer_guards).await
+    prepare_thread_rollouts(store, &mut thread_rollouts).await?;
+    delete_prepared_thread(store, thread_rollouts, &mut writer_guards).await
 }
 
 pub(super) async fn delete_threads(
     store: &LocalThreadStore,
     params: DeleteThreadsParams,
+) -> ThreadStoreResult<()> {
+    delete_threads_with_state_cleanup(store, params, MainStateCleanup::CallerOwned).await
+}
+
+pub(super) async fn delete_expired_threads(
+    store: &LocalThreadStore,
+    params: DeleteThreadsParams,
+) -> ThreadStoreResult<()> {
+    delete_threads_with_state_cleanup(store, params, MainStateCleanup::BeforeRollouts).await
+}
+
+async fn delete_threads_with_state_cleanup(
+    store: &LocalThreadStore,
+    params: DeleteThreadsParams,
+    main_state_cleanup: MainStateCleanup,
 ) -> ThreadStoreResult<()> {
     let thread_ids = params.thread_ids;
     if thread_ids.is_empty() {
@@ -97,16 +121,40 @@ pub(super) async fn delete_threads(
     }
 
     let reference_index = scan_reference_index(store).await?;
-    let thread_rollouts = thread_ids
+    let mut thread_rollouts = thread_ids
         .iter()
         .map(|thread_id| ThreadRollouts::from_index(&reference_index, *thread_id))
         .collect::<Vec<_>>();
     ensure_no_external_references(&reference_index, thread_rollouts.as_slice())?;
 
     let mut writer_guards = store.acquire_writer_locks(&lock_thread_ids).await?;
-    for thread_rollouts in thread_rollouts {
-        match delete_thread_after_reference_check(store, thread_rollouts, &mut writer_guards).await
+    for thread_rollouts in &mut thread_rollouts {
+        prepare_thread_rollouts(store, thread_rollouts).await?;
+    }
+    if matches!(main_state_cleanup, MainStateCleanup::BeforeRollouts) {
+        let deletion_thread_ids = lock_thread_ids.iter().copied().collect::<HashSet<_>>();
+        if store
+            .live_recorders
+            .lock()
+            .await
+            .keys()
+            .any(|thread_id| deletion_thread_ids.contains(thread_id))
         {
+            return Err(ThreadStoreError::Conflict {
+                message: "an expired thread became active during retention".to_string(),
+            });
+        }
+        if let Some(state_db) = store.state_db().await {
+            state_db
+                .delete_threads_strict(&lock_thread_ids)
+                .await
+                .map_err(|err| ThreadStoreError::Internal {
+                    message: format!("failed to delete expired thread state: {err}"),
+                })?;
+        }
+    }
+    for thread_rollouts in thread_rollouts {
+        match delete_prepared_thread(store, thread_rollouts, &mut writer_guards).await {
             Ok(()) | Err(ThreadStoreError::ThreadNotFound { .. }) => {}
             Err(err) => return Err(err),
         }
@@ -163,10 +211,9 @@ fn referenced_thread_error(thread_id: codex_protocol::ThreadId) -> ThreadStoreEr
     }
 }
 
-async fn delete_thread_after_reference_check(
+async fn prepare_thread_rollouts(
     store: &LocalThreadStore,
-    mut thread_rollouts: ThreadRollouts,
-    writer_guards: &mut Vec<super::writer_lock::WriterLockGuard>,
+    thread_rollouts: &mut ThreadRollouts,
 ) -> ThreadStoreResult<()> {
     let thread_id = thread_rollouts.thread_id;
     let thread_id_str = thread_id.to_string();
@@ -202,6 +249,15 @@ async fn delete_thread_after_reference_check(
         }
     }
     thread_rollouts.rollout_ids.insert(thread_id);
+    Ok(())
+}
+
+async fn delete_prepared_thread(
+    store: &LocalThreadStore,
+    thread_rollouts: ThreadRollouts,
+    writer_guards: &mut Vec<super::writer_lock::WriterLockGuard>,
+) -> ThreadStoreResult<()> {
+    let thread_id = thread_rollouts.thread_id;
     for rollout_id in thread_rollouts.rollout_ids {
         super::thread_history::delete_thread(store, rollout_id).await?;
     }
@@ -211,14 +267,15 @@ async fn delete_thread_after_reference_check(
         writer_guards.push(entry.writer_lock);
     }
     let found_rollout_path = !thread_rollouts.paths.is_empty();
-    for rollout_path in thread_rollouts.paths {
-        delete_rollout_file(store, rollout_path.as_path())?;
-    }
     remove_thread_name_entries(store.config.codex_home.as_path(), thread_id)
         .await
         .map_err(|err| ThreadStoreError::Internal {
             message: format!("failed to delete thread name index entries for {thread_id}: {err}"),
         })?;
+    // Keep the rollout as the retry/discovery anchor until every other store is clean.
+    for rollout_path in thread_rollouts.paths {
+        delete_rollout_file(store, rollout_path.as_path())?;
+    }
 
     if !found_rollout_path {
         return Err(ThreadStoreError::ThreadNotFound { thread_id });

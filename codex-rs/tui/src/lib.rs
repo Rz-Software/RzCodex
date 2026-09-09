@@ -563,6 +563,9 @@ where
     F: FnOnce(InProcessClientStartArgs) -> Fut,
     Fut: Future<Output = std::io::Result<InProcessAppServerClient>>,
 {
+    #[cfg(test)]
+    crate::test_support::mark_rollout_retention_ran_for_tests(&config.codex_home)?;
+
     let config_warnings = config
         .startup_warnings
         .iter()

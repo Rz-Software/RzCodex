@@ -2524,6 +2524,32 @@
         }
       ]
     },
+    "InputModality": {
+      "description": "Canonical user-input modality tags advertised by a model.",
+      "oneOf": [
+        {
+          "description": "Plain text turns and tool payloads.",
+          "enum": [
+            "text"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Image attachments included in user turns.",
+          "enum": [
+            "image"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Audio attachments included in user turns.",
+          "enum": [
+            "audio"
+          ],
+          "type": "string"
+        }
+      ]
+    },
     "ItemCompletedNotification": {
       "properties": {
         "completedAtMs": {
@@ -5834,6 +5860,15 @@
         },
         "model": {
           "type": "string"
+        },
+        "modelInputModalities": {
+          "items": {
+            "$ref": "#/definitions/InputModality"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
         },
         "modelProvider": {
           "type": "string"

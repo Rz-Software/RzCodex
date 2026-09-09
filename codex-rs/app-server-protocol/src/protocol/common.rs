@@ -3150,6 +3150,7 @@ mod tests {
                 },
                 model: "gpt-5".to_string(),
                 model_provider: "openai".to_string(),
+                model_input_modalities: None,
                 service_tier: None,
                 cwd,
                 runtime_workspace_roots: Vec::new(),
@@ -3572,6 +3573,7 @@ mod tests {
                 "method": "model/list",
                 "id": 6,
                 "params": {
+                    "threadId": null,
                     "limit": null,
                     "cursor": null,
                     "includeHidden": null
@@ -4411,6 +4413,7 @@ mod tests {
                     active_permission_profile: None,
                     model: "gpt-5.4".to_string(),
                     model_provider: "openai".to_string(),
+                    model_input_modalities: None,
                     service_tier: None,
                     effort: None,
                     summary: None,

@@ -728,6 +728,7 @@ pub(super) async fn handle_pending_thread_resume_request(
     let ThreadConfigSnapshot {
         model,
         model_provider_id,
+        model_input_modalities,
         service_tier,
         approval_policy,
         approvals_reviewer,
@@ -747,6 +748,7 @@ pub(super) async fn handle_pending_thread_resume_request(
         thread,
         model,
         model_provider: model_provider_id,
+        model_input_modalities,
         service_tier,
         cwd,
         runtime_workspace_roots: workspace_roots,

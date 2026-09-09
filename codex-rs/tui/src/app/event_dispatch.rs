@@ -1581,7 +1581,11 @@ impl App {
             }
             AppEvent::FetchModels { request_id } => {
                 if self.chat_widget.model_popup_request_is_current(request_id) {
-                    app_server.fetch_models(request_id, self.app_event_tx.clone());
+                    app_server.fetch_models(
+                        request_id,
+                        self.active_thread_id,
+                        self.app_event_tx.clone(),
+                    );
                 }
             }
             AppEvent::ModelsLoaded { request_id, result } => {
@@ -2627,13 +2631,21 @@ impl App {
                 self.open_agent_picker(app_server).await;
             }
             AppEvent::SetSubagentRoute { route_id } => {
-                self.chat_widget.activate_subagent_route(&route_id);
+                self.chat_widget.activate_subagent_route(&route_id).await;
             }
             AppEvent::OpenMainAgentRoutePicker => {
                 self.chat_widget.open_main_agent_route_picker();
             }
             AppEvent::SetMainAgentRoute { route_id } => {
                 self.set_main_agent_route(app_server, &route_id).await;
+            }
+            AppEvent::MainAgentRouteHealthLoaded { request_id, health } => {
+                self.chat_widget
+                    .apply_main_agent_route_health(request_id, health);
+            }
+            AppEvent::SubagentRouteHealthLoaded { request_id, health } => {
+                self.chat_widget
+                    .apply_subagent_route_health(request_id, health);
             }
             AppEvent::AgentPickerThreadsLoaded {
                 primary_thread_id,

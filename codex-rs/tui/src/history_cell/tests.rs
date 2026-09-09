@@ -546,6 +546,7 @@ fn session_configured_event(model: &str) -> ThreadSessionState {
         thread_name: None,
         model: model.to_string(),
         model_provider_id: "test-provider".to_string(),
+        model_input_modalities: None,
         service_tier: None,
         approval_policy: AskForApproval::Never,
         approvals_reviewer: codex_protocol::config_types::ApprovalsReviewer::User,
@@ -1252,7 +1253,9 @@ fn vite_plus_update_available_history_cell_snapshot() {
         "9.9.9".to_string(),
         Some(UpdateAction::VitePlusGlobalLatest),
     );
-    let rendered = render_lines(&cell.display_lines(/*width*/ 110)).join("\n");
+    let rendered = render_lines(&cell.display_lines(/*width*/ 110))
+        .join("\n")
+        .replace(crate::version::CODEX_CLI_VERSION, "<VERSION>");
 
     insta::assert_snapshot!(rendered);
 }

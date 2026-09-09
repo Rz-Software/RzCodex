@@ -170,10 +170,24 @@ impl CatalogRequestProcessor {
         &self,
         params: ModelListParams,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        let thread = match params.thread_id.as_deref() {
+            Some(thread_id) => {
+                let thread_id = ThreadId::from_string(thread_id)
+                    .map_err(|err| invalid_request(format!("invalid thread id: {err}")))?;
+                Some(
+                    self.thread_manager
+                        .get_thread(thread_id)
+                        .await
+                        .map_err(|_| invalid_request(format!("thread not found: {thread_id}")))?,
+                )
+            }
+            None => None,
+        };
         Self::list_models(
             self.thread_manager.clone(),
             self.config.http_client_factory(),
             params,
+            thread,
         )
         .await
         .map(|response| Some(response.into()))
@@ -244,18 +258,24 @@ impl CatalogRequestProcessor {
         thread_manager: Arc<ThreadManager>,
         http_client_factory: codex_http_client::HttpClientFactory,
         params: ModelListParams,
+        thread: Option<Arc<CodexThread>>,
     ) -> Result<ModelListResponse, JSONRPCErrorError> {
         let ModelListParams {
+            thread_id: _,
             limit,
             cursor,
             include_hidden,
         } = params;
-        let models = supported_models(
-            thread_manager,
-            include_hidden.unwrap_or(false),
-            http_client_factory,
-        )
-        .await;
+        let include_hidden = include_hidden.unwrap_or(false);
+        let models = match thread {
+            Some(thread) => thread
+                .list_models(include_hidden, http_client_factory)
+                .await
+                .into_iter()
+                .map(crate::models::model_from_preset)
+                .collect(),
+            None => supported_models(thread_manager, include_hidden, http_client_factory).await,
+        };
         let total = models.len();
 
         if total == 0 {

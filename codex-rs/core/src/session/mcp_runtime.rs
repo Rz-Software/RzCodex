@@ -381,9 +381,11 @@ impl Session {
                 .collect(),
         );
         McpRuntimeInput {
-            // A model step may expose tools lazily, but its MCP catalog must be complete. A
-            // process cache can be stale or bounded and is not authoritative for a child.
-            startup_policy: McpStartupPolicy::Eager,
+            startup_policy: if matches!(desired.session_source, SessionSource::SubAgent(_)) {
+                McpStartupPolicy::LazyWhenCached
+            } else {
+                McpStartupPolicy::Eager
+            },
             config: mcp_config,
             plugins_available,
             ready_selected_capability_roots: ready_selected_capability_roots.to_vec(),

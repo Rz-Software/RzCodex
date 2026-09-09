@@ -1,11 +1,10 @@
 #!/usr/bin/env node
 
-import { createServer } from "node:http";
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { basename, isAbsolute, join } from "node:path";
-import { existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import {
   TaskStateError,
   formatNativeToolProgress,
@@ -19,13 +18,22 @@ import {
 import { projectInstructionsPromptSection } from "./native-project-instructions.mjs";
 import {
   NativeCliAgentError,
+  nativeExecutionPolicyFromTaskState,
   nativeCliAgentContext,
   nativeCliUsage,
   openCodeGoQuotaState,
   runCommandCodeNativeAgent,
   runOpenCodeNativeAgent,
+  validateFinalNativePrompt,
 } from "./native-cli-agent-runner.mjs";
 import { providerFailureDiagnostics } from "./native-subagent-provider-router.mjs";
+import { exitWhenParentStops } from "./bridge-lifecycle.mjs";
+import {
+  createAuthenticatedBridgeServer,
+  executionPolicy as checkedExecutionPolicy,
+  loadBridgeBearerToken,
+  sanitizeChildEnvironment,
+} from "./bridge-security.mjs";
 
 const COMMAND_CODE_PACKAGE_NAME = "command-code";
 const MINIMUM_COMMAND_CODE_VERSION = "1.33.0";
@@ -130,17 +138,10 @@ const PROVIDER_OPAQUE_INPUT_TYPES = new Set([
   "context_compaction",
   "compaction_trigger",
 ]);
-const EXIT_WITH_PARENT_ARGUMENT = "--exit-with-parent";
-const PARENT_EXIT_POLL_INTERVAL_MS = 250;
-const CURSOR_PROMPT_ARGUMENT_LIMIT = 24_000;
+const NATIVE_CLI_HEARTBEAT_INTERVAL_MS = 5_000;
 const CURSOR_STDERR_LIMIT = 16 * 1024;
 const CURSOR_REQUEST_TIMEOUT_MS = 30 * 60 * 1000;
 const CURSOR_AGENT_ROOT = join(process.env.LOCALAPPDATA || join(homedir(), "AppData", "Local"), "cursor-agent");
-const CURSOR_REQUEST_DIRECTORY = join(
-  process.env.CODEX_HOME || join(homedir(), ".codex"),
-  "commandcode-bridge",
-  "cursor-requests",
-);
 
 let commandCodeInstallation;
 const cursorRuntime = {
@@ -271,21 +272,6 @@ function resolveSubagentModelAlias(model, provider) {
 
 function isManagedModelAlias(model) {
   return model === SUBAGENT_MODEL_ALIAS || model === MAIN_AGENT_MODEL_ALIAS;
-}
-
-function exitWhenParentStops() {
-  if (!process.argv.includes(EXIT_WITH_PARENT_ARGUMENT)) return;
-
-  const parentPid = process.ppid;
-  const timer = setInterval(() => {
-    try {
-      process.kill(parentPid, 0);
-    } catch {
-      clearInterval(timer);
-      process.exit(0);
-    }
-  }, PARENT_EXIT_POLL_INTERVAL_MS);
-  timer.unref();
 }
 
 class BridgeError extends Error {
@@ -768,6 +754,7 @@ function translateResponsesRequest(body) {
   const inputItems = typeof input === "string" ? [{ type: "message", role: "user", content: [{ type: "input_text", text: input }] }] : input;
   if (!Array.isArray(inputItems)) throw new BridgeError("input must be a string or array");
   const taskState = taskStateFromInput(inputItems, MAX_ACTIVE_TASK_CHARS);
+  const workingDirectory = workingDirectoryFrom(body);
 
   const translatedTools = Array.isArray(body.tools)
     ? body.tools.flatMap(translateToolDefinition)
@@ -787,7 +774,7 @@ function translateResponsesRequest(body) {
   const toolCalls = new Map();
   const messages = [];
   const systemParts = [body.model === MAIN_AGENT_MODEL_ALIAS ? MAIN_AGENT_CONTRACT : NATIVE_DELEGATION_CONTRACT];
-  const projectInstructions = projectInstructionsPromptSection(body.client_metadata?.cwd);
+  const projectInstructions = projectInstructionsPromptSection(workingDirectory);
   if (projectInstructions) systemParts.push(projectInstructions);
   if (body.instructions !== undefined) systemParts.push(requireString(body.instructions, "instructions"));
   systemParts.push(...taskControlPromptSections(taskState));
@@ -958,7 +945,6 @@ function translateResponsesRequest(body) {
     params.reasoning_effort = requireString(body.reasoning.effort, "reasoning.effort");
   }
 
-  const workingDirectory = workingDirectoryFrom(body);
   const sessionId = sessionIdFrom(body);
 
   return {
@@ -1278,12 +1264,38 @@ function jsonResponse(response, status, value) {
   response.end(body);
 }
 
-function bearerFrom(request) {
-  const value = request.headers.authorization;
-  if (typeof value !== "string" || !/^Bearer\s+\S+$/i.test(value)) {
-    throw new BridgeError("Authorization: Bearer <CommandCode API key> is required", 401);
+function commandCodeProviderAuthorization(source = process.env) {
+  const environmentKey = typeof source.COMMAND_CODE_API_KEY === "string"
+    ? source.COMMAND_CODE_API_KEY.trim()
+    : "";
+  if (environmentKey) return `Bearer ${environmentKey}`;
+  try {
+    const auth = JSON.parse(readFileSync(join(homedir(), ".commandcode", "auth.json"), "utf8"));
+    if (typeof auth?.apiKey === "string" && auth.apiKey.trim()) return `Bearer ${auth.apiKey.trim()}`;
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      throw new BridgeError(`CommandCode provider credentials are unreadable: ${error.message}`, 500);
+    }
   }
-  return value;
+  throw new BridgeError("CommandCode provider credentials are unavailable", 503);
+}
+
+function openCodeProviderAuthorization(source = process.env, userHome = homedir()) {
+  const environmentKey = typeof source.OPENCODE_API_KEY === "string"
+    ? source.OPENCODE_API_KEY.trim()
+    : "";
+  if (environmentKey) return `Bearer ${environmentKey}`;
+  try {
+    const auth = JSON.parse(readFileSync(join(userHome, ".local", "share", "opencode", "auth.json"), "utf8"));
+    if (typeof auth?.opencode?.key === "string" && auth.opencode.key.trim()) {
+      return `Bearer ${auth.opencode.key.trim()}`;
+    }
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      throw new BridgeError(`OpenCode Zen provider credentials are unreadable: ${error.message}`, 500);
+    }
+  }
+  throw new BridgeError("OpenCode Zen provider credentials are unavailable", 503);
 }
 
 function cursorContentText(value, label) {
@@ -1313,7 +1325,7 @@ function cursorResponseErrorCode(error) {
 }
 
 function nativeCliResponseErrorCode(error) {
-  return Array.isArray(error?.nativeToolNames) && error.nativeToolNames.length > 0
+  return nativeProviderWorkCommitted(error)
     ? "provider_state_changed"
     : "external_provider_error";
 }
@@ -1331,11 +1343,15 @@ function cursorPromptFrom(body) {
     : input;
   if (!Array.isArray(items)) throw new BridgeError("input must be a string or array");
   const taskState = taskStateFromInput(items, MAX_ACTIVE_TASK_CHARS);
+  const workingDirectory = workingDirectoryFrom(body);
+  if (!isAbsolute(workingDirectory) || !existsSync(workingDirectory)) {
+    throw new BridgeError(`Cursor working directory does not exist: ${JSON.stringify(workingDirectory)}`);
+  }
 
   const sections = [
     mainAgent ? MAIN_AGENT_CONTRACT : NATIVE_DELEGATION_CONTRACT,
   ];
-  const projectInstructions = projectInstructionsPromptSection(body.client_metadata?.cwd);
+  const projectInstructions = projectInstructionsPromptSection(workingDirectory);
   if (projectInstructions) sections.push(projectInstructions);
   if (body.instructions !== undefined) {
     const instructions = requireString(body.instructions, "instructions");
@@ -1389,18 +1405,26 @@ function cursorPromptFrom(body) {
     throw new BridgeError(`${label} has unsupported Cursor input type ${JSON.stringify(item.type)}`);
   }
   sections.push(...taskControlPromptSections(taskState));
-  const prompt = sections.filter(Boolean).join("\n\n");
-  if (!prompt) throw new BridgeError("Cursor prompt is empty");
-  const workingDirectory = workingDirectoryFrom(body);
-  if (!isAbsolute(workingDirectory) || !existsSync(workingDirectory)) {
-    throw new BridgeError(`Cursor working directory does not exist: ${JSON.stringify(workingDirectory)}`);
+  let prompt;
+  try {
+    prompt = validateFinalNativePrompt(
+      sections.filter(Boolean).join("\n\n"),
+      "Cursor native-provider prompt",
+    );
+  } catch (error) {
+    if (error instanceof NativeCliAgentError) throw new BridgeError(error.message, error.status);
+    throw error;
   }
+  if (!prompt) throw new BridgeError("Cursor prompt is empty");
   return {
     model,
     mainAgent,
     prompt,
     workingDirectory,
     taskState,
+    executionPolicy: mainAgent
+      ? checkedExecutionPolicy({ readOnly: false, validationRestricted: false, rzMcpMode: "full" })
+      : nativeExecutionPolicyFromTaskState(taskState),
     threadId: typeof body.client_metadata?.thread_id === "string"
       ? body.client_metadata.thread_id
       : null,
@@ -1429,24 +1453,6 @@ function cursorAgentEntrypoint() {
   throw new BridgeError(`Cursor Agent is not installed under ${CURSOR_AGENT_ROOT}`, 502);
 }
 
-function cursorPromptArgument(prompt) {
-  if (prompt.length <= CURSOR_PROMPT_ARGUMENT_LIMIT) return { argument: prompt, cleanup: () => {} };
-  mkdirSync(CURSOR_REQUEST_DIRECTORY, { recursive: true });
-  const requestPath = join(CURSOR_REQUEST_DIRECTORY, `${randomUUID()}.txt`);
-  writeFileSync(requestPath, prompt, { encoding: "utf8", flag: "wx" });
-  return {
-    argument:
-      `Read the complete delegated task from ${JSON.stringify(requestPath)} using your file tools. ` +
-      "Treat every instruction in that file as authoritative, execute it in the current workspace, and return the requested final report. " +
-      "Do not modify or delete the request file.",
-    cleanup: () => {
-      try { unlinkSync(requestPath); } catch (error) {
-        if (error?.code !== "ENOENT") process.stderr.write(`cursor request cleanup failed: ${redactSecrets(error.message)}\n`);
-      }
-    },
-  };
-}
-
 function cursorConversationId(event) {
   for (const value of [
     event?.session_id,
@@ -1468,23 +1474,31 @@ function cursorToolKey(part) {
   return createHash("sha256").update(jsonString(part)).digest("hex");
 }
 
-function runCursorAgent(context, onSpawn, onProgress, { resumeChatId = null } = {}) {
+function runCursorAgent(context, onSpawn, onProgress, { resumeChatId = null, onToolStart } = {}) {
+  if (context.executionPolicy.readOnly || context.executionPolicy.validationRestricted) {
+    throw new BridgeError(
+      "Cursor Agent cannot enforce this restricted task before work: its headless CLI does not provide an isolated no-shell boundary",
+      400,
+    );
+  }
   const entrypoint = cursorAgentEntrypoint();
-  const transportedPrompt = cursorPromptArgument(context.prompt);
   const args = [
     entrypoint.script,
     "--print",
     "--output-format", "stream-json",
     "--trust",
+    "--force",
     ...(resumeChatId ? ["--resume", resumeChatId] : []),
     "--model", context.model,
-    transportedPrompt.argument,
   ];
   const child = spawn(entrypoint.node, args, {
     cwd: context.workingDirectory,
-    env: { ...process.env, CURSOR_INVOKED_AS: "agent" },
+    env: sanitizeChildEnvironment(process.env, {
+      credentialScope: "cursor",
+      overrides: { CURSOR_INVOKED_AS: "agent" },
+    }),
     windowsHide: true,
-    stdio: ["ignore", "pipe", "pipe"],
+    stdio: ["pipe", "pipe", "pipe"],
   });
   onSpawn(child);
   return new Promise((resolve, reject) => {
@@ -1495,6 +1509,7 @@ function runCursorAgent(context, onSpawn, onProgress, { resumeChatId = null } = 
     let resultEvent = null;
     let initializedModel = "";
     let chatId = resumeChatId;
+    let terminationError = null;
     const nativeToolNames = [];
     const nativeRzMcpTools = [];
     const seenNativeTools = new Set();
@@ -1512,8 +1527,12 @@ function runCursorAgent(context, onSpawn, onProgress, { resumeChatId = null } = 
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      transportedPrompt.cleanup();
       error ? reject(preserveCursorCommit(error, nativeToolNames, chatId)) : resolve(value);
+    };
+    const terminate = (error) => {
+      if (settled || terminationError) return;
+      terminationError = error;
+      child.kill();
     };
     const parseLine = (line) => {
       if (!line.trim()) return;
@@ -1533,6 +1552,7 @@ function runCursorAgent(context, onSpawn, onProgress, { resumeChatId = null } = 
             if (seenNativeTools.has(toolKey)) continue;
             seenNativeTools.add(toolKey);
             nativeToolNames.push(part.name);
+            onToolStart?.({ id: toolKey, name: part.name, input: part.input });
             const rzMcpTool = rzMcpToolNameFromNativeProgress(part.name, part.input);
             if (rzMcpTool) nativeRzMcpTools.push(rzMcpTool);
             pendingNativeTools.set(toolKey, { name: part.name, input: part.input });
@@ -1560,8 +1580,7 @@ function runCursorAgent(context, onSpawn, onProgress, { resumeChatId = null } = 
       }
     };
     const timer = setTimeout(() => {
-      child.kill();
-      finish(new BridgeError(`Cursor Agent exceeded ${CURSOR_REQUEST_TIMEOUT_MS}ms`, 504));
+      terminate(new BridgeError(`Cursor Agent exceeded ${CURSOR_REQUEST_TIMEOUT_MS}ms`, 504));
     }, CURSOR_REQUEST_TIMEOUT_MS);
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (chunk) => {
@@ -1575,9 +1594,19 @@ function runCursorAgent(context, onSpawn, onProgress, { resumeChatId = null } = 
     });
     child.stderr.setEncoding("utf8");
     child.stderr.on("data", (chunk) => { stderr = `${stderr}${chunk}`.slice(-CURSOR_STDERR_LIMIT); });
-    child.once("error", (error) => finish(new BridgeError(`Cursor Agent failed to start: ${error.message}`, 502)));
+    child.stdin.once("error", (error) => {
+      terminate(new BridgeError(`Cursor Agent could not receive its prompt on stdin: ${error.message}`, 502));
+    });
+    child.stdin.end(context.prompt, "utf8");
+    child.once("error", (error) => finish(
+      terminationError || new BridgeError(`Cursor Agent failed to start: ${error.message}`, 502),
+    ));
     child.once("close", (code, signal) => {
       parseLine(stdoutBuffer);
+      if (terminationError) {
+        finish(terminationError);
+        return;
+      }
       if (code !== 0) {
         const detail = stderr.trim() ? `: ${redactSecrets(stderr.trim())}` : "";
         finish(new BridgeError(`Cursor Agent exited with ${signal ? `signal ${signal}` : `code ${code}`}${detail}`, 502));
@@ -1648,12 +1677,20 @@ async function handleCursorResponses(request, response) {
     return;
   }
   const progress = nativeCliProgressEmitter(response);
+  const announcedToolStarts = new Set();
   try {
     const result = await runCursorAgent(
       context,
       (spawned) => { child = spawned; },
       ({ name, input, index }) => progress.emit(formatNativeToolProgress("cursor", index, name, input)),
-      { resumeChatId },
+      {
+        resumeChatId,
+        onToolStart: ({ id }) => {
+          if (announcedToolStarts.has(id)) return;
+          announcedToolStarts.add(id);
+          emitProviderWorkStarted(response, responseId, context.model);
+        },
+      },
     );
     if (clientGone) {
       if (stateKey && result.chatId && result.nativeToolNames.length > 0) {
@@ -1744,7 +1781,7 @@ async function handleCursorResponses(request, response) {
 }
 
 async function handleLegacyCommandCodeResponses(request, response, parsedBody = null) {
-  const authorization = bearerFrom(request);
+  const authorization = commandCodeProviderAuthorization();
   const body = parsedBody ?? await readJsonRequest(request);
   const translated = translateResponsesRequest(body);
   const installation = readCommandCodeInstallation();
@@ -2875,7 +2912,7 @@ function transformOpenCodeChatSseBlock(block, state, toolInfo) {
 }
 
 async function handleLegacyOpenCodeResponses(request, response, parsedBody = null) {
-  const authorization = bearerFrom(request);
+  const authorization = openCodeProviderAuthorization();
   const translated = normalizeOpenCodeRequest(parsedBody ?? await readJsonRequest(request));
   const taskState = translated.taskState;
   const transport = openCodeTransport(translated.body.model);
@@ -3040,6 +3077,46 @@ function nativeCliToolEvent(event, state) {
   return null;
 }
 
+function nativeCliStartedToolEvent(event, state) {
+  if (event?.type === "tool_use") {
+    return {
+      id: event.part?.callID || event.part?.id || event.part?.callId,
+      name: event.part?.tool,
+      input: event.part?.state?.input,
+    };
+  }
+  const payload = event?.type === "event" ? event.event : null;
+  if (payload?.type === "tool_running" || payload?.type === "tool_completed") {
+    return {
+      id: payload.toolCallId,
+      name: payload.toolName,
+      input: payload.toolInput
+        ?? payload.input
+        ?? payload.arguments
+        ?? (state?.lastCompletedToolCallId === payload.toolCallId
+          ? state.lastCompletedToolInput
+          : undefined),
+    };
+  }
+  return null;
+}
+
+function providerWorkStartedPayload(responseId, model) {
+  return {
+    response: {
+      id: responseId,
+      object: "response",
+      model,
+      status: "in_progress",
+      metadata: { provider_work_started: true },
+    },
+  };
+}
+
+function emitProviderWorkStarted(response, responseId, model) {
+  return writeSse(response, "response.in_progress", providerWorkStartedPayload(responseId, model));
+}
+
 function openCodeTaskRouteKey(context) {
   const ownershipHash = taskOwnershipHash(context.taskState);
   return context.threadId && ownershipHash ? `${context.threadId}:${ownershipHash}` : null;
@@ -3148,14 +3225,22 @@ async function handleNativeCliResponses(request, response, provider, parsedBody 
   });
   const progress = nativeCliProgressEmitter(response);
   const announcedTools = new Set();
-  let lastHeartbeatAt = 0;
+  const announcedToolStarts = new Set();
+  const heartbeatTimer = setInterval(() => {
+    if (clientGone || response.writableEnded) return;
+    writeSse(response, "response.in_progress", {
+      response: { id: responseId, object: "response", model: body.model, status: "in_progress" },
+    });
+  }, NATIVE_CLI_HEARTBEAT_INTERVAL_MS);
+  heartbeatTimer.unref?.();
   const onEvent = (event, state) => {
-    const now = Date.now();
-    if (now - lastHeartbeatAt >= 5_000) {
-      lastHeartbeatAt = now;
-      writeSse(response, "response.in_progress", {
-        response: { id: responseId, object: "response", model: body.model, status: "in_progress" },
-      });
+    const startedTool = nativeCliStartedToolEvent(event, state);
+    if (startedTool?.name) {
+      const startedKey = startedTool.id || `${startedTool.name}:${announcedToolStarts.size}`;
+      if (!announcedToolStarts.has(startedKey)) {
+        announcedToolStarts.add(startedKey);
+        emitProviderWorkStarted(response, responseId, body.model);
+      }
     }
     const tool = nativeCliToolEvent(event, state);
     if (!tool?.name) return;
@@ -3238,12 +3323,14 @@ async function handleNativeCliResponses(request, response, provider, parsedBody 
           rzmcp_tools_called: [...new Set(result.rzMcpTools || [])],
           provider_mutation_count: result.mutationCount,
           peak_turn_context_tokens: result.peakTurnInputTokens,
-          normalized_prompt_chars: context.prompt.length,
+          normalized_prompt_chars: result.normalizedPromptChars ?? context.prompt.length,
           codex_tool_schema_bytes_forwarded: 0,
           codex_tool_schema_bytes_ignored: context.toolSchemaBytesIgnored,
           lazy_rzmcp_proxy_tools: commandCode || context.executionPolicy.rzMcpMode !== "disabled" ? 2 : 0,
-          complete_active_task_delivered: context.taskDiagnostics.completeTaskDelivered,
-          active_task_hash: context.taskDiagnostics.taskHash,
+          complete_active_task_delivered: (result.taskDiagnostics ?? context.taskDiagnostics).completeTaskDelivered,
+          active_task_hash: (result.taskDiagnostics ?? context.taskDiagnostics).taskHash,
+          active_task_included_this_turn: (result.taskDiagnostics ?? context.taskDiagnostics).activeTaskIncludedThisTurn,
+          active_task_retained_in_provider_session: (result.taskDiagnostics ?? context.taskDiagnostics).retainedInProviderSession,
         },
       },
     });
@@ -3267,6 +3354,7 @@ async function handleNativeCliResponses(request, response, provider, parsedBody 
     });
     response.end();
   } finally {
+    clearInterval(heartbeatTimer);
     request.removeListener("aborted", abort);
   }
 }
@@ -3286,12 +3374,23 @@ async function handleOpenCodeResponses(request, response) {
 }
 
 async function selfTest() {
-  readCommandCodeInstallation();
+  if (openCodeProviderAuthorization({ OPENCODE_API_KEY: " fixture-key " }, homedir()) !== "Bearer fixture-key") {
+    throw new Error("self-test failed: OpenCode Zen provider authorization must not reuse bridge credentials");
+  }
   if (
     nativeCliToolEvent({ type: "event", event: { type: "tool_running", toolCallId: "call-1", toolName: "read" } }) !== null
     || nativeCliToolEvent({ type: "event", event: { type: "tool_completed", toolCallId: "call-1", toolName: "read" } })?.name !== "read"
   ) {
     throw new Error("self-test failed: CommandCode progress boundary must follow tool completion");
+  }
+  const workStarted = providerWorkStartedPayload("resp_fixture", "fixture-model");
+  if (
+    workStarted.response?.status !== "in_progress"
+    || workStarted.response?.metadata?.provider_work_started !== true
+    || nativeCliStartedToolEvent({ type: "event", event: { type: "tool_running", toolCallId: "call-1", toolName: "read" } })?.name !== "read"
+    || nativeCliStartedToolEvent({ type: "tool_use", part: { callID: "call-2", tool: "edit", state: { status: "running" } } })?.name !== "edit"
+  ) {
+    throw new Error("self-test failed: native provider tool starts must emit authoritative structured ownership");
   }
   if (
     nativeCliResponseErrorCode({ nativeToolNames: ["read"] }) !== "provider_state_changed"
@@ -3335,6 +3434,30 @@ async function selfTest() {
     recipient: "/root/worker",
     content: [{ type: "input_text", text }],
   });
+  let oversizedCursorPromptError = null;
+  try {
+    cursorPromptFrom({
+      model: "cursor/test-model",
+      input: [
+        taskItem(analysisTaskText),
+        ...Array.from({ length: 4 }, (_, index) => ({
+          type: "message",
+          role: "user",
+          content: `cursor-oversized-${index}:`.padEnd(31_000, "x"),
+        })),
+      ],
+      stream: true,
+      client_metadata: { cwd: homedir() },
+    });
+  } catch (error) {
+    oversizedCursorPromptError = error;
+  }
+  if (
+    oversizedCursorPromptError?.status !== 413
+    || !oversizedCursorPromptError.message.includes("Cursor native-provider prompt requires")
+  ) {
+    throw new Error("self-test failed: oversized final Cursor prompt escaped the shared aggregate budget");
+  }
   const nativeTaskPayload = "Message Type: NEW_TASK\nTask name: /root/native-cli-fixture\nPayload:\nRead the bounded fixture and report exactly once.";
   const nativeContext = nativeCliAgentContext({
     model: "@preset/codex-subagents",
@@ -4914,16 +5037,23 @@ async function selfTest() {
 }
 
 function start() {
-  const installation = readCommandCodeInstallation();
   const port = configuredPort();
-  const server = createServer(async (request, response) => {
+  const token = loadBridgeBearerToken();
+  const server = createAuthenticatedBridgeServer(async (request, response) => {
     try {
       if (request.method === "GET" && request.url === "/health") {
+        let commandCodeStatus;
+        try {
+          const installation = readCommandCodeInstallation();
+          commandCodeStatus = { available: true, version: installation.version };
+        } catch (error) {
+          commandCodeStatus = { available: false, error: redactSecrets(error.message) };
+        }
         const managedOpenCode = openCodeManagedRoute();
         const openCodeQuota = openCodeGoQuotaState.snapshot();
         jsonResponse(response, 200, {
           ok: true,
-          commandCodeVersion: installation.version,
+          commandCode: commandCodeStatus,
           openCodeSchemaAdapter: true,
           openCodeManagedRoute: {
             primary: {
@@ -4972,14 +5102,14 @@ function start() {
       const message = error instanceof BridgeError ? error.message : `Bridge error: ${error.message}`;
       jsonResponse(response, status, { error: { type: "bridge_error", message: redactSecrets(message) } });
     }
-  });
+  }, { token });
 
   server.on("error", (error) => {
     process.stderr.write(`commandcode-bridge: ${error.message}\n`);
     process.exitCode = 1;
   });
   server.listen(port, "127.0.0.1", () => {
-    process.stdout.write(`commandcode-bridge listening on 127.0.0.1:${port} (CommandCode ${installation.version})\n`);
+    process.stdout.write(`commandcode-bridge listening on authenticated 127.0.0.1:${port}\n`);
   });
 }
 

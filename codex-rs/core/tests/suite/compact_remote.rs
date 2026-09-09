@@ -1711,7 +1711,7 @@ async fn remote_compact_v2_reuses_compaction_trigger_for_followups() -> Result<(
 
     let response_requests = responses_mock.requests();
     let compact_request = &response_requests[3];
-    let item_create_time = |request: &responses::ResponsesRequest, text: &str| {
+    let item_create_time = |request: &responses::ResponsesRequest, text: &str, label: &str| {
         request
             .input()
             .into_iter()
@@ -1727,11 +1727,18 @@ async fn remote_compact_v2_reuses_compaction_trigger_for_followups() -> Result<(
                 item.pointer("/internal_chat_message_metadata_passthrough/create_time")
                     .cloned()
             })
-            .expect("matching message should include a creation timestamp")
+            .unwrap_or_else(|| panic!("{label} should include a creation timestamp"))
     };
-    let original_user_create_time = item_create_time(&response_requests[0], "hello remote compact");
-    let delegated_task_create_time =
-        item_create_time(&response_requests[1], &delegated_task_ciphertext);
+    let original_user_create_time = item_create_time(
+        &response_requests[0],
+        "hello remote compact",
+        "original user message",
+    );
+    let delegated_task_create_time = item_create_time(
+        &response_requests[1],
+        &delegated_task_ciphertext,
+        "delegated task message",
+    );
     assert!(
         compact_request
             .inputs_of_type("agent_message")
@@ -1812,15 +1819,23 @@ async fn remote_compact_v2_reuses_compaction_trigger_for_followups() -> Result<(
 
     let follow_up_request = response_requests.last().expect("follow-up request missing");
     assert_eq!(
-        item_create_time(follow_up_request, "hello remote compact"),
+        item_create_time(
+            follow_up_request,
+            "hello remote compact",
+            "follow-up retained original user message",
+        ),
         original_user_create_time
     );
     assert_eq!(
-        item_create_time(follow_up_request, &delegated_task_ciphertext),
+        item_create_time(
+            follow_up_request,
+            &delegated_task_ciphertext,
+            "follow-up retained delegated task message",
+        ),
         delegated_task_create_time
     );
     assert!(
-        item_create_time(follow_up_request, "after compact")
+        item_create_time(follow_up_request, "after compact", "follow-up user message",)
             .as_f64()
             .is_some_and(|create_time| create_time > 0.0)
     );

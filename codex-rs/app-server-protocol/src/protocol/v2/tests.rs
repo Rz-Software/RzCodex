@@ -308,6 +308,7 @@ fn thread_resume_response_round_trips_initial_turns_page() {
         },
         model: "gpt-5".to_string(),
         model_provider: "openai".to_string(),
+        model_input_modalities: None,
         service_tier: None,
         cwd: absolute_path("tmp"),
         runtime_workspace_roots: Vec::new(),
@@ -4920,6 +4921,44 @@ fn thread_settings_update_params_round_trip_model_provider() {
 
     let serialized = serde_json::to_value(params).expect("params should serialize");
     assert_eq!(serialized["modelProvider"], "codebuddy");
+}
+
+#[test]
+fn thread_settings_update_params_preserve_input_modality_override_states() {
+    let explicit: ThreadSettingsUpdateParams = serde_json::from_value(json!({
+        "threadId": "thread_123",
+        "modelInputModalities": ["text"]
+    }))
+    .expect("params should deserialize");
+    assert_eq!(
+        explicit.model_input_modalities,
+        Some(Some(vec![
+            codex_protocol::openai_models::InputModality::Text
+        ]))
+    );
+
+    let clear: ThreadSettingsUpdateParams = serde_json::from_value(json!({
+        "threadId": "thread_123",
+        "modelInputModalities": null
+    }))
+    .expect("params should deserialize");
+    assert_eq!(&clear.model_input_modalities, &Some(None));
+
+    let omitted = ThreadSettingsUpdateParams {
+        thread_id: "thread_123".to_string(),
+        ..Default::default()
+    };
+    assert_eq!(&omitted.model_input_modalities, &None);
+    assert_eq!(
+        serde_json::to_value(omitted)
+            .expect("params should serialize")
+            .get("modelInputModalities"),
+        None
+    );
+    assert_eq!(
+        serde_json::to_value(clear).expect("params should serialize")["modelInputModalities"],
+        serde_json::Value::Null
+    );
 }
 
 #[test]

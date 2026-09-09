@@ -108,7 +108,7 @@ const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 #[cfg(not(windows))]
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const TEST_ORIGINATOR: &str = "codex_vscode";
-const MULTI_AGENT_V2_NAMESPACE: &str = "collaboration";
+const MULTI_AGENT_V2_NAMESPACE: &str = "rz_collaboration";
 const INVALID_REQUEST_ERROR_CODE: i64 = -32600;
 const TINY_PNG_BYTES: &[u8] = &[
     137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0,
@@ -2731,6 +2731,13 @@ async fn turn_start_exec_approval_toggle_v2() -> Result<()> {
     let tmp = TempDir::new()?;
     let codex_home = tmp.path().to_path_buf();
     let bearer_token = "example_bearer_token_1234567890";
+    #[cfg(target_os = "windows")]
+    let first_shell_command = vec![
+        "Write-Output".to_string(),
+        "True".to_string(),
+        format!("Authorization: Bearer {bearer_token}"),
+    ];
+    #[cfg(not(target_os = "windows"))]
     let first_shell_command = vec![
         "python3".to_string(),
         "-c".to_string(),
@@ -2742,6 +2749,14 @@ async fn turn_start_exec_approval_toggle_v2() -> Result<()> {
     )?);
     let expected_display_command =
         expected_approval_command.replace(bearer_token, "[REDACTED_SECRET]");
+    #[cfg(target_os = "windows")]
+    let second_shell_command = vec!["Write-Output".to_string(), "42".to_string()];
+    #[cfg(not(target_os = "windows"))]
+    let second_shell_command = vec![
+        "python3".to_string(),
+        "-c".to_string(),
+        "print(42)".to_string(),
+    ];
 
     // Mock server: first turn requests a shell call (elicitation), then completes.
     // Second turn same, but we'll set approval_policy=never to avoid elicitation.
@@ -2754,11 +2769,7 @@ async fn turn_start_exec_approval_toggle_v2() -> Result<()> {
         )?,
         create_final_assistant_message_sse_response("done 1")?,
         create_command_execution_sse_response(
-            vec![
-                "python3".to_string(),
-                "-c".to_string(),
-                "print(42)".to_string(),
-            ],
+            second_shell_command,
             /*workdir*/ None,
             Some(5000),
             "call2",

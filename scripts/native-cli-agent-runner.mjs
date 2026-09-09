@@ -10,8 +10,9 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { homedir } from "node:os";
-import { isAbsolute, join, relative, resolve } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { delimiter, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   TaskStateError,
   activeTaskPromptSection,
@@ -24,9 +25,16 @@ import {
   taskStateFromInput,
 } from "./codebuddy-subagent-task-state.mjs";
 import { projectInstructionsPromptSection } from "./native-project-instructions.mjs";
+import {
+  assertProviderBoundaryEnforceable,
+  executionPolicy as checkedExecutionPolicy,
+  sanitizeChildEnvironment,
+} from "./bridge-security.mjs";
 
 const MAX_ACTIVE_TASK_CHARS = 40_000;
 const MAX_MAIN_PROMPT_CHARS = 120_000;
+const MAX_RETAINED_DELIVERY_IDENTITIES = 4_096;
+const MAX_RETAINED_DELIVERY_ID_CHARS = 256;
 const OLLAMA_CLOUD_CONTEXT_WINDOW = 1_048_576;
 const REQUEST_TIMEOUT_MS = 30 * 60 * 1000;
 const ROUTE_OWNERSHIP_TIMEOUT_MS = 55 * 1000;
@@ -43,15 +51,17 @@ const STDERR_LIMIT = 16 * 1024;
 const STATE_CLEANUP_RETRY_MS = 50;
 const STATE_CLEANUP_RELEASE_MS = 2 * 1000;
 const STALE_STATE_AGE_MS = REQUEST_TIMEOUT_MS + 5 * 60 * 1000;
+const ORPHAN_STATE_MARKER_SUFFIX = ".orphan.json";
 const OPENCODE_EXE = join(
   process.env.APPDATA || join(homedir(), "AppData", "Roaming"),
   "npm", "node_modules", "opencode-ai", "bin", "opencode.exe",
 );
-const COMMAND_CODE_PACKAGE = join(
-  process.env.APPDATA || join(homedir(), "AppData", "Roaming"),
-  "npm", "node_modules", "command-code",
-);
-const COMMAND_CODE_ENTRY = join(COMMAND_CODE_PACKAGE, "dist", "index.mjs");
+function commandCodePackageDirectory(source = process.env) {
+  return source.COMMANDCODE_PACKAGE_DIR || join(
+    source.APPDATA || join(homedir(), "AppData", "Roaming"),
+    "npm", "node_modules", "command-code",
+  );
+}
 const OPENCODE_STATE_DIRECTORY = join(
   process.env.LOCALAPPDATA || join(homedir(), "AppData", "Local"),
   "RzCodex", "native-cli-agents",
@@ -64,7 +74,6 @@ const COMMAND_CODE_HOME_CONFIG_DIRECTORY = join(COMMAND_CODE_HOME_DIRECTORY, ".c
 const COMMAND_CODE_LAUNCH_DIRECTORY = join(COMMAND_CODE_HOME_DIRECTORY, "workspace-root");
 const LAZY_RZMCP_PROXY = join(import.meta.dirname, "devin-rzmcp-lazy-proxy.mjs");
 const ROLE_TAG = /<(?:external_cli|codebuddy|cursor)_route_instructions>([\s\S]*?)<\/(?:external_cli|codebuddy|cursor)_route_instructions>/gi;
-const VALIDATION_RESTRICTED_TASK = /\b(?:do not|must not|never)[^.\n]{0,160}\b(?:build|compile|run\s+(?:the\s+)?tests?|test|control\s+(?:the\s+)?editor|use\s+(?:the\s+)?editor|pie|sie)\b|\bno\s+(?:build|compile|tests?|editor|pie|sie)\b/i;
 const MUTATION_TOOL = /^(?:apply_patch|edit|edit_file|write|write_file|create_file|delete_file|move_file)$/i;
 const LAZY_RZMCP_CALL_TOOL = /(?:^|[_:.-])call_rzmcp_tool$/i;
 const NATIVE_MCP_CALL_TOOL = /^mcp_call_tool$/i;
@@ -72,9 +81,8 @@ const READ_ONLY_RZMCP_TOOL_NAME = /^(?:analyze|check|count|describe|discover|doe
 const OLLAMA_USAGE_LIMIT = /providerID=ollama[\s\S]{0,2000}(?:reached|exceeded)[\s\S]{0,120}(?:session\s+)?usage limit|providerID=ollama[\s\S]{0,2000}\b429\b[\s\S]{0,120}(?:quota|usage|limit)/i;
 const OPENCODE_GO_QUOTA_LIMIT = /\b(?:monthly|weekly|daily|5[- ]?hour|five[- ]?hour)\s+(?:usage\s+)?limit\b|\busage\s+limit\s+(?:reached|exceeded|exhausted)\b|\b(?:insufficient balance|creditserror|not enough credits?|credits? exhausted)\b/i;
 const OPENCODE_TRANSIENT_RATE_LIMIT = /\bAI_APICallError:\s*Rate limit exceeded\b/i;
-const retainedOpenCodeStates = new Set();
-const retainedOpenCodeProgress = new Map();
-const retainedCommandCodeSessions = new Set();
+const retainedOpenCodeSessions = new Map();
+const retainedCommandCodeSessions = new Map();
 const nativeStateTails = new Map();
 const OPENCODE_GO_QUOTA_STATE_FILE = join(OPENCODE_STATE_DIRECTORY, "opencode-go-quota-state.json");
 const QUOTA_RECOVERY_PROBE_MS = 30 * 60 * 1000;
@@ -149,6 +157,7 @@ export class RecoveryProbeState {
 
   persist() {
     if (!this.statePath) return;
+    mkdirSync(dirname(this.statePath), { recursive: true });
     const temporaryPath = `${this.statePath}.${process.pid}.tmp`;
     try {
       writeFileSync(
@@ -176,8 +185,27 @@ export class RecoveryProbeState {
   }
 }
 
-mkdirSync(OPENCODE_STATE_DIRECTORY, { recursive: true });
-export const openCodeGoQuotaState = new RecoveryProbeState(OPENCODE_GO_QUOTA_STATE_FILE);
+class LazyRecoveryProbeState extends RecoveryProbeState {
+  constructor(statePath) {
+    super(null);
+    this.statePath = statePath;
+    this.loaded = false;
+  }
+
+  ensureLoaded() {
+    if (this.loaded) return;
+    this.loaded = true;
+    this.load();
+  }
+
+  isActive() { this.ensureLoaded(); return super.isActive(); }
+  record(reason, nowMs = this.now()) { this.ensureLoaded(); return super.record(reason, nowMs); }
+  claimRecoveryProbe(nowMs = this.now()) { this.ensureLoaded(); return super.claimRecoveryProbe(nowMs); }
+  clear() { this.ensureLoaded(); return super.clear(); }
+  snapshot() { this.ensureLoaded(); return super.snapshot(); }
+}
+
+export const openCodeGoQuotaState = new LazyRecoveryProbeState(OPENCODE_GO_QUOTA_STATE_FILE);
 
 function commandCodeReasoningArgs(model, effort) {
   return COMMANDCODE_FIXED_REASONING_MODELS.has(model) ? [] : ["--effort", effort];
@@ -201,6 +229,19 @@ export class NativeCliAgentError extends Error {
     this.name = "NativeCliAgentError";
     this.status = status;
   }
+}
+
+export function validateFinalNativePrompt(prompt, label = "Native-provider prompt") {
+  if (typeof prompt !== "string") {
+    throw new NativeCliAgentError(`${label} must be a string`, 400);
+  }
+  if (prompt.length > MAX_MAIN_PROMPT_CHARS) {
+    throw new NativeCliAgentError(
+      `${label} requires ${prompt.length} characters, exceeding the ${MAX_MAIN_PROMPT_CHARS}-character transport limit`,
+      413,
+    );
+  }
+  return prompt;
 }
 
 function json(value) {
@@ -253,25 +294,18 @@ function nativeToolIsMutation(name, input, executionPolicy) {
   return rzMcpToolName === null || !READ_ONLY_RZMCP_TOOL_NAME.test(rzMcpToolName);
 }
 
-function sanitizedEnvironment(source = process.env) {
-  const env = { ...source, NO_COLOR: "1" };
-  for (const key of [
-    "DEVIN_API_KEY", "DEVIN_ORG_ID", "COGNITION_API_KEY", "OPENAI_API_KEY",
-    "OPENAI_ORG_ID", "OPENAI_PROJECT_ID", "CODEX_API_KEY", "OPENROUTER_API_KEY",
-    "TENCENT_API_KEY", "TENCENTCLOUD_SECRET_ID", "TENCENTCLOUD_SECRET_KEY",
-    "CODEBUDDY_API_KEY", "COMMAND_CODE_API_KEY", "OLLAMA_API_KEY",
-  ]) delete env[key];
-  return env;
-}
-
 function commandCodeMcpConfigText() {
+  const commandEnvironment = {
+    PATH: `${dirname(process.execPath)}${delimiter}${process.env.PATH || ""}`,
+  };
   return `${JSON.stringify({
     mcpServers: {
       rzmcp: {
-        // CommandCode starts stdio MCP servers with `shell: true` on Windows. An absolute
-        // node.exe path under Program Files is split by cmd.exe before the proxy can start.
+        // CommandCode's supported stdio MCP launcher resolves the command through PATH. Pin the
+        // current Node directory first so Windows never has to shell-parse an executable path.
         command: "node",
         args: [LAZY_RZMCP_PROXY],
+        env: commandEnvironment,
         enabled: true,
       },
     },
@@ -315,7 +349,7 @@ function commandCodeApiKey(source = process.env) {
 
 function commandCodeEnvironment() {
   ensureCommandCodeHome();
-  const env = sanitizedEnvironment();
+  const env = sanitizeChildEnvironment(process.env, { credentialScope: "commandcode" });
   env.HOME = COMMAND_CODE_HOME_DIRECTORY;
   env.USERPROFILE = COMMAND_CODE_HOME_DIRECTORY;
   const apiKey = commandCodeApiKey();
@@ -323,8 +357,8 @@ function commandCodeEnvironment() {
   return env;
 }
 
-function commandCodePrompt(context) {
-  return `[CommandCode workspace boundary]\nThe CLI launch directory is an internal MCP-isolation directory, not the project. The authoritative workspace is ${context.workingDirectory}. Use absolute paths for file tools. Begin every shell command by changing to that workspace with PowerShell Set-Location -LiteralPath. Do not inspect or write the internal launch directory.\n\n${context.prompt}`;
+function commandCodePrompt(context, prompt = context.prompt) {
+  return `[CommandCode workspace boundary]\nThe CLI launch directory is an internal MCP-isolation directory, not the project. The authoritative workspace is ${context.workingDirectory}. Use absolute paths for file tools. Begin every shell command by changing to that workspace with PowerShell Set-Location -LiteralPath. Do not inspect or write the internal launch directory.\n\n${prompt}`;
 }
 
 function delay(milliseconds) {
@@ -359,21 +393,43 @@ async function cleanupNativeState(dbPath) {
     if (pending.size === 0 || Date.now() >= deadline) break;
     await delay(STATE_CLEANUP_RETRY_MS);
   } while (true);
-  for (const path of pending) reportRetainedNativeState(path, lastError);
+  const markerPath = `${dbPath}${ORPHAN_STATE_MARKER_SUFFIX}`;
+  if (pending.size > 0) {
+    for (const path of pending) reportRetainedNativeState(path, lastError);
+    try {
+      writeFileSync(markerPath, `${json({ version: 1, dbPath, orphanedAt: Date.now() })}\n`, "utf8");
+    } catch (error) {
+      reportRetainedNativeState(markerPath, error);
+    }
+  } else {
+    try { unlinkSync(markerPath); } catch (error) {
+      if (error?.code !== "ENOENT") reportRetainedNativeState(markerPath, error);
+    }
+  }
 }
 
 function sweepStaleNativeState(now = Date.now()) {
   if (!existsSync(OPENCODE_STATE_DIRECTORY)) return;
   for (const name of readdirSync(OPENCODE_STATE_DIRECTORY)) {
-    const path = join(OPENCODE_STATE_DIRECTORY, name);
+    if (!name.endsWith(`.db${ORPHAN_STATE_MARKER_SUFFIX}`)) continue;
+    const markerPath = join(OPENCODE_STATE_DIRECTORY, name);
     try {
-      if (now - statSync(path).mtimeMs < STALE_STATE_AGE_MS) continue;
-      unlinkSync(path);
-      const dbPath = path.replace(/-(?:shm|wal)$/, "");
-      retainedOpenCodeStates.delete(dbPath);
-      retainedOpenCodeProgress.delete(dbPath);
+      if (now - statSync(markerPath).mtimeMs < STALE_STATE_AGE_MS) continue;
+      const marker = JSON.parse(readFileSync(markerPath, "utf8"));
+      const dbPath = resolve(String(marker?.dbPath || ""));
+      const expectedDbPath = resolve(markerPath.slice(0, -ORPHAN_STATE_MARKER_SUFFIX.length));
+      if (marker?.version !== 1 || dbPath !== expectedDbPath) {
+        throw new Error("invalid native-state orphan marker");
+      }
+      if (retainedOpenCodeSessions.has(dbPath) || nativeStateTails.has(dbPath)) continue;
+      for (const path of nativeStatePaths(dbPath)) {
+        try { unlinkSync(path); } catch (error) {
+          if (error?.code !== "ENOENT") throw error;
+        }
+      }
+      unlinkSync(markerPath);
     } catch (error) {
-      if (error?.code !== "ENOENT") reportRetainedNativeState(path, error);
+      if (error?.code !== "ENOENT") reportRetainedNativeState(markerPath, error);
     }
   }
 }
@@ -432,43 +488,59 @@ function portableText(value) {
   }).filter(Boolean).join("\n");
 }
 
-function mainAgentHistory(input) {
+function mainAgentHistory(input, availableChars) {
   const sections = [];
   for (let index = 0; index < input.length; index += 1) {
     const item = input[index];
     if (!item || typeof item !== "object") continue;
     if (item.type === "message") {
       const text = portableText(item.content);
-      if (text) sections.push(`[${item.role || "message"}]\n${text}`);
+      if (text) sections.push({ inputIndex: index, current: item.role === "user", text: `[${item.role || "message"}]\n${text}` });
       continue;
     }
     if (item.type === "agent_message") {
       const text = portableText(item.content);
-      if (text) sections.push(`[Agent message]\n${text}`);
+      if (text) sections.push({ inputIndex: index, current: true, text: `[Agent message]\n${text}` });
       continue;
     }
     if (item.type === "reasoning") {
       const text = Array.isArray(item.summary)
         ? item.summary.map((part) => part?.text || "").join("")
         : "";
-      if (text) sections.push(`[Prior reasoning summary]\n${text}`);
+      if (text) sections.push({ inputIndex: index, current: false, text: `[Prior reasoning summary]\n${text}` });
       continue;
     }
     if (["function_call", "custom_tool_call", "tool_search_call"].includes(item.type)) {
-      sections.push(`[Prior Codex tool request ${item.name || "tool_search"}]\n${portableText(item.arguments ?? item.input ?? item.query)}`);
+      sections.push({ inputIndex: index, current: false, text: `[Prior Codex tool request ${item.name || "tool_search"}]\n${portableText(item.arguments ?? item.input ?? item.query)}` });
       continue;
     }
     if (["function_call_output", "custom_tool_call_output", "tool_search_output"].includes(item.type)) {
-      sections.push(`[Prior Codex tool result]\n${portableText(item.output ?? item.tools)}`);
+      sections.push({ inputIndex: index, current: false, text: `[Prior Codex tool result]\n${portableText(item.output ?? item.tools)}` });
     }
   }
+  const currentStart = sections.findLast((section) => section.current)?.inputIndex;
+  if (currentStart === undefined) {
+    throw new NativeCliAgentError("native main-agent route received no current user request", 400);
+  }
+  const required = sections.filter((section) => section.inputIndex >= currentStart);
+  const requiredChars = required.reduce((total, section) => total + section.text.length + 2, 0);
+  if (requiredChars > availableChars) {
+    throw new NativeCliAgentError(
+      `Current main-agent request requires ${requiredChars} prompt characters, exceeding the ${availableChars}-character remaining native-provider limit`,
+      413,
+    );
+  }
   const retained = [];
-  let chars = 0;
+  let chars = requiredChars;
   for (let index = sections.length - 1; index >= 0; index -= 1) {
     const section = sections[index];
-    if (chars + section.length + 2 > MAX_MAIN_PROMPT_CHARS) break;
-    retained.unshift(section);
-    chars += section.length + 2;
+    if (section.inputIndex >= currentStart) {
+      retained.unshift(section.text);
+      continue;
+    }
+    if (chars + section.text.length + 2 > availableChars) continue;
+    retained.unshift(section.text);
+    chars += section.text.length + 2;
   }
   return retained;
 }
@@ -479,14 +551,133 @@ function latestControlMessage(taskState) {
   return message?.text?.trim() || "";
 }
 
-function executionPolicy(taskState) {
+function retainedDeliveryItems(input, taskState) {
+  const taskMessagesByIndex = new Map(taskState.messages.map((message) => [message.index, message]));
+  const items = [];
+  const identities = new Set();
+  const append = (inputIndex, item, kind, text) => {
+    const itemId = typeof item.id === "string" && item.id
+      ? item.id
+      : kind === "tool_result" && typeof item.call_id === "string" && item.call_id
+        ? item.call_id
+        : null;
+    const identitySource = typeof item.id === "string" && item.id ? "item" : "call";
+    if (!itemId) {
+      throw new NativeCliAgentError(
+        `Retained native delivery item input[${inputIndex}] (${item.type}) has no stable item.id${kind === "tool_result" ? " or call_id" : ""}`,
+        400,
+      );
+    }
+    if (itemId.length > MAX_RETAINED_DELIVERY_ID_CHARS) {
+      throw new NativeCliAgentError(
+        `Retained native delivery item input[${inputIndex}] identity is ${itemId.length} characters; maximum is ${MAX_RETAINED_DELIVERY_ID_CHARS}`,
+        413,
+      );
+    }
+    const identity = `${item.type}:${identitySource}:${itemId}`;
+    if (identities.has(identity)) {
+      throw new NativeCliAgentError(
+        `Retained native delivery received duplicate stable identity ${JSON.stringify(identity)}`,
+        400,
+      );
+    }
+    identities.add(identity);
+    if (identities.size > MAX_RETAINED_DELIVERY_IDENTITIES) {
+      throw new NativeCliAgentError(
+        `Retained native delivery contains more than ${MAX_RETAINED_DELIVERY_IDENTITIES} identity-bearing items`,
+        413,
+      );
+    }
+    items.push({ inputIndex, identity, kind, text });
+  };
+  for (let inputIndex = 0; inputIndex < input.length; inputIndex += 1) {
+    const item = input[inputIndex];
+    if (!item || typeof item !== "object") continue;
+    if (item.type === "agent_message") {
+      const text = taskMessagesByIndex.get(inputIndex)?.text;
+      if (text) append(inputIndex, item, "parent_control", text);
+      continue;
+    }
+    if (["function_call_output", "custom_tool_call_output", "tool_search_output"].includes(item.type)) {
+      const outputText = portableText(item.output ?? item.tools);
+      append(
+        inputIndex,
+        item,
+        "tool_result",
+        `[New Codex tool result${item.call_id ? `: ${item.call_id}` : ""}]\n${outputText || "(empty result)"}`,
+      );
+    }
+  }
+  return items;
+}
+
+function activeTaskDeliveryIdentity(context) {
+  return context.retainedDeliveryItems
+    .find((item) => item.inputIndex === context.taskState.activeTask?.index)
+    ?.identity ?? null;
+}
+
+function deliveredNativeInput(context, retainedSession = null) {
+  const deliveredItemIdentities = new Set(retainedSession?.deliveredItemIdentities || []);
+  for (const item of context.retainedDeliveryItems) deliveredItemIdentities.add(item.identity);
+  if (deliveredItemIdentities.size > MAX_RETAINED_DELIVERY_IDENTITIES) {
+    throw new NativeCliAgentError(
+      `Retained native session delivery identity state would exceed ${MAX_RETAINED_DELIVERY_IDENTITIES} items`,
+      413,
+    );
+  }
+  return {
+    lastDeliveredTaskIdentity: activeTaskDeliveryIdentity(context),
+    lastDeliveredTaskHash: context.taskState.activeTask?.hash ?? null,
+    deliveredItemIdentities: [...deliveredItemIdentities],
+  };
+}
+
+function retainedContinuation(context, retainedSession) {
+  const activeTask = context.taskState.activeTask;
+  const activeTaskIdentity = activeTaskDeliveryIdentity(context);
+  const taskChanged = retainedSession.lastDeliveredTaskIdentity !== activeTaskIdentity
+    || retainedSession.lastDeliveredTaskHash !== activeTask?.hash;
+  const deliveredItemIdentities = new Set(retainedSession.deliveredItemIdentities || []);
+  const sections = [
+    "[Retained native session continuation]\nContinue the same bounded assignment from the provider-private state retained in this session. Do not restart the investigation or repeat completed work. Apply only the new authoritative task/control/result material below, then continue or return immediately as directed.",
+  ];
+  if (taskChanged) sections.push(activeTaskPromptSection(context.taskState));
+  for (const item of context.retainedDeliveryItems) {
+    if (deliveredItemIdentities.has(item.identity)) continue;
+    if (item.inputIndex === activeTask?.index) continue;
+    sections.push(item.kind === "parent_control"
+      ? `[New parent control message - authoritative]\n${item.text}`
+      : item.text);
+  }
+  sections.push(...taskControlPromptSections(context.taskState));
+  const prompt = sections.filter(Boolean).join("\n\n");
+  validateFinalNativePrompt(prompt, "Retained native-provider continuation");
+  let taskDiagnostics;
+  try {
+    taskDiagnostics = taskDeliveryDiagnostics(context.taskState, prompt, {
+      activeTaskIncludedThisTurn: taskChanged,
+      retainedInProviderSession: !taskChanged,
+    });
+  } catch (error) {
+    if (error instanceof TaskStateError) throw new NativeCliAgentError(error.message, 400);
+    throw error;
+  }
+  return {
+    prompt,
+    taskDiagnostics,
+    delivery: deliveredNativeInput(context, retainedSession),
+  };
+}
+
+export function nativeExecutionPolicyFromTaskState(taskState) {
   const task = taskState.activeTask?.text || "";
   const readOnly = taskState.activeTask?.intent === "analysis" || isExplicitReadOnlyTask(task);
-  return {
+  return checkedExecutionPolicy({
     readOnly,
-    validationRestricted: VALIDATION_RESTRICTED_TASK.test(task),
+    validationRestricted: true,
     rzMcpMode: rzMcpModeForTask(task, readOnly),
-  };
+  });
 }
 
 export function nativeCliAgentContext(body, { provider, model, requiredEffort, mainAgent = false }) {
@@ -510,18 +701,28 @@ export function nativeCliAgentContext(body, { provider, model, requiredEffort, m
     throw new NativeCliAgentError(`${provider} native CLI route received no active NEW_TASK payload`, 400);
   }
   const workingDirectory = workingDirectoryFrom(body, input);
+  const executionPolicy = mainAgent
+    ? checkedExecutionPolicy({ readOnly: false, validationRestricted: false, rzMcpMode: "full" })
+    : nativeExecutionPolicyFromTaskState(taskState);
+  const turnContract = mainAgent
+    ? "[RzCodex main-agent contract]\nAct as the primary coding agent for this conversation. Use your local file, search, edit, shell, and lazy RzMCP tools directly. Follow the supplied RzCodex and project instructions, preserve unrelated work, and complete the current user request before returning unless a concrete blocker requires user input."
+    : executionPolicy.readOnly
+      ? "[Single native-agent turn contract]\nComplete this delegated task within this one Codex subagent turn using local file read and search tools only. File writes, shell execution, builds, compilation, tests, editor control, PIE/SIE, runtime validation, and final integration are disabled and reserved to the parent. Never delegate or request that the parent perform an ordinary read/search operation. Return only when the bounded analysis is complete or a concrete blocker requires parent input."
+      : "[Single native-agent turn contract]\nComplete this delegated task within this one Codex subagent turn using local file read, search, and edit tools directly. Shell execution, builds, compilation, tests, editor control, PIE/SIE, runtime validation, and final integration are disabled and reserved to the parent. Never delegate or request that the parent perform an ordinary file operation. Implement and statically review the bounded change, then report the exact focused validation the parent should run.";
+  const platformBoundary = mainAgent
+    ? "The host shell is PowerShell on Windows."
+    : "This delegated provider boundary does not expose shell or validation/editor tools.";
   const sections = [
-    mainAgent
-      ? "[RzCodex main-agent contract]\nAct as the primary coding agent for this conversation. Use your local file, search, edit, shell, and lazy RzMCP tools directly. Follow the supplied RzCodex and project instructions, preserve unrelated work, and complete the current user request before returning unless a concrete blocker requires user input."
-      : "[Single native-agent turn contract]\nComplete this delegated task within this one Codex subagent turn. Use your own local file, search, edit, and shell tools directly. Never delegate to another agent, task, teammate, swarm, or background worker. Do not return an intention, a deferred tool request, or a request for the parent to execute an ordinary file/shell operation. Return only when the bounded task is complete or a concrete blocker requires parent input. Honor the project AGENTS.md in the working directory. Builds, tests, editor control, PIE/SIE, runtime validation, and final integration remain owned by the parent whenever the task or project instructions reserve them.",
-    "[Native tool boundary]\nThe host shell is PowerShell on Windows. Never read, grep, decode, strings-scan, hex-dump, or otherwise inspect Unreal .uasset or .umap bytes through file or shell tools. When the task authorizes RzMCP, it is exposed lazily as exactly search_rzmcp_tools and call_rzmcp_tool: search for a focused schema first, then call only a discovered tool. Never enumerate or request the full RzMCP catalog. If those tools are disabled, unavailable, or semantically insufficient, return that concrete blocker; do not approximate asset semantics from binary bytes or repeat equivalent offset/chunk probes. Never read secret environment files.",
+    turnContract,
+    `[Native tool boundary]\n${platformBoundary} Never read, grep, decode, strings-scan, hex-dump, or otherwise inspect Unreal .uasset or .umap bytes through file or shell tools. When the task authorizes RzMCP, it is exposed lazily as exactly search_rzmcp_tools and call_rzmcp_tool: search for a focused schema first, then call only a discovered tool. Never enumerate or request the full RzMCP catalog. If those tools are disabled, unavailable, or semantically insufficient, return that concrete blocker; do not approximate asset semantics from binary bytes or repeat equivalent offset/chunk probes. Never read secret environment files.`,
     projectInstructionsPromptSection(workingDirectory),
   ];
   if (mainAgent) {
     if (typeof body.instructions === "string" && body.instructions.trim()) {
       sections.push(`[RzCodex instructions]\n${body.instructions.trim()}`);
     }
-    sections.push(...mainAgentHistory(input));
+    const fixedPromptChars = sections.filter(Boolean).join("\n\n").length;
+    sections.push(...mainAgentHistory(input, MAX_MAIN_PROMPT_CHARS - fixedPromptChars - 2));
   } else {
     const role = roleInstructionsFrom(body.instructions);
     if (role) sections.push(`[Role instructions]\n${role}`);
@@ -532,6 +733,7 @@ export function nativeCliAgentContext(body, { provider, model, requiredEffort, m
     if (control && control !== taskState.activeTask.text) sections.push(`[Latest parent control message]\n${control}`);
   }
   const prompt = sections.filter(Boolean).join("\n\n");
+  validateFinalNativePrompt(prompt);
   let diagnostics;
   try {
     diagnostics = taskDeliveryDiagnostics(taskState, prompt);
@@ -551,9 +753,8 @@ export function nativeCliAgentContext(body, { provider, model, requiredEffort, m
     workingDirectory,
     taskState,
     taskDiagnostics: diagnostics,
-    executionPolicy: mainAgent
-      ? { readOnly: false, validationRestricted: false, rzMcpMode: "full" }
-      : executionPolicy(taskState),
+    executionPolicy,
+    retainedDeliveryItems: retainedDeliveryItems(input, taskState),
     toolSchemaBytesIgnored: Buffer.byteLength(json(body.tools || [])),
   };
 }
@@ -594,22 +795,23 @@ function nativeProcess({
   label,
   requestTimeoutMs = REQUEST_TIMEOUT_MS,
   routeOwnershipTimeoutMs = ROUTE_OWNERSHIP_TIMEOUT_MS,
+  stdinText = null,
 }) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
       cwd,
       env,
       windowsHide: true,
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: [stdinText === null ? "ignore" : "pipe", "pipe", "pipe"],
     });
     let settled = false;
+    let terminationError = null;
     let stdoutBuffer = "";
     let stderr = "";
     const routeOwnershipDeadline = Date.now() + routeOwnershipTimeoutMs;
     const state = {};
     const requestTimer = setTimeout(() => {
-      child.kill();
-      finish(new NativeCliAgentError(`${label} exceeded ${requestTimeoutMs}ms`, 504));
+      terminate(new NativeCliAgentError(`${label} exceeded ${requestTimeoutMs}ms`, 504));
     }, requestTimeoutMs);
     const routeOwnershipTimer = setInterval(() => {
       if (
@@ -621,16 +823,19 @@ function nativeProcess({
         return;
       }
       if (Date.now() < routeOwnershipDeadline) return;
-      child.kill();
-      finish(new NativeCliAgentError(
+      terminate(new NativeCliAgentError(
         `${label} did not begin provider tool work within ${routeOwnershipTimeoutMs}ms`,
         504,
       ));
     }, Math.min(1_000, Math.max(10, Math.floor(routeOwnershipTimeoutMs / 4))));
     routeOwnershipTimer.unref?.();
     const abort = () => {
+      terminate(new NativeCliAgentError(`${label} was aborted`, 499));
+    };
+    const terminate = (error) => {
+      if (settled || terminationError) return;
+      terminationError = attachNativeState(error, state);
       child.kill();
-      finish(new NativeCliAgentError(`${label} was aborted`, 499));
     };
     const finish = (error, value) => {
       if (settled) return;
@@ -654,8 +859,7 @@ function nativeProcess({
           stderr = `${stderr}${line}\n`.slice(-STDERR_LIMIT);
           return;
         }
-        child.kill();
-        finish(error);
+        terminate(error);
       }
     };
     child.stdout.setEncoding("utf8");
@@ -674,14 +878,19 @@ function nativeProcess({
       try {
         inspectStderr?.(stderr, state);
       } catch (error) {
-        child.kill();
-        finish(error);
+        terminate(error);
       }
     });
-    child.once("error", (error) => finish(new NativeCliAgentError(`${label} failed to start: ${error.message}`)));
+    child.once("error", (error) => finish(
+      terminationError || new NativeCliAgentError(`${label} failed to start: ${error.message}`),
+    ));
     child.once("close", (code, closeSignal) => {
       consume(stdoutBuffer);
       if (settled) return;
+      if (terminationError) {
+        finish(terminationError);
+        return;
+      }
       if (code !== 0) {
         const detail = stderr.trim() ? `: ${stderr.trim()}` : "";
         finish(new NativeCliAgentError(`${label} exited with ${closeSignal ? `signal ${closeSignal}` : `code ${code}`}${detail}`));
@@ -689,6 +898,12 @@ function nativeProcess({
       }
       finish(undefined, { state, stderr });
     });
+    if (stdinText !== null) {
+      child.stdin.once("error", (error) => {
+        terminate(new NativeCliAgentError(`${label} could not receive its prompt on stdin: ${error.message}`));
+      });
+      child.stdin.end(stdinText, "utf8");
+    }
     if (signal?.aborted) abort();
     else signal?.addEventListener("abort", abort, { once: true });
   });
@@ -723,6 +938,8 @@ function openCodeResult(context, state, model) {
     peakTurnInputTokens: state.peakTurnInputTokens || 0,
     lastTextSequence: state.lastTextSequence || 0,
     lastToolSequence: state.lastToolSequence || 0,
+    startedTools: [...(state.startedTools || [])],
+    commitUncertain: (state.startedTools || []).some((tool) => tool.status !== "completed"),
     model,
   };
 }
@@ -736,6 +953,16 @@ function attachNativeState(error, state) {
   error.providerMutationCount = Number(
     nativeState.mutationCount ?? error.providerMutationCount ?? 0,
   );
+  error.nativeToolInputs = [...(nativeState.toolInputs || error.nativeToolInputs || [])];
+  error.nativeStartedTools = [
+    ...(nativeState.startedTools || error.nativeStartedTools || []),
+  ].map((tool) => ({ ...tool }));
+  error.commitUncertain = nativeState.commitUncertain === true
+    || (nativeState.startedTools || []).some((tool) => tool.status !== "completed")
+    || error.commitUncertain === true;
+  if (error.nativeToolNames.length > 0 || nativeState.providerToolStarted === true) {
+    error.routeCommitted = true;
+  }
   Object.defineProperty(error, "nativeState", {
     value: nativeState,
     configurable: true,
@@ -760,6 +987,8 @@ function mergeNativeExecutionResults(previous, current) {
     executionCount: Number(previous.executionCount || 1) + Number(current.executionCount || 1),
     sameSessionContinuations: Number(previous.sameSessionContinuations || 0)
       + Number(current.sameSessionContinuations || 0),
+    startedTools: [...(previous.startedTools || []), ...(current.startedTools || [])],
+    commitUncertain: previous.commitUncertain === true || current.commitUncertain === true,
   };
 }
 
@@ -789,6 +1018,8 @@ function mergeRecoveredResult(primary, recovered) {
     peakTurnInputTokens: Math.max(primary.peakTurnInputTokens, recovered.peakTurnInputTokens),
     executionCount: 2,
     sameSessionContinuations: 1,
+    startedTools: [...(primary.startedTools || []), ...(recovered.startedTools || [])],
+    commitUncertain: primary.commitUncertain === true || recovered.commitUncertain === true,
   };
 }
 
@@ -814,7 +1045,9 @@ async function completeOpenCodeTurn(context, model, runInitial, runContinuation,
       mutationCount: error.providerMutationCount || 0,
     }, model);
   }
-  if (initialFailure?.status === 499 || primary.toolNames.length === 0) throw initialFailure;
+  if (initialFailure?.status === 499 || primary.toolNames.length === 0 || primary.commitUncertain) {
+    throw initialFailure;
+  }
   onRecovery?.({
     toolCalls: primary.toolNames.length,
     mutationCount: primary.mutationCount,
@@ -919,6 +1152,14 @@ function openCodeConfig(context, providerKind) {
         : { enabled: false },
     },
   };
+  if (context.executionPolicy.readOnly) {
+    config.permission.edit = "deny";
+    config.permission.write = "deny";
+    config.permission.patch = "deny";
+  }
+  if (context.executionPolicy.readOnly || context.executionPolicy.validationRestricted) {
+    config.permission.bash = "deny";
+  }
   if (providerKind === "ollama") {
     config.provider = {
       ollama: {
@@ -961,6 +1202,8 @@ function openCodeParser(event, state, executionPolicy, providerKind = null) {
   state.inputTokens ||= 0;
   state.outputTokens ||= 0;
   state.peakTurnInputTokens ||= 0;
+  state.startedTools ||= [];
+  state.startedToolIndexes ||= new Map();
   state.eventSequence = Number(state.eventSequence || 0) + 1;
   if (event.type === "error") {
     const errorName = typeof event.error?.name === "string" ? event.error.name : "provider error";
@@ -983,22 +1226,40 @@ function openCodeParser(event, state, executionPolicy, providerKind = null) {
     state.finalText = event.part.text;
     state.lastTextSequence = state.eventSequence;
   }
-  if (event.type === "tool_use") state.providerToolStarted = true;
-  if (event.type === "tool_use" && event.part?.state?.status === "completed") {
+  if (event.type === "tool_use") {
+    state.providerToolStarted = true;
     const name = String(event.part.tool || "unknown_tool");
     const input = event.part?.state?.input;
-    state.toolNames.push(name);
-    state.toolInputs.push(input ?? null);
+    const key = String(
+      event.part?.id
+      || event.part?.callID
+      || event.part?.callId
+      || createHash("sha256").update(`${name}\0${json(input ?? null)}`).digest("hex"),
+    );
+    let toolIndex = state.startedToolIndexes.get(key);
+    if (toolIndex === undefined) {
+      toolIndex = state.startedTools.length;
+      state.startedToolIndexes.set(key, toolIndex);
+      state.startedTools.push({ key, name, input: input ?? null, status: "started" });
+      state.toolNames.push(name);
+      state.toolInputs.push(input ?? null);
+      state.lastToolSequence = state.eventSequence;
+      if (nativeToolIsMutation(name, input, executionPolicy)) state.mutationCount += 1;
+    } else if (input !== undefined) {
+      state.startedTools[toolIndex].input = input;
+      state.toolInputs[toolIndex] = input;
+    }
+    if (event.part?.state?.status === "completed") {
+      state.startedTools[toolIndex].status = "completed";
+    }
     if (LAZY_RZMCP_CALL_TOOL.test(name)) {
       const outer = parsedToolInput(input);
       const nested = outer?.tool_name === "call_rzmcp_tool"
         ? parsedToolInput(outer.arguments)
         : outer;
-      if (typeof nested?.name === "string" && nested.name) state.rzMcpTools.push(nested.name);
-    }
-    state.lastToolSequence = state.eventSequence;
-    if (nativeToolIsMutation(name, input, executionPolicy)) {
-      state.mutationCount += 1;
+      if (typeof nested?.name === "string" && nested.name && !state.rzMcpTools.includes(nested.name)) {
+        state.rzMcpTools.push(nested.name);
+      }
     }
   }
   if (event.type === "step_finish") {
@@ -1012,7 +1273,6 @@ function openCodeParser(event, state, executionPolicy, providerKind = null) {
 function openCodeRunArgs(
   context,
   providerKind,
-  prompt,
   continueSession = false,
   agent = OPENCODE_PRIMARY_AGENT,
 ) {
@@ -1025,7 +1285,6 @@ function openCodeRunArgs(
     "--model", `${providerKind}/${context.model}`,
     "--variant", context.requiredEffort,
     "--dir", context.workingDirectory,
-    prompt,
   );
   return args;
 }
@@ -1073,22 +1332,49 @@ export async function runOpenCodeNativeAgent(context, {
   onRecovery,
   onSessionStart,
 }) {
+  assertProviderBoundaryEnforceable(context.provider, {
+    fileWrites: context.executionPolicy.readOnly ? "disabled" : "unrestricted",
+    shell: context.executionPolicy.readOnly || context.executionPolicy.validationRestricted
+      ? "disabled"
+      : "unrestricted",
+    validationTools: context.executionPolicy.readOnly || context.executionPolicy.validationRestricted
+      ? "disabled"
+      : "unrestricted",
+    editorControl: context.executionPolicy.readOnly || context.executionPolicy.validationRestricted
+      ? "disabled"
+      : "unrestricted",
+  }, context.executionPolicy);
   if (!existsSync(OPENCODE_EXE)) throw new NativeCliAgentError(`OpenCode CLI is missing at ${OPENCODE_EXE}`);
   if (!existsSync(LAZY_RZMCP_PROXY)) throw new NativeCliAgentError(`Lazy RzMCP proxy is missing at ${LAZY_RZMCP_PROXY}`);
   mkdirSync(OPENCODE_STATE_DIRECTORY, { recursive: true });
   sweepStaleNativeState();
   const dbPath = retainedNativeStatePath(context, providerKind);
   const releaseNativeState = await acquireNativeState(dbPath);
-  const resumeRetainedSession = retainedOpenCodeStates.has(dbPath) && nativeStateExists(dbPath);
+  const retainedSession = retainedOpenCodeSessions.get(dbPath) || null;
+  const resumeRetainedSession = retainedSession !== null && nativeStateExists(dbPath);
   onSessionStart?.({ resumed: resumeRetainedSession });
-  const priorProgress = resumeRetainedSession ? retainedOpenCodeProgress.get(dbPath) : null;
-  retainedOpenCodeStates.delete(dbPath);
+  const priorProgress = resumeRetainedSession ? retainedSession.progress : null;
+  let turnDelivery;
+  try {
+    turnDelivery = resumeRetainedSession
+      ? retainedContinuation(context, retainedSession)
+      : {
+          prompt: context.prompt,
+          taskDiagnostics: context.taskDiagnostics,
+          delivery: deliveredNativeInput(context),
+        };
+  } catch (error) {
+    releaseNativeState();
+    throw error;
+  }
+  retainedOpenCodeSessions.delete(dbPath);
   if (!resumeRetainedSession) {
-    retainedOpenCodeProgress.delete(dbPath);
     if (nativeStateExists(dbPath)) await cleanupNativeState(dbPath);
   }
   const env = {
-    ...sanitizedEnvironment(),
+    ...sanitizeChildEnvironment(process.env, {
+      credentialScope: providerKind === "ollama" ? "ollama" : "opencode",
+    }),
     RZCODEX_SUBAGENT_RZMCP_MODE: context.executionPolicy.rzMcpMode,
     OPENCODE_CONFIG_CONTENT: openCodeConfig(context, providerKind),
     OPENCODE_DB: dbPath,
@@ -1115,7 +1401,7 @@ export async function runOpenCodeNativeAgent(context, {
   ) => {
     const { state } = await nativeProcess({
       command: OPENCODE_EXE,
-      args: openCodeRunArgs(context, providerKind, prompt, continueSession, agent),
+      args: openCodeRunArgs(context, providerKind, continueSession, agent),
       cwd: context.workingDirectory,
       env,
       signal,
@@ -1125,6 +1411,7 @@ export async function runOpenCodeNativeAgent(context, {
       label: `${context.provider} native OpenCode agent`,
       requestTimeoutMs: timeoutMs,
       routeOwnershipTimeoutMs: routeOwnershipTimeout(continueSession, timeoutMs),
+      stdinText: validateFinalNativePrompt(prompt, `${context.provider} native OpenCode prompt`),
     });
     return state;
   };
@@ -1133,7 +1420,7 @@ export async function runOpenCodeNativeAgent(context, {
     const currentResult = await completeOpenCodeTurn(
       context,
       model,
-      () => run(context.prompt, resumeRetainedSession),
+      () => run(turnDelivery.prompt, resumeRetainedSession),
       (prompt) => run(
         prompt,
         true,
@@ -1144,14 +1431,18 @@ export async function runOpenCodeNativeAgent(context, {
     );
     const result = mergeNativeExecutionResults(priorProgress, currentResult);
     if (context.taskState.checkpointRequested) {
-      retainedOpenCodeStates.add(dbPath);
-      retainedOpenCodeProgress.set(dbPath, result);
+      retainedOpenCodeSessions.set(dbPath, {
+        progress: result,
+        ...turnDelivery.delivery,
+      });
       preserveRetainedSession = true;
     }
     return {
       ...result,
       actualReasoningEffort: context.requiredEffort,
       resumedProviderSession: resumeRetainedSession,
+      taskDiagnostics: turnDelivery.taskDiagnostics,
+      normalizedPromptChars: turnDelivery.prompt.length,
     };
   } catch (error) {
     const currentProgress = {
@@ -1166,10 +1457,16 @@ export async function runOpenCodeNativeAgent(context, {
     const cumulativeProgress = mergeNativeExecutionResults(priorProgress, currentProgress);
     attachNativeState(error, cumulativeProgress);
     if (resumeRetainedSession) error.routeCommitted = true;
-    preserveRetainedSession = resumeRetainedSession || cumulativeProgress.toolNames.length > 0;
+    const currentProviderWorkStarted = currentProgress.toolNames.length > 0
+      || error.nativeState?.providerToolStarted === true;
+    preserveRetainedSession = resumeRetainedSession || currentProviderWorkStarted;
     if (preserveRetainedSession) {
-      retainedOpenCodeStates.add(dbPath);
-      retainedOpenCodeProgress.set(dbPath, cumulativeProgress);
+      retainedOpenCodeSessions.set(dbPath, currentProviderWorkStarted
+        ? {
+            progress: cumulativeProgress,
+            ...turnDelivery.delivery,
+          }
+        : retainedSession);
     }
     throw error;
   } finally {
@@ -1177,8 +1474,7 @@ export async function runOpenCodeNativeAgent(context, {
     // provider task correctness: retry the release window, retain a named artifact if it remains
     // locked, and let the age-based sweep remove it after no legitimate request can still own it.
     if (!preserveRetainedSession) {
-      retainedOpenCodeStates.delete(dbPath);
-      retainedOpenCodeProgress.delete(dbPath);
+      retainedOpenCodeSessions.delete(dbPath);
       await cleanupNativeState(dbPath);
     }
     releaseNativeState();
@@ -1196,6 +1492,8 @@ function commandCodeParser(event, state, executionPolicy) {
   state.outputTokens ||= 0;
   state.peakTurnInputTokens ||= 0;
   state.pendingToolInputs ||= new Map();
+  state.startedTools ||= [];
+  state.startedToolIndexes ||= new Map();
   state.eventSequence = Number(state.eventSequence || 0) + 1;
   if (payload?.type === "text_delta" && typeof payload.delta === "string") {
     state.finalText += payload.delta;
@@ -1203,12 +1501,31 @@ function commandCodeParser(event, state, executionPolicy) {
   }
   if (payload?.type === "tool_running" || payload?.type === "tool_completed") {
     state.providerToolStarted = true;
+    const name = String(payload.toolName || "unknown_tool");
+    const key = String(payload.toolCallId || `${name}:${state.startedTools.length}`);
+    const input = payload.toolInput
+      ?? payload.input
+      ?? payload.arguments
+      ?? state.pendingToolInputs.get(payload.toolCallId);
+    let toolIndex = state.startedToolIndexes.get(key);
+    if (toolIndex === undefined) {
+      toolIndex = state.startedTools.length;
+      state.startedToolIndexes.set(key, toolIndex);
+      state.startedTools.push({ key, name, input: input ?? null, status: "started" });
+      state.toolNames.push(name);
+      state.toolInputs.push(input ?? null);
+      state.lastToolSequence = state.eventSequence;
+      if (nativeToolIsMutation(name, input, executionPolicy)) state.mutationCount += 1;
+    } else if (input !== undefined) {
+      state.startedTools[toolIndex].input = input;
+      state.toolInputs[toolIndex] = input;
+    }
+    if (payload.type === "tool_completed") state.startedTools[toolIndex].status = "completed";
   }
   if (payload?.type === "tool_queued" && payload.toolCallId) {
     state.pendingToolInputs.set(payload.toolCallId, payload.input);
   }
   if (payload?.type === "tool_completed") {
-    const name = String(payload.toolName || "unknown_tool");
     const input = payload.toolInput
       ?? payload.input
       ?? payload.arguments
@@ -1216,12 +1533,9 @@ function commandCodeParser(event, state, executionPolicy) {
     state.pendingToolInputs.delete(payload.toolCallId);
     state.lastCompletedToolCallId = payload.toolCallId;
     state.lastCompletedToolInput = input;
-    state.toolNames.push(name);
-    state.toolInputs.push(input ?? null);
+    const name = String(payload.toolName || "unknown_tool");
     const rzMcpTool = nativeRzMcpToolName(name, input);
-    if (rzMcpTool) state.rzMcpTools.push(rzMcpTool);
-    state.lastToolSequence = state.eventSequence;
-    if (nativeToolIsMutation(name, input, executionPolicy)) state.mutationCount += 1;
+    if (rzMcpTool && !state.rzMcpTools.includes(rzMcpTool)) state.rzMcpTools.push(rzMcpTool);
   }
   if (payload?.type === "model_request_end") {
     const input = Number(payload.usage?.inputTokens || 0);
@@ -1235,17 +1549,55 @@ function commandCodeParser(event, state, executionPolicy) {
   }
 }
 
+function assertCommandCodeExecutionPolicy(executionPolicy) {
+  if (executionPolicy.readOnly || executionPolicy.validationRestricted) {
+    throw new NativeCliAgentError(
+      "CommandCode cannot enforce this task before work: its headless CLI has no provider boundary that disables all file writes, shell, and validation tools",
+      400,
+    );
+  }
+}
+
 export async function runCommandCodeNativeAgent(context, { signal, onEvent }) {
-  if (!existsSync(COMMAND_CODE_ENTRY)) {
-    throw new NativeCliAgentError(`CommandCode CLI is missing at ${COMMAND_CODE_ENTRY}`);
+  assertCommandCodeExecutionPolicy(context.executionPolicy);
+  assertProviderBoundaryEnforceable(context.provider, {
+    fileWrites: "unrestricted",
+    shell: "unrestricted",
+    validationTools: "unrestricted",
+    editorControl: "unrestricted",
+  }, context.executionPolicy);
+  const commandCodeEntry = join(commandCodePackageDirectory(), "dist", "index.mjs");
+  if (!existsSync(commandCodeEntry)) {
+    throw new NativeCliAgentError(`CommandCode CLI is missing at ${commandCodeEntry}`);
   }
   const sessionName = commandCodeSessionName(context);
   const releaseNativeState = await acquireNativeState(`commandcode:${sessionName || randomUUID()}`);
-  const resumeRetainedSession = sessionName ? retainedCommandCodeSessions.has(sessionName) : false;
+  const retainedSession = sessionName ? retainedCommandCodeSessions.get(sessionName) || null : null;
+  const resumeRetainedSession = retainedSession !== null;
+  const priorProgress = resumeRetainedSession ? retainedSession.progress : null;
+  let turnDelivery;
+  let providerPrompt;
+  try {
+    turnDelivery = resumeRetainedSession
+      ? retainedContinuation(context, retainedSession)
+      : {
+          prompt: context.prompt,
+          taskDiagnostics: context.taskDiagnostics,
+          delivery: deliveredNativeInput(context),
+        };
+    providerPrompt = validateFinalNativePrompt(
+      commandCodePrompt(context, turnDelivery.prompt),
+      `${context.provider} native CommandCode prompt`,
+    );
+  } catch (error) {
+    releaseNativeState();
+    throw error;
+  }
+  if (sessionName) retainedCommandCodeSessions.delete(sessionName);
   const reasoningArgs = commandCodeReasoningArgs(context.model, context.requiredEffort);
   const args = [
-    COMMAND_CODE_ENTRY,
-    "-p", commandCodePrompt(context),
+    commandCodeEntry,
+    "-p",
     "--output-format", "json",
     "--add-dir", context.workingDirectory,
     ...(sessionName
@@ -1274,12 +1626,9 @@ export async function runCommandCodeNativeAgent(context, { signal, onEvent }) {
       onEvent,
       parseLine: (event, state) => commandCodeParser(event, state, parserPolicy),
       label: `${context.provider} native CommandCode agent`,
+      stdinText: providerPrompt,
     });
-    if (sessionName) {
-      if (context.taskState.checkpointRequested) retainedCommandCodeSessions.add(sessionName);
-      else retainedCommandCodeSessions.delete(sessionName);
-    }
-    return {
+    const currentResult = {
       ...validateResult(context, {
         finalText: state.finalText || "",
         toolNames: state.toolNames || [],
@@ -1291,16 +1640,63 @@ export async function runCommandCodeNativeAgent(context, { signal, onEvent }) {
         peakTurnInputTokens: state.peakTurnInputTokens || 0,
         lastTextSequence: state.lastTextSequence || 0,
         lastToolSequence: state.lastToolSequence || 0,
+        startedTools: [...(state.startedTools || [])],
+        commitUncertain: (state.startedTools || []).some((tool) => tool.status !== "completed"),
         model: context.model,
       }),
       executionCount: 1,
       sameSessionContinuations: resumeRetainedSession ? 1 : 0,
+    };
+    const result = mergeNativeExecutionResults(priorProgress, currentResult);
+    if (sessionName) {
+      if (context.taskState.checkpointRequested) {
+        retainedCommandCodeSessions.set(sessionName, {
+          progress: result,
+          ...turnDelivery.delivery,
+        });
+      }
+    }
+    return {
+      ...result,
       resumedProviderSession: resumeRetainedSession,
       actualReasoningEffort: reasoningArgs.length > 0 ? context.requiredEffort : "fixed-model-maximum",
+      taskDiagnostics: turnDelivery.taskDiagnostics,
+      normalizedPromptChars: providerPrompt.length,
     };
   } catch (error) {
-    if (sessionName && error?.status === 499 && (error.nativeToolNames || []).length > 0) {
-      retainedCommandCodeSessions.add(sessionName);
+    const currentState = error.nativeState || {
+      toolNames: error.nativeToolNames || [],
+      toolInputs: error.nativeToolInputs || [],
+      rzMcpTools: error.nativeRzMcpTools || [],
+      mutationCount: error.providerMutationCount || 0,
+    };
+    const currentProgress = {
+      finalText: currentState.finalText || "",
+      toolNames: currentState.toolNames || [],
+      toolInputs: currentState.toolInputs || [],
+      rzMcpTools: currentState.rzMcpTools || [],
+      mutationCount: currentState.mutationCount || 0,
+      inputTokens: currentState.inputTokens || 0,
+      outputTokens: currentState.outputTokens || 0,
+      peakTurnInputTokens: currentState.peakTurnInputTokens || 0,
+      startedTools: [...(currentState.startedTools || [])],
+      commitUncertain: (currentState.startedTools || []).some((tool) => tool.status !== "completed"),
+      model: context.model,
+      executionCount: 1,
+      sameSessionContinuations: resumeRetainedSession ? 1 : 0,
+    };
+    const currentProviderWorkStarted = currentProgress.toolNames.length > 0
+      || currentState.providerToolStarted === true;
+    const cumulativeProgress = mergeNativeExecutionResults(priorProgress, currentProgress);
+    attachNativeState(error, cumulativeProgress);
+    if (resumeRetainedSession) error.routeCommitted = true;
+    if (sessionName && (resumeRetainedSession || currentProviderWorkStarted)) {
+      retainedCommandCodeSessions.set(sessionName, currentProviderWorkStarted
+        ? {
+            progress: cumulativeProgress,
+            ...turnDelivery.delivery,
+          }
+        : retainedSession);
     }
     throw error;
   } finally {
@@ -1310,6 +1706,40 @@ export async function runCommandCodeNativeAgent(context, { signal, onEvent }) {
 
 export async function nativeCliAgentRunnerSelfTest() {
   const authoritativeWorkspace = join(import.meta.dirname, "..");
+  for (const executionPolicy of [
+    checkedExecutionPolicy({ readOnly: true }),
+    checkedExecutionPolicy({ validationRestricted: true }),
+  ]) {
+    let boundaryError = null;
+    try {
+      assertCommandCodeExecutionPolicy(executionPolicy);
+    } catch (error) {
+      boundaryError = error;
+    }
+    if (boundaryError?.status !== 400 || !boundaryError.message.includes("cannot enforce this task before work")) {
+      throw new Error("CommandCode restricted work did not fail before provider execution");
+    }
+  }
+  assertCommandCodeExecutionPolicy(checkedExecutionPolicy());
+  const exactPromptBudgetFixture = "x".repeat(MAX_MAIN_PROMPT_CHARS);
+  if (validateFinalNativePrompt(exactPromptBudgetFixture) !== exactPromptBudgetFixture) {
+    throw new Error("native prompt budget rejected an exact-limit prompt");
+  }
+  let commandCodeFinalPromptBudgetError = null;
+  try {
+    validateFinalNativePrompt(
+      commandCodePrompt({ workingDirectory: authoritativeWorkspace }, exactPromptBudgetFixture),
+      "fixture native CommandCode prompt",
+    );
+  } catch (error) {
+    commandCodeFinalPromptBudgetError = error;
+  }
+  if (
+    commandCodeFinalPromptBudgetError?.status !== 413
+    || !commandCodeFinalPromptBudgetError.message.includes("exceeding the 120000-character transport limit")
+  ) {
+    throw new Error("CommandCode final workspace-wrapped prompt escaped the shared aggregate budget");
+  }
   if (
     commandCodeReasoningArgs("meta/muse-spark-1.3-contributor", "max").length !== 0
     || commandCodeReasoningArgs("z-ai/glm-5.3-flash", "max").join(" ") !== "--effort max"
@@ -1361,6 +1791,25 @@ export async function nativeCliAgentRunnerSelfTest() {
     || lazyRzMcpProgressFixture.mutationCount !== 0
   ) {
     throw new Error("native OpenCode lazy RzMCP calls were not identified authoritatively");
+  }
+  const startedToolFixture = {};
+  openCodeParser({
+    type: "tool_use",
+    part: {
+      callID: "started-tool-fixture",
+      tool: "edit",
+      state: { status: "running", input: { filePath: join(authoritativeWorkspace, "fixture.txt") } },
+    },
+  }, startedToolFixture, { rzMcpMode: "no-validation", workingDirectory: authoritativeWorkspace });
+  const startedToolError = attachNativeState(new NativeCliAgentError("fixture interrupted"), startedToolFixture);
+  if (
+    startedToolError.routeCommitted !== true
+    || startedToolError.commitUncertain !== true
+    || startedToolError.nativeToolNames?.join(",") !== "edit"
+    || startedToolError.nativeToolInputs?.[0]?.filePath !== join(authoritativeWorkspace, "fixture.txt")
+    || startedToolError.nativeStartedTools?.[0]?.status !== "started"
+  ) {
+    throw new Error("native OpenCode started tool did not commit route ownership with explicit diagnostics");
   }
   const commandCodeLazyRzMcpFixture = {};
   commandCodeParser({
@@ -1492,6 +1941,98 @@ export async function nativeCliAgentRunnerSelfTest() {
   ) {
     throw new Error("native CLI continuation changed the retained provider-session identity");
   }
+  const reindexedOriginalRetainedContext = nativeCliAgentContext(retainedContextBody([
+    ...Array.from({ length: 10 }, (_, index) => ({ type: "compaction", id: `compaction-${index}` })),
+    originalTaskItem,
+  ]), {
+    provider: "fixture",
+    model: "fixture-model",
+    requiredEffort: "max",
+  });
+  const retainedDeliveryRecord = {
+    progress: null,
+    ...deliveredNativeInput(reindexedOriginalRetainedContext),
+  };
+  const checkpointControlText = "Message Type: MESSAGE\nTask name: /root/cwd_fixture\nPayload:\nCheckpoint now and preserve the native provider session; do not start another tool call.";
+  const unseenToolResult = "fixture-result-that-must-survive-retained-delivery";
+  const compactedCheckpointContext = nativeCliAgentContext(retainedContextBody([
+    originalTaskItem,
+    {
+      type: "agent_message",
+      id: "retained-checkpoint-control",
+      author: "Codex",
+      recipient: "/root/cwd_fixture",
+      content: [{ type: "input_text", text: checkpointControlText }],
+    },
+    {
+      type: "function_call_output",
+      id: "fcout_retained_fixture",
+      call_id: "retained-fixture-call",
+      output: unseenToolResult,
+    },
+  ]), {
+    provider: "fixture",
+    model: "fixture-model",
+    requiredEffort: "max",
+  });
+  const unchangedTaskContinuation = retainedContinuation(
+    compactedCheckpointContext,
+    retainedDeliveryRecord,
+  );
+  const changedTaskContinuation = retainedContinuation(
+    continuedRetainedContext,
+    retainedDeliveryRecord,
+  );
+  const sameTextDistinctTaskContext = nativeCliAgentContext(retainedContextBody([
+    originalTaskItem,
+    {
+      ...originalTaskItem,
+      id: "retained-same-text-distinct-task",
+    },
+  ]), {
+    provider: "fixture",
+    model: "fixture-model",
+    requiredEffort: "max",
+  });
+  const sameTextDistinctTaskContinuation = retainedContinuation(
+    sameTextDistinctTaskContext,
+    retainedDeliveryRecord,
+  );
+  if (
+    originalRetainedContext.prompt.split(cwdTask).length - 1 !== 1
+    || unchangedTaskContinuation.prompt.includes(cwdTask)
+    || unchangedTaskContinuation.taskDiagnostics.activeTaskIncludedThisTurn
+    || !unchangedTaskContinuation.taskDiagnostics.retainedInProviderSession
+    || !unchangedTaskContinuation.prompt.includes(checkpointControlText)
+    || !unchangedTaskContinuation.prompt.includes(unseenToolResult)
+    || changedTaskContinuation.prompt.split(continuationTask).length - 1 !== 1
+    || changedTaskContinuation.prompt.includes(cwdTask)
+    || !changedTaskContinuation.taskDiagnostics.activeTaskIncludedThisTurn
+    || changedTaskContinuation.taskDiagnostics.retainedInProviderSession
+    || sameTextDistinctTaskContinuation.prompt.split(cwdTask).length - 1 !== 1
+    || !sameTextDistinctTaskContinuation.taskDiagnostics.activeTaskIncludedThisTurn
+    || sameTextDistinctTaskContinuation.taskDiagnostics.retainedInProviderSession
+    || unchangedTaskContinuation.delivery.deliveredItemIdentities.length
+      !== retainedDeliveryRecord.deliveredItemIdentities.length + 2
+  ) {
+    throw new Error("retained native session delivery replayed tasks or dropped reindexed control/result input");
+  }
+  let idlessRetainedItemError = null;
+  try {
+    nativeCliAgentContext(retainedContextBody([{
+      ...originalTaskItem,
+      id: undefined,
+    }]), {
+      provider: "fixture",
+      model: "fixture-model",
+      requiredEffort: "max",
+    });
+  } catch (error) {
+    idlessRetainedItemError = error;
+  }
+  if (!idlessRetainedItemError?.message.includes("has no stable item.id")) {
+    throw new Error("retained native session silently accepted an id-less deliverable item");
+  }
   if (
     !cwdContext.prompt.includes("[Native tool boundary]")
     || !cwdContext.prompt.includes("[Project AGENTS instructions - authoritative and complete]")
@@ -1535,6 +2076,34 @@ export async function nativeCliAgentRunnerSelfTest() {
     || genericEditorBan.rzMcpMode !== "disabled"
   ) {
     throw new Error("native CLI RzMCP task capability classification failed");
+  }
+  const ordinaryMutationTask = "Message Type: NEW_TASK\nTask name: /root/default_validation_fixture\nPayload:\nFix the bounded parser defect and return the changed file.";
+  const ordinaryMutationContext = nativeCliAgentContext({
+    model: "@preset/codex-subagents",
+    reasoning: { effort: "max" },
+    stream: true,
+    client_metadata: { cwd: authoritativeWorkspace },
+    input: [{
+      type: "agent_message",
+      id: "default-validation-fixture",
+      author: "Codex",
+      recipient: "/root/default_validation_fixture",
+      content: [{ type: "input_text", text: ordinaryMutationTask }],
+    }],
+  }, {
+    provider: "fixture",
+    model: "fixture-model",
+    requiredEffort: "max",
+  });
+  if (
+    ordinaryMutationContext.taskDiagnostics.taskIntent !== "mutation"
+    || ordinaryMutationContext.executionPolicy.readOnly
+    || !ordinaryMutationContext.executionPolicy.validationRestricted
+    || ordinaryMutationContext.executionPolicy.rzMcpMode !== "no-validation"
+    || !ordinaryMutationContext.prompt.includes("Shell execution, builds, compilation, tests, editor control")
+    || ordinaryMutationContext.prompt.includes("edit, and shell tools directly")
+  ) {
+    throw new Error("native mutation task without prohibition words escaped the parent-owned validation boundary");
   }
   const priorTaskText = "Message Type: NEW_TASK\nTask name: /root/resume_fixture\nPayload:\nInspect the exact bounded source and report the original evidence.";
   const intermediateResumeTaskText = "Message Type: NEW_TASK\nTask name: /root/resume_fixture\nPayload:\nBridge repaired. Resume the same bounded task from its original scope and preserve the focused ownership.";
@@ -1720,26 +2289,27 @@ export async function nativeCliAgentRunnerSelfTest() {
   ) {
     throw new Error("native OpenCode same-session terminal recovery failed");
   }
-  const initialArgs = openCodeRunArgs(resumedMutationContext, "ollama", resumedMutationContext.prompt);
+  const initialArgs = openCodeRunArgs(resumedMutationContext, "ollama", false);
   const recoveryArgs = openCodeRunArgs(
     resumedMutationContext,
     "ollama",
-    recoveryPrompt,
     true,
     OPENCODE_TERMINAL_AGENT,
   );
-  const nonOllamaArgs = openCodeRunArgs(resumedMutationContext, "opencode", resumedMutationContext.prompt);
+  const nonOllamaArgs = openCodeRunArgs(resumedMutationContext, "opencode", false);
   if (
     initialArgs.includes("--continue")
     || !initialArgs.includes("--title")
     || initialArgs[initialArgs.indexOf("--agent") + 1] !== OPENCODE_PRIMARY_AGENT
     || !initialArgs.includes("--print-logs")
     || !initialArgs.includes("ERROR")
+    || initialArgs.includes(resumedMutationContext.prompt)
     || !recoveryArgs.includes("--continue")
     || recoveryArgs.includes("--title")
     || recoveryArgs[recoveryArgs.indexOf("--agent") + 1] !== OPENCODE_TERMINAL_AGENT
     || !nonOllamaArgs.includes("--print-logs")
     || !nonOllamaArgs.includes("ERROR")
+    || nonOllamaArgs.includes(resumedMutationContext.prompt)
     || routeOwnershipTimeout(false, 120_000) !== ROUTE_OWNERSHIP_TIMEOUT_MS
     || routeOwnershipTimeout(true, 120_000) !== 120_000
   ) {
@@ -1859,6 +2429,24 @@ export async function nativeCliAgentRunnerSelfTest() {
     if (event.type === "reasoning") state.providerActivityObserved = true;
     if (event.type === "done") state.finalText = event.text;
   };
+  const stdinFixtureText = "exact stdin prompt with spaces, quotes ' \" and a newline\nsecond line";
+  const stdinTransport = await nativeProcess({
+    command: process.execPath,
+    args: [
+      "-e",
+      "let input=''; process.stdin.setEncoding('utf8'); process.stdin.on('data', chunk => { input += chunk; }); process.stdin.on('end', () => console.log(JSON.stringify({type:'done',text:input})));",
+    ],
+    cwd: process.cwd(),
+    env: sanitizeChildEnvironment(process.env),
+    parseLine: fixtureParser,
+    label: "stdin transport fixture",
+    requestTimeoutMs: 2_000,
+    routeOwnershipTimeoutMs: 1_500,
+    stdinText: stdinFixtureText,
+  });
+  if (stdinTransport.state.finalText !== stdinFixtureText) {
+    throw new Error("native CLI prompt was not delivered losslessly through child stdin");
+  }
   const postToolSilence = await nativeProcess({
     command: process.execPath,
     args: [
@@ -1866,7 +2454,7 @@ export async function nativeCliAgentRunnerSelfTest() {
       "console.log(JSON.stringify({type:'tool',name:'read'})); setTimeout(() => { console.log(JSON.stringify({type:'done',text:'complete'})); }, 350);",
     ],
     cwd: process.cwd(),
-    env: sanitizedEnvironment(),
+    env: sanitizeChildEnvironment(process.env),
     parseLine: fixtureParser,
     label: "post-tool silence fixture",
     requestTimeoutMs: 2_000,
@@ -1882,7 +2470,7 @@ export async function nativeCliAgentRunnerSelfTest() {
       "console.log(JSON.stringify({type:'reasoning'})); setTimeout(() => { console.log(JSON.stringify({type:'done',text:'complete'})); }, 350);",
     ],
     cwd: process.cwd(),
-    env: sanitizedEnvironment(),
+    env: sanitizeChildEnvironment(process.env),
     parseLine: fixtureParser,
     label: "active provider reasoning fixture",
     requestTimeoutMs: 2_000,
@@ -1902,7 +2490,7 @@ export async function nativeCliAgentRunnerSelfTest() {
         "console.error('level=ERROR providerID=ollama modelID=fixture error.error=\"AI_APICallError: reached your session usage limit\"'); setTimeout(() => {}, 1000);",
       ],
       cwd: process.cwd(),
-      env: sanitizedEnvironment(),
+      env: sanitizeChildEnvironment(process.env),
       parseLine: fixtureParser,
       inspectStderr: (stderr) => inspectOpenCodeStderr("ollama", stderr),
       label: "Ollama quota fixture",
@@ -1928,7 +2516,7 @@ export async function nativeCliAgentRunnerSelfTest() {
       "console.error('level=ERROR providerID=ollama message=temporary-note'); console.log(JSON.stringify({type:'done',text:'complete'}));",
     ],
     cwd: process.cwd(),
-    env: sanitizedEnvironment(),
+    env: sanitizeChildEnvironment(process.env),
     parseLine: fixtureParser,
     inspectStderr: (stderr) => inspectOpenCodeStderr("ollama", stderr),
     label: "Ollama benign stderr fixture",
@@ -2010,10 +2598,9 @@ export async function nativeCliAgentRunnerSelfTest() {
     throw new Error("OpenCode Go quota classification confused exhaustion, transient throttling, or the free provider");
   }
 
-  mkdirSync(OPENCODE_STATE_DIRECTORY, { recursive: true });
   const openCodeQuotaFixturePath = join(
-    OPENCODE_STATE_DIRECTORY,
-    `opencode-go-quota-self-test-${process.pid}.json`,
+    tmpdir(),
+    `rzcodex-opencode-go-quota-self-test-${process.pid}-${randomUUID()}.json`,
   );
   let quotaNow = 1_000;
   try {
@@ -2047,7 +2634,7 @@ export async function nativeCliAgentRunnerSelfTest() {
       command: process.execPath,
       args: ["-e", "setTimeout(() => {}, 1000);"],
       cwd: process.cwd(),
-      env: sanitizedEnvironment(),
+      env: sanitizeChildEnvironment(process.env),
       parseLine: fixtureParser,
       label: "pre-tool silence fixture",
       requestTimeoutMs: 2_000,
@@ -2069,4 +2656,12 @@ export function nativeCliUsage(result) {
     output_tokens_details: { reasoning_tokens: 0 },
     total_tokens: result.inputTokens + result.outputTokens,
   };
+}
+
+const directlyExecuted = process.argv[1]
+  ? resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))
+  : false;
+if (directlyExecuted && process.argv.includes("--self-test")) {
+  await nativeCliAgentRunnerSelfTest();
+  process.stdout.write("native-cli-agent-runner self-test: ok\n");
 }

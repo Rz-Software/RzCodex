@@ -11,6 +11,7 @@ use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::Personality;
 use codex_protocol::models::ActivePermissionProfile;
 use codex_protocol::models::PermissionProfile;
+use codex_protocol::openai_models::InputModality;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 
@@ -34,6 +35,7 @@ pub(crate) struct ThreadSessionState {
     pub(crate) thread_name: Option<String>,
     pub(crate) model: String,
     pub(crate) model_provider_id: String,
+    pub(crate) model_input_modalities: Option<Vec<InputModality>>,
     pub(crate) service_tier: Option<String>,
     pub(crate) approval_policy: AskForApproval,
     pub(crate) approvals_reviewer: codex_protocol::config_types::ApprovalsReviewer,

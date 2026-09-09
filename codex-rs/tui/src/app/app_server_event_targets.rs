@@ -252,6 +252,7 @@ mod tests {
             active_permission_profile: None,
             model: "gpt-5.4".to_string(),
             model_provider: "openai".to_string(),
+            model_input_modalities: None,
             service_tier: None,
             effort: Some(ReasoningEffort::High),
             summary: None,

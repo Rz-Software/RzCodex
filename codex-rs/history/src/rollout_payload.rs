@@ -176,7 +176,6 @@ pub(super) struct CompactedItemWire<'a> {
 
 impl<'a> From<&'a CompactedItem> for CompactedItemWire<'a> {
     fn from(item: &'a CompactedItem) -> Self {
-        let prune_repeated_inline_images = item.window_number.is_some_and(|number| number > 1);
         let replacement_history_metadata = item
             .replacement_history
             .as_ref()
@@ -197,7 +196,13 @@ impl<'a> From<&'a CompactedItem> for CompactedItemWire<'a> {
                 items
                     .iter()
                     .map(|envelope| {
-                        persisted_response_item(&envelope.item, prune_repeated_inline_images)
+                        persisted_response_item(
+                            &envelope.item,
+                            envelope
+                                .metadata
+                                .as_ref()
+                                .is_some_and(|metadata| metadata.inline_images_persisted),
+                        )
                     })
                     .collect()
             }),
@@ -274,6 +279,32 @@ fn prune_inline_base64_images(item: &mut ResponseItem) -> bool {
     }
 }
 
+pub(super) fn has_inline_base64_images(item: &ResponseItem) -> bool {
+    match item {
+        ResponseItem::Message { content, .. } => content.iter().any(|content_item| {
+            matches!(
+                content_item,
+                ContentItem::InputImage { image_url, .. }
+                    if is_inline_base64_image_url(image_url)
+            )
+        }),
+        ResponseItem::FunctionCallOutput { output, .. }
+        | ResponseItem::CustomToolCallOutput { output, .. } => {
+            let FunctionCallOutputBody::ContentItems(content) = &output.body else {
+                return false;
+            };
+            content.iter().any(|content_item| {
+                matches!(
+                    content_item,
+                    FunctionCallOutputContentItem::InputImage { image_url, .. }
+                        if is_inline_base64_image_url(image_url)
+                )
+            })
+        }
+        _ => false,
+    }
+}
+
 fn is_inline_base64_image_url(url: &str) -> bool {
     if !url
         .get(.."data:".len())
@@ -299,7 +330,7 @@ impl TryFrom<CompactedItemWire<'_>> for CompactedItem {
     type Error = String;
 
     fn try_from(item: CompactedItemWire<'_>) -> Result<Self, Self::Error> {
-        let replacement_history = match (
+        let mut replacement_history: Option<Vec<ResponseItemEnvelope>> = match (
             item.replacement_history,
             item.replacement_history_metadata,
         ) {
@@ -333,6 +364,9 @@ impl TryFrom<CompactedItemWire<'_>> for CompactedItem {
             }
             (None, None) => None,
         };
+        if let Some(replacement_history) = replacement_history.as_mut() {
+            super::mark_inline_images_persisted(replacement_history);
+        }
 
         let mut window_number = item.window_number;
         let window_id = match item.window_id {

@@ -420,7 +420,7 @@ async fn parent_response(
                     responses::ev_response_created(call_id),
                     responses::ev_function_call_with_namespace(
                         call_id,
-                        "collaboration",
+                        "rz_collaboration",
                         tool_name,
                         &arguments.to_string(),
                     ),
@@ -678,13 +678,22 @@ async fn guardian_v2_routes_scoped_tool_approvals(
         } else {
             json!({ "decision": "block", "reason": USER_INPUT_HOOK_FEEDBACK })
         };
-        let hook_path = codex_home.path().join("guardian-post-tool-hook.py");
-        std::fs::write(&hook_path, format!("print({:?})\n", output.to_string()))?;
+        let hook_output = output.to_string();
+        let hook_command = if cfg!(windows) {
+            let hook_path = codex_home.path().join("guardian-post-tool-hook.ps1");
+            let powershell_output = hook_output.replace('\'', "''");
+            std::fs::write(&hook_path, format!("Write-Output '{powershell_output}'\n"))?;
+            let hook_path = hook_path.to_string_lossy().replace('\\', "/");
+            format!("powershell -NoProfile -ExecutionPolicy Bypass -File \"{hook_path}\"")
+        } else {
+            let hook_path = codex_home.path().join("guardian-post-tool-hook.py");
+            std::fs::write(&hook_path, format!("print({hook_output:?})\n"))?;
+            format!("python3 {}", hook_path.display())
+        };
         std::fs::write(
             codex_home.path().join("requirements.toml"),
             format!(
-                "[hooks]\n\n[[hooks.PostToolUse]]\nmatcher = '^request_user_input$'\n\n[[hooks.PostToolUse.hooks]]\ntype = 'command'\ncommand = 'python3 {}'\n",
-                hook_path.display()
+                "[hooks]\n\n[[hooks.PostToolUse]]\nmatcher = '^request_user_input$'\n\n[[hooks.PostToolUse.hooks]]\ntype = 'command'\ncommand = {hook_command:?}\n"
             ),
         )?;
     }

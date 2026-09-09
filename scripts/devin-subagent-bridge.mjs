@@ -2,12 +2,12 @@
 
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
-import { createServer } from "node:http";
-import { homedir } from "node:os";
-import { dirname, isAbsolute, join } from "node:path";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { DatabaseSync } from "node:sqlite";
+import { createRequire } from "node:module";
+import { exitWhenParentStops } from "./bridge-lifecycle.mjs";
 import {
   TaskStateError,
   activeTaskPromptSection,
@@ -24,6 +24,15 @@ import {
 } from "./codebuddy-subagent-task-state.mjs";
 import { projectInstructionsPromptSection } from "./native-project-instructions.mjs";
 import {
+  assertProviderBoundaryEnforceable,
+  bridgeAuthorizationHeaders,
+  createAuthenticatedBridgeServer,
+  executionPolicy as sharedExecutionPolicy,
+  loadBridgeBearerToken,
+  providerBoundaryRequirements,
+  sanitizeChildEnvironment,
+} from "./bridge-security.mjs";
+import {
   ActiveTaskProviderPins,
   ActiveTaskRoutePins,
   fallbackForwardBody,
@@ -33,7 +42,6 @@ import {
 } from "./native-subagent-provider-router.mjs";
 import {
   NativeCliAgentError,
-  nativeCliAgentRunnerSelfTest,
   nativeCliAgentContext,
   runOpenCodeNativeAgent,
 } from "./native-cli-agent-runner.mjs";
@@ -50,9 +58,8 @@ const OLLAMA_REQUIRED_EFFORT = "max";
 const LEGACY_REQUEST_EFFORTS = new Set(["max"]);
 const DEFAULT_PORT = 54548;
 const MAX_REQUEST_BYTES = 32 * 1024 * 1024;
-// Keep enough task-local tool history for complex implementation work without approaching the
-// providers' very large context windows. About 120k characters is roughly the requested 30k-token
-// working context; trivial turns remain much smaller because this is only a cap.
+// Bound the assembled prompt's JavaScript string length before transport. This is not
+// a tokenizer-based context limit; provider tokenization and framing remain provider-specific.
 const MAX_PROMPT_CHARS = 120_000;
 const MAX_ACTIVE_TASK_CHARS = 40_000;
 const OUTPUT_LIMIT = 2 * 1024 * 1024;
@@ -64,6 +71,7 @@ const PROVIDER_RECOVERY_BACKOFF_MS = 1 * 1000;
 const ROUTE_CAPACITY_WAIT_MS = PROVIDER_RECOVERY_BUDGET_MS;
 const NATIVE_PROGRESS_POLL_MS = 1 * 1000;
 const NATIVE_PROVIDER_INACTIVITY_MS = 55 * 1000;
+const RETAINED_TASK_OWNER_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const FREE_ROUTE_CONCURRENCY = 2;
 const OLLAMA_CLOUD_CONCURRENCY = 3;
 const RESOURCE_BACKOFF_BASE_MS = 5 * 1000;
@@ -84,7 +92,10 @@ const CODEBUDDY_REQUIRED_AUTH_SOURCE = "www.codebuddy.ai";
 const CODEBUDDY_REQUIRED_EFFORT = "max";
 const REQUIRED_AUTO_PROVIDER_ORDER = ["antigravity", "devin", "ollama", "opencode", "codebuddy", "devin-free"];
 const SCRIPT_DIRECTORY = dirname(fileURLToPath(import.meta.url));
-const CENTRAL_CONFIG = join(homedir(), ".codex", "subagent-models.json");
+const require = createRequire(import.meta.url);
+let databaseSyncClass = null;
+const CODEX_HOME_DIRECTORY = process.env.CODEX_HOME || join(homedir(), ".codex");
+const CENTRAL_CONFIG = join(CODEX_HOME_DIRECTORY, "subagent-models.json");
 const USER_DEVIN_CONFIG = join(process.env.APPDATA || join(homedir(), "AppData", "Roaming"), "devin", "config.json");
 const DEVIN_HOME = join(process.env.LOCALAPPDATA || join(homedir(), "AppData", "Local"), "RzCodex", "devin-subagents");
 const ISOLATED_CONFIG = join(DEVIN_HOME, "config.json");
@@ -99,9 +110,14 @@ const INTERRUPTED_STREAM = /stream (?:was )?interrupted|stream disconnected|conn
 const PROVIDER_COMPACTION = /provider context compacted/i;
 const READ_ONLY_RZMCP_TOOL_NAME = /^(?:analyze|check|count|describe|discover|does|enumerate|find|get|has|inspect|is|list|locate|query|read|resolve|search|validate)_/i;
 const PERMISSION_REJECTION = /rejected a tool call that requires confirmation|permission (?:was )?denied|requires (?:user )?confirmation/i;
-const VALIDATION_RESTRICTED_TASK = /\b(?:do not|must not|never)[^.\n]{0,160}\b(?:build|compile|run\s+(?:the\s+)?tests?|test|control\s+(?:the\s+)?editor|use\s+(?:the\s+)?editor|pie|sie)\b|\bno\s+(?:build|compile|tests?|editor|pie|sie)\b|\b(?:aucun(?:e)?|sans|interdiction\s+d['’](?:ex[eé]cuter|utiliser))[^.\n]{0,160}\b(?:build|compil(?:e|er|ation)|tests?|editor|[eé]diteur|pie|sie)\b/i;
 const QUOTA_STATE_VERSION = 2;
 const RECOVERY_PROBE_STATE_VERSION = 1;
+const DEVIN_PROVIDER_BOUNDARY = Object.freeze({
+  fileWrites: "unrestricted",
+  shell: "unrestricted",
+  validationTools: "unrestricted",
+  editorControl: "unrestricted",
+});
 
 class BridgeError extends Error {
   constructor(message, status = 400) {
@@ -360,29 +376,27 @@ class RecoveryProbeState {
 }
 
 function sanitizedEnvironment(source = process.env) {
-  const env = { ...source, NO_COLOR: "1" };
-  for (const key of [
-    "DEVIN_API_KEY", "DEVIN_ORG_ID", "COGNITION_API_KEY", "OPENAI_API_KEY",
-    "OPENAI_ORG_ID", "OPENAI_PROJECT_ID", "CODEX_API_KEY", "OPENROUTER_API_KEY",
-    "TENCENT_API_KEY", "TENCENTCLOUD_SECRET_ID", "TENCENTCLOUD_SECRET_KEY",
-    "CODEBUDDY_API_KEY", "OPENCODE_API_KEY", "COMMAND_CODE_API_KEY",
-    "OLLAMA_API_KEY",
-  ]) delete env[key];
-  return env;
+  return sanitizeChildEnvironment(source, { credentialScope: "none" });
 }
 
-function executionPolicyFromTaskState(taskState) {
+export function executionPolicyFromTaskState(taskState) {
   const taskText = taskState?.activeTask?.text || "";
   const readOnly = taskState?.activeTask?.intent === "analysis" || isExplicitReadOnlyTask(taskText);
-  const validationRestricted = VALIDATION_RESTRICTED_TASK.test(taskText);
+  const validationRestricted = !readOnly;
+  const requestedRzMcpMode = rzMcpModeForTask(taskText, readOnly);
+  const rzMcpMode = validationRestricted && requestedRzMcpMode === "full"
+    ? "no-validation"
+    : requestedRzMcpMode;
   return {
-    // Devin's non-interactive auto and accept-edits modes still reject ordinary shell commands.
-    // Native subagents need the same file/shell surface as the other managed providers; task scope
-    // and RzMCP access remain constrained independently below and in the pinned task prompt.
+    ...sharedExecutionPolicy({
+      readOnly,
+      validationRestricted,
+      rzMcpMode,
+    }),
+    // Devin's non-interactive restricted modes do not provide a proven independent file/shell
+    // boundary. Unrestricted work uses its full native surface; restricted work is rejected before
+    // session lease or provider spawn by assertDevinTaskBoundary.
     permissionMode: "dangerous",
-    rzMcpMode: rzMcpModeForTask(taskText, readOnly),
-    readOnly,
-    validationRestricted,
   };
 }
 
@@ -391,6 +405,21 @@ function providerEnvironment(executionPolicy) {
     ...sanitizedEnvironment(),
     RZCODEX_SUBAGENT_RZMCP_MODE: executionPolicy.rzMcpMode,
   };
+}
+
+function providerBoundaryPrompt(policy) {
+  const requirements = providerBoundaryRequirements(policy);
+  return `[Enforced provider boundary]\nFile writes: ${requirements.fileWrites}. Shell: ${requirements.shell}. Validation tools: ${requirements.validationTools}. Editor control: ${requirements.editorControl}. RzMCP mode: ${policy.rzMcpMode}. A provider that cannot enforce every disabled capability must reject this task before work.`;
+}
+
+export function assertDevinTaskBoundary(policy) {
+  try {
+    assertProviderBoundaryEnforceable("Devin CLI", DEVIN_PROVIDER_BOUNDARY, policy);
+  } catch (error) {
+    const rejection = new BridgeError(error.message, 422);
+    rejection.routeSkipped = true;
+    throw rejection;
+  }
 }
 
 function centralRoute() {
@@ -558,14 +587,12 @@ function ensureRuntimeConfig() {
   })}\n`, "utf8");
 }
 
-if (!existsSync(DEVIN_EXE)) throw new BridgeError(`Devin CLI is missing at ${DEVIN_EXE}`, 500);
-if (!existsSync(DEVIN_DB)) throw new BridgeError(`Devin session database is missing at ${DEVIN_DB}`, 500);
-ensureRuntimeConfig();
-const calendarQuotaState = new CalendarQuotaState(QUOTA_STATE_FILE);
-const ollamaQuotaState = new RecoveryProbeState(OLLAMA_QUOTA_STATE_FILE);
-const route = centralRoute();
-const catalog = modelCatalog();
-const auth = authStatus();
+let calendarQuotaState = null;
+let ollamaQuotaState = null;
+let route = null;
+let catalog = null;
+let auth = null;
+let bridgeToken = null;
 
 function catalogModel(uid, expectedLabel, mustBeFree) {
   const model = catalog.find((entry) => entry.model_uid === uid);
@@ -579,10 +606,23 @@ function catalogModel(uid, expectedLabel, mustBeFree) {
   return model;
 }
 
-const models = {
-  primary: catalogModel(route.primaryModel, "GLM-5.3 Flash Max", false),
-  terminal: catalogModel(route.terminalFallbackModel, "GLM-5.2 High", true),
-};
+let models = null;
+
+function initializeProductionRuntime() {
+  if (!existsSync(DEVIN_EXE)) throw new BridgeError(`Devin CLI is missing at ${DEVIN_EXE}`, 500);
+  if (!existsSync(DEVIN_DB)) throw new BridgeError(`Devin session database is missing at ${DEVIN_DB}`, 500);
+  bridgeToken = loadBridgeBearerToken();
+  ensureRuntimeConfig();
+  calendarQuotaState = new CalendarQuotaState(QUOTA_STATE_FILE);
+  ollamaQuotaState = new RecoveryProbeState(OLLAMA_QUOTA_STATE_FILE);
+  route = centralRoute();
+  catalog = modelCatalog();
+  auth = authStatus();
+  models = {
+    primary: catalogModel(route.primaryModel, "GLM-5.3 Flash Max", false),
+    terminal: catalogModel(route.terminalFallbackModel, "GLM-5.2 High", true),
+  };
+}
 
 const runtime = {
   incomingRequests: 0, requests: 0, completed: 0, failed: 0, rejected: 0,
@@ -595,6 +635,7 @@ const runtime = {
   streamContinuations: 0, compactionCheckpoints: 0,
   providerCheckpoints: 0,
   permissionCheckpoints: 0, activeResourceBackoffs: 0,
+  sessionCleanupFailures: 0, lastSessionCleanupError: null,
   lastResourceModel: null, lastResourceRetryAttempt: 0,
   lastResourceBackoffMs: 0, lastResourceRetryAt: null,
   lastStreamContinuationAt: null, lastStreamContinuationSessionHash: null,
@@ -634,7 +675,95 @@ const ollamaCapacity = { active: 0, waiters: [] };
 const activeThreadTurns = new Map();
 const quotaTaskPins = new ActiveTaskRoutePins();
 const providerTaskPins = new ActiveTaskProviderPins();
-const retainedDevinSessions = new Map();
+
+export class RetainedProviderSessions {
+  #sessions = new Map();
+
+  constructor({ maxAgeMs = RETAINED_TASK_OWNER_MAX_AGE_MS, now = Date.now } = {}) {
+    if (!Number.isFinite(maxAgeMs) || maxAgeMs <= 0) {
+      throw new BridgeError("retained session maxAgeMs must be a positive number", 500);
+    }
+    this.maxAgeMs = maxAgeMs;
+    this.now = now;
+  }
+
+  retain(ownerKey, taskHash, session) {
+    if (typeof ownerKey !== "string" || !ownerKey) return false;
+    if (typeof taskHash !== "string" || !taskHash || !session) return false;
+    this.#sessions.set(ownerKey, {
+      taskHash,
+      session,
+      expiresAt: this.now() + this.maxAgeMs,
+    });
+    return true;
+  }
+
+  take(ownerKey, taskHash) {
+    if (typeof ownerKey !== "string" || !ownerKey) return null;
+    if (typeof taskHash !== "string" || !taskHash) return null;
+    const entry = this.#sessions.get(ownerKey);
+    if (!entry) return null;
+    if (entry.taskHash !== taskHash) {
+      this.#sessions.delete(ownerKey);
+      return null;
+    }
+    if (entry.expiresAt <= this.now()) {
+      entry.session = null;
+      entry.expired = true;
+    }
+    if (entry.expired === true) {
+      const error = new BridgeError(
+        "Retained provider ownership expired; explicit parent resolution is required before this task can run again",
+        409,
+      );
+      error.routeCommitted = true;
+      error.providerTaskPinPreserved = true;
+      throw error;
+    }
+    this.#sessions.delete(ownerKey);
+    return entry.session;
+  }
+
+  has(ownerKey, taskHash) {
+    const entry = this.#sessions.get(ownerKey);
+    if (!entry) return false;
+    if (entry.taskHash !== taskHash) {
+      this.#sessions.delete(ownerKey);
+      return false;
+    }
+    if (entry.expiresAt <= this.now()) {
+      entry.session = null;
+      entry.expired = true;
+    }
+    return true;
+  }
+
+  get size() {
+    const now = this.now();
+    for (const entry of this.#sessions.values()) {
+      if (entry.expiresAt <= now) {
+        entry.session = null;
+        entry.expired = true;
+      }
+    }
+    return this.#sessions.size;
+  }
+}
+
+const retainedDevinSessions = new RetainedProviderSessions();
+
+export async function withRetainedProviderSession(registry, ownerKey, taskHash, callback) {
+  const retainedSession = registry.take(ownerKey, taskHash);
+  let transferred = false;
+  const lease = { transfer: () => { transferred = true; } };
+  try {
+    return await callback(retainedSession, lease);
+  } catch (error) {
+    const sessionToRestore = error?.retainedProviderSession || (!transferred ? retainedSession : null);
+    if (sessionToRestore) registry.retain(ownerKey, taskHash, sessionToRestore);
+    throw error;
+  }
+}
 
 function ownershipTaskHash(context) {
   return taskOwnershipHash(context.taskState) ?? context.taskDiagnostics?.taskHash ?? null;
@@ -648,20 +777,46 @@ function pinProviderTask(context, stage) {
   return changed;
 }
 
-function preserveProviderPinForAbortedTurn(context, error, signal) {
+export function reconcileProviderPinAfterAbort(
+  pins,
+  threadId,
+  taskHash,
+  error,
+  signal,
+  existingPinnedStage = null,
+) {
   if (!signal?.aborted) return null;
-  const stage = providerTaskPins.get(context.threadId, ownershipTaskHash(context));
+  const stage = pins.get(threadId, taskHash);
   if (stage === null) return null;
-  runtime.lastPinnedProviderStage = stage;
-  error.providerTaskPinPreserved = true;
-  error.routeCommitted = true;
+  const committed = error?.routeCommitted === true
+    || error?.providerTaskPinPreserved === true
+    || existingPinnedStage === stage;
+  if (committed) {
+    error.providerTaskPinPreserved = true;
+    error.routeCommitted = true;
+    return stage;
+  }
+  pins.release(threadId, taskHash);
+  return null;
+}
+
+function preserveProviderPinForAbortedTurn(context, error, signal, existingPinnedStage) {
+  const stage = reconcileProviderPinAfterAbort(
+    providerTaskPins,
+    context.threadId,
+    ownershipTaskHash(context),
+    error,
+    signal,
+    existingPinnedStage,
+  );
+  if (stage !== null) runtime.lastPinnedProviderStage = stage;
+  else runtime.lastPinnedProviderStage = null;
   return stage;
 }
 
 function retainedDevinSessionKey(context, selectedModel) {
-  const taskHash = ownershipTaskHash(context);
-  if (!context.threadId || !taskHash || !selectedModel?.model_uid) return null;
-  return `${context.threadId}:${taskHash}:${selectedModel.model_uid}`;
+  if (!context.threadId || !selectedModel?.model_uid) return null;
+  return `${context.threadId}:${selectedModel.model_uid}`;
 }
 
 function syncRouteCapacityRuntime() {
@@ -891,7 +1046,7 @@ function promptFrom(body) {
   const requestId = randomUUID();
   const workingDirectory = workingDirectoryFrom(body, input);
   const executionPolicy = mainAgent
-    ? { permissionMode: "dangerous", rzMcpMode: "full", readOnly: false, validationRestricted: false }
+    ? { ...sharedExecutionPolicy(), permissionMode: "dangerous" }
     : executionPolicyFromTaskState(taskState);
   const threadId = typeof body.client_metadata?.thread_id === "string"
     ? body.client_metadata.thread_id
@@ -902,7 +1057,7 @@ function promptFrom(body) {
       : `[Native delegated coding contract]\nRzCodex request ID: ${requestId}\nWork directly in the supplied workspace as the bounded native sub-agent. Use the file and command tools available in this turn. Do not spawn provider-side subagents. Honor project AGENTS.md ownership boundaries exactly; when builds, tests, editor control, PIE, runtime validation, or RzMCP execution are reserved to the parent, do not invoke them and instead report the exact checks the parent should run. For Unreal/RzMCP work that is within your assigned ownership, use only the lazy RzMCP proxy surface: search with an exact or focused query, then call only a discovered tool. Never use or request the full RzMCP catalog. On Windows, use PowerShell-native commands, single-quote ripgrep patterns containing |, and never assume Unix-only commands such as head are installed. Return concise evidence as soon as the bounded task is complete or genuinely blocked.\nAuthoritative workspace: ${workingDirectory}`,
     mainAgent
       ? `[Provider permissions]\nNon-interactive native file, shell, and full lazy RzMCP access are enabled for the main agent. These capabilities do not expand the user request or project instructions.`
-      : `[Enforced provider permissions]\nNon-interactive native file and shell tools are enabled with Devin permission mode ${executionPolicy.permissionMode}. This permission mode does not expand the active task. RzMCP mode: ${executionPolicy.rzMcpMode}. The active task's scope and restrictions remain hard boundaries, not suggestions.`,
+      : providerBoundaryPrompt(executionPolicy),
     projectInstructionsPromptSection(workingDirectory),
   ];
   if (mainAgent && typeof body.instructions === "string" && body.instructions.trim()) {
@@ -1492,7 +1647,8 @@ function terminalAssistantFromRows(conversationRows) {
 }
 
 function inspectSession(requestId) {
-  const db = new DatabaseSync(DEVIN_DB, { readOnly: true });
+  databaseSyncClass ??= require("node:sqlite").DatabaseSync;
+  const db = new databaseSyncClass(DEVIN_DB, { readOnly: true });
   try {
     const session = db.prepare(`
       SELECT s.id, s.model, s.metadata, s.last_activity_at
@@ -1800,6 +1956,14 @@ function preserveProviderSession(error, session, executionPolicy) {
   return error;
 }
 
+export function devinPostToolQuotaFailure(session, executionPolicy) {
+  return preserveProviderSession(
+    new BridgeError("Devin quota ended after executing native tools; the turn was not replayed", 502),
+    session,
+    executionPolicy,
+  );
+}
+
 function providerCheckpointReason({ resourceFailure, streamFailure, compactionFailure, permissionFailure, incompleteTurn }) {
   if (resourceFailure) return "the provider reported a transient resource failure";
   if (streamFailure) return "the provider stream ended before a terminal response";
@@ -2069,7 +2233,14 @@ function responsesResult(completion, selected, fallbackState, transport) {
   };
 }
 
-function finalizeDevinResult(context, selected, routeResult, fallbackState, preserveSession = false) {
+export function finalizeDevinResult(
+  context,
+  selected,
+  routeResult,
+  fallbackState,
+  preserveSession = false,
+  { remove = removeSession } = {},
+) {
   const { cliResult, session } = routeResult;
   if (!session) {
     if (cliResult.code !== 0 || !cliResult.stdout) {
@@ -2077,7 +2248,8 @@ function finalizeDevinResult(context, selected, routeResult, fallbackState, pres
     }
     throw new BridgeError("Devin completed without a traceable ephemeral session", 502);
   }
-  let validated = false;
+  let result = null;
+  let failure = null;
   try {
     if (cliResult.code !== 0 || !cliResult.stdout) {
       throw new BridgeError(`Devin failed: ${cliResult.stderr || cliResult.stdout || `exit ${cliResult.code}`}`, 502);
@@ -2105,7 +2277,7 @@ function finalizeDevinResult(context, selected, routeResult, fallbackState, pres
     const outputTokensPerSecond = generationSeconds > 0 ? measuredOutputTokens / generationSeconds : null;
     const toolCalls = session.toolCalls.filter((call) => call?.name);
     const rzMcpTools = toolCalls.map(calledRzMcpToolName).filter(Boolean);
-    const result = {
+    result = {
       text: session.terminalText, selected, providerMetadata: {},
       quotaFallback: fallbackState.quotaFallback,
       terminalFallback: fallbackState.terminalFallback,
@@ -2117,13 +2289,33 @@ function finalizeDevinResult(context, selected, routeResult, fallbackState, pres
       toolSchemaBytesIgnored: fallbackState.toolSchemaBytesIgnored,
       toolSchemaBytesForwarded: 0,
     };
-    validated = true;
-    return result;
   } catch (error) {
-    throw preserveProviderCommit(error, session, context.executionPolicy);
-  } finally {
-    if (!preserveSession || !validated) removeSession(session.id);
+    failure = preserveProviderCommit(error, session, context.executionPolicy);
+    if (failure.routeCommitted === true) {
+      preserveProviderSession(failure, session, context.executionPolicy);
+    }
   }
+
+  const mustPreserveSession = preserveSession || failure?.routeCommitted === true;
+  if (!mustPreserveSession) {
+    try {
+      remove(session.id);
+    } catch (cleanupError) {
+      runtime.sessionCleanupFailures += 1;
+      runtime.lastSessionCleanupError = sanitizedProviderFailure(cleanupError);
+      if (failure) {
+        Object.defineProperty(failure, "sessionCleanupError", {
+          value: runtime.lastSessionCleanupError,
+          configurable: true,
+        });
+      } else {
+        result.preserveProviderSession = true;
+        result.sessionCleanupError = runtime.lastSessionCleanupError;
+      }
+    }
+  }
+  if (failure) throw failure;
+  return result;
 }
 
 function fallbackState(context, failures, terminalFallback = false) {
@@ -2158,7 +2350,8 @@ async function runAntigravityStage(context, requestBody, failures, onProgress, s
       endpoint: ANTIGRAVITY_BRIDGE_ENDPOINT,
       body: forwardedBody,
       signal,
-        onEvent: streamRelay.accept,
+      headers: bridgeAuthorizationHeaders(bridgeToken),
+      onEvent: streamRelay.accept,
     });
     validateOAuthFallbackCompletion(completion, {
       provider: route.antigravityProvider,
@@ -2204,7 +2397,8 @@ async function runCodeBuddyStage(context, requestBody, failures, onProgress, sig
       endpoint: CODEBUDDY_BRIDGE_ENDPOINT,
       body: forwardedBody,
       signal,
-        onEvent: streamRelay.accept,
+      headers: bridgeAuthorizationHeaders(bridgeToken),
+      onEvent: streamRelay.accept,
     });
     validateOAuthFallbackCompletion(completion, {
       provider: "codebuddy",
@@ -2252,6 +2446,7 @@ async function runOpenCodeStage(context, requestBody, failures, onProgress, sign
       endpoint: OPENCODE_BRIDGE_ENDPOINT,
       body: forwardedBody,
       signal,
+      headers: bridgeAuthorizationHeaders(bridgeToken),
       onEvent: streamRelay.accept,
     });
     validateOAuthFallbackCompletion(completion, {
@@ -2294,6 +2489,30 @@ async function runOpenCodeStage(context, requestBody, failures, onProgress, sign
   }
 }
 
+export async function withRecoveryProbeAfterCapacity({
+  selected,
+  signal,
+  recoveryState,
+  run,
+  capacityOptions,
+  withCapacity = withRouteCapacity,
+  onSkipped = () => {},
+  onClaimed = () => {},
+}) {
+  return withCapacity(selected, signal, async () => {
+    if (recoveryState.isActive()) {
+      if (!recoveryState.claimRecoveryProbe()) {
+        onSkipped();
+        const error = new BridgeError("Provider usage limit is currently exhausted", 503);
+        error.routeSkipped = true;
+        throw error;
+      }
+      onClaimed();
+    }
+    return run();
+  }, capacityOptions);
+}
+
 async function runOllamaStage(
   context,
   requestBody,
@@ -2306,18 +2525,18 @@ async function runOllamaStage(
   const selected = ollamaSelection(
     failures.length > 0 ? "auto_ollama_after_prior_provider_failure" : "explicit_ollama_route",
   );
-  if (ollamaQuotaState.isActive()) {
-    if (!ollamaQuotaState.claimRecoveryProbe()) {
-      runtime.ollamaQuotaSkips += 1;
-      onProgress?.("Ollama cloud usage limit is cached; skipping this provider until its bounded recovery probe.\n");
-      const error = new BridgeError("Ollama cloud usage limit is currently exhausted", 503);
-      error.routeSkipped = true;
-      throw error;
-    }
-    runtime.ollamaQuotaRecoveryProbes += 1;
-  }
   try {
-    return await withRouteCapacity(selected, signal, async () => {
+    return await withRecoveryProbeAfterCapacity({
+      selected,
+      signal,
+      recoveryState: ollamaQuotaState,
+      capacityOptions,
+      onSkipped: () => {
+        runtime.ollamaQuotaSkips += 1;
+        onProgress?.("Ollama cloud usage limit is cached; skipping this provider until its bounded recovery probe.\n");
+      },
+      onClaimed: () => { runtime.ollamaQuotaRecoveryProbes += 1; },
+      run: async () => {
       runtime.providerAttempts.ollama += 1;
       runtime.lastProviderSequence.push("ollama");
       pinProviderTask(context, "ollama");
@@ -2414,7 +2633,8 @@ async function runOllamaStage(
         toolSchemaBytesForwarded: 0,
         streamRelay,
       };
-    }, capacityOptions);
+      },
+    });
   } catch (error) {
     if (error?.quotaFailure === true) {
       ollamaQuotaState.record("session_usage_limit");
@@ -2438,40 +2658,53 @@ async function runDevinStage(
   terminalFallback,
   capacityOptions,
 ) {
+  assertDevinTaskBoundary(context.executionPolicy);
   const freeModel = selected.key === "terminal";
   const providerKey = freeModel ? "devinFree" : "devin";
   const stage = terminalFallback ? "devin-free" : "devin";
   pinProviderTask(context, stage);
   const retainedSessionKey = retainedDevinSessionKey(context, selected.model);
-  const retainedSession = retainedSessionKey
-    ? retainedDevinSessions.get(retainedSessionKey) || null
-    : null;
-  if (retainedSessionKey) retainedDevinSessions.delete(retainedSessionKey);
+  const retainedTaskHash = ownershipTaskHash(context);
   runtime.providerAttempts[providerKey] += 1;
   runtime.lastProviderSequence.push(terminalFallback ? "devin-free" : "devin");
   let routeResult;
   try {
-    routeResult = await withRouteCapacity(selected, signal, () => {
-      onProgress?.(`Devin native worker started with ${selected.model.label}.\n`);
-      return runCliWithProviderRecovery(
-        context,
-        selected.model,
-        onSpawn,
-        (progress) => {
-          if (progress?.kind === "recovery") {
-            onProgress?.(`Devin native same-session recovery: ${progress.reason}.\n`);
-            return;
-          }
-          onProgress?.(formatNativeToolProgress("Devin", progress.index, progress.name, progress.input));
+    routeResult = await withRouteCapacity(
+      selected,
+      signal,
+      () => withRetainedProviderSession(
+        retainedDevinSessions,
+        retainedSessionKey,
+        retainedTaskHash,
+        (retainedSession, lease) => {
+          onProgress?.(`Devin native worker started with ${selected.model.label}.\n`);
+          return runCliWithProviderRecovery(
+            context,
+            selected.model,
+            (spawned) => {
+              lease.transfer();
+              onSpawn(spawned);
+            },
+            (progress) => {
+              if (progress?.kind === "recovery") {
+                onProgress?.(`Devin native same-session recovery: ${progress.reason}.\n`);
+                return;
+              }
+              onProgress?.(formatNativeToolProgress("Devin", progress.index, progress.name, progress.input));
+            },
+            signal,
+            Date.now() + REQUEST_TIMEOUT_MS,
+            retainedSession ? { initialResumeSession: retainedSession } : undefined,
+          );
         },
-        signal,
-        Date.now() + REQUEST_TIMEOUT_MS,
-        retainedSession ? { initialResumeSession: retainedSession } : undefined,
-      );
-    }, capacityOptions);
+      ),
+      capacityOptions,
+    );
   } catch (error) {
-    if (retainedSessionKey && error?.retainedProviderSession) {
-      retainedDevinSessions.set(retainedSessionKey, error.retainedProviderSession);
+    if (
+      retainedSessionKey
+      && retainedDevinSessions.has(retainedSessionKey, retainedTaskHash)
+    ) {
       pinProviderTask(context, stage);
     }
     error.failedStage ||= terminalFallback ? "devin-free" : "devin";
@@ -2479,12 +2712,11 @@ async function runDevinStage(
   }
   if (!freeModel && isQuotaFailure(routeResult.cliResult)) {
     if (providerToolCalls(routeResult.session).length > 0) {
-      const error = preserveProviderCommit(
-        new BridgeError("Devin quota ended after executing native tools; the turn was not replayed", 502),
-        routeResult.session,
-        context.executionPolicy,
-      );
-      removeSession(routeResult.session.id);
+      const error = devinPostToolQuotaFailure(routeResult.session, context.executionPolicy);
+      if (retainedSessionKey) {
+        retainedDevinSessions.retain(retainedSessionKey, retainedTaskHash, routeResult.session);
+      }
+      pinProviderTask(context, stage);
       throw error;
     }
     if (routeResult.session) removeSession(routeResult.session.id);
@@ -2502,14 +2734,30 @@ async function runDevinStage(
   }
   const preserveSession = Boolean(retainedSessionKey)
     && (context.taskState.checkpointRequested || routeResult.preserveProviderSession === true);
-  const result = finalizeDevinResult(
-    context,
-    selected,
-    routeResult,
-    fallbackState(context, failures, terminalFallback),
-    preserveSession,
-  );
-  if (preserveSession) retainedDevinSessions.set(retainedSessionKey, routeResult.session);
+  let result;
+  try {
+    result = finalizeDevinResult(
+      context,
+      selected,
+      routeResult,
+      fallbackState(context, failures, terminalFallback),
+      preserveSession,
+    );
+  } catch (error) {
+    if (retainedSessionKey && error?.retainedProviderSession) {
+      retainedDevinSessions.retain(
+        retainedSessionKey,
+        retainedTaskHash,
+        error.retainedProviderSession,
+      );
+      pinProviderTask(context, stage);
+    }
+    throw error;
+  }
+  if (preserveSession || result.preserveProviderSession === true) {
+    retainedDevinSessions.retain(retainedSessionKey, retainedTaskHash, routeResult.session);
+    pinProviderTask(context, stage);
+  }
   return result;
 }
 
@@ -2633,7 +2881,12 @@ async function executeAuto(context, requestBody, onSpawn, onProgress, signal, cr
       },
     });
   } catch (error) {
-    const abortedStage = preserveProviderPinForAbortedTurn(context, error, signal);
+    const abortedStage = preserveProviderPinForAbortedTurn(
+      context,
+      error,
+      signal,
+      pinnedStage,
+    );
     if (abortedStage !== null) {
       throw error;
     }
@@ -2832,6 +3085,13 @@ function createProviderStreamRelay(
   const accept = async (event) => {
     const payload = event.payload || {};
     if (event.type === "response.in_progress") {
+      if (payload.response?.metadata?.provider_work_started === true) {
+        providerWorkCommitted = true;
+        const toolName = payload.response.metadata.native_tool_name;
+        if (typeof toolName === "string" && toolName.trim()) {
+          progress?.emit(`${providerLabel} started native tool ${progressToolName(toolName)}.\n`);
+        }
+      }
       writeSseHeartbeat(response, responseId, modelAlias);
       return;
     }
@@ -2859,7 +3119,6 @@ function createProviderStreamRelay(
       && typeof payload.delta === "string"
       && payload.delta
     ) {
-      if (/\bnative tool\b/i.test(payload.delta)) providerWorkCommitted = true;
       progress?.emit(payload.delta);
       return;
     }
@@ -3167,7 +3426,7 @@ function managedModelsResponse() {
   ] };
 }
 
-function health(requestedRoute = "auto") {
+function health(listeningPort, requestedRoute = "auto") {
   const defaultActual = requestedRoute === "devin-free"
     ? { provider: "devin", model: models.terminal.model_uid, label: models.terminal.label }
     : requestedRoute === "ollama"
@@ -3175,7 +3434,7 @@ function health(requestedRoute = "auto") {
       : { provider: route.antigravityProvider, model: route.antigravityModels[0], label: route.antigravityModels[0] };
   const routeActual = runtime.actualByConfiguredRoute[requestedRoute] || defaultActual;
   return {
-    ok: true, provider: PROVIDER_ID, port, modelAlias: MODEL_ALIAS,
+    ok: true, provider: PROVIDER_ID, port: listeningPort, modelAlias: MODEL_ALIAS,
     modelAliases: {
       auto: MODEL_ALIAS,
       devinFree: DEVIN_FREE_MODEL_ALIAS,
@@ -3269,7 +3528,10 @@ function health(requestedRoute = "auto") {
     },
     apiKeysStripped: true, ollamaApiKeyRequired: false,
     isolatedConfigImports: ["agents_standard"], lazyRzMcpProxyTools: 2,
-    rawPromptFilesRetained: false, ephemeralSessionsRemoved: true,
+    rawPromptFilesRetained: false,
+    ephemeralSessionsRemoved: retainedDevinSessions.size === 0,
+    retainedDevinTaskOwners: retainedDevinSessions.size,
+    retainedSessionPolicy: "terminal_unowned_removed_committed_owner_retained_or_tombstoned",
     activeThreadTurns: activeThreadTurns.size, pinnedQuotaTasks: quotaTaskPins.size,
     pinnedProviderTasks: providerTaskPins.size,
     calendarQuotaState: calendarQuotaState.snapshot(),
@@ -3284,8 +3546,62 @@ function jsonResponse(response, status, value) {
   response.end(body);
 }
 
+function initializeSelfTestRuntime() {
+  route = {
+    autoProviderOrder: [...REQUIRED_AUTO_PROVIDER_ORDER],
+    primaryModel: "fixture-devin-primary",
+    terminalFallbackModel: "fixture-devin-free",
+    antigravityProvider: "antigravity",
+    antigravityModels: ["fixture-antigravity-primary", "fixture-antigravity-fallback"],
+    codeBuddyModel: "fixture-codebuddy",
+    nativeFallbackRoute: "native",
+    openCodeModel: "fixture/opencode-primary",
+    openCodeResponseModel: "fixture/opencode-primary",
+    openCodeEffort: OPENCODE_REQUIRED_EFFORT,
+    openCodeFallbackModel: "fixture/opencode-fallback",
+    openCodeFallbackEffort: OPENCODE_FALLBACK_REQUIRED_EFFORT,
+    openCodeResponseModels: ["fixture/opencode-primary", "fixture/opencode-fallback"],
+    openCodeInputModalities: ["text"],
+    ollamaModel: "fixture-ollama",
+    ollamaLabel: "Fixture Ollama",
+    ollamaResponseModels: ["fixture-ollama"],
+    ollamaEffort: OLLAMA_REQUIRED_EFFORT,
+    ollamaInputModalities: ["text"],
+    ollamaMaxConcurrency: OLLAMA_CLOUD_CONCURRENCY,
+    inputModalities: ["text"],
+  };
+  models = {
+    primary: {
+      model_uid: route.primaryModel,
+      label: "GLM-5.3 Flash Max",
+      cost_tier: "Paid",
+      cost_summary: "fixture",
+      max_context_tokens: 200_000,
+    },
+    terminal: {
+      model_uid: route.terminalFallbackModel,
+      label: "GLM-5.2 High",
+      cost_tier: "Free",
+      cost_summary: "Free",
+      max_context_tokens: 200_000,
+    },
+  };
+  auth = { source: "Devin authenticated session", tier: "fixture", plan: "fixture" };
+  catalog = [models.primary, models.terminal];
+  calendarQuotaState = new CalendarQuotaState(null);
+  ollamaQuotaState = new RecoveryProbeState(null);
+}
+
 async function selfTest() {
-  await nativeCliAgentRunnerSelfTest();
+  const selfTestDirectory = mkdtempSync(join(tmpdir(), "rzcodex-devin-self-test-"));
+  try {
+  const selfTestHealthPort = DEFAULT_PORT + 1;
+  for (const requestedRoute of ["auto", "devin-free"]) {
+    const healthResponse = health(selfTestHealthPort, requestedRoute);
+    if (healthResponse.port !== selfTestHealthPort || healthResponse.provider !== PROVIDER_ID) {
+      throw new Error(`health reported the wrong listening port for ${requestedRoute}`);
+    }
+  }
   const fixedQuotaNow = new Date(2026, 7, 28, 12, 0, 0, 0).getTime();
   const selfTestQuotaState = new CalendarQuotaState(null, () => fixedQuotaNow);
   const selfTestTaskPins = new ActiveTaskRoutePins();
@@ -3323,7 +3639,7 @@ async function selfTest() {
   if (selfTestQuotaState.isActive(weeklyRetryAt) || selfTestQuotaState.snapshot(weeklyRetryAt).active) {
     throw new Error("calendar quota route did not reopen at its refresh boundary");
   }
-  const quotaFixturePath = join(REQUEST_DIRECTORY, `quota-state-self-test-${process.pid}.json`);
+  const quotaFixturePath = join(selfTestDirectory, `quota-state-self-test-${process.pid}.json`);
   try {
     const persistentQuota = new CalendarQuotaState(quotaFixturePath, () => fixedQuotaNow);
     persistentQuota.record(dailyQuotaFailure);
@@ -3341,7 +3657,7 @@ async function selfTest() {
   }
   let ollamaProbeNow = fixedQuotaNow;
   const ollamaQuotaFixturePath = join(
-    REQUEST_DIRECTORY,
+    selfTestDirectory,
     `ollama-quota-state-self-test-${process.pid}.json`,
   );
   try {
@@ -3438,8 +3754,8 @@ async function selfTest() {
   const boundedMutationPolicy = executionPolicyFromTaskState({
     activeTask: { text: "Implement the bounded source fix. Do not build or run tests." },
   });
-  const unrestrictedMutationPolicy = executionPolicyFromTaskState({
-    activeTask: { text: "Implement and verify the bounded source fix." },
+  const ordinaryMutationPolicy = executionPolicyFromTaskState({
+    activeTask: { text: "Fix the bounded source defect." },
   });
   const scopedMutationPolicy = executionPolicyFromTaskState({
     activeTask: { text: "Implement the fix. Do not edit unrelated files." },
@@ -3475,8 +3791,9 @@ async function selfTest() {
     || readOnlyPolicy.rzMcpMode !== "disabled"
     || boundedMutationPolicy.permissionMode !== "dangerous"
     || boundedMutationPolicy.rzMcpMode !== "no-validation"
-    || unrestrictedMutationPolicy.permissionMode !== "dangerous"
-    || unrestrictedMutationPolicy.rzMcpMode !== "no-validation"
+    || ordinaryMutationPolicy.permissionMode !== "dangerous"
+    || ordinaryMutationPolicy.validationRestricted !== true
+    || ordinaryMutationPolicy.rzMcpMode !== "no-validation"
     || scopedMutationPolicy.permissionMode !== "dangerous"
     || scopedMutationPolicy.rzMcpMode !== "no-validation"
     || shorthandMutationPolicy.permissionMode !== "dangerous"
@@ -4646,6 +4963,7 @@ async function selfTest() {
     abortedProviderContext,
     abortedProviderError,
     abortedProviderController.signal,
+    "devin-free",
   );
   if (
     abortedProviderStage !== "devin-free"
@@ -4759,38 +5077,52 @@ async function selfTest() {
     throw new Error("Ollama cloud route capacity failed");
   }
   process.stdout.write("devin-subagent-bridge self-test: ok\n");
-}
-
-if (process.argv.includes("--self-test")) {
-  await selfTest();
-  process.exit(0);
-}
-
-const portValue = Number.parseInt(process.env.RZCODEX_DEVIN_BRIDGE_PORT || `${DEFAULT_PORT}`, 10);
-if (!Number.isInteger(portValue) || portValue < 1 || portValue > 65535) throw new BridgeError("Invalid bridge port", 500);
-const port = portValue;
-const server = createServer(async (request, response) => {
-  runtime.incomingRequests += 1;
-  try {
-    const url = new URL(request.url || "/", `http://${request.headers.host || "127.0.0.1"}`);
-    if (request.method === "GET" && url.pathname === "/health") {
-      const requestedRoute = url.searchParams.get("route") || "auto";
-      if (!["auto", "devin-free", "ollama"].includes(requestedRoute)) {
-        return jsonResponse(response, 400, { error: { message: `Unknown health route ${json(requestedRoute)}` } });
-      }
-      return jsonResponse(response, 200, health(requestedRoute));
-    }
-    if (request.method === "GET" && ["/models", "/v1/models"].includes(url.pathname)) return jsonResponse(response, 200, managedModelsResponse());
-    if (request.method === "POST" && url.pathname === "/v1/responses") return await handleResponses(request, response);
-    runtime.rejected += 1;
-    runtime.lastRejectedError = `No route for ${request.method} ${url.pathname}`;
-    return jsonResponse(response, 404, { error: { message: runtime.lastRejectedError } });
-  } catch (error) {
-    runtime.rejected += 1;
-    runtime.lastRejectedError = error.message;
-    if (!response.headersSent) jsonResponse(response, error.status || 500, { error: { message: error.message } });
-    else if (!response.writableEnded) response.end();
+  } finally {
+    rmSync(selfTestDirectory, { recursive: true, force: true });
   }
-});
+}
 
-server.listen(port, "127.0.0.1");
+const isDirectExecution = Boolean(process.argv[1])
+  && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
+
+if (isDirectExecution) {
+  if (process.argv.includes("--self-test")) {
+    initializeSelfTestRuntime();
+    await selfTest();
+  } else {
+    exitWhenParentStops();
+    initializeProductionRuntime();
+    const portValue = Number.parseInt(process.env.RZCODEX_DEVIN_BRIDGE_PORT || `${DEFAULT_PORT}`, 10);
+    if (!Number.isInteger(portValue) || portValue < 1 || portValue > 65535) throw new BridgeError("Invalid bridge port", 500);
+    const port = portValue;
+    const server = createAuthenticatedBridgeServer(async (request, response) => {
+      runtime.incomingRequests += 1;
+      try {
+        const url = new URL(request.url || "/", `http://${request.headers.host || "127.0.0.1"}`);
+        if (request.method === "GET" && url.pathname === "/health") {
+          const requestedRoute = url.searchParams.get("route") || "auto";
+          if (!["auto", "devin-free", "ollama"].includes(requestedRoute)) {
+            return jsonResponse(response, 400, { error: { message: `Unknown health route ${json(requestedRoute)}` } });
+          }
+          return jsonResponse(response, 200, health(port, requestedRoute));
+        }
+        if (request.method === "GET" && ["/models", "/v1/models"].includes(url.pathname)) {
+          return jsonResponse(response, 200, managedModelsResponse());
+        }
+        if (request.method === "POST" && url.pathname === "/v1/responses") {
+          return await handleResponses(request, response);
+        }
+        runtime.rejected += 1;
+        runtime.lastRejectedError = `No route for ${request.method} ${url.pathname}`;
+        return jsonResponse(response, 404, { error: { message: runtime.lastRejectedError } });
+      } catch (error) {
+        runtime.rejected += 1;
+        runtime.lastRejectedError = error.message;
+        if (!response.headersSent) jsonResponse(response, error.status || 500, { error: { message: error.message } });
+        else if (!response.writableEnded) response.end();
+      }
+    }, { token: bridgeToken });
+
+    server.listen(port, "127.0.0.1");
+  }
+}

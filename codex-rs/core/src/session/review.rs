@@ -15,16 +15,14 @@ pub(super) async fn spawn_review_thread(
         .review_model
         .clone()
         .unwrap_or_else(|| parent_turn_context.model_info().slug.clone());
-    let available_models = sess
-        .services
+    let available_models = parent_turn_context
         .models_manager
         .list_models(
             RefreshStrategy::OnlineIfUncached,
             config.http_client_factory(),
         )
         .await;
-    let review_model_info = sess
-        .services
+    let review_model_info = parent_turn_context
         .models_manager
         .get_model_info(&model, &config.to_models_manager_config())
         .await;
@@ -153,6 +151,7 @@ pub(super) async fn spawn_review_thread(
         current_settings: ArcSwap::from(step_settings),
         session_telemetry: session_telemetry_for_context,
         provider: provider_for_context,
+        models_manager: Arc::clone(&parent_turn_context.models_manager),
         session_source,
         history_mode: parent_turn_context.history_mode,
         parent_thread_id: parent_turn_context.parent_thread_id,

@@ -97,6 +97,7 @@ pub struct MemorySummarizeOutput {
 #[derive(Debug)]
 pub enum ResponseEvent {
     Created,
+    ProviderWorkStarted,
     SafetyBuffering(SafetyBuffering),
     OutputItemDone(ResponseItem),
     OutputItemAdded(ResponseItem),

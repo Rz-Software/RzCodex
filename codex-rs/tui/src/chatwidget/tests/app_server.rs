@@ -25,6 +25,7 @@ fn thread_settings_for_test(
             ),
             model: model.to_string(),
             model_provider: "openai".to_string(),
+            model_input_modalities: Some(vec![InputModality::Text]),
             service_tier: Some(ServiceTier::Fast.request_value().to_string()),
             effort: Some(ReasoningEffortConfig::High),
             summary: None,
@@ -50,6 +51,7 @@ fn configured_thread_session(thread_id: ThreadId) -> crate::session_state::Threa
         thread_name: None,
         model: "gpt-5.2".to_string(),
         model_provider_id: "openai".to_string(),
+        model_input_modalities: None,
         service_tier: None,
         approval_policy: AskForApproval::Never,
         approvals_reviewer: ApprovalsReviewer::User,
@@ -394,6 +396,11 @@ async fn thread_settings_updated_updates_visible_state_without_transcript() {
         codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_READ_ONLY
     );
     assert_eq!(chat.config_ref().personality, Some(Personality::Pragmatic));
+    assert_eq!(
+        chat.config_ref().model_input_modalities,
+        Some(vec![InputModality::Text])
+    );
+    assert!(!chat.current_model_supports_images());
     assert_eq!(chat.active_collaboration_mode_kind(), ModeKind::Plan);
     assert!(
         drain_insert_history(&mut rx).is_empty(),
@@ -409,6 +416,49 @@ async fn thread_settings_updated_updates_visible_state_without_transcript() {
     );
 
     assert_eq!(chat.current_model(), "gpt-5.4");
+}
+
+#[tokio::test]
+async fn thread_settings_updated_accepts_remote_provider_and_clears_local_details() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.2")).await;
+    let thread_id = ThreadId::new();
+    chat.handle_thread_session(configured_thread_session(thread_id));
+    let _ = drain_insert_history(&mut rx);
+    assert_eq!(chat.config_ref().model_provider_id, "openai");
+    chat.runtime_model_provider_base_url = Some("http://stale-provider.invalid".to_string());
+
+    let mut notification = thread_settings_for_test("remote-model", thread_id);
+    notification.thread_settings.model_provider = "remote-only".to_string();
+    chat.handle_server_notification(
+        ServerNotification::ThreadSettingsUpdated(notification),
+        /*replay_kind*/ None,
+    );
+
+    assert_eq!(chat.config_ref().model_provider_id, "remote-only");
+    assert_eq!(chat.config_ref().model_provider.name, "remote-only");
+    assert_eq!(chat.config_ref().model_provider.base_url, None);
+    assert_eq!(chat.runtime_model_provider_base_url(), None);
+    assert_eq!(chat.current_model(), "remote-model");
+}
+
+#[tokio::test]
+async fn session_switch_restores_provider_and_input_capabilities() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.2")).await;
+    chat.runtime_model_provider_base_url = Some("http://stale-provider.invalid".to_string());
+    let mut session = configured_thread_session(ThreadId::new());
+    session.model_provider_id = "remote-only".to_string();
+    session.model_input_modalities = Some(vec![InputModality::Text]);
+
+    chat.handle_thread_session(session);
+
+    assert_eq!(chat.config_ref().model_provider_id, "remote-only");
+    assert_eq!(chat.config_ref().model_provider.name, "remote-only");
+    assert_eq!(chat.runtime_model_provider_base_url(), None);
+    assert_eq!(
+        chat.config_ref().model_input_modalities,
+        Some(vec![InputModality::Text])
+    );
+    assert!(!chat.current_model_supports_images());
 }
 
 #[tokio::test]

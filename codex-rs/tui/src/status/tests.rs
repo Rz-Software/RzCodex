@@ -212,6 +212,25 @@ fn sanitize_directory(lines: Vec<String>) -> Vec<String> {
                 line
             }
         })
+        .map(|line| {
+            // Keep snapshots independent of the host locale while preserving
+            // ordinary spaces in prose. `format_with_separators` only emits
+            // grouping marks between digits for the values covered here.
+            let chars = line.chars().collect::<Vec<_>>();
+            let mut normalized = String::with_capacity(line.len());
+            for (index, character) in chars.iter().enumerate() {
+                let between_digits = index > 0
+                    && index + 1 < chars.len()
+                    && chars[index - 1].is_ascii_digit()
+                    && chars[index + 1].is_ascii_digit();
+                if between_digits && matches!(*character, ' ' | '\u{00A0}' | '\u{202F}') {
+                    normalized.push(',');
+                } else {
+                    normalized.push(*character);
+                }
+            }
+            normalized
+        })
         .collect()
 }
 

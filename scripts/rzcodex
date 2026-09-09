@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+launcher="$(cygpath -w "$script_dir/rzcodex-launch.ps1")"
+pwsh="$(cygpath -u "${ProgramFiles:?}/PowerShell/7/pwsh.exe")"
+if [[ ! -x "$pwsh" ]]; then
+  printf 'RzCodex requires PowerShell 7 at %s.\n' "$pwsh" >&2
+  exit 2
+fi
+if (( $# == 0 )); then
+  exec "$pwsh" -NoLogo -NoProfile -ExecutionPolicy Bypass -File "$launcher"
+fi
+exec "$pwsh" -NoLogo -NoProfile -ExecutionPolicy Bypass -File "$launcher" -CommandArguments "$@"

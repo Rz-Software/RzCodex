@@ -35,6 +35,8 @@ use tracing::instrument;
 
 pub use crate::tools::context::ToolCallSource;
 
+const LEGACY_COLLABORATION_NAMESPACE: &str = "collaboration";
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ToolCall {
     pub tool_name: ToolName,
@@ -45,14 +47,18 @@ pub struct ToolCall {
 
 impl ToolCall {
     pub(crate) fn direct_source(&self) -> ToolCallSource {
-        if matches!(
+        let is_collaboration_tool = matches!(
             self.tool_name.name.as_str(),
             "spawn_agent" | "send_message" | "followup_task"
-        ) && self
-            .encrypted_function_args
-            .as_ref()
-            .is_none_or(Vec::is_empty)
-        {
+        );
+        let is_plaintext_message = match self.encrypted_function_args.as_deref() {
+            Some(arguments) => arguments.is_empty(),
+            // OpenRouter's legacy collaboration namespace predates the marker and omits it for
+            // plaintext calls. New namespaces use an explicit empty marker so an omitted field
+            // remains the encrypted/default path.
+            None => self.tool_name.namespace.as_deref() == Some(LEGACY_COLLABORATION_NAMESPACE),
+        };
+        if is_collaboration_tool && is_plaintext_message {
             ToolCallSource::DirectPlaintextMessage
         } else {
             ToolCallSource::Direct

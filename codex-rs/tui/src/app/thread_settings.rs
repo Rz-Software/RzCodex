@@ -10,6 +10,7 @@ use codex_app_server_protocol::ApprovalsReviewer as AppServerApprovalsReviewer;
 use codex_app_server_protocol::AskForApproval as AppServerAskForApproval;
 use codex_app_server_protocol::ThreadSettings;
 use codex_app_server_protocol::ThreadSettingsUpdateParams;
+use codex_config::probe_subagent_route;
 use codex_config::resolve_subagent_route;
 use codex_config::types::ApprovalsReviewer;
 use codex_protocol::ThreadId;
@@ -39,6 +40,22 @@ impl App {
             ));
             return;
         };
+        let probe_home = self.config.codex_home.to_path_buf();
+        let probe_route = selected.route.clone();
+        let probe =
+            tokio::task::spawn_blocking(move || probe_subagent_route(&probe_home, &probe_route))
+                .await;
+        let probe = match probe {
+            Ok(probe) => probe,
+            Err(err) => Err(anyhow::anyhow!("health check task failed: {err}")),
+        };
+        if let Err(err) = probe {
+            self.chat_widget.add_error_message(format!(
+                "Main-agent route `{}` became unavailable; this conversation and its saved defaults were not changed: {err:#}",
+                selected.id
+            ));
+            return;
+        }
         let model = selected
             .route
             .main_model
@@ -63,6 +80,7 @@ impl App {
             thread_id: thread_id.to_string(),
             model: Some(model.clone()),
             model_provider: Some(provider_id.clone()),
+            model_input_modalities: Some(selected.route.input_modalities.clone()),
             effort: Some(effort.clone()),
             collaboration_mode: Some(collaboration_mode),
             ..ThreadSettingsUpdateParams::default()
@@ -73,8 +91,13 @@ impl App {
 
         self.config.model_provider_id.clone_from(&provider_id);
         self.config.model_provider = provider;
+        self.config
+            .model_input_modalities
+            .clone_from(&selected.route.input_modalities);
         self.chat_widget.set_model_provider(&provider_id);
         self.chat_widget.set_model(&model);
+        self.chat_widget
+            .set_model_input_modalities(selected.route.input_modalities.clone());
         self.on_update_reasoning_effort(Some(effort.clone()));
         self.sync_active_thread_service_tier_to_cached_session()
             .await;
@@ -85,6 +108,7 @@ impl App {
                 &provider_id,
                 &model,
                 Some(&effort),
+                selected.route.input_modalities.as_deref(),
             ),
         )
         .await
@@ -319,6 +343,9 @@ fn apply_thread_settings_to_session(session: &mut ThreadSessionState, settings: 
         session.reasoning_effort = settings.effort.clone();
     }
     session.model_provider_id = settings.model_provider.clone();
+    session
+        .model_input_modalities
+        .clone_from(&settings.model_input_modalities);
     session.service_tier = settings.service_tier.clone();
     session.approval_policy = settings.approval_policy;
     session.approvals_reviewer = settings.approvals_reviewer.to_core();
@@ -346,9 +373,33 @@ fn thread_settings_update_has_changes(params: &ThreadSettingsUpdateParams) -> bo
         || params.permissions.is_some()
         || params.model.is_some()
         || params.model_provider.is_some()
+        || params.model_input_modalities.is_some()
         || params.service_tier.is_some()
         || params.effort.is_some()
         || params.summary.is_some()
         || params.collaboration_mode.is_some()
         || params.personality.is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codex_protocol::openai_models::InputModality;
+
+    #[test]
+    fn capability_only_thread_settings_updates_are_not_discarded() {
+        let explicit = ThreadSettingsUpdateParams {
+            thread_id: ThreadId::new().to_string(),
+            model_input_modalities: Some(Some(vec![InputModality::Text])),
+            ..Default::default()
+        };
+        let clear = ThreadSettingsUpdateParams {
+            thread_id: ThreadId::new().to_string(),
+            model_input_modalities: Some(None),
+            ..Default::default()
+        };
+
+        assert!(thread_settings_update_has_changes(&explicit));
+        assert!(thread_settings_update_has_changes(&clear));
+    }
 }

@@ -201,12 +201,19 @@ impl SqliteQueueStore {
     }
 
     pub(crate) async fn delete_thread_queue(&self, thread_id: ThreadId) -> anyhow::Result<bool> {
-        Ok(sqlx::query("DELETE FROM queued_items WHERE thread_id = ?")
-            .bind(thread_id.to_string())
-            .execute(self.pool.as_ref())
+        let thread_id = thread_id.to_string();
+        let mut transaction = self.pool.begin().await?;
+        let deleted_items = sqlx::query("DELETE FROM queued_items WHERE thread_id = ?")
+            .bind(thread_id.as_str())
+            .execute(transaction.as_mut())
             .await?
-            .rows_affected()
-            > 0)
+            .rows_affected();
+        sqlx::query("DELETE FROM queued_thread_revisions WHERE thread_id = ?")
+            .bind(thread_id)
+            .execute(transaction.as_mut())
+            .await?;
+        transaction.commit().await?;
+        Ok(deleted_items > 0)
     }
 }
 

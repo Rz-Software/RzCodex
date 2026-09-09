@@ -5,6 +5,7 @@ use crate::legacy_core::config::ConfigOverrides;
 use codex_app_server_client::AppServerClient;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
+use codex_protocol::openai_models::InputModality;
 use color_eyre::eyre::WrapErr;
 use pretty_assertions::assert_eq;
 use std::path::Path;
@@ -32,11 +33,21 @@ fn trusted_project_edit_targets_project_trust_level() {
 #[test]
 fn model_provider_selection_edits_persist_one_coherent_default() {
     assert_eq!(
-        build_model_provider_selection_edits("codebuddy", "@preset/rzcodex-main", Some("max"),),
+        build_model_provider_selection_edits(
+            "codebuddy",
+            "@preset/rzcodex-main",
+            Some("max"),
+            Some(&[InputModality::Text]),
+        ),
         vec![
             ConfigEdit {
                 key_path: "model_provider".to_string(),
                 value: serde_json::json!("codebuddy"),
+                merge_strategy: MergeStrategy::Replace,
+            },
+            ConfigEdit {
+                key_path: "model_input_modalities".to_string(),
+                value: serde_json::json!(["text"]),
                 merge_strategy: MergeStrategy::Replace,
             },
             ConfigEdit {

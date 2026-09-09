@@ -556,6 +556,7 @@ impl AppServerSession {
                     .request_typed::<ModelListResponse>(ClientRequest::ModelList {
                         request_id: model_request_id,
                         params: ModelListParams {
+                            thread_id: None,
                             cursor: None,
                             limit: None,
                             include_hidden: Some(true),
@@ -2104,6 +2105,7 @@ async fn thread_session_state_from_thread_start_response(
         response.thread.path.clone(),
         response.model.clone(),
         response.model_provider.clone(),
+        response.model_input_modalities.clone(),
         response.service_tier.clone(),
         response.approval_policy,
         response.approvals_reviewer.to_core(),
@@ -2145,6 +2147,7 @@ async fn thread_session_state_from_thread_resume_response(
         response.thread.path.clone(),
         response.model.clone(),
         response.model_provider.clone(),
+        response.model_input_modalities.clone(),
         response.service_tier.clone(),
         response.approval_policy,
         response.approvals_reviewer.to_core(),
@@ -2177,6 +2180,7 @@ async fn thread_session_state_from_thread_fork_response(
         response.thread.path.clone(),
         response.model.clone(),
         response.model_provider.clone(),
+        response.model_input_modalities.clone(),
         response.service_tier.clone(),
         response.approval_policy,
         response.approvals_reviewer.to_core(),
@@ -2227,6 +2231,7 @@ async fn thread_session_state_from_thread_response(
     rollout_path: Option<PathBuf>,
     model: String,
     model_provider_id: String,
+    model_input_modalities: Option<Vec<codex_protocol::openai_models::InputModality>>,
     service_tier: Option<String>,
     approval_policy: AskForApproval,
     approvals_reviewer: codex_protocol::config_types::ApprovalsReviewer,
@@ -2255,6 +2260,7 @@ async fn thread_session_state_from_thread_response(
         thread_name,
         model,
         model_provider_id,
+        model_input_modalities,
         service_tier,
         approval_policy,
         approvals_reviewer,
@@ -3620,9 +3626,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resume_response_restores_turns_from_thread_items() {
+    async fn resume_response_restores_turns_and_authoritative_modalities() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
-        let config = build_config(&temp_dir).await;
+        let mut config = build_config(&temp_dir).await;
+        config.model_provider_id = "configured-provider".to_string();
         let thread_id = ThreadId::new();
         let forked_from_id = ThreadId::new();
         let read_only_profile = PermissionProfile::read_only();
@@ -3686,6 +3693,7 @@ mod tests {
             },
             model: "gpt-5.4".to_string(),
             model_provider: "openai".to_string(),
+            model_input_modalities: Some(vec![codex_protocol::openai_models::InputModality::Text]),
             service_tier: None,
             cwd: test_path_buf("/tmp/project").abs(),
             runtime_workspace_roots: vec![
@@ -3726,6 +3734,11 @@ mod tests {
             response.instruction_source_path_uris()
         );
         assert_eq!(started.session.permission_profile, read_only_profile);
+        assert_eq!(started.session.model_provider_id, "openai");
+        assert_eq!(
+            started.session.model_input_modalities,
+            Some(vec![codex_protocol::openai_models::InputModality::Text])
+        );
         assert_eq!(started.turns.len(), 1);
         assert_eq!(started.turns[0], response.thread.turns[0]);
         assert!(!started.blocks_direct_input);
@@ -3829,6 +3842,7 @@ mod tests {
             /*rollout_path*/ None,
             "gpt-5.4".to_string(),
             "openai".to_string(),
+            /*model_input_modalities*/ None,
             /*service_tier*/ None,
             AskForApproval::Never,
             codex_protocol::config_types::ApprovalsReviewer::User,
@@ -3864,6 +3878,7 @@ mod tests {
             /*rollout_path*/ None,
             "gpt-5.4".to_string(),
             "openai".to_string(),
+            /*model_input_modalities*/ None,
             /*service_tier*/ None,
             AskForApproval::Never,
             codex_protocol::config_types::ApprovalsReviewer::User,

@@ -128,8 +128,8 @@ pub(crate) struct TurnMetadataState {
     // so metadata reflects the selected environment's backend.
     pub(crate) sandbox_tags: SandboxTags,
     auto_review_enabled: bool,
-    node_repl_auto_review_required: bool,
-    node_repl_disabled: bool,
+    node_repl_auto_review_required: AtomicBool,
+    node_repl_disabled: AtomicBool,
     enriched_workspaces: RwLock<Option<BTreeMap<String, TurnMetadataWorkspace>>>,
     tool_namespaces_info: RwLock<Option<TurnToolNamespacesInfo>>,
     turn_started_at_unix_ms: RwLock<Option<i64>>,
@@ -214,8 +214,10 @@ impl TurnMetadataState {
             turn_id,
             sandbox_tags,
             auto_review_enabled,
-            node_repl_auto_review_required: model_info.node_repl_auto_review_required,
-            node_repl_disabled: model_info.node_repl_disabled,
+            node_repl_auto_review_required: AtomicBool::new(
+                model_info.node_repl_auto_review_required,
+            ),
+            node_repl_disabled: AtomicBool::new(model_info.node_repl_disabled),
             enriched_workspaces: RwLock::new(None),
             tool_namespaces_info: RwLock::new(None),
             turn_started_at_unix_ms: RwLock::new(None),
@@ -225,6 +227,13 @@ impl TurnMetadataState {
             enrichment_task: Mutex::new(None),
             git_enrichment_complete: watch::channel(/*init*/ true).0,
         }
+    }
+
+    pub(crate) fn update_model_capabilities(&self, model_info: &ModelInfo) {
+        self.node_repl_auto_review_required
+            .store(model_info.node_repl_auto_review_required, Ordering::Relaxed);
+        self.node_repl_disabled
+            .store(model_info.node_repl_disabled, Ordering::Relaxed);
     }
 
     pub(crate) fn current_meta_value_for_mcp_request(
@@ -427,8 +436,10 @@ impl TurnMetadataState {
             thread_source: self.thread_source.clone(),
             turn_trigger: self.turn_trigger.get().cloned(),
             auto_review_enabled: Some(self.auto_review_enabled),
-            node_repl_auto_review_required: Some(self.node_repl_auto_review_required),
-            node_repl_disabled: Some(self.node_repl_disabled),
+            node_repl_auto_review_required: Some(
+                self.node_repl_auto_review_required.load(Ordering::Relaxed),
+            ),
+            node_repl_disabled: Some(self.node_repl_disabled.load(Ordering::Relaxed)),
             workspaces: self.current_workspaces(),
             tool_namespaces_info: self
                 .tool_namespaces_info

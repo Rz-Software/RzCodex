@@ -11,7 +11,6 @@ const CHECKPOINT_DIRECTIVE = [
   /^\s*(?:please\s+)?(?:return|send|provide|give|report)\s+(?:(?:an?|the|your|current|immediate|brief|concise|requested)\s+){0,6}(?:checkpoint(?:\/report)?|status report|progress report)\b/i,
   /^\s*(?:please\s+)?(?:immediate\s+)?checkpoint(?:\/report)?\s*(?::|-|\bnow\b|\bimmediately\b)/i,
   /^\s*(?:please\s+)?(?:current|immediate|brief|concise)\s+(?:status report|progress report)\s*(?::|-|\bnow\b|\bimmediately\b)/i,
-  /^\s*(?:please\s+)?(?:finish|complete)\b[^\n.!?]{0,120}\b(?:then|and)\s+(?:return|send|provide|give|report)\s+(?:(?:an?|the|your|current|immediate|brief|concise|requested)\s+){0,6}(?:checkpoint(?:\/report)?|status report|progress report)\b/i,
 ];
 const IMMEDIATE_RETURN_DIRECTIVE = [
   /^\s*(?:please\s+)?(?:return|report|respond|send|provide|give)\b[^\n.!?]{0,180}\b(?:immediately|right now|now)\b/i,

@@ -17,7 +17,14 @@ pub(crate) fn agent_status_from_event(msg: &EventMsg) -> Option<AgentStatus> {
             }
             _ => Some(AgentStatus::Errored(format!("{:?}", ev.reason))),
         },
-        EventMsg::Error(ev) => Some(AgentStatus::Errored(ev.message.clone())),
+        EventMsg::Error(ev)
+            if ev
+                .codex_error_info
+                .as_ref()
+                .is_none_or(codex_protocol::protocol::CodexErrorInfo::affects_turn_status) =>
+        {
+            Some(AgentStatus::Errored(ev.message.clone()))
+        }
         EventMsg::ShutdownComplete => Some(AgentStatus::Shutdown),
         _ => None,
     }

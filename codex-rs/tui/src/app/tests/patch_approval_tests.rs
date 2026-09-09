@@ -122,13 +122,15 @@ fn open_patch(app: &mut App, rx: &mut UnboundedReceiver<AppEvent>) -> ApplyPatch
 }
 
 fn render_pager(app: &mut App, width: u16, height: u16) -> Buffer {
-    let area = Rect::new(/*x*/ 0, /*y*/ 0, width, height);
-    let mut buffer = Buffer::empty(area);
-    let Some(Overlay::Static(overlay)) = app.overlay.as_mut() else {
-        panic!("expected the patch pager");
-    };
-    overlay.render(area, &mut buffer);
-    buffer
+    crate::diff_render::tests::with_test_dark_ansi16_diff_render_context(|| {
+        let area = Rect::new(/*x*/ 0, /*y*/ 0, width, height);
+        let mut buffer = Buffer::empty(area);
+        let Some(Overlay::Static(overlay)) = app.overlay.as_mut() else {
+            panic!("expected the patch pager");
+        };
+        overlay.render(area, &mut buffer);
+        buffer
+    })
 }
 
 fn assert_decision(

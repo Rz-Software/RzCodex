@@ -16,6 +16,7 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
+use core_test_support::hooks::python_hook_command;
 use core_test_support::hooks::trust_discovered_hooks;
 use core_test_support::responses;
 use core_test_support::responses::ResponseMock;
@@ -855,10 +856,6 @@ with Path(r"{log_path}").open("a", encoding="utf-8") as handle:
         log_path = log_path.display(),
     );
     fs::write(script_path, script).expect("write compact hook script");
-}
-
-fn python_hook_command(script_path: &Path) -> String {
-    format!("python3 \"{}\"", script_path.display())
 }
 
 fn hook_log_view(path: &Path) -> Result<Value> {

@@ -1,0 +1,133 @@
+{
+  "$schema": "./rzcodex-setup.schema.json",
+  "schemaVersion": 1,
+  "sharedCodexHome": "%USERPROFILE%\\.codex",
+  "stateRoot": "%LOCALAPPDATA%\\RzCodex",
+  "installRoot": "%USERPROFILE%\\.codex\\forked-bin",
+  "separateAgentRoles": true,
+  "routing": {
+    "relativePath": "subagent-models.json",
+    "schemaFile": "rzcodex-subagent-models.schema.json",
+    "defaultFile": "rzcodex-subagent-models.default.json",
+    "preserveExisting": true
+  },
+  "stableLauncherFiles": [
+    "bridge-security.mjs",
+    "rzcodex-bridge-auth-token.mjs",
+    "rzcodex-launch.ps1",
+    "rzcodex.ps1",
+    "rzcodex.cmd",
+    "rzcodex"
+  ],
+  "validation": {
+    "rustPackages": [
+      "codex-agent-roles",
+      "codex-analytics",
+      "codex-app-server-protocol",
+      "codex-app-server",
+      "codex-build-info",
+      "codex-cli",
+      "codex-api",
+      "codex-config",
+      "codex-core",
+      "codex-exec",
+      "codex-history",
+      "codex-model-provider-info",
+      "codex-models-manager",
+      "codex-otel",
+      "codex-protocol",
+      "codex-response-debug-context",
+      "codex-rollout",
+      "codex-state",
+      "codex-thread-store",
+      "codex-tui",
+      "codex-windows-sandbox"
+    ],
+    "javascript": [
+      ["--test", "scripts/native-project-instructions.test.mjs"],
+      ["--test", "scripts/native-subagent-provider-router.test.mjs"],
+      ["--test", "scripts/bridge-security.test.mjs"],
+      ["--test", "scripts/devin-subagent-bridge.test.mjs"],
+      ["scripts/native-cli-agent-runner.mjs", "--self-test"],
+      ["scripts/devin-rzmcp-lazy-proxy.mjs", "--self-test"],
+      ["scripts/devin-subagent-bridge.mjs", "--self-test"],
+      ["scripts/codebuddy-subagent-bridge.mjs", "--self-test"],
+      ["scripts/commandcode-subagent-bridge.mjs", "--self-test"],
+      ["scripts/antigravity-subagent-bridge.mjs", "--self-test"],
+      ["--test", "scripts/rzcodex-deployment.test.mjs"]
+    ]
+  },
+  "deploymentFiles": [
+    "scripts/antigravity-subagent-bridge.mjs",
+    "scripts/bridge-lifecycle.mjs",
+    "scripts/bridge-security.mjs",
+    "scripts/codebuddy-subagent-bridge.mjs",
+    "scripts/codebuddy-subagent-task-state.mjs",
+    "scripts/commandcode-subagent-bridge.mjs",
+    "scripts/devin-rzmcp-lazy-proxy.mjs",
+    "scripts/devin-subagent-bridge.mjs",
+    "scripts/native-cli-agent-runner.mjs",
+    "scripts/native-project-instructions.mjs",
+    "scripts/native-subagent-provider-router.mjs",
+    "scripts/rzcodex-bridge-supervisor.ps1",
+    "scripts/rzcodex-bridge-auth-token.mjs",
+    "scripts/rzcodex-config-migrate.mjs",
+    "scripts/rzcodex-deployment.psm1",
+    "scripts/rzcodex-deployment.test.mjs",
+    "scripts/rzcodex.cmd",
+    "scripts/rzcodex",
+    "scripts/rzcodex-launch.ps1",
+    "scripts/rzcodex.ps1",
+    "scripts/rzcodex-setup-bridge-token.mjs",
+    "scripts/rzcodex-setup.ps1",
+    "scripts/rzcodex-setup.manifest.json",
+    "scripts/rzcodex-setup.schema.json",
+    "scripts/rzcodex-subagent-models.default.json",
+    "scripts/rzcodex-subagent-models.schema.json",
+    "scripts/rzcodex-update.ps1"
+  ],
+  "binaries": [
+    "codex.exe",
+    "codex-code-mode-host.exe",
+    "codex-command-runner.exe",
+    "codex-windows-sandbox-setup.exe"
+  ],
+  "bridges": {
+    "antigravity": {
+      "taskName": "RzCodex Antigravity Bridge",
+      "script": "antigravity-subagent-bridge.mjs",
+      "arguments": ["--exit-with-parent"],
+      "restartPolicy": "always"
+    },
+    "codebuddy": {
+      "taskName": "RzCodex CodeBuddy Bridge",
+      "script": "codebuddy-subagent-bridge.mjs",
+      "arguments": ["--exit-with-parent"],
+      "restartPolicy": "always"
+    },
+    "commandcode": {
+      "taskName": "Codex CommandCode Bridge",
+      "script": "commandcode-subagent-bridge.mjs",
+      "arguments": ["--exit-with-parent"],
+      "restartPolicy": "always"
+    },
+    "devin": {
+      "taskName": "RzCodex Devin Bridge",
+      "script": "devin-subagent-bridge.mjs",
+      "arguments": ["--exit-with-parent"],
+      "restartPolicy": "always"
+    }
+  },
+  "supervisor": {
+    "initialRestartDelaySeconds": 5,
+    "maximumRestartDelaySeconds": 60,
+    "stableRuntimeSeconds": 300,
+    "maximumLogBytes": 8388608,
+    "retainedLogs": 4
+  },
+  "updaterTask": {
+    "taskName": "RzCodex Auto Update",
+    "dailyAt": "22:03",
+    "executionTimeLimitHours": 4
+  }
+}

@@ -3,6 +3,7 @@ use crate::context::world_state::WorldStateSnapshot;
 use crate::context_manager::is_user_turn_boundary;
 use codex_history::ResponseItemEnvelope;
 use codex_protocol::protocol::SessionContextWindow;
+use std::collections::HashMap;
 use uuid::Uuid;
 
 // Return value of `Session::reconstruct_history_from_rollout`, bundling the rebuilt history with
@@ -65,6 +66,58 @@ struct ActiveReplaySegment<'a> {
 fn turn_ids_are_compatible(active_turn_id: Option<&str>, item_turn_id: Option<&str>) -> bool {
     active_turn_id
         .is_none_or(|turn_id| item_turn_id.is_none_or(|item_turn_id| item_turn_id == turn_id))
+}
+
+fn model_provider_ids_by_turn(
+    thread_id: ThreadId,
+    rollout_items: &[RolloutItem],
+) -> HashMap<String, String> {
+    let mut current_model_provider_id = None;
+    let mut active_turn_id: Option<String> = None;
+    let mut providers = HashMap::new();
+
+    for item in rollout_items {
+        match item {
+            RolloutItem::SessionMeta(session_meta) if session_meta.meta.id == thread_id => {
+                current_model_provider_id = session_meta.meta.model_provider.clone();
+            }
+            RolloutItem::EventMsg(EventMsg::SessionConfigured(event))
+                if event.thread_id == thread_id =>
+            {
+                current_model_provider_id = Some(event.model_provider_id.clone());
+            }
+            RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event))
+                if event.thread_id.is_none_or(|owner| owner == thread_id) =>
+            {
+                current_model_provider_id = Some(event.thread_settings.model_provider_id.clone());
+                if let Some(turn_id) = &active_turn_id {
+                    providers.insert(
+                        turn_id.clone(),
+                        event.thread_settings.model_provider_id.clone(),
+                    );
+                }
+            }
+            RolloutItem::EventMsg(EventMsg::TurnStarted(event)) => {
+                active_turn_id = Some(event.turn_id.clone());
+                if let Some(model_provider_id) = &current_model_provider_id {
+                    providers.insert(event.turn_id.clone(), model_provider_id.clone());
+                }
+            }
+            RolloutItem::TurnContext(context) => {
+                if let (Some(turn_id), Some(model_provider_id)) =
+                    (&context.turn_id, &context.model_provider_id)
+                {
+                    providers.insert(turn_id.clone(), model_provider_id.clone());
+                }
+            }
+            RolloutItem::EventMsg(EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_)) => {
+                active_turn_id = None;
+            }
+            _ => {}
+        }
+    }
+
+    providers
 }
 
 fn finalize_active_segment<'a>(
@@ -163,6 +216,8 @@ impl Session {
         // Rollback is "drop the newest N user turns". While scanning in reverse, that becomes
         // "skip the next N user-turn segments we finalize".
         let mut pending_rollback_turns = 0usize;
+        let model_provider_ids_by_turn =
+            model_provider_ids_by_turn(self.thread_id(), rollout_items);
         // Reverse replay accumulates rollout items into the newest in-progress turn segment until
         // we hit its matching `TurnStarted`, at which point the segment can be finalized.
         let mut active_segment: Option<ActiveReplaySegment<'_>> = None;
@@ -247,8 +302,14 @@ impl Session {
                         active_segment.turn_id.as_deref(),
                         ctx.turn_id.as_deref(),
                     ) {
+                        let model_provider_id = ctx.model_provider_id.clone().or_else(|| {
+                            active_segment.turn_id.as_ref().and_then(|turn_id| {
+                                model_provider_ids_by_turn.get(turn_id).cloned()
+                            })
+                        });
                         active_segment.previous_turn_settings = Some(PreviousTurnSettings {
                             model: ctx.model.clone(),
+                            model_provider_id,
                             comp_hash: ctx.comp_hash.clone(),
                             realtime_active: ctx.realtime_active,
                         });

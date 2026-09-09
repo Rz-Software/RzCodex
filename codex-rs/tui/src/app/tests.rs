@@ -1904,10 +1904,17 @@ async fn agent_picker_separates_active_agents_from_transcript_history() {
     assert_eq!(params.tabs[1].label, "History (1)");
     assert_eq!(params.tabs[1].items[0].name, "Finished [explorer]");
     assert_eq!(params.initial_tab_id.as_deref(), Some("active"));
+    assert_eq!(params.initial_selected_idx, Some(0));
+
+    app.active_thread_id = Some(running_thread_id);
+    let params = app.agent_picker_selection_view_params(/*selected*/ None);
+    assert_eq!(params.initial_tab_id.as_deref(), Some("active"));
+    assert_eq!(params.initial_selected_idx, Some(1));
 
     app.active_thread_id = Some(history_thread_id);
     let params = app.agent_picker_selection_view_params(/*selected*/ None);
     assert_eq!(params.initial_tab_id.as_deref(), Some("history"));
+    assert_eq!(params.initial_selected_idx, Some(0));
 }
 
 #[tokio::test]
@@ -5357,6 +5364,7 @@ async fn render_clear_ui_header_after_long_transcript_for_snapshot() -> String {
             thread_name: None,
             model: "gpt-test".to_string(),
             model_provider_id: "test-provider".to_string(),
+            model_input_modalities: None,
             service_tier: None,
             approval_policy: AskForApproval::Never,
             approvals_reviewer: ApprovalsReviewer::User,
@@ -5868,6 +5876,7 @@ fn test_thread_session(thread_id: ThreadId, cwd: PathBuf) -> ThreadSessionState 
         thread_name: None,
         model: "gpt-test".to_string(),
         model_provider_id: "test-provider".to_string(),
+        model_input_modalities: None,
         service_tier: None,
         approval_policy: AskForApproval::Never,
         approvals_reviewer: ApprovalsReviewer::User,
@@ -6705,6 +6714,7 @@ async fn backtrack_selection_preserves_selected_prompt_and_requests_branch() {
             thread_name: None,
             model: "gpt-test".to_string(),
             model_provider_id: "test-provider".to_string(),
+            model_input_modalities: None,
             service_tier: None,
             approval_policy: AskForApproval::Never,
             approvals_reviewer: ApprovalsReviewer::User,
@@ -6776,6 +6786,7 @@ async fn backtrack_selection_preserves_selected_prompt_and_requests_branch() {
             thread_name: None,
             model: "gpt-test".to_string(),
             model_provider_id: "test-provider".to_string(),
+            model_input_modalities: None,
             service_tier: None,
             approval_policy: AskForApproval::Never,
             approvals_reviewer: ApprovalsReviewer::User,
@@ -7851,6 +7862,7 @@ async fn new_session_requests_shutdown_for_previous_conversation() {
             thread_name: None,
             model: "gpt-test".to_string(),
             model_provider_id: "test-provider".to_string(),
+            model_input_modalities: None,
             service_tier: None,
             approval_policy: AskForApproval::Never,
             approvals_reviewer: ApprovalsReviewer::User,
@@ -8488,6 +8500,7 @@ async fn inactive_thread_settings_notification_updates_cached_collaboration_mode
             ),
             model: "gpt-plan".to_string(),
             model_provider: "openai".to_string(),
+            model_input_modalities: Some(vec![codex_protocol::openai_models::InputModality::Text]),
             service_tier: None,
             effort: collaboration_mode.settings.reasoning_effort.clone(),
             summary: None,
@@ -8514,6 +8527,10 @@ async fn inactive_thread_settings_notification_updates_cached_collaboration_mode
         .clone()
         .expect("inactive session should remain cached");
     assert_eq!(cached_session.model, "gpt-test");
+    assert_eq!(
+        cached_session.model_input_modalities,
+        Some(vec![codex_protocol::openai_models::InputModality::Text])
+    );
     assert_eq!(cached_session.personality, Some(Personality::Pragmatic));
     assert_eq!(
         cached_session.collaboration_mode.as_deref(),
@@ -8526,6 +8543,10 @@ async fn inactive_thread_settings_notification_updates_cached_collaboration_mode
         ModeKind::Plan
     );
     assert_eq!(app.chat_widget.current_model(), "gpt-plan");
+    assert_eq!(
+        app.chat_widget.config_ref().model_input_modalities,
+        Some(vec![codex_protocol::openai_models::InputModality::Text])
+    );
     assert_eq!(
         app.chat_widget.current_collaboration_mode().model(),
         "gpt-test"
@@ -8552,6 +8573,7 @@ async fn clear_only_ui_reset_preserves_chat_session_state() {
             thread_name: Some("keep me".to_string()),
             model: "gpt-test".to_string(),
             model_provider_id: "test-provider".to_string(),
+            model_input_modalities: None,
             service_tier: None,
             approval_policy: AskForApproval::Never,
             approvals_reviewer: ApprovalsReviewer::User,

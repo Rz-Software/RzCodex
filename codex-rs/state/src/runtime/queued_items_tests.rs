@@ -245,6 +245,13 @@ async fn deleting_a_thread_removes_its_queue() {
             .unwrap()
             .is_empty()
     );
+    let revision_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM queued_thread_revisions WHERE thread_id = ?")
+            .bind(thread_id.to_string())
+            .fetch_one(runtime.thread_queue().pool.as_ref())
+            .await
+            .unwrap();
+    assert_eq!(0, revision_count);
 }
 
 #[tokio::test]

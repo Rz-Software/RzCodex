@@ -1,4 +1,6 @@
 const DEFAULT_MAX_RESPONSE_BYTES = 32 * 1024 * 1024;
+const DEFAULT_INACTIVITY_TIMEOUT_MS = 60 * 1000;
+const DEFAULT_REQUEST_TIMEOUT_MS = 35 * 60 * 1000;
 const MAX_RECOVERED_PARTIAL_TEXT_CHARS = 64 * 1024;
 const MAX_PROVIDER_DIAGNOSTIC_NAMES = 512;
 const MAX_PROVIDER_DIAGNOSTIC_NAME_CHARS = 160;
@@ -12,7 +14,6 @@ export class ProviderRouteError extends Error {
 }
 
 function validateTimeout(value, label) {
-  if (value === undefined || value === null || value === 0) return 0;
   if (!Number.isFinite(value) || value <= 0) {
     throw new ProviderRouteError(`${label} must be a positive number`, 500);
   }
@@ -24,6 +25,8 @@ function streamObservation() {
     responseId: null,
     responseModel: null,
     eventCount: 0,
+    providerWorkStarted: false,
+    startedToolNames: new Set(),
     completedOutputItems: new Map(),
     partialText: new Map(),
   };
@@ -35,6 +38,16 @@ function observeStreamEvent(observation, event) {
   if (event.type === "response.created") {
     observation.responseId = payload.response?.id || observation.responseId;
     observation.responseModel = payload.response?.model || observation.responseModel;
+  }
+  if (
+    event.type === "response.in_progress"
+    && payload.response?.metadata?.provider_work_started === true
+  ) {
+    observation.providerWorkStarted = true;
+    const toolName = payload.response.metadata.native_tool_name;
+    if (typeof toolName === "string" && toolName.trim()) {
+      observation.startedToolNames.add(toolName.trim().slice(0, MAX_PROVIDER_DIAGNOSTIC_NAME_CHARS));
+    }
   }
   if (
     ["response.incomplete", "response.completed"].includes(event.type)
@@ -71,6 +84,24 @@ function attachStreamObservation(error, observation, recoverable = false) {
     .sort(([left], [right]) => left - right)
     .map(([, item]) => item);
   error.partialOutputText = [...observation.partialText.values()].join("\n").slice(-MAX_RECOVERED_PARTIAL_TEXT_CHARS);
+  if (observation.providerWorkStarted) {
+    error.nativeStartedTools = true;
+    error.nativeToolNames = providerDiagnosticNames(
+      error.nativeToolNames,
+      [...observation.startedToolNames],
+    );
+    error.routeCommitted = true;
+  }
+  const completedToolItems = error.completedOutputItems.filter((item) =>
+    ["function_call", "custom_tool_call", "tool_search_call"].includes(item?.type));
+  if (completedToolItems.length > 0) {
+    error.toolCalls = Math.max(Number(error.toolCalls || 0), completedToolItems.length);
+    error.nativeToolNames = providerDiagnosticNames(
+      error.nativeToolNames,
+      completedToolItems.map((item) => item?.name || "tool_search"),
+    );
+    error.routeCommitted = true;
+  }
   if (recoverable) error.recoverableStreamFailure = true;
   return error;
 }
@@ -83,32 +114,11 @@ function incompleteStreamError(observation, detail = "Fallback bridge ended with
 
 function isMeaningfulStreamEvent(event) {
   if (event.type === "response.in_progress") {
-    return typeof event.payload?.response?.metadata?.provider_activity === "string";
+    const metadata = event.payload?.response?.metadata;
+    return metadata?.provider_work_started === true
+      || typeof metadata?.provider_activity === "string";
   }
   return event.type !== "response.created";
-}
-
-export function completedResponseFromRecoverableStream(error) {
-  if (error?.recoverableStreamFailure !== true || !Array.isArray(error.completedOutputItems)) return null;
-  const output = error.completedOutputItems.filter((item) => item?.type !== "reasoning");
-  if (output.length === 0) return null;
-  return {
-    id: error.responseId || "resp_recovered_stream",
-    object: "response",
-    status: "completed",
-    model: error.responseModel || "unknown",
-    output,
-    usage: {
-      input_tokens: 0,
-      input_tokens_details: { cached_tokens: 0 },
-      output_tokens: 0,
-      output_tokens_details: { reasoning_tokens: 0 },
-      total_tokens: 0,
-    },
-    metadata: { recovered_from_completed_stream_items: true },
-    error: null,
-    incomplete_details: null,
-  };
 }
 
 export class ActiveTaskRoutePins {
@@ -426,8 +436,9 @@ export async function runResponsesBridge({
   signal,
   fetchImpl = globalThis.fetch,
   maxResponseBytes = DEFAULT_MAX_RESPONSE_BYTES,
-  inactivityTimeoutMs = 0,
-  requestTimeoutMs = 0,
+  inactivityTimeoutMs = DEFAULT_INACTIVITY_TIMEOUT_MS,
+  requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
+  headers = {},
   onEvent = async () => {},
 }) {
   const inactivityMs = validateTimeout(inactivityTimeoutMs, "inactivityTimeoutMs");
@@ -466,7 +477,7 @@ export async function runResponsesBridge({
   try {
     response = await fetchImpl(endpoint, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { ...headers, "content-type": "application/json" },
       body: JSON.stringify(body),
       signal: controller.signal,
     });
@@ -536,7 +547,13 @@ export async function runResponsesBridge({
   } catch (error) {
     if (localAbortError) throw localAbortError;
     if (signal?.aborted || error?.name === "AbortError") throw error;
-    if (error instanceof ProviderRouteError) throw error;
+    if (error instanceof ProviderRouteError) {
+      throw attachStreamObservation(
+        error,
+        observation,
+        error.recoverableStreamFailure === true,
+      );
+    }
     throw attachStreamObservation(
       new ProviderRouteError(`Fallback bridge stream failed: ${error.message}`, 502, { cause: error }),
       observation,

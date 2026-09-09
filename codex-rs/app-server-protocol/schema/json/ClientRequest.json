@@ -1615,6 +1615,32 @@
       ],
       "type": "object"
     },
+    "InputModality": {
+      "description": "Canonical user-input modality tags advertised by a model.",
+      "oneOf": [
+        {
+          "description": "Plain text turns and tool payloads.",
+          "enum": [
+            "text"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Image attachments included in user turns.",
+          "enum": [
+            "image"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Audio attachments included in user turns.",
+          "enum": [
+            "audio"
+          ],
+          "type": "string"
+        }
+      ]
+    },
     "InternalChatMessageMetadataPassthrough": {
       "description": "Internal Responses API passthrough metadata copied into underlying chat messages.\n\nResponses API strongly types this payload. Do not modify it without first getting API approval and making the corresponding Responses API change.",
       "properties": {
@@ -2195,6 +2221,13 @@
           "minimum": 0.0,
           "type": [
             "integer",
+            "null"
+          ]
+        },
+        "threadId": {
+          "description": "Optional loaded thread whose active provider catalog should own the result.",
+          "type": [
+            "string",
             "null"
           ]
         }

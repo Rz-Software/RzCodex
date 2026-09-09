@@ -29,6 +29,7 @@ use core_test_support::PathBufExt;
 use core_test_support::assert_regex_match;
 use core_test_support::context_snapshot;
 use core_test_support::context_snapshot::ContextSnapshotOptions;
+use core_test_support::hooks::python_hook_command;
 use core_test_support::hooks::trust_discovered_hooks;
 use core_test_support::responses::ResponsesRequest;
 use core_test_support::responses::ev_assistant_message;
@@ -129,10 +130,6 @@ fn ev_completed_with_usage(id: &str, input_tokens: i64, output_tokens: i64) -> V
             }
         }
     })
-}
-
-fn python_hook_command(script_path: &Path) -> String {
-    format!("python3 \"{}\"", script_path.display())
 }
 
 fn write_token_budget_compact_hooks(home: &Path) {

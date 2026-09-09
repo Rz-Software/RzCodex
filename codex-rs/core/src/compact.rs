@@ -581,11 +581,19 @@ pub(crate) fn is_summary_message(message: &str) -> bool {
     message.starts_with(format!("{SUMMARY_PREFIX}\n").as_str())
 }
 
-pub(crate) fn is_new_task_agent_message(item: &ResponseItem) -> bool {
+pub(crate) fn is_delegated_task_agent_message(item: &ResponseItem) -> bool {
     matches!(
         item,
-        ResponseItem::AgentMessage { content, .. }
-            if matches!(
+        ResponseItem::AgentMessage {
+            author,
+            recipient,
+            content,
+            ..
+        }
+            if !author
+                .strip_prefix(recipient)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+            && matches!(
                 content.first(),
                 Some(AgentMessageInputContent::InputText { text })
                     if text.starts_with("Message Type: NEW_TASK\n")
@@ -599,7 +607,7 @@ pub(crate) fn latest_active_subagent_task(
     history
         .iter()
         .rev()
-        .find(|envelope| is_new_task_agent_message(&envelope.item))
+        .find(|envelope| is_delegated_task_agent_message(&envelope.item))
         .cloned()
 }
 
@@ -611,7 +619,7 @@ pub(crate) fn pin_active_subagent_task(
         return compacted_history;
     };
 
-    compacted_history.retain(|envelope| !is_new_task_agent_message(&envelope.item));
+    compacted_history.retain(|envelope| !is_delegated_task_agent_message(&envelope.item));
     let insertion_index = compacted_history
         .iter()
         .rposition(|envelope| match &envelope.item {

@@ -5,6 +5,19 @@ use codex_core::config::Config;
 use codex_features::Feature;
 use codex_hooks::HookListEntry;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use std::path::Path;
+
+pub fn python_executable() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "python"
+    } else {
+        "python3"
+    }
+}
+
+pub fn python_hook_command(script_path: &Path) -> String {
+    format!("{} \"{}\"", python_executable(), script_path.display())
+}
 
 pub fn trust_discovered_hooks(config: &mut Config) {
     config

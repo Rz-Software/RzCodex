@@ -23,6 +23,13 @@
         "integer",
         "null"
       ]
+    },
+    "threadId": {
+      "description": "Optional loaded thread whose active provider catalog should own the result.",
+      "type": [
+        "string",
+        "null"
+      ]
     }
   },
   "title": "ModelListParams",

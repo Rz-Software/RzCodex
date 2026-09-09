@@ -28,6 +28,19 @@ pub const IS_MANAGED_RZCODEX_BUILD: bool = option_env!("RZCODEX_BASE_VERSION").i
 /// Source checkout used by the managed updater that produced this executable.
 pub const RZCODEX_REPOSITORY_ROOT: Option<&str> = option_env!("RZCODEX_REPO_ROOT");
 
+/// Immutable source identity stamped by the managed RzCodex deployment pipeline.
+///
+/// Clean release builds use their Git commit. Local builds append the digest of
+/// the explicitly selected dirty inputs so two builds from the same commit are
+/// never presented as the same source.
+pub const RZCODEX_BUILD_SOURCE_ID: Option<&str> = option_env!("RZCODEX_BUILD_SOURCE_ID");
+
+/// Base Git commit from which the managed build snapshot was created.
+pub const RZCODEX_SOURCE_COMMIT: Option<&str> = option_env!("RZCODEX_SOURCE_COMMIT");
+
+/// SHA-256 digest of the immutable source snapshot's changes over its base commit.
+pub const RZCODEX_SOURCE_TREE_HASH: Option<&str> = option_env!("RZCODEX_SOURCE_TREE_HASH");
+
 /// Initialize build information from the commit stamped into the calling executable.
 ///
 /// The environment lookup intentionally expands at the macro call site so Git
@@ -35,7 +48,11 @@ pub const RZCODEX_REPOSITORY_ROOT: Option<&str> = option_env!("RZCODEX_REPO_ROOT
 #[macro_export]
 macro_rules! initialize {
     () => {
-        $crate::BuildInfo::initialize(option_env!("STABLE_GIT_COMMIT").unwrap_or("dev"));
+        $crate::BuildInfo::initialize(
+            option_env!("RZCODEX_BUILD_SOURCE_ID")
+                .or(option_env!("STABLE_GIT_COMMIT"))
+                .unwrap_or("dev"),
+        );
     };
 }
 

@@ -2,6 +2,7 @@
 
 use anyhow::Context;
 use anyhow::Result;
+use pretty_assertions::assert_eq;
 use std::io;
 use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
@@ -79,5 +80,34 @@ fn setup_helper_embeds_as_invoker_manifest() -> Result<()> {
         return Err(io::Error::last_os_error()).context("unload setup helper resource module");
     }
 
+    Ok(())
+}
+
+/// build.rs must hand the linker a manifest path under OUT_DIR: a shared
+/// CARGO_TARGET_DIR replays cached /MANIFESTINPUT link args after the
+/// originating checkout is deleted, so the referenced file has to live in the
+/// target dir, not the source tree.
+#[test]
+fn setup_manifest_is_materialized_into_build_output_dir() -> Result<()> {
+    let Some(out_dir) = option_env!("OUT_DIR") else {
+        // Bazel compiles this crate with build_script_enabled = False and no
+        // OUT_DIR; the materialization contract only exists under Cargo.
+        return Ok(());
+    };
+    let source_manifest =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("codex-windows-sandbox-setup.manifest");
+    let materialized_manifest = PathBuf::from(out_dir).join("codex-windows-sandbox-setup.manifest");
+    let expected = std::fs::read(&source_manifest)
+        .with_context(|| format!("read {}", source_manifest.display()))?;
+    let materialized = std::fs::read(&materialized_manifest).with_context(|| {
+        format!(
+            "build.rs must copy the setup manifest into OUT_DIR, not found at {}",
+            materialized_manifest.display()
+        )
+    })?;
+    assert_eq!(
+        expected, materialized,
+        "OUT_DIR manifest copy diverged from the source manifest"
+    );
     Ok(())
 }

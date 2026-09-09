@@ -226,6 +226,7 @@ impl ModelInfoOverrides {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct StepSettingsUpdate {
     pub(crate) model: Option<String>,
+    pub(crate) model_input_modalities: Option<Option<Vec<InputModality>>>,
     pub(crate) effort: Option<Option<ReasoningEffort>>,
     /// A complete collaboration mode takes precedence over model and effort edits.
     pub(crate) collaboration_mode: Option<CollaborationMode>,

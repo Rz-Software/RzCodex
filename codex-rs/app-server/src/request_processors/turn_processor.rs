@@ -8,6 +8,7 @@ use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
+use codex_protocol::openai_models::InputModality;
 use codex_protocol::protocol::AdditionalContextEntry as CoreAdditionalContextEntry;
 use codex_protocol::protocol::AdditionalContextKind as CoreAdditionalContextKind;
 use codex_protocol::protocol::TurnSettingsUpdate;
@@ -121,6 +122,7 @@ struct ThreadSettingsBuildParams {
     permissions: Option<String>,
     model: Option<String>,
     model_provider: Option<String>,
+    model_input_modalities: Option<Option<Vec<InputModality>>>,
     service_tier: Option<Option<String>>,
     effort: Option<ReasoningEffort>,
     summary: Option<ReasoningSummary>,
@@ -616,6 +618,7 @@ impl TurnRequestProcessor {
                     permissions: params.permissions,
                     model: params.model,
                     model_provider: None,
+                    model_input_modalities: None,
                     service_tier: params.service_tier,
                     effort: params.effort,
                     summary: params.summary,
@@ -765,6 +768,7 @@ impl TurnRequestProcessor {
             permissions,
             model,
             model_provider,
+            model_input_modalities,
             service_tier,
             effort,
             summary,
@@ -797,6 +801,7 @@ impl TurnRequestProcessor {
             || permissions.is_some()
             || model.is_some()
             || model_provider.is_some()
+            || model_input_modalities.is_some()
             || service_tier.is_some()
             || effort.is_some()
             || summary.is_some()
@@ -866,6 +871,7 @@ impl TurnRequestProcessor {
                     windows_sandbox_level: None,
                     model: model.clone(),
                     model_provider: model_provider.clone(),
+                    model_input_modalities: model_input_modalities.clone(),
                     effort: effort.clone(),
                     summary,
                     service_tier: service_tier.clone(),
@@ -889,6 +895,7 @@ impl TurnRequestProcessor {
             windows_sandbox_level: None,
             model,
             model_provider,
+            model_input_modalities,
             effort,
             summary,
             service_tier,
@@ -926,6 +933,7 @@ impl TurnRequestProcessor {
                     permissions: params.permissions,
                     model: params.model,
                     model_provider: params.model_provider,
+                    model_input_modalities: params.model_input_modalities,
                     service_tier: params.service_tier,
                     effort: params.effort,
                     summary: params.summary,

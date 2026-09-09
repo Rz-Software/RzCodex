@@ -1271,6 +1271,7 @@ impl SessionTelemetry {
     fn responses_type(event: &ResponseEvent) -> String {
         match event {
             ResponseEvent::Created => "created".into(),
+            ResponseEvent::ProviderWorkStarted => "provider_work_started".into(),
             ResponseEvent::OutputItemDone(item) | ResponseEvent::OutputItemAdded(item) => {
                 SessionTelemetry::responses_item_type(item)
             }

@@ -9,6 +9,10 @@ use std::env;
 use std::process::Command;
 
 use codex_build_info::CLI_VERSION;
+use codex_build_info::RZCODEX_BUILD_SOURCE_ID;
+use codex_build_info::RZCODEX_REPOSITORY_ROOT;
+use codex_build_info::RZCODEX_SOURCE_COMMIT;
+use codex_build_info::RZCODEX_SOURCE_TREE_HASH;
 use codex_install_context::InstallContext;
 use codex_install_context::InstallMethod;
 
@@ -20,8 +24,8 @@ use super::push_path_detail;
 
 /// Builds the process provenance row for the current Codex executable.
 ///
-/// This check is informational and should not fail on its own; inconsistent
-/// install state is reported by the installation and update checks instead.
+/// This check is informational and does not validate a managed deployment pointer or
+/// installed-file hashes. The RzCodex bootstrap performs those checks before launch.
 pub(super) fn runtime_check() -> DoctorCheck {
     let current_exe = env::current_exe().ok();
     let install_context = doctor_install_context(current_exe.as_deref());
@@ -36,8 +40,20 @@ pub(super) fn runtime_check() -> DoctorCheck {
             "install method: {}",
             describe_install_context(&install_context)
         ),
-        format!("commit: {}", build_commit()),
+        format!(
+            "build source: {}",
+            RZCODEX_BUILD_SOURCE_ID.unwrap_or("unmanaged")
+        ),
     ];
+    if let Some(source_commit) = RZCODEX_SOURCE_COMMIT {
+        details.push(format!("source commit: {source_commit}"));
+    }
+    if let Some(source_tree_hash) = RZCODEX_SOURCE_TREE_HASH {
+        details.push(format!("source tree hash: {source_tree_hash}"));
+    }
+    if let Some(repository_root) = RZCODEX_REPOSITORY_ROOT {
+        details.push(format!("source repository: {repository_root}"));
+    }
     push_path_detail(&mut details, "current executable", current_exe.as_deref());
 
     DoctorCheck::new(
@@ -149,10 +165,4 @@ fn search_provider(context: &InstallContext) -> &'static str {
     } else {
         "system"
     }
-}
-
-fn build_commit() -> &'static str {
-    option_env!("CODEX_BUILD_COMMIT")
-        .or(option_env!("GIT_COMMIT"))
-        .unwrap_or("unknown")
 }

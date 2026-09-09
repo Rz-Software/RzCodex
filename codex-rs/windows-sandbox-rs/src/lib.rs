@@ -392,8 +392,8 @@ mod windows_impl {
     use windows_sys::Win32::Foundation::HANDLE_FLAG_INHERIT;
     use windows_sys::Win32::Foundation::SetHandleInformation;
     use windows_sys::Win32::System::Pipes::CreatePipe;
+    use windows_sys::Win32::System::Pipes::PeekNamedPipe;
     use windows_sys::Win32::System::Threading::GetExitCodeProcess;
-    use windows_sys::Win32::System::Threading::INFINITE;
     use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
     type PipeHandles = ((HANDLE, HANDLE), (HANDLE, HANDLE), (HANDLE, HANDLE));
@@ -404,38 +404,109 @@ mod windows_impl {
         Cancelled,
     }
 
+    const CAPTURE_WAIT_INTERVAL: Duration = Duration::from_millis(10);
+    const WAIT_TIMEOUT: u32 = 0x0000_0102;
+
+    /// Consumes the bytes available at one point in time without waiting for a descendant to close
+    /// its inherited write handle. The availability snapshot bounds this call even when a
+    /// preserved descendant continues writing to the pipe, and every synchronous read is limited
+    /// to bytes already reported by that snapshot.
+    fn drain_capture_output_available(
+        output_read: HANDLE,
+        output: &mut Vec<u8>,
+        tmp: &mut [u8; 8192],
+    ) -> bool {
+        let mut available: u32 = 0;
+        let mut peeked: u32 = 0;
+        let peek_ok = unsafe {
+            PeekNamedPipe(
+                output_read,
+                std::ptr::null_mut(),
+                0,
+                &mut peeked,
+                &mut available,
+                std::ptr::null_mut(),
+            )
+        };
+        if peek_ok == 0 {
+            return false;
+        }
+
+        let mut drained = false;
+        while available != 0 {
+            let read_len = available.min(tmp.len() as u32);
+            let mut read_bytes: u32 = 0;
+            let read_ok = unsafe {
+                windows_sys::Win32::Storage::FileSystem::ReadFile(
+                    output_read,
+                    tmp.as_mut_ptr(),
+                    read_len,
+                    &mut read_bytes,
+                    std::ptr::null_mut(),
+                )
+            };
+            if read_bytes != 0 {
+                drained = true;
+                output.extend_from_slice(&tmp[..read_bytes as usize]);
+                available = available.saturating_sub(read_bytes);
+            }
+            if read_ok == 0 || read_bytes == 0 {
+                break;
+            }
+        }
+        drained
+    }
+
+    fn drain_capture_outputs(
+        stdout_read: HANDLE,
+        stderr_read: HANDLE,
+        stdout: &mut Vec<u8>,
+        stderr: &mut Vec<u8>,
+    ) -> bool {
+        let mut stdout_tmp = [0u8; 8192];
+        let mut stderr_tmp = [0u8; 8192];
+        let stdout_drained = drain_capture_output_available(stdout_read, stdout, &mut stdout_tmp);
+        let stderr_drained = drain_capture_output_available(stderr_read, stderr, &mut stderr_tmp);
+        stdout_drained || stderr_drained
+    }
+
     fn wait_for_process(
         process: HANDLE,
         timeout_ms: Option<u64>,
         cancellation: Option<&WindowsSandboxCancellationToken>,
+        stdout_read: HANDLE,
+        stderr_read: HANDLE,
+        stdout: &mut Vec<u8>,
+        stderr: &mut Vec<u8>,
     ) -> WaitOutcome {
-        let Some(cancellation) = cancellation else {
-            let timeout = timeout_ms.map(|ms| ms as u32).unwrap_or(INFINITE);
-            let res = unsafe { WaitForSingleObject(process, timeout) };
-            return if res == 0x0000_0102 {
-                WaitOutcome::TimedOut
-            } else {
-                WaitOutcome::Exited
-            };
-        };
-
         let deadline = timeout_ms.map(|ms| Instant::now() + Duration::from_millis(ms));
         loop {
-            if cancellation.is_cancelled() {
+            let output_drained = drain_capture_outputs(stdout_read, stderr_read, stdout, stderr);
+            if cancellation.is_some_and(super::WindowsSandboxCancellationToken::is_cancelled) {
                 return WaitOutcome::Cancelled;
             }
+            let wait_interval = if output_drained {
+                Duration::ZERO
+            } else {
+                CAPTURE_WAIT_INTERVAL
+            };
             let wait_ms = match deadline {
                 Some(deadline) => {
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     if remaining.is_zero() {
                         return WaitOutcome::TimedOut;
                     }
-                    remaining.min(Duration::from_millis(50)).as_millis() as u32
+                    let wait_ms = remaining.min(wait_interval).as_millis() as u32;
+                    if output_drained {
+                        wait_ms
+                    } else {
+                        wait_ms.max(1)
+                    }
                 }
-                None => 50,
+                None => wait_interval.as_millis() as u32,
             };
             let res = unsafe { WaitForSingleObject(process, wait_ms) };
-            if res == 0x0000_0102 {
+            if res == WAIT_TIMEOUT {
                 continue;
             }
             return WaitOutcome::Exited;
@@ -624,52 +695,17 @@ mod windows_impl {
             CloseHandle(err_w);
         }
 
-        let (tx_out, rx_out) = std::sync::mpsc::channel::<Vec<u8>>();
-        let (tx_err, rx_err) = std::sync::mpsc::channel::<Vec<u8>>();
-        let t_out = std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let mut tmp = [0u8; 8192];
-            loop {
-                let mut read_bytes: u32 = 0;
-                let ok = unsafe {
-                    windows_sys::Win32::Storage::FileSystem::ReadFile(
-                        out_r,
-                        tmp.as_mut_ptr(),
-                        tmp.len() as u32,
-                        &mut read_bytes,
-                        std::ptr::null_mut(),
-                    )
-                };
-                if ok == 0 || read_bytes == 0 {
-                    break;
-                }
-                buf.extend_from_slice(&tmp[..read_bytes as usize]);
-            }
-            let _ = tx_out.send(buf);
-        });
-        let t_err = std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let mut tmp = [0u8; 8192];
-            loop {
-                let mut read_bytes: u32 = 0;
-                let ok = unsafe {
-                    windows_sys::Win32::Storage::FileSystem::ReadFile(
-                        err_r,
-                        tmp.as_mut_ptr(),
-                        tmp.len() as u32,
-                        &mut read_bytes,
-                        std::ptr::null_mut(),
-                    )
-                };
-                if ok == 0 || read_bytes == 0 {
-                    break;
-                }
-                buf.extend_from_slice(&tmp[..read_bytes as usize]);
-            }
-            let _ = tx_err.send(buf);
-        });
-
-        let wait_outcome = wait_for_process(pi.hProcess, timeout_ms, cancellation.as_ref());
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let wait_outcome = wait_for_process(
+            pi.hProcess,
+            timeout_ms,
+            cancellation.as_ref(),
+            out_r,
+            err_r,
+            &mut stdout,
+            &mut stderr,
+        );
         let timed_out = matches!(wait_outcome, WaitOutcome::TimedOut);
         let cancelled = matches!(wait_outcome, WaitOutcome::Cancelled);
         let mut exit_code_u32: u32 = 1;
@@ -703,7 +739,13 @@ mod windows_impl {
             );
         }
 
+        // The root has exited or the job has been terminated. Consume the bytes already buffered
+        // before closing the reads; preserved descendants may keep the write ends open forever.
+        drain_capture_outputs(out_r, err_r, &mut stdout, &mut stderr);
+
         unsafe {
+            CloseHandle(out_r);
+            CloseHandle(err_r);
             if pi.hThread != 0 {
                 CloseHandle(pi.hThread);
             }
@@ -712,10 +754,6 @@ mod windows_impl {
             }
             CloseHandle(security.h_token);
         }
-        let _ = t_out.join();
-        let _ = t_err.join();
-        let stdout = rx_out.recv().unwrap_or_default();
-        let stderr = rx_err.recv().unwrap_or_default();
         let exit_code = if timed_out {
             128 + 64
         } else {

@@ -68,6 +68,8 @@ use codex_analytics::InvocationType;
 use codex_analytics::TurnResolvedConfigFact;
 use codex_analytics::build_track_events_context;
 use codex_async_utils::OrCancelExt;
+use codex_config::ResolvedSubagentRoute;
+use codex_config::resolve_active_subagent_route;
 use codex_config::resolve_subagent_route;
 use codex_connectors::AppToolPolicyEvaluator;
 use codex_core_plugins::RecommendedPluginCandidatesInput;
@@ -140,6 +142,73 @@ use tracing::warn;
 
 const POST_SAMPLING_TOKEN_ESTIMATE_TARGET: &str = "codex_core::post_sampling_token_estimate";
 
+#[derive(Clone, Debug)]
+struct NativeSubagentFallbackSnapshot {
+    source_route_id: String,
+    target: ResolvedSubagentRoute,
+}
+
+fn snapshot_native_subagent_fallback(
+    turn_context: &TurnContext,
+) -> Result<Option<NativeSubagentFallbackSnapshot>, String> {
+    if !matches!(
+        turn_context.session_source,
+        SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. })
+    ) {
+        return Ok(None);
+    }
+
+    let Some(source) = resolve_active_subagent_route(turn_context.config.codex_home.as_ref())
+        .map_err(|err| format!("failed to resolve the active subagent route: {err:#}"))?
+    else {
+        return Ok(None);
+    };
+    let source_matches_turn = source.route.model_provider == turn_context.config.model_provider_id
+        && source.route.model == turn_context.model_info().slug
+        && turn_context.initial_settings.reasoning_effort() == Some(&source.route.reasoning_effort)
+        && source.route.input_modalities == turn_context.config.model_input_modalities;
+    if !source_matches_turn {
+        return Ok(None);
+    }
+
+    let Some(target_route_id) = source.route.native_fallback_route.as_deref() else {
+        return Ok(None);
+    };
+    let target = resolve_subagent_route(turn_context.config.codex_home.as_ref(), target_route_id)
+        .map_err(|err| {
+        format!(
+            "subagent route `{}` has invalid native fallback route `{target_route_id}`: {err:#}",
+            source.id
+        )
+    })?;
+    Ok(Some(NativeSubagentFallbackSnapshot {
+        source_route_id: source.id,
+        target,
+    }))
+}
+
+fn response_item_commits_external_work(item: &ResponseItem) -> bool {
+    match item {
+        ResponseItem::Message { role, .. } => role == "assistant",
+        ResponseItem::AgentMessage { .. }
+        | ResponseItem::LocalShellCall { .. }
+        | ResponseItem::FunctionCall { .. }
+        | ResponseItem::ToolSearchCall { .. }
+        | ResponseItem::WebSearchCall { .. }
+        | ResponseItem::ImageGenerationCall { .. }
+        | ResponseItem::CustomToolCall { .. }
+        | ResponseItem::FunctionCallOutput { .. }
+        | ResponseItem::ToolSearchOutput { .. }
+        | ResponseItem::CustomToolCallOutput { .. } => true,
+        ResponseItem::AdditionalTools { .. }
+        | ResponseItem::Reasoning { .. }
+        | ResponseItem::Compaction { .. }
+        | ResponseItem::CompactionTrigger { .. }
+        | ResponseItem::ContextCompaction { .. }
+        | ResponseItem::Other => false,
+    }
+}
+
 /// Takes initial turn input and runs a loop where, at each sampling request,
 /// the model replies with either:
 ///
@@ -173,6 +242,8 @@ pub(crate) async fn run_turn(
     };
     let mut execution_turn_context = Arc::clone(&turn_context);
     let mut native_fallback_active = false;
+    let native_fallback_snapshot = snapshot_native_subagent_fallback(&turn_context);
+    let mut external_work_observed = false;
     // TODO(ccunningham): Pre-turn compaction runs before context updates and the
     // new user message are recorded. Estimate pending incoming items (context
     // diffs/full reinjection + user input) and trigger compaction preemptively
@@ -291,6 +362,7 @@ pub(crate) async fn run_turn(
         .await;
     sess.set_previous_turn_settings(Some(PreviousTurnSettings {
         model: execution_turn_context.model_info().slug.clone(),
+        model_provider_id: Some(execution_turn_context.config.model_provider_id.clone()),
         comp_hash: execution_turn_context.model_info().comp_hash.clone(),
         realtime_active: Some(execution_turn_context.realtime_active),
     }))
@@ -407,6 +479,7 @@ pub(crate) async fn run_turn(
                 &responses_metadata,
                 sampling_request_input,
                 cancellation_token.child_token(),
+                &mut external_work_observed,
             )
             .await
         }
@@ -591,6 +664,7 @@ pub(crate) async fn run_turn(
                 ) =>
             {
                 if native_fallback_active
+                    || external_work_observed
                     || !matches!(
                         turn_context.session_source,
                         SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. })
@@ -609,18 +683,46 @@ pub(crate) async fn run_turn(
                     break;
                 }
 
-                let CodexErrorDetails::NativeSubagentFallback { route } = codex_error.details()
+                let CodexErrorDetails::NativeSubagentFallback { route, .. } = codex_error.details()
                 else {
                     unreachable!("guarded native fallback error")
                 };
-                let resolved = match resolve_subagent_route(
-                    execution_turn_context.config.codex_home.as_ref(),
-                    route,
-                ) {
-                    Ok(resolved) => resolved,
-                    Err(err) => {
+                let resolved = match &native_fallback_snapshot {
+                    Ok(Some(snapshot)) if snapshot.target.id == *route => snapshot.target.clone(),
+                    Ok(Some(snapshot)) => {
                         let error = CodexErr::InvalidRequest(format!(
-                            "Native subagent fallback route `{route}` is invalid: {err:#}"
+                            "Subagent route `{}` requested unauthorized native fallback route `{route}`; configured route is `{}`.",
+                            snapshot.source_route_id, snapshot.target.id
+                        ));
+                        let error_info = error.to_codex_protocol_error();
+                        sess.emit_turn_error_lifecycle(turn_context.as_ref(), error_info.clone())
+                            .await;
+                        sess.track_turn_codex_error(turn_context.as_ref(), &error);
+                        sess.send_event(
+                            &turn_context,
+                            EventMsg::Error(error.to_error_event(/*message_prefix*/ None)),
+                        )
+                        .await;
+                        break;
+                    }
+                    Ok(None) => {
+                        let error = CodexErr::InvalidRequest(format!(
+                            "Native fallback route `{route}` was requested without a matching configured source-route snapshot."
+                        ));
+                        let error_info = error.to_codex_protocol_error();
+                        sess.emit_turn_error_lifecycle(turn_context.as_ref(), error_info.clone())
+                            .await;
+                        sess.track_turn_codex_error(turn_context.as_ref(), &error);
+                        sess.send_event(
+                            &turn_context,
+                            EventMsg::Error(error.to_error_event(/*message_prefix*/ None)),
+                        )
+                        .await;
+                        break;
+                    }
+                    Err(snapshot_error) => {
+                        let error = CodexErr::InvalidRequest(format!(
+                            "Native fallback route `{route}` could not be authorized: {snapshot_error}"
                         ));
                         let error_info = error.to_codex_protocol_error();
                         sess.emit_turn_error_lifecycle(turn_context.as_ref(), error_info.clone())
@@ -635,7 +737,7 @@ pub(crate) async fn run_turn(
                     }
                 };
                 let fallback_turn_context = match execution_turn_context
-                    .with_native_subagent_route(&resolved, &sess.services.models_manager)
+                    .with_native_subagent_route(&resolved)
                     .await
                 {
                     Ok(fallback_turn_context) => Arc::new(fallback_turn_context),
@@ -658,6 +760,7 @@ pub(crate) async fn run_turn(
                     .new_session_for_provider(fallback_turn_context.provider.clone());
                 sess.set_previous_turn_settings(Some(PreviousTurnSettings {
                     model: fallback_turn_context.model_info().slug.clone(),
+                    model_provider_id: Some(fallback_turn_context.config.model_provider_id.clone()),
                     comp_hash: fallback_turn_context.model_info().comp_hash.clone(),
                     realtime_active: Some(fallback_turn_context.realtime_active),
                 }))
@@ -672,9 +775,17 @@ pub(crate) async fn run_turn(
                     }),
                 )
                 .await;
+                let fallback_step_context = sess
+                    .capture_step_context(Arc::clone(&fallback_turn_context), &cancellation_token)
+                    .await?;
+                world_state = sess
+                    .record_context_updates_and_set_reference_context_item(
+                        fallback_step_context.as_ref(),
+                    )
+                    .await?;
                 execution_turn_context = fallback_turn_context;
                 native_fallback_active = true;
-                next_step_context = None;
+                next_step_context = Some(fallback_step_context);
                 can_drain_pending_input = false;
                 continue;
             }
@@ -1231,6 +1342,12 @@ async fn maybe_run_previous_model_inline_compact(
     let Some(previous_turn_settings) = sess.previous_turn_settings().await else {
         return Ok(());
     };
+    if !same_model_provider(
+        previous_turn_settings.model_provider_id.as_deref(),
+        turn_context.config.model_provider_id.as_str(),
+    ) {
+        return Ok(());
+    }
     let should_compact_for_comp_hash_change = comp_hash_changed(
         previous_turn_settings.comp_hash.as_deref(),
         turn_context.model_info().comp_hash.as_deref(),
@@ -1238,7 +1355,7 @@ async fn maybe_run_previous_model_inline_compact(
     let previous_model = previous_turn_settings.model;
     let previous_model_turn_context = Arc::new(
         turn_context
-            .with_model(previous_model.clone(), &sess.services.models_manager)
+            .with_model(previous_model.clone(), &turn_context.models_manager)
             .await,
     );
 
@@ -1313,6 +1430,13 @@ async fn maybe_run_previous_model_inline_compact(
         .await?;
     }
     Ok(())
+}
+
+fn same_model_provider(
+    previous_model_provider_id: Option<&str>,
+    current_model_provider_id: &str,
+) -> bool {
+    previous_model_provider_id == Some(current_model_provider_id)
 }
 
 #[instrument(
@@ -1492,6 +1616,7 @@ async fn run_sampling_request(
     responses_metadata: &CodexResponsesMetadata,
     input: Vec<ResponseItem>,
     cancellation_token: CancellationToken,
+    external_work_observed: &mut bool,
 ) -> CodexResult<(SamplingRequestResult, Vec<ResponseItem>)> {
     let turn_context = Arc::clone(&step_context.turn);
     let base_instructions = sess.get_prompt_base_instructions().await;
@@ -1541,6 +1666,7 @@ async fn run_sampling_request(
             Arc::clone(&turn_diff_tracker),
             &prompt,
             cancellation_token.child_token(),
+            external_work_observed,
         )
         .await
         {
@@ -2339,6 +2465,7 @@ async fn try_run_sampling_request(
     turn_diff_tracker: SharedTurnDiffTracker,
     prompt: &Prompt,
     cancellation_token: CancellationToken,
+    external_work_observed: &mut bool,
 ) -> CodexResult<SamplingRequestResult> {
     let turn_context = Arc::clone(&step_context.turn);
     feedback_tags!(
@@ -2446,8 +2573,19 @@ async fn try_run_sampling_request(
             .record_responses(&handle_responses, &event);
         record_turn_ttft_metric(&turn_context, &event).await;
 
+        let response_commits_external_work = match &event {
+            ResponseEvent::ProviderWorkStarted => true,
+            ResponseEvent::OutputItemDone(item) | ResponseEvent::OutputItemAdded(item) => {
+                response_item_commits_external_work(item)
+            }
+            ResponseEvent::OutputTextDelta(_) | ResponseEvent::ToolCallInputDelta { .. } => true,
+            _ => false,
+        };
+        *external_work_observed |= response_commits_external_work;
+
         match event {
             ResponseEvent::Created => {}
+            ResponseEvent::ProviderWorkStarted => {}
             ResponseEvent::OutputItemDone(mut item) => {
                 assign_missing_streamed_response_item_id(&mut item, active_item.as_ref());
                 if analytics_tool_call_ids.len() < MAX_ANALYTICS_TOOL_CALL_IDS_PER_RESPONSE {
@@ -2687,7 +2825,7 @@ async fn try_run_sampling_request(
             }
             ResponseEvent::ModelsEtag(etag) => {
                 // Update internal state with latest models etag
-                sess.services
+                turn_context
                     .models_manager
                     .refresh_if_new_etag(etag, turn_context.config.http_client_factory())
                     .await;

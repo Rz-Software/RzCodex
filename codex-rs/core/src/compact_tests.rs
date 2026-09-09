@@ -123,6 +123,71 @@ fn pin_active_subagent_task_preserves_latest_complete_new_task_exactly_once() {
 }
 
 #[test]
+fn pin_active_subagent_task_does_not_replace_assignment_with_descendant_followup() {
+    let assigned_task = new_task_agent_message("assigned-task", "complete assignment payload");
+    let descendant_followup = ResponseItem::AgentMessage {
+        id: Some(ResponseItemId::with_suffix("amsg", "descendant-followup")),
+        author: "/root/worker/child".to_string(),
+        recipient: "/root/worker".to_string(),
+        content: vec![
+            AgentMessageInputContent::InputText {
+                text: "Message Type: NEW_TASK\nTask name: /root/worker\nSender: /root/worker/child\nPayload:\n"
+                    .to_string(),
+            },
+            AgentMessageInputContent::EncryptedContent {
+                encrypted_content: "follow-up payload".to_string(),
+            },
+        ],
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let source = vec![
+        ResponseItemEnvelope::new(assigned_task.clone()),
+        ResponseItemEnvelope::new(descendant_followup.clone()),
+    ];
+
+    let active_task = latest_active_subagent_task(&source);
+    let summary = user_message(&format!("{SUMMARY_PREFIX}\nsummary"));
+    let pinned = pin_active_subagent_task(
+        vec![
+            ResponseItemEnvelope::new(descendant_followup.clone()),
+            ResponseItemEnvelope::new(summary.clone()),
+        ],
+        active_task,
+    );
+
+    assert_eq!(
+        pinned,
+        vec![
+            ResponseItemEnvelope::new(descendant_followup),
+            ResponseItemEnvelope::new(assigned_task),
+            ResponseItemEnvelope::new(summary),
+        ]
+    );
+}
+
+#[test]
+fn pin_active_subagent_task_preserves_sibling_assignment() {
+    let mut sibling_task = new_task_agent_message("sibling-task", "complete sibling assignment");
+    if let ResponseItem::AgentMessage {
+        author, content, ..
+    } = &mut sibling_task
+    {
+        *author = "/root/worker2".to_string();
+        content[0] = AgentMessageInputContent::InputText {
+            text:
+                "Message Type: NEW_TASK\nTask name: /root/worker\nSender: /root/worker2\nPayload:\n"
+                    .to_string(),
+        };
+    }
+    let source = vec![ResponseItemEnvelope::new(sibling_task.clone())];
+
+    assert_eq!(
+        pin_active_subagent_task(Vec::new(), latest_active_subagent_task(&source)),
+        vec![ResponseItemEnvelope::new(sibling_task)]
+    );
+}
+
+#[test]
 fn content_items_to_text_joins_non_empty_segments() {
     let items = vec![
         ContentItem::InputText {
@@ -652,6 +717,7 @@ async fn process_compacted_history_reinjects_model_switch_message() {
     }];
     let previous_turn_settings = PreviousTurnSettings {
         model: "previous-regular-model".to_string(),
+        model_provider_id: None,
         comp_hash: None,
         realtime_active: None,
     };

@@ -26,6 +26,7 @@ const RUN_MARKER: &str = "rollout-retention.last-run";
 struct RetentionStats {
     deleted_threads: usize,
     skipped_referenced_threads: usize,
+    skipped_active_threads: usize,
 }
 
 struct IndexedRollout {
@@ -52,8 +53,8 @@ pub(super) async fn prune_expired_rollouts(store: &LocalThreadStore) -> ThreadSt
     persist_run_marker(&store.config.codex_home)
         .map_err(internal_error("persist rollout retention marker"))?;
     info!(
-        "rollout retention finished: deleted_threads={}, skipped_referenced_threads={}",
-        stats.deleted_threads, stats.skipped_referenced_threads
+        "rollout retention finished: deleted_threads={}, skipped_referenced_threads={}, skipped_active_threads={}",
+        stats.deleted_threads, stats.skipped_referenced_threads, stats.skipped_active_threads
     );
     Ok(())
 }
@@ -96,11 +97,20 @@ async fn prune_expired_rollouts_at(
         .collect::<HashSet<_>>();
     let initial_candidate_count = candidates.len();
     remove_threads_with_retained_references(&mut candidates, &indexed_rollouts, &reference_index);
+    let referenced_candidate_count = candidates.len();
+    let active_thread_ids = store
+        .live_recorders
+        .lock()
+        .await
+        .keys()
+        .copied()
+        .collect::<HashSet<_>>();
+    candidates.retain(|thread_id| !active_thread_ids.contains(thread_id));
 
     let mut thread_ids = candidates.into_iter().collect::<Vec<_>>();
     thread_ids.sort_unstable_by_key(ToString::to_string);
     if !thread_ids.is_empty() {
-        super::delete_thread::delete_threads(
+        super::delete_thread::delete_expired_threads(
             store,
             DeleteThreadsParams {
                 thread_ids: thread_ids.clone(),
@@ -110,7 +120,9 @@ async fn prune_expired_rollouts_at(
     }
     Ok(RetentionStats {
         deleted_threads: thread_ids.len(),
-        skipped_referenced_threads: initial_candidate_count.saturating_sub(thread_ids.len()),
+        skipped_referenced_threads: initial_candidate_count
+            .saturating_sub(referenced_candidate_count),
+        skipped_active_threads: referenced_candidate_count.saturating_sub(thread_ids.len()),
     })
 }
 

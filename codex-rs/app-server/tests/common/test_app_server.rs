@@ -1956,6 +1956,16 @@ impl TestAppServerBuilder {
                 )
             }
         };
+        // App-server fixtures use historical timestamps. Mark retention as
+        // recently completed so startup maintenance does not delete those
+        // fixtures before the test exercises them.
+        let retention_marker = codex_home.join(".tmp").join("rollout-retention.last-run");
+        std::fs::create_dir_all(
+            retention_marker
+                .parent()
+                .context("rollout retention marker should have a parent")?,
+        )?;
+        std::fs::write(retention_marker, b"test fixture setup\n")?;
         let attribution_settings_server = if codex_home.join("auth.json").is_file() {
             let config_path = codex_home.join("config.toml");
             let config = std::fs::read_to_string(&config_path)?;

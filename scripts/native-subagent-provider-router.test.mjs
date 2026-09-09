@@ -4,7 +4,6 @@ import test from "node:test";
 import {
   ActiveTaskProviderPins,
   ActiveTaskRoutePins,
-  completedResponseFromRecoverableStream,
   fallbackForwardBody,
   completedResponseFromSse,
   parseResponsesSse,
@@ -222,7 +221,7 @@ test("the loopback Responses client accepts a chunked fallback completion", asyn
   });
 });
 
-test("completed output items survive a stream that closes before response.completed", async () => {
+test("completed tool output makes a truncated stream irreversibly committed", async () => {
   const tool = completion().output[0];
   await withServer((_request, response) => {
     response.writeHead(200, { "content-type": "text/event-stream" });
@@ -240,11 +239,48 @@ test("completed output items survive a stream that closes before response.comple
     assert.equal(failure?.incompleteStream, true);
     assert.equal(failure?.recoverableStreamFailure, true);
     assert.equal(failure?.observedEventCount, 2);
-    assert.deepEqual(completedResponseFromRecoverableStream(failure)?.output, [tool]);
+    assert.deepEqual(failure?.completedOutputItems, [tool]);
+    assert.equal(failure?.routeCommitted, true);
+    assert.deepEqual(failure?.nativeToolNames, ["exec_command"]);
   });
 });
 
-test("an incomplete terminal response recovers only completed output items", async () => {
+test("a structured native tool start followed by stream termination cannot advance providers", async () => {
+  await withServer((_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.end([
+      sse("response.created", {
+        response: { id: "resp-tool-start", model: MODEL_ALIAS, status: "in_progress" },
+      }),
+      sse("response.in_progress", {
+        response: {
+          id: "resp-tool-start",
+          status: "in_progress",
+          metadata: { provider_work_started: true, native_tool_name: "apply_patch" },
+        },
+      }),
+    ].join(""));
+  }, async (endpoint) => {
+    let laterProviderCalls = 0;
+    await assert.rejects(
+      runOrderedProviderChain({
+        stages: [
+          { name: "codebuddy", run: () => runResponsesBridge({ endpoint, body: {} }) },
+          { name: "devin-free", run: async () => { laterProviderCalls += 1; } },
+        ],
+      }),
+      (error) => (
+        error.routeCommitted === true
+        && error.nativeStartedTools === true
+        && error.nativeToolNames.join(",") === "apply_patch"
+        && error.failedStage === "codebuddy"
+      ),
+    );
+    assert.equal(laterProviderCalls, 0);
+  });
+});
+
+test("an incomplete terminal response preserves completed tool ownership", async () => {
   const completedTool = { ...completion().output[0], status: "completed" };
   const incompleteMessage = {
     type: "message",
@@ -272,7 +308,9 @@ test("an incomplete terminal response recovers only completed output items", asy
       failure = error;
     }
     assert.match(failure?.message || "", /max_output_tokens/);
-    assert.deepEqual(completedResponseFromRecoverableStream(failure)?.output, [completedTool]);
+    assert.deepEqual(failure?.completedOutputItems, [completedTool]);
+    assert.equal(failure?.routeCommitted, true);
+    assert.deepEqual(failure?.nativeToolNames, ["exec_command"]);
   });
 });
 
@@ -341,6 +379,31 @@ test("transport heartbeats do not hide provider silence while explicit provider 
       inactivityTimeoutMs: 50,
     }), completion());
   });
+});
+
+test("forwarded provider requests always have finite request and inactivity deadlines", async () => {
+  await withServer((_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.write(sse("response.created", { response: { id: "resp-request-deadline", status: "in_progress" } }));
+  }, async (endpoint) => {
+    await assert.rejects(
+      runResponsesBridge({
+        endpoint,
+        body: {},
+        inactivityTimeoutMs: 100,
+        requestTimeoutMs: 30,
+      }),
+      /recovery exceeded 30ms/,
+    );
+  });
+  await assert.rejects(
+    runResponsesBridge({ endpoint: "http://127.0.0.1/never", body: {}, requestTimeoutMs: 0 }),
+    /requestTimeoutMs must be a positive number/,
+  );
+  await assert.rejects(
+    runResponsesBridge({ endpoint: "http://127.0.0.1/never", body: {}, inactivityTimeoutMs: 0 }),
+    /inactivityTimeoutMs must be a positive number/,
+  );
 });
 
 test("the loopback Responses client rejects provider, HTTP, content, and size failures", async () => {

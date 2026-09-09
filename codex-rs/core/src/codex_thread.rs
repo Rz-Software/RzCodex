@@ -30,6 +30,7 @@ use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::models::ActivePermissionProfile;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::openai_models::InputModality;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EnvironmentConfig;
@@ -82,6 +83,7 @@ static LIVE_THREADS: Gauge = Gauge::new("core.threads.live");
 pub struct ThreadConfigSnapshot {
     pub model: String,
     pub model_provider_id: String,
+    pub model_input_modalities: Option<Vec<InputModality>>,
     pub service_tier: Option<String>,
     pub approval_policy: AskForApproval,
     pub approvals_reviewer: ApprovalsReviewer,
@@ -147,6 +149,7 @@ pub struct CodexThreadSettingsOverrides {
     pub windows_sandbox_level: Option<WindowsSandboxLevel>,
     pub model: Option<String>,
     pub model_provider: Option<String>,
+    pub model_input_modalities: Option<Option<Vec<InputModality>>>,
     pub effort: Option<Option<ReasoningEffort>>,
     pub summary: Option<ReasoningSummary>,
     pub service_tier: Option<Option<String>>,
@@ -553,6 +556,7 @@ impl CodexThread {
             windows_sandbox_level,
             model,
             model_provider,
+            model_input_modalities,
             effort,
             summary,
             service_tier,
@@ -563,6 +567,7 @@ impl CodexThread {
             model_provider,
             step_settings: StepSettingsUpdate {
                 model,
+                model_input_modalities,
                 effort,
                 collaboration_mode,
                 reasoning_summary: summary,
@@ -772,6 +777,17 @@ impl CodexThread {
     /// Returns thread-owned settings suitable for rollout persistence and resume.
     pub async fn thread_settings_snapshot(&self) -> ThreadSettingsSnapshot {
         self.session.thread_settings_snapshot().await
+    }
+
+    /// Lists models from the provider snapshot currently owned by this thread.
+    pub async fn list_models(
+        &self,
+        include_hidden: bool,
+        http_client_factory: codex_http_client::HttpClientFactory,
+    ) -> Vec<codex_protocol::openai_models::ModelPreset> {
+        self.session
+            .list_models(include_hidden, http_client_factory)
+            .await
     }
 
     /// Captures thread-owned settings and environment selections for runtime restoration.

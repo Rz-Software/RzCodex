@@ -3,6 +3,7 @@ use std::time::Duration;
 use anyhow::Error;
 use anyhow::Result;
 use app_test_support::ChatGptAuthFixture;
+use app_test_support::MockResponsesConfig;
 use app_test_support::TestAppServer;
 use app_test_support::write_chatgpt_auth;
 use app_test_support::write_models_cache;
@@ -15,6 +16,10 @@ use codex_app_server_protocol::ModelServiceTier;
 use codex_app_server_protocol::ModelUpgradeInfo;
 use codex_app_server_protocol::ReasoningEffortOption;
 use codex_app_server_protocol::RequestId;
+use codex_app_server_protocol::ThreadSettingsUpdateParams;
+use codex_app_server_protocol::ThreadSettingsUpdateResponse;
+use codex_app_server_protocol::ThreadSettingsUpdatedNotification;
+use codex_app_server_protocol::ThreadStartParams;
 use codex_config::types::AuthCredentialsStoreMode;
 use codex_protocol::openai_models::MODEL_SPECIALTY_CYBER;
 use codex_protocol::openai_models::ModelInfo;
@@ -114,6 +119,7 @@ async fn list_models_returns_all_models_with_large_limit() -> Result<()> {
         .request(|request_id| ClientRequest::ModelList {
             request_id,
             params: ModelListParams {
+                thread_id: None,
                 limit: Some(100),
                 cursor: None,
                 include_hidden: None,
@@ -144,6 +150,7 @@ async fn list_models_includes_hidden_models() -> Result<()> {
         .request(|request_id| ClientRequest::ModelList {
             request_id,
             params: ModelListParams {
+                thread_id: None,
                 limit: Some(100),
                 cursor: None,
                 include_hidden: Some(true),
@@ -231,6 +238,7 @@ openai_base_url = "{server_uri}/v1"
         .await?;
     let request_id = mcp
         .send_list_models_request(ModelListParams {
+            thread_id: None,
             limit: Some(100),
             cursor: None,
             include_hidden: None,
@@ -284,6 +292,108 @@ openai_base_url = "{server_uri}/v1"
 }
 
 #[tokio::test]
+async fn list_models_uses_the_loaded_threads_active_provider_catalog() -> Result<()> {
+    let initial_server = MockServer::start().await;
+    let selected_server = MockServer::start().await;
+    let selected_model = serde_json::from_value::<ModelInfo>(json!({
+        "slug": "selected-provider-only",
+        "display_name": "Selected Provider Only",
+        "description": "Model exposed only by the selected provider",
+        "default_reasoning_level": "high",
+        "supported_reasoning_levels": [
+            {"effort": "high", "description": "High"}
+        ],
+        "shell_type": "shell_command",
+        "visibility": "list",
+        "minimal_client_version": [0, 1, 0],
+        "supported_in_api": true,
+        "priority": 0,
+        "support_verbosity": false,
+        "default_verbosity": null,
+        "apply_patch_tool_type": null,
+        "truncation_policy": {"mode": "bytes", "limit": 10_000},
+        "supports_image_detail_original": false,
+        "multi_agent_version": "v2",
+        "context_window": 272_000,
+        "max_context_window": 272_000,
+        "experimental_supported_tools": [],
+    }))?;
+    let models_mock = mount_models_once(
+        &selected_server,
+        ModelsResponse {
+            models: vec![selected_model],
+        },
+    )
+    .await;
+
+    let codex_home = TempDir::new()?;
+    MockResponsesConfig::new(&initial_server.uri())
+        .with_provider_config("supports_websockets = false")
+        .with_extra_config(&format!(
+            r#"
+[model_providers.selected_provider]
+name = "Selected provider"
+base_url = "{}/v1"
+wire_api = "responses"
+supports_websockets = false
+requires_openai_auth = true
+"#,
+            selected_server.uri()
+        ))
+        .write(codex_home.path())?;
+    write_chatgpt_auth(
+        codex_home.path(),
+        ChatGptAuthFixture::new("chatgpt-access-token").plan_type("pro"),
+        AuthCredentialsStoreMode::File,
+    )?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized()
+        .await?;
+    let thread = mcp.start_thread(ThreadStartParams::default()).await?.thread;
+    let _: ThreadSettingsUpdateResponse = mcp
+        .request(|request_id| ClientRequest::ThreadSettingsUpdate {
+            request_id,
+            params: ThreadSettingsUpdateParams {
+                thread_id: thread.id.clone(),
+                model: Some("selected-provider-only".to_string()),
+                model_provider: Some("selected_provider".to_string()),
+                ..Default::default()
+            },
+        })
+        .await?;
+    let settings_updated: ThreadSettingsUpdatedNotification = timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_notification("thread/settings/updated"),
+    )
+    .await??;
+    assert_eq!(
+        settings_updated.thread_settings.model_provider,
+        "selected_provider"
+    );
+    let ModelListResponse { data, next_cursor } = mcp
+        .request(|request_id| ClientRequest::ModelList {
+            request_id,
+            params: ModelListParams {
+                thread_id: Some(thread.id),
+                limit: None,
+                cursor: None,
+                include_hidden: None,
+            },
+        })
+        .await?;
+
+    assert!(
+        data.iter()
+            .any(|model| model.model == "selected-provider-only"),
+        "active provider catalog should include the selected provider model"
+    );
+    assert!(next_cursor.is_none());
+    assert_eq!(models_mock.requests().len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
 async fn list_models_pagination_works() -> Result<()> {
     let codex_home = TempDir::new()?;
     write_models_cache(codex_home.path())?;
@@ -305,6 +415,7 @@ async fn list_models_pagination_works() -> Result<()> {
             .request(|request_id| ClientRequest::ModelList {
                 request_id,
                 params: ModelListParams {
+                    thread_id: None,
                     limit: Some(1),
                     cursor: cursor.clone(),
                     include_hidden: None,
@@ -341,6 +452,7 @@ async fn list_models_rejects_invalid_cursor() -> Result<()> {
 
     let request_id = mcp
         .send_list_models_request(ModelListParams {
+            thread_id: None,
             limit: None,
             cursor: Some("invalid".to_string()),
             include_hidden: None,

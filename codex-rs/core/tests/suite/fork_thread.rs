@@ -4,17 +4,24 @@ use codex_core::ForkSnapshot;
 use codex_core::NewThread;
 use codex_core::TurnInputRequest;
 use codex_core::parse_turn_item;
+use codex_history::CodexHarnessMetadata;
+use codex_history::CompactedItem;
 use codex_history::InitialHistory;
+use codex_history::ResponseItemEnvelope;
 use codex_history::ResumedHistory;
 use codex_history::RolloutItem;
 use codex_history::RolloutLine;
+use codex_protocol::ResponseItemId;
 use codex_protocol::ThreadId;
 use codex_protocol::items::TurnItem;
 use codex_protocol::mcp::ClientMcpExtensions;
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadSettingsAppliedEvent;
 use codex_protocol::protocol::ThreadSettingsSnapshot;
+use codex_protocol::protocol::ThreadSource;
 use codex_protocol::user_input::UserInput;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_response_created;
@@ -179,6 +186,137 @@ async fn fork_thread_from_history_does_not_require_source_rollout_path() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn copied_paginated_fork_persists_inherited_history() {
     assert_copied_fork_persists_inherited_history(ThreadHistoryMode::Paginated).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn copied_fork_cold_resume_preserves_inherited_compacted_inline_image() {
+    assert_copied_fork_cold_resume_preserves_inherited_compacted_inline_image(
+        ThreadHistoryMode::Legacy,
+        /*thread_source*/ None,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn copied_paginated_subagent_cold_resume_preserves_inherited_compacted_inline_image() {
+    assert_copied_fork_cold_resume_preserves_inherited_compacted_inline_image(
+        ThreadHistoryMode::Paginated,
+        Some(ThreadSource::Subagent),
+    )
+    .await;
+}
+
+async fn assert_copied_fork_cold_resume_preserves_inherited_compacted_inline_image(
+    history_mode: ThreadHistoryMode,
+    thread_source: Option<ThreadSource>,
+) {
+    skip_if_no_network!();
+
+    let server = MockServer::start().await;
+    let sse = sse(vec![ev_response_created("resp"), ev_completed("resp")]);
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(sse, "text/event-stream"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut builder = test_codex().with_history_mode(history_mode);
+    let test = builder.build(&server).await.expect("create conversation");
+    let thread_manager = test.thread_manager.clone();
+    let image_url = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
+    let inherited_history = InitialHistory::Resumed(ResumedHistory {
+        conversation_id: test.session_configured.thread_id,
+        history: Arc::new(vec![RolloutItem::Compacted(CompactedItem {
+            message: "image checkpoint".to_string(),
+            replacement_history: Some(vec![ResponseItemEnvelope {
+                item: ResponseItem::Message {
+                    id: Some(ResponseItemId::with_suffix("msg", "inherited-image")),
+                    role: "user".to_string(),
+                    content: vec![ContentItem::InputImage {
+                        image_url: image_url.to_string(),
+                        detail: None,
+                    }],
+                    phase: None,
+                    internal_chat_message_metadata_passthrough: None,
+                },
+                metadata: Some(CodexHarnessMetadata {
+                    inline_images_persisted: true,
+                    ..Default::default()
+                }),
+            }]),
+            guardian_history: None,
+            mcp_resource_origins: None,
+            window_number: Some(1),
+            first_window_id: None,
+            previous_window_id: None,
+            window_id: None,
+            compaction_response_id: None,
+            latest_token_usage_record: None,
+        })]),
+        rollout_path: None,
+    });
+    let forked = thread_manager
+        .fork_thread_from_history(
+            ForkSnapshot::Interrupted,
+            test.config.clone(),
+            inherited_history,
+            thread_source,
+            /*parent_trace*/ None,
+            ClientMcpExtensions::default(),
+            /*reserved_thread_id*/ None,
+        )
+        .await
+        .expect("fork copied compacted history")
+        .thread;
+    let forked_path = forked.rollout_path().expect("forked rollout path");
+    forked
+        .shutdown_and_wait()
+        .await
+        .expect("shutdown copied fork");
+
+    let resumed_history = codex_rollout::RolloutRecorder::get_rollout_history(&forked_path)
+        .await
+        .expect("load copied fork history");
+    let resumed = thread_manager
+        .resume_thread_with_history(
+            test.config.clone(),
+            resumed_history,
+            codex_core::test_support::auth_manager_from_auth(codex_login::CodexAuth::from_api_key(
+                "dummy",
+            )),
+            /*parent_trace*/ None,
+            ClientMcpExtensions::default(),
+        )
+        .await
+        .expect("cold resume copied fork")
+        .thread;
+    resumed
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "continue after cold resume".to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await
+        .expect("start resumed turn");
+    wait_for_event(&resumed, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+
+    let requests = server.received_requests().await.expect("response requests");
+    let input = serde_json::to_string(
+        &requests
+            .last()
+            .expect("resumed model request")
+            .body_json::<serde_json::Value>()
+            .expect("response request body")["input"],
+    )
+    .expect("serialize model input");
+    assert!(
+        input.contains(image_url),
+        "cold-resumed copied fork should retain the inherited inline image"
+    );
 }
 
 async fn assert_copied_fork_persists_inherited_history(history_mode: ThreadHistoryMode) {

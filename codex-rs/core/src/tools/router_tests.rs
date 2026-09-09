@@ -88,6 +88,34 @@ fn collaboration_calls_with_encrypted_arguments_preserve_encryption() {
     assert_eq!(call.direct_source(), ToolCallSource::Direct);
 }
 
+#[test]
+fn current_collaboration_namespace_without_marker_preserves_encryption() {
+    let call = ToolCall {
+        tool_name: ToolName::namespaced("rz_collaboration", "spawn_agent"),
+        call_id: "call-encrypted-spawn".to_string(),
+        payload: ToolPayload::Function {
+            arguments: r#"{"message":"encrypted payload"}"#.to_string(),
+        },
+        encrypted_function_args: None,
+    };
+
+    assert_eq!(call.direct_source(), ToolCallSource::Direct);
+}
+
+#[test]
+fn current_collaboration_namespace_uses_explicit_empty_marker_for_plaintext() {
+    let call = ToolCall {
+        tool_name: ToolName::namespaced("rz_collaboration", "spawn_agent"),
+        call_id: "call-plaintext-spawn".to_string(),
+        payload: ToolPayload::Function {
+            arguments: r#"{"message":"plaintext payload"}"#.to_string(),
+        },
+        encrypted_function_args: Some(Vec::new()),
+    };
+
+    assert_eq!(call.direct_source(), ToolCallSource::DirectPlaintextMessage);
+}
+
 impl codex_extension_api::ToolContributor for ExtensionEchoContributor {
     fn tools(
         &self,

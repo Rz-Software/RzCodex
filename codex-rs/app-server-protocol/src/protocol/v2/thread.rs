@@ -31,6 +31,7 @@ pub use codex_protocol::dynamic_tools::DynamicToolNamespaceSpec;
 pub use codex_protocol::dynamic_tools::DynamicToolNamespaceTool;
 pub use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::openai_models::InputModality;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::ThreadGoalStatus as CoreThreadGoalStatus;
 use codex_protocol::protocol::TokenUsage as CoreTokenUsage;
@@ -182,6 +183,9 @@ pub struct ThreadStartResponse {
     pub thread: Thread,
     pub model: String,
     pub model_provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub model_input_modalities: Option<Vec<InputModality>>,
     pub service_tier: Option<String>,
     pub cwd: AbsolutePathBuf,
     /// Thread-scoped runtime workspace roots used to materialize
@@ -251,6 +255,16 @@ pub struct ThreadSettingsUpdateParams {
     /// Provider and model should be supplied together when moving a thread between providers.
     #[ts(optional = nullable)]
     pub model_provider: Option<String>,
+    /// Override the model input capabilities for subsequent turns. `null` resolves them from the
+    /// selected provider catalog; omission leaves the current override unchanged.
+    #[serde(
+        default,
+        deserialize_with = "crate::protocol::serde_helpers::deserialize_double_option",
+        serialize_with = "crate::protocol::serde_helpers::serialize_double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[ts(optional = nullable)]
+    pub model_input_modalities: Option<Option<Vec<InputModality>>>,
     /// Override the service tier for subsequent turns. `null` clears the
     /// current service tier; omission leaves it unchanged.
     #[serde(
@@ -299,6 +313,9 @@ pub struct ThreadSettings {
     pub active_permission_profile: Option<ActivePermissionProfile>,
     pub model: String,
     pub model_provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub model_input_modalities: Option<Vec<InputModality>>,
     pub service_tier: Option<String>,
     pub effort: Option<ReasoningEffort>,
     pub summary: Option<ReasoningSummary>,
@@ -421,6 +438,9 @@ pub struct ThreadResumeResponse {
     pub thread: Thread,
     pub model: String,
     pub model_provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub model_input_modalities: Option<Vec<InputModality>>,
     pub service_tier: Option<String>,
     pub cwd: AbsolutePathBuf,
     /// Thread-scoped runtime workspace roots used to materialize
@@ -612,6 +632,9 @@ pub struct ThreadForkResponse {
     pub thread: Thread,
     pub model: String,
     pub model_provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub model_input_modalities: Option<Vec<InputModality>>,
     pub service_tier: Option<String>,
     pub cwd: AbsolutePathBuf,
     /// Thread-scoped runtime workspace roots used to materialize

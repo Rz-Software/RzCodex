@@ -105,6 +105,7 @@ impl SessionState {
     pub(crate) fn previous_turn_settings(&self) -> Option<PreviousTurnSettings> {
         self.previous_turn_settings.clone()
     }
+
     pub(crate) fn set_previous_turn_settings(
         &mut self,
         previous_turn_settings: Option<PreviousTurnSettings>,

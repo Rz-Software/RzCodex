@@ -15044,6 +15044,13 @@
               "integer",
               "null"
             ]
+          },
+          "threadId": {
+            "description": "Optional loaded thread whose active provider catalog should own the result.",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "title": "ModelListParams",
@@ -20619,6 +20626,15 @@
           "model": {
             "type": "string"
           },
+          "modelInputModalities": {
+            "items": {
+              "$ref": "#/definitions/v2/InputModality"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
           "modelProvider": {
             "type": "string"
           },
@@ -22865,6 +22881,15 @@
           "model": {
             "type": "string"
           },
+          "modelInputModalities": {
+            "items": {
+              "$ref": "#/definitions/v2/InputModality"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
           "modelProvider": {
             "type": "string"
           },
@@ -23338,6 +23363,15 @@
           "model": {
             "type": "string"
           },
+          "modelInputModalities": {
+            "items": {
+              "$ref": "#/definitions/v2/InputModality"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
           "modelProvider": {
             "type": "string"
           },
@@ -23608,6 +23642,15 @@
           },
           "model": {
             "type": "string"
+          },
+          "modelInputModalities": {
+            "items": {
+              "$ref": "#/definitions/v2/InputModality"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
           },
           "modelProvider": {
             "type": "string"

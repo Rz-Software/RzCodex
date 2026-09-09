@@ -16,7 +16,11 @@ async fn model_picker_refresh_updates_app_catalog_from_app_server() -> Result<()
     let mut app_server = start_config_write_test_app_server(&app).await?;
     let mut tui = crate::tui::test_support::make_test_tui()?;
     let fast = Some(ServiceTier::Fast.request_value());
-    let thread_id = ThreadId::new();
+    let thread_id = app_server
+        .start_thread(&app.config)
+        .await?
+        .session
+        .thread_id;
     let mut session = test_thread_session(thread_id, test_path_buf("/tmp/project"));
     session.model = "gpt-5.4".to_string();
     app.primary_thread_id = Some(thread_id);

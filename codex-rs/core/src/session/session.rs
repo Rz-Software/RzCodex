@@ -81,6 +81,8 @@ pub(crate) struct Session {
 pub(crate) struct SessionConfiguration {
     /// Runtime provider and its provider-specific execution policy.
     pub(super) provider: SharedModelProvider,
+    /// Model metadata owner created by the same provider snapshot.
+    pub(super) models_manager: SharedModelsManager,
 
     /// Desired configured inputs inherited by future turns.
     pub(super) step_settings: Arc<StepSettings>,
@@ -246,6 +248,10 @@ impl SessionConfiguration {
         ThreadConfigSnapshot {
             model: self.step_settings.collaboration_mode.model().to_string(),
             model_provider_id: self.original_config_do_not_use.model_provider_id.clone(),
+            model_input_modalities: self
+                .original_config_do_not_use
+                .model_input_modalities
+                .clone(),
             service_tier: self.step_settings.service_tier.clone(),
             approval_policy: self.step_settings.approval_policy.value(),
             approvals_reviewer: self.step_settings.approvals_reviewer,
@@ -286,6 +292,10 @@ impl SessionConfiguration {
         ThreadSettingsSnapshot {
             model: self.step_settings.collaboration_mode.model().to_string(),
             model_provider_id: self.original_config_do_not_use.model_provider_id.clone(),
+            model_input_modalities: self
+                .original_config_do_not_use
+                .model_input_modalities
+                .clone(),
             service_tier: self.step_settings.service_tier.clone(),
             approval_policy: self.step_settings.approval_policy.value(),
             approvals_reviewer: self.step_settings.approvals_reviewer,
@@ -317,6 +327,11 @@ impl SessionConfiguration {
             approval_policy: Some(self.step_settings.approval_policy.value()),
             approvals_reviewer: Some(self.step_settings.approvals_reviewer),
             model_provider: Some(self.original_config_do_not_use.model_provider_id.clone()),
+            model_input_modalities: Some(
+                self.original_config_do_not_use
+                    .model_input_modalities
+                    .clone(),
+            ),
             permission_profile: Some(self.permission_profile()),
             active_permission_profile: self.active_permission_profile(),
             windows_sandbox_level: Some(self.windows_sandbox_level),
@@ -754,6 +769,9 @@ impl Session {
         );
         if let InitialHistory::Forked(items) = &mut initial_history {
             Self::assign_missing_rollout_response_item_ids(items);
+            if matches!(&fork_persistence, ForkPersistence::Copied) {
+                Self::reset_copied_checkpoint_inline_image_persistence(items);
+            }
         }
         let multi_agent_version = multi_agent_version.map(OnceLock::from).unwrap_or_default();
         let initial_multi_agent_version = multi_agent_version.get().copied();
@@ -1008,6 +1026,15 @@ impl Session {
                 error!("failed to initialize thread persistence: {e:#}");
                 e
             })?);
+        if is_paginated_subagent
+            && matches!(&fork_persistence, ForkPersistence::Copied)
+            && live_thread_init.as_ref().is_some()
+            && let InitialHistory::Forked(items) = &mut initial_history
+        {
+            // Paginated children write inherited context during LiveThread creation. Restore the
+            // marker only after that child-owned append has succeeded.
+            Self::mark_copied_checkpoint_inline_images_persisted(items);
+        }
         let session_result: anyhow::Result<Arc<Self>> = async {
             let rollout_path = if let Some(live_thread) = live_thread_init.as_ref() {
                 live_thread.local_rollout_path().await?
@@ -1447,15 +1474,14 @@ impl Session {
                 thread_store: Arc::clone(&thread_store),
                 attestation_provider: attestation_provider.clone(),
                 time_provider,
-                model_client: ModelClient::new(
-                    Some(Arc::clone(&auth_manager)),
+                model_client: ModelClient::new_with_provider(
                     if config.features.enabled(Feature::UseAgentIdentity) {
                         AgentIdentityAuthPolicy::ChatGptAuth
                     } else {
                         AgentIdentityAuthPolicy::JwtOnly
                     },
                     thread_id,
-                    session_configuration.provider.info().clone(),
+                    Arc::clone(&session_configuration.provider),
                     session_configuration.session_source.clone(),
                     session_configuration.originator.clone(),
                     config.model_verbosity,

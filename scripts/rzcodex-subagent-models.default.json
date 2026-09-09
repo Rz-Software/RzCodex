@@ -1,0 +1,33 @@
+{
+  "$schema": "./rzcodex-subagent-models.schema.json",
+  "openrouter": "@preset/codex-subagents",
+  "opencode": "opencode-go/omen-alpha",
+  "opencodeFallback": "opencode/muse-spark-1.3-contributor-free",
+  "commandcode": "meta/muse-spark-1.3-contributor",
+  "cursor": "cursor-grok-4.6-medium",
+  "autoProviderOrder": ["antigravity", "devin", "ollama", "opencode", "codebuddy", "devin-free"],
+  "codebuddy": { "model": "hy4-preview", "inputModalities": ["text"] },
+  "devin": { "primaryModel": "glm-5-3-flash-max", "terminalFallbackModel": "glm-5-2", "inputModalities": ["text"] },
+  "antigravity": { "primaryModel": "claude-opus-4-6-thinking", "quotaFallbackModel": "gemini-3.8-flash-high", "inputModalities": ["text"] },
+  "ollama": {
+    "model": "glm-5.3-flash:cloud",
+    "label": "GLM 5.3 Flash Max",
+    "maxConcurrency": 3,
+    "responseModels": ["glm-5.3-flash:cloud", "glm-5.3-flash"],
+    "reasoningEffort": "max",
+    "inputModalities": ["text"]
+  },
+  "routes": {
+    "auto": { "label": "Automatic provider chain", "modelProvider": "devin", "model": "@preset/codex-subagents", "mainModel": "@preset/rzcodex-main", "reasoningEffort": "high", "inputModalities": ["text"], "healthUrl": "http://127.0.0.1:54548/health?route=auto", "healthAuth": "bridgeBearer", "nativeFallbackRoute": "native" },
+    "native": { "label": "Native OpenAI Luna Max", "modelProvider": "openai", "model": "gpt-5.6-luna", "reasoningEffort": "max", "inputModalities": ["text", "image"] },
+    "native-sol": { "label": "Native OpenAI Sol High", "modelProvider": "openai", "model": "gpt-5.6-sol", "reasoningEffort": "high", "inputModalities": ["text", "image"] },
+    "codebuddy": { "label": "Tencent CodeBuddy", "modelProvider": "codebuddy", "model": "@preset/codex-subagents", "mainModel": "@preset/rzcodex-main", "reasoningEffort": "max", "inputModalities": ["text"], "healthUrl": "http://127.0.0.1:54547/health", "healthAuth": "bridgeBearer" },
+    "devin-free": { "label": "Devin GLM 5.2 (free)", "modelProvider": "devin", "model": "@preset/codex-subagents-devin-free", "mainModel": "@preset/rzcodex-main-devin-free", "reasoningEffort": "high", "inputModalities": ["text"], "healthUrl": "http://127.0.0.1:54548/health?route=devin-free", "healthAuth": "bridgeBearer" },
+    "ollama": { "label": "Ollama GLM 5.3 Flash Max", "modelProvider": "ollama_native", "model": "@preset/codex-subagents-ollama", "mainModel": "@preset/rzcodex-main-ollama", "reasoningEffort": "max", "inputModalities": ["text"], "healthUrl": "http://127.0.0.1:11434/api/version", "healthAuth": "none" },
+    "opencode": { "label": "OpenCode Omen Alpha / Muse Free", "modelProvider": "opencode", "model": "@preset/codex-subagents", "mainModel": "@preset/rzcodex-main", "reasoningEffort": "high", "fallbackReasoningEffort": "xhigh", "inputModalities": ["text"], "healthUrl": "http://127.0.0.1:54545/health", "healthAuth": "bridgeBearer" },
+    "commandcode": { "label": "CommandCode Muse Spark 1.3 Contributor", "modelProvider": "commandcode", "model": "@preset/codex-subagents", "mainModel": "@preset/rzcodex-main", "reasoningEffort": "max", "inputModalities": ["text"], "healthUrl": "http://127.0.0.1:54545/health", "healthAuth": "bridgeBearer" },
+    "cursor": { "label": "Cursor CLI", "modelProvider": "cursor", "model": "@preset/codex-subagents", "mainModel": "@preset/rzcodex-main", "reasoningEffort": "high", "inputModalities": ["text"], "healthUrl": "http://127.0.0.1:54545/health", "healthAuth": "bridgeBearer" },
+    "antigravity": { "label": "Google Antigravity", "modelProvider": "antigravity", "model": "@preset/codex-subagents", "mainModel": "@preset/rzcodex-main", "reasoningEffort": "high", "inputModalities": ["text"], "healthUrl": "http://127.0.0.1:54549/health", "healthAuth": "bridgeBearer" },
+    "openrouter": { "label": "OpenRouter", "modelProvider": "openrouter", "model": "minimax/minimax-m3:free", "reasoningEffort": "max", "inputModalities": ["text"] }
+  }
+}

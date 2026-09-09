@@ -1,4 +1,5 @@
 use std::env;
+use std::fs;
 use std::path::PathBuf;
 
 const SETUP_BIN: &str = "codex-windows-sandbox-setup";
@@ -13,8 +14,23 @@ fn main() -> Result<(), String> {
 
     let manifest_dir = env::var_os("CARGO_MANIFEST_DIR")
         .ok_or_else(|| "CARGO_MANIFEST_DIR should be set for build scripts".to_string())?;
-    let manifest_path = PathBuf::from(manifest_dir).join(SETUP_MANIFEST);
-    let manifest_path = manifest_path.display();
+    let out_dir = env::var_os("OUT_DIR")
+        .ok_or_else(|| "OUT_DIR should be set for build scripts".to_string())?;
+
+    // A shared CARGO_TARGET_DIR replays cached rustc-link-arg-bin output even
+    // after the originating checkout is deleted, so the /MANIFESTINPUT path
+    // must point into the target dir. Materialize the manifest under OUT_DIR;
+    // a source-tree path would dangle once that checkout is removed.
+    let source_manifest = PathBuf::from(manifest_dir).join(SETUP_MANIFEST);
+    let embedded_manifest = PathBuf::from(out_dir).join(SETUP_MANIFEST);
+    fs::copy(&source_manifest, &embedded_manifest).map_err(|error| {
+        format!(
+            "failed to copy {} to {}: {error}",
+            source_manifest.display(),
+            embedded_manifest.display()
+        )
+    })?;
+    let manifest_path = embedded_manifest.display();
 
     // Keep this scoped to the setup helper so Codex binaries that link the
     // library do not inherit any resource metadata from this package.

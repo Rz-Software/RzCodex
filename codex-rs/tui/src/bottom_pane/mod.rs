@@ -1350,6 +1350,13 @@ impl BottomPane {
             .and_then(|view| view.active_tab_id())
     }
 
+    pub(crate) fn active_tab_id_for_present_view(&self, view_id: &'static str) -> Option<&str> {
+        self.view_stack
+            .iter()
+            .rfind(|view| view.view_id() == Some(view_id))
+            .and_then(|view| view.active_tab_id())
+    }
+
     /// Forward a suggestion to its matching prompt, even beneath another view.
     pub(crate) fn apply_text_suggestion(
         &mut self,

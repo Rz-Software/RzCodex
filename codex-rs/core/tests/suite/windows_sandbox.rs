@@ -105,11 +105,18 @@ fn stage_windows_sandbox_helpers() -> anyhow::Result<()> {
         let helper = codex_utils_cargo_bin::cargo_bin(helper_name)?;
         let file_name = Path::new(helper_name).with_extension("exe");
         let destination = resources_dir.join(file_name);
+        // All Windows sandbox tests resolve helpers from this shared resources directory. Once
+        // the staged copy came from the current build, avoid opening it for replacement: a
+        // helper process from another test may still have the executable open.
+        if staged_helper_matches(&helper, &destination)? {
+            continue;
+        }
         if let Err(err) = std::fs::copy(&helper, &destination) {
             // A sandbox helper can briefly remain alive after the sandboxed
             // command exits. Bazel may retry the test while that process still
-            // has the staged executable open, so keep the already-staged copy.
-            if err.kind() == std::io::ErrorKind::PermissionDenied && destination.exists() {
+            // has the staged executable open, so keep the already-staged copy
+            // when it is from the same build.
+            if destination.exists() && staged_helper_matches(&helper, &destination)? {
                 continue;
             }
             return Err(err).with_context(|| {
@@ -122,6 +129,29 @@ fn stage_windows_sandbox_helpers() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+fn staged_helper_matches(source: &Path, destination: &Path) -> anyhow::Result<bool> {
+    let source_metadata = std::fs::metadata(source)
+        .with_context(|| format!("read helper source metadata {}", source.display()))?;
+    let destination_metadata = match std::fs::metadata(destination) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("read staged helper metadata {}", destination.display()));
+        }
+    };
+
+    if source_metadata.len() != destination_metadata.len() {
+        return Ok(false);
+    }
+
+    let source_bytes = std::fs::read(source)
+        .with_context(|| format!("read helper source bytes {}", source.display()))?;
+    let destination_bytes = std::fs::read(destination)
+        .with_context(|| format!("read staged helper bytes {}", destination.display()))?;
+    Ok(source_bytes == destination_bytes)
 }
 
 #[tokio::test]
@@ -220,8 +250,15 @@ async fn windows_elevated_does_not_create_missing_workspace_metadata() -> anyhow
     stage_windows_sandbox_helpers()?;
     let workspace = TempDir::new()?;
     let cwd = dunce::canonicalize(workspace.path())?.abs();
-    let permission_profile = PermissionProfile::workspace_write()
-        .materialize_project_roots_with_workspace_roots(std::slice::from_ref(&cwd));
+    // This test only exercises workspace metadata materialization. Keep the host TEMP roots out
+    // of the ACL payload so setup does not recursively process the shared test-machine temp tree.
+    let permission_profile = PermissionProfile::workspace_write_with(
+        &[],
+        NetworkSandboxPolicy::Restricted,
+        /*exclude_tmpdir_env_var*/ true,
+        /*exclude_slash_tmp*/ true,
+    )
+    .materialize_project_roots_with_workspace_roots(std::slice::from_ref(&cwd));
 
     let output = process_exec_tool_call(
         ExecParams {
@@ -422,44 +459,6 @@ async fn windows_elevated_unified_exec_enforces_managed_deny_reads() -> anyhow::
                 .features
                 .enable(Feature::UnifiedExec)
                 .expect("test config should allow unified exec");
-
-            let file_system_sandbox_policy = FileSystemSandboxPolicy::restricted(vec![
-                FileSystemSandboxEntry {
-                    path: FileSystemPath::Special {
-                        value: FileSystemSpecialPath::Root,
-                    },
-                    access: FileSystemAccessMode::Read,
-                    missing_path_behavior: None,
-                },
-                FileSystemSandboxEntry {
-                    path: FileSystemPath::Special {
-                        value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
-                    },
-                    access: FileSystemAccessMode::Write,
-                    missing_path_behavior: None,
-                },
-                FileSystemSandboxEntry {
-                    path: FileSystemPath::GlobPattern {
-                        pattern: "**/*.env".to_string(),
-                    },
-                    access: FileSystemAccessMode::Deny,
-                    missing_path_behavior: None,
-                },
-                FileSystemSandboxEntry {
-                    path: FileSystemPath::Path {
-                        path: config.cwd.join("exact-secret.txt").into(),
-                    },
-                    access: FileSystemAccessMode::Deny,
-                    missing_path_behavior: None,
-                },
-            ]);
-            config
-                .permissions
-                .set_permission_profile(PermissionProfile::from_runtime_permissions(
-                    &file_system_sandbox_policy,
-                    NetworkSandboxPolicy::Restricted,
-                ))
-                .expect("set managed deny-read permission profile");
         })
         .with_workspace_setup(|cwd, _fs| async move {
             std::fs::write(
@@ -507,11 +506,50 @@ async fn windows_elevated_unified_exec_enforces_managed_deny_reads() -> anyhow::
     )
     .await;
 
-    let permission_profile = harness
-        .test()
-        .config
-        .permissions
-        .effective_permission_profile();
+    let cwd = harness.test().config.cwd.clone();
+    let file_system_sandbox_policy = FileSystemSandboxPolicy::restricted(vec![
+        FileSystemSandboxEntry {
+            path: FileSystemPath::Special {
+                value: FileSystemSpecialPath::Root,
+            },
+            access: FileSystemAccessMode::Read,
+            missing_path_behavior: None,
+        },
+        FileSystemSandboxEntry {
+            path: FileSystemPath::Special {
+                value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
+            },
+            access: FileSystemAccessMode::Write,
+            missing_path_behavior: None,
+        },
+        FileSystemSandboxEntry {
+            path: FileSystemPath::GlobPattern {
+                pattern: "**/*.env".to_string(),
+            },
+            access: FileSystemAccessMode::Deny,
+            missing_path_behavior: None,
+        },
+        FileSystemSandboxEntry {
+            path: FileSystemPath::Path {
+                path: cwd.join("exact-secret.txt").into(),
+            },
+            access: FileSystemAccessMode::Deny,
+            missing_path_behavior: None,
+        },
+    ]);
+    let permission_profile = PermissionProfile::from_runtime_permissions(
+        &file_system_sandbox_policy,
+        NetworkSandboxPolicy::Restricted,
+    );
+    // Provision from the host before turn preparation loads AGENTS.md through the filesystem
+    // helper. That nested helper cannot perform the initial elevated setup itself.
+    codex_core::windows_sandbox::run_elevated_setup(
+        &permission_profile,
+        std::slice::from_ref(&cwd),
+        cwd.as_path(),
+        &HashMap::new(),
+        codex_home.path(),
+    )?;
     harness
         .submit_with_permission_profile("read the sandbox fixtures", permission_profile)
         .await?;

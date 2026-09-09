@@ -3,23 +3,34 @@
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { createServer } from "node:http";
 import { homedir } from "node:os";
-import { isAbsolute, join, normalize } from "node:path";
+import { dirname, isAbsolute, join, normalize, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   TaskStateError,
   activeTaskPromptSection,
   formatNativeToolProgress,
   isBridgeProgressReasoning,
+  isExplicitReadOnlyTask,
   normalizeAgentMessageContent,
   referencedPriorTaskPromptSection,
   taskControlPromptSections,
   taskDeliveryDiagnostics,
   taskOwnershipHash,
+  rzMcpModeForTask,
   taskStateFromInput,
 } from "./codebuddy-subagent-task-state.mjs";
 import { projectInstructionsPromptSection } from "./native-project-instructions.mjs";
 import { providerFailureDiagnostics } from "./native-subagent-provider-router.mjs";
+import { exitWhenParentStops } from "./bridge-lifecycle.mjs";
+import {
+  assertProviderBoundaryEnforceable,
+  codexHome,
+  createAuthenticatedBridgeServer,
+  executionPolicy as createExecutionPolicy,
+  loadBridgeBearerToken,
+  sanitizeChildEnvironment,
+} from "./bridge-security.mjs";
 
 const PROVIDER_ID = "antigravity";
 const MODEL_ALIAS = "@preset/codex-subagents";
@@ -39,6 +50,7 @@ const INIT_TIMEOUT_MS = 30 * 1000;
 const SESSION_IDLE_MS = 30 * 60 * 1000;
 const SSE_HEARTBEAT_MS = 15 * 1000;
 const MAX_SESSIONS = 8;
+const MAX_OWNED_SESSION_STATES = 128;
 const QUOTA_CACHE_MS = 30 * 1000;
 const PRIMARY_QUOTA_BUCKET_IDS = ["3p-weekly", "3p-5h"];
 const FALLBACK_QUOTA_BUCKET_IDS = ["gemini-weekly", "gemini-5h"];
@@ -48,37 +60,34 @@ const INTERRUPTED_STREAM_FAILURE = /the stream was interrupted\.\s*please contin
 const STREAM_CONTINUATION_BACKOFF_BASE_MS = 1_000;
 const STREAM_CONTINUATION_BACKOFF_MAX_MS = 10_000;
 const STREAM_CONTINUATION_RECOVERY_BUDGET_MS = 45_000;
-const CENTRAL_CONFIG = join(homedir(), ".codex", "subagent-models.json");
+const CODEX_HOME = codexHome();
+const CENTRAL_CONFIG = join(CODEX_HOME, "subagent-models.json");
 const AGY_EXE = join(process.env.LOCALAPPDATA || join(homedir(), "AppData", "Local"), "agy", "bin", "agy.exe");
-const MCP_CONFIG = join(homedir(), ".gemini", "config", "mcp_config.json");
+const SCRIPT_DIRECTORY = dirname(fileURLToPath(import.meta.url));
+const MCP_SERVER_SCRIPT = join(SCRIPT_DIRECTORY, "devin-rzmcp-lazy-proxy.mjs");
+const ISOLATED_HOME = join(CODEX_HOME, "antigravity-bridge", "home");
+const ISOLATED_CONFIG_DIRECTORY = join(ISOLATED_HOME, ".gemini", "config");
+const MCP_CONFIG = join(ISOLATED_CONFIG_DIRECTORY, "mcp_config.json");
 const LAZY_MCP_SERVER = "rzcodex-lazy";
-const AGENT_ID = "rzcodex-native";
-const AGENT_DEFINITION_PATH = join(homedir(), ".gemini", "config", "agents", AGENT_ID, "agent.md");
-const AGENT_DEFINITION = `---
-name: ${AGENT_ID}
-description: Restricted primary agent used by RzCodex native workers.
-tools:
-  - view_file
-  - list_dir
-  - find_by_name
-  - grep_search
-  - run_command
-  - manage_task
-  - write_to_file
-  - replace_file_content
-  - search_web
-  - read_url_content
-mainAgent: true
-subagent: false
-forceDisableFundamentalComponents: true
-commandExecutionPolicy: eager
-inheritCustomizations: false
----
+const AGENT_IDS = Object.freeze({
+  main: "rzcodex-main",
+  readOnly: "rzcodex-native-readonly",
+  noValidation: "rzcodex-native-no-validation",
+});
+const READ_TOOLS = Object.freeze(["view_file", "list_dir", "find_by_name", "grep_search", "search_web", "read_url_content"]);
+const WRITE_TOOLS = Object.freeze(["write_to_file", "replace_file_content"]);
+const MAIN_TOOLS = Object.freeze([...READ_TOOLS, "run_command", "manage_task", ...WRITE_TOOLS]);
+const AGENT_PREAMBLE = "You are a bounded native agent. Never delegate or invoke another agent. Honor the supplied workspace and task policy exactly. Keep each reasoning/tool cycle focused and return promptly when complete or concretely blocked.";
 
-# RzCodex native worker
+function agentDefinition(id, description, tools) {
+  return `---\nname: ${id}\ndescription: ${description}\ntools:\n${tools.map((tool) => `  - ${tool}`).join("\n")}\nmainAgent: true\nsubagent: false\nforceDisableFundamentalComponents: true\ncommandExecutionPolicy: eager\ninheritCustomizations: false\n---\n\n# RzCodex managed agent\n\n${AGENT_PREAMBLE}\n`;
+}
 
-You are already a bounded native sub-agent owned by a separate Codex main agent. Work directly on the assigned task. Never delegate, invoke another agent, define an agent, or create background work. Honor project AGENTS.md ownership boundaries exactly; when builds, tests, editor control, PIE, runtime validation, or RzMCP execution are reserved to the parent, do not invoke them and instead report the exact checks the parent should run. Use run_command for read-only inspection only; never edit, create, move, delete, build, test, or invoke a side-effecting script through it. On Windows, use PowerShell-native commands, single-quote ripgrep patterns containing |, and never assume Unix-only commands such as head are installed. A long run_command may be moved to the background by the client runtime; manage only that command with manage_task and do not poll it repeatedly. If manage_task reports that exact command is still running and there is no other useful work, schedule at most one wait of 10 seconds or less with Prompt "Wait for task-N to finish" and TimerCondition set to that exact task; never use schedule for future work, recurring work, delegation, or a new prompt. Use the dedicated file tools for file mutations. Keep each reasoning/tool cycle focused, return promptly when the task is complete, and return a concise concrete blocker or question when the main agent must decide something.
-`;
+const AGENT_DEFINITIONS = new Map([
+  [AGENT_IDS.main, agentDefinition(AGENT_IDS.main, "RzCodex primary agent.", MAIN_TOOLS)],
+  [AGENT_IDS.readOnly, agentDefinition(AGENT_IDS.readOnly, "Read-only RzCodex native worker.", READ_TOOLS)],
+  [AGENT_IDS.noValidation, agentDefinition(AGENT_IDS.noValidation, "File-editing RzCodex worker without shell or validation tools.", [...READ_TOOLS, ...WRITE_TOOLS])],
+]);
 const MUTATION_TOOLS = new Set(["multi_replace_file_content", "replace_file_content", "sed_file", "write_to_file"]);
 const BOUNDED_WAIT_TOOL = "schedule";
 const MAX_BOUNDED_WAIT_SECONDS = 10;
@@ -139,26 +148,65 @@ function requireString(value, label) {
   return value;
 }
 
-function sanitizedEnvironment(source = process.env) {
-  const env = { ...source, NO_COLOR: "1" };
-  for (const key of [
-    "ANTHROPIC_API_KEY", "AZURE_OPENAI_API_KEY", "CODEBUDDY_API_KEY", "CODEX_API_KEY",
-    "COGNITION_API_KEY", "COMMAND_CODE_API_KEY", "DEVIN_API_KEY", "GEMINI_API_KEY",
-    "GOOGLE_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_CLOUD_PROJECT",
-    "OPENAI_API_KEY", "OPENAI_ORG_ID", "OPENAI_PROJECT_ID", "OPENROUTER_API_KEY",
-    "TENCENT_API_KEY", "TENCENTCLOUD_SECRET_ID", "TENCENTCLOUD_SECRET_KEY",
-    "VERTEX_AI_API_KEY",
-  ]) delete env[key];
-  return env;
+function sanitizedEnvironment(policy = createExecutionPolicy(), source = process.env) {
+  return sanitizeChildEnvironment(source, {
+    credentialScope: "none",
+    overrides: {
+      HOME: ISOLATED_HOME,
+      USERPROFILE: ISOLATED_HOME,
+      RZCODEX_SUBAGENT_RZMCP_MODE: policy.rzMcpMode,
+    },
+  });
 }
 
-function ensureAgentDefinition() {
-  mkdirSync(join(homedir(), ".gemini", "config", "agents", AGENT_ID), { recursive: true });
-  const current = existsSync(AGENT_DEFINITION_PATH)
-    ? readFileSync(AGENT_DEFINITION_PATH, "utf8")
-    : null;
-  if (current !== AGENT_DEFINITION) writeFileSync(AGENT_DEFINITION_PATH, AGENT_DEFINITION, "utf8");
-  return sha256(AGENT_DEFINITION);
+function writeExactFile(path, content) {
+  mkdirSync(dirname(path), { recursive: true });
+  const current = existsSync(path) ? readFileSync(path, "utf8") : null;
+  if (current !== content) writeFileSync(path, content, "utf8");
+}
+
+function ensureIsolatedRuntimeFiles() {
+  if (!existsSync(MCP_SERVER_SCRIPT)) {
+    throw new BridgeError(`Antigravity lazy MCP proxy is missing at ${MCP_SERVER_SCRIPT}`, 500);
+  }
+  const mcpContent = `${json({
+    mcpServers: {
+      [LAZY_MCP_SERVER]: { command: process.execPath, args: [MCP_SERVER_SCRIPT] },
+    },
+  })}\n`;
+  writeExactFile(MCP_CONFIG, mcpContent);
+  const definitionHashes = {};
+  for (const [id, definition] of AGENT_DEFINITIONS) {
+    writeExactFile(join(ISOLATED_CONFIG_DIRECTORY, "agents", id, "agent.md"), definition);
+    definitionHashes[id] = sha256(definition);
+  }
+  return Object.freeze(definitionHashes);
+}
+
+function executionPolicyForContext(mainAgent, taskState) {
+  if (mainAgent) return createExecutionPolicy();
+  const task = taskState.activeTask?.text || "";
+  const readOnly = taskState.activeTask?.intent === "analysis" || isExplicitReadOnlyTask(task);
+  return createExecutionPolicy({
+    readOnly,
+    validationRestricted: !readOnly,
+    rzMcpMode: rzMcpModeForTask(task, readOnly),
+  });
+}
+
+function agentProfileFor(mainAgent, policy) {
+  const id = mainAgent
+    ? AGENT_IDS.main
+    : policy.readOnly ? AGENT_IDS.readOnly : AGENT_IDS.noValidation;
+  const tools = mainAgent ? MAIN_TOOLS : policy.readOnly ? READ_TOOLS : [...READ_TOOLS, ...WRITE_TOOLS];
+  const boundary = {
+    fileWrites: tools.some((tool) => WRITE_TOOLS.includes(tool)) ? "unrestricted" : "disabled",
+    shell: tools.includes("run_command") ? "unrestricted" : "disabled",
+    validationTools: tools.includes("run_command") ? "unrestricted" : "disabled",
+    editorControl: tools.includes("run_command") ? "unrestricted" : "disabled",
+  };
+  assertProviderBoundaryEnforceable("Antigravity", boundary, policy);
+  return Object.freeze({ id, tools, boundary, mode: policy.readOnly ? "plan" : "accept-edits" });
 }
 
 function providerFailureDetail(result, stderr) {
@@ -185,7 +233,8 @@ function providerFailureDetail(result, stderr) {
 function attachTurnProgress(error, turn) {
   error.toolCalls = turn.toolStepKeys.size;
   error.toolNames = [...turn.toolNames];
-  error.mutationToolCalls = turn.mutationToolStepKeys.size;
+  error.mutationToolCalls = turn.mutationToolStartedKeys?.size ?? turn.mutationToolStepKeys.size;
+  error.successfulMutationToolCalls = turn.mutationToolStepKeys.size;
   error.rzMcpTools = [...turn.rzMcpTools];
   error.subagentActivity = turn.subagentActivity;
   error.forbiddenToolName = turn.forbiddenToolName;
@@ -396,11 +445,21 @@ function verifyLazyMcpConfig() {
   } catch (error) {
     throw new BridgeError(`Cannot read Antigravity MCP configuration: ${error.message}`, 500);
   }
-  const server = parsed?.mcpServers?.[LAZY_MCP_SERVER];
-  if (!server || server.disabled === true || typeof server.command !== "string") {
-    throw new BridgeError(`Antigravity MCP server ${LAZY_MCP_SERVER} is not enabled`, 500);
+  const servers = parsed?.mcpServers;
+  if (!servers || typeof servers !== "object" || Array.isArray(servers)) {
+    throw new BridgeError("Antigravity isolated MCP configuration is invalid", 500);
   }
-  return { command: server.command, argumentCount: Array.isArray(server.args) ? server.args.length : 0 };
+  const serverNames = Object.keys(servers);
+  const server = servers[LAZY_MCP_SERVER];
+  if (
+    serverNames.length !== 1
+    || serverNames[0] !== LAZY_MCP_SERVER
+    || server?.command !== process.execPath
+    || json(server?.args) !== json([MCP_SERVER_SCRIPT])
+  ) {
+    throw new BridgeError(`Antigravity isolated MCP configuration must expose only ${LAZY_MCP_SERVER}`, 500);
+  }
+  return { path: MCP_CONFIG, command: server.command, argumentCount: server.args.length, isolated: true };
 }
 
 function contentText(value, label) {
@@ -447,8 +506,11 @@ function workingDirectoryFrom(body, input) {
   throw new BridgeError("Antigravity request has no valid authoritative working directory");
 }
 
-function delegationContract(requestId, workingDirectory) {
-  return `[Native Antigravity delegation contract]\nRzCodex request ID: ${requestId}\nWork directly in the supplied workspace as the bounded native sub-agent. Use Antigravity's local file and shell tools; do not emit Codex tool calls and do not invoke Antigravity subagents. AGY's run_command tool starts in an internal scratch directory, so every shell command must begin by changing to the authoritative workspace with Set-Location -LiteralPath, and every file-tool path must be absolute. For Unreal/RzMCP work, use only MCP server ${LAZY_MCP_SERVER}: discover a small focused schema with search_rzmcp_tools, then call only a discovered tool through call_rzmcp_tool. Never request or enumerate the full RzMCP catalog. Return concise evidence as soon as the bounded task is complete or genuinely blocked.\nAuthoritative workspace: ${workingDirectory}`;
+function delegationContract(requestId, workingDirectory, policy) {
+  const localTools = policy.readOnly
+    ? "Use only Antigravity's read-only file/search tools; shell and file writes are disabled."
+    : "Use Antigravity's file read/search/edit tools; shell, builds, tests, and editor control are disabled.";
+  return `[Native Antigravity delegation contract]\nRzCodex request ID: ${requestId}\nWork directly in the supplied workspace as the bounded native sub-agent. ${localTools} Do not emit Codex tool calls and do not invoke Antigravity subagents. Every file-tool path must be absolute. For Unreal/RzMCP work, use only MCP server ${LAZY_MCP_SERVER}: discover a small focused schema with search_rzmcp_tools, then call only a discovered tool through call_rzmcp_tool. Never request or enumerate the full RzMCP catalog. Return concise evidence as soon as the bounded task is complete or genuinely blocked.\nAuthoritative workspace: ${workingDirectory}`;
 }
 
 function mainAgentContract(requestId, workingDirectory) {
@@ -463,13 +525,23 @@ function messageKey(item, text) {
 function historyEntries(input, taskState) {
   const agentMessages = new Map(taskState.messages.map((message) => [message.index, message]));
   const entries = [];
+  let latestUserMessageIndex = -1;
+  for (let index = 0; index < input.length; index += 1) {
+    if (
+      input[index]?.type === "message"
+      && input[index]?.role === "user"
+      && (!taskState.activeTask || index > taskState.activeTask.index)
+    ) latestUserMessageIndex = index;
+  }
   for (let index = 0; index < input.length; index += 1) {
     const item = assertObject(input[index], `input[${index}]`);
     let text = "";
     let checkpoint = false;
+    let control = false;
     if (item.type === "message") {
       if (["system", "developer"].includes(item.role)) continue;
       text = `[${item.role}]\n${contentText(item.content, `input[${index}].content`)}`;
+      control = index === latestUserMessageIndex;
     } else if (item.type === "agent_message") {
       const message = agentMessages.get(index) ?? {
         ...normalizeAgentMessageContent(item.content, `input[${index}].content`),
@@ -481,6 +553,7 @@ function historyEntries(input, taskState) {
       if (message.newTask) continue;
       if (message.index === taskState.referencedPriorControl?.index) continue;
       checkpoint = message.checkpoint;
+      control = true;
       text = `[Inter-agent message ${message.author} -> ${message.recipient}]\n${message.text}`;
     } else if (["function_call", "custom_tool_call", "tool_search_call"].includes(item.type)) {
       text = `[Prior Codex tool request ${item.name || "tool_search"}; call_id=${item.call_id}]`;
@@ -498,8 +571,16 @@ function historyEntries(input, taskState) {
     } else {
       throw new BridgeError(`input[${index}] has unsupported type ${json(item.type)}`);
     }
-    text = text.slice(-MAX_HISTORY_ENTRY_CHARS);
-    entries.push({ index, checkpoint, text, key: messageKey(item, text) });
+    if (text.length > MAX_HISTORY_ENTRY_CHARS) {
+      if (control) {
+        throw new BridgeError(
+          `Antigravity current control entry input[${index}] is ${text.length} characters; maximum is ${MAX_HISTORY_ENTRY_CHARS}`,
+          400,
+        );
+      }
+      text = `${text.slice(0, MAX_HISTORY_ENTRY_CHARS - 24)}\n[history entry truncated]`;
+    }
+    entries.push({ index, checkpoint, control, text, key: messageKey(item, text) });
   }
   return entries;
 }
@@ -507,11 +588,19 @@ function historyEntries(input, taskState) {
 function boundedEntries(entries, budget, activeTaskText, entrySeparatorChars = 0) {
   const retained = [];
   let remaining = Math.max(0, budget);
-  for (let index = entries.length - 1; index >= 0 && remaining > entrySeparatorChars; index -= 1) {
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
     let text = entries[index].text;
     if (activeTaskText) text = text.split(activeTaskText).join("[duplicate active task omitted]");
     const textBudget = remaining - entrySeparatorChars;
-    if (text.length > textBudget) text = text.slice(-textBudget);
+    if (text.length > textBudget) {
+      if (entries[index].control) {
+        throw new BridgeError(
+          `Antigravity current control entry requires ${text.length} characters but only ${Math.max(0, textBudget)} remain`,
+          400,
+        );
+      }
+      continue;
+    }
     retained.unshift({ ...entries[index], text });
     remaining -= text.length + entrySeparatorChars;
   }
@@ -541,15 +630,22 @@ function requestContext(body) {
     if (error instanceof TaskStateError) throw new BridgeError(error.message);
     throw error;
   }
+  if (!mainAgent && !taskState.activeTask) {
+    throw new BridgeError("Antigravity subagent request has no active NEW_TASK", 400);
+  }
   const requestId = randomUUID();
-  const workingDirectory = workingDirectoryFrom(body, input);
+  const workingDirectory = resolve(workingDirectoryFrom(body, input));
   const entries = historyEntries(input, taskState);
   const threadId = typeof body.client_metadata?.thread_id === "string" && body.client_metadata.thread_id
     ? body.client_metadata.thread_id
     : null;
   const conversationKey = threadId || taskState.activeTask?.name || null;
+  const policy = executionPolicyForContext(mainAgent, taskState);
+  const agentProfile = agentProfileFor(mainAgent, policy);
+  const workspaceKey = process.platform === "win32" ? workingDirectory.toLowerCase() : workingDirectory;
+  const compatibilityKey = sha256(json({ workspaceKey, mainAgent, policy }));
   const sessionKey = conversationKey
-    ? `${conversationKey}:${mainAgent ? "main" : "subagent"}`
+    ? `${conversationKey}:${mainAgent ? "main" : "subagent"}:${compatibilityKey}`
     : null;
   return {
     requestId,
@@ -558,6 +654,9 @@ function requestContext(body) {
     sessionKey,
     modelAlias: requestedModel,
     mainAgent,
+    policy,
+    agentProfile,
+    compatibilityKey,
     roleInstructions: mainAgent ? "" : roleInstructionsFrom(body.instructions),
     mainInstructions: mainAgent && typeof body.instructions === "string" ? body.instructions.trim() : "",
     taskState,
@@ -571,7 +670,7 @@ function fullPrompt(context) {
   const sections = [
     context.mainAgent
       ? mainAgentContract(context.requestId, context.workingDirectory)
-      : delegationContract(context.requestId, context.workingDirectory),
+      : delegationContract(context.requestId, context.workingDirectory, context.policy),
     projectInstructionsPromptSection(context.workingDirectory),
   ];
   if (context.mainAgent) {
@@ -616,7 +715,15 @@ function fullPrompt(context) {
 function resumePrompt(context, session) {
   const unseen = context.entries.filter((entry) => !session.seenMessageKeys.has(entry.key));
   const taskControlSections = context.mainAgent ? [] : taskControlPromptSections(context.taskState);
-  const controlChars = taskControlSections.reduce((sum, section) => sum + section.length + 2, 0);
+  const activeTaskNeedsDelivery = !context.mainAgent
+    && context.taskState.activeTask
+    && context.taskState.activeTask.hash !== session.lastDeliveredTaskHash;
+  const activeTask = activeTaskNeedsDelivery ? activeTaskPromptSection(context.taskState) : "";
+  const mandatorySections = [activeTask, ...taskControlSections].filter(Boolean);
+  const controlChars = mandatorySections.reduce((sum, section) => sum + section.length + 2, 0);
+  if (controlChars > MAX_RESUME_PROMPT_CHARS) {
+    throw new BridgeError("Antigravity current task controls exceeded the resume prompt limit", 400);
+  }
   const retained = boundedEntries(
     unseen,
     MAX_RESUME_PROMPT_CHARS - controlChars,
@@ -627,11 +734,15 @@ function resumePrompt(context, session) {
     : `[Native Antigravity resume]\nContinue the retained active task in ${context.workingDirectory}. Task hash: ${context.taskState.activeTask?.hash || "none"}. The original task remains authoritative; do not restart the investigation.`;
   const sections = [
     resumeHeader,
+    ...(session.providerWorkStarted
+      ? ["[Retained provider ownership - authoritative]\nProvider tool work already started in this exact Antigravity conversation. Continue from retained state and do not replay completed work."]
+      : []),
     ...retained.filter((entry) => !entry.checkpoint).map((entry) => entry.text),
     ...retained.filter((entry) => entry.checkpoint).map((entry) => entry.text),
+    ...(activeTask ? [activeTask] : []),
     ...taskControlSections,
   ];
-  if (retained.length === 0) sections.push("Continue from the retained provider state and return when complete or concretely blocked.");
+  if (retained.length === 0 && !activeTask) sections.push("Continue from the retained provider state and return when complete or concretely blocked.");
   return sections.join("\n\n");
 }
 
@@ -762,6 +873,7 @@ async function runWithInterruptedStreamRecovery(
   const conversationId = session.init?.conversationId || null;
   const progress = emptyInterruptedProgress();
   let currentPrompt = prompt;
+  let currentDelivery = options.delivery || null;
   let attempt = 0;
   let recoveryDeadline = null;
   for (;;) {
@@ -796,9 +908,12 @@ async function runWithInterruptedStreamRecovery(
       const result = await session.run(
         currentPrompt,
         signal,
-        (event) => onProgress({ ...event, index: progress.toolCalls + event.index }),
+        (event) => onProgress(event.kind === "tool"
+          ? { ...event, index: progress.toolCalls + event.index }
+          : event),
         remainingMs,
         remainingUncommittedMs,
+        currentDelivery,
       );
       if ((result.conversationId || null) !== conversationId) {
         session.close?.();
@@ -844,33 +959,54 @@ async function runWithInterruptedStreamRecovery(
         throw error;
       }
       currentPrompt = interruptedStreamContinuationPrompt(session);
+      currentDelivery = null;
     }
   }
 }
 
-function sessionArguments(selectedModel, conversationId = null) {
+function sessionArguments(selectedModel, agentProfile, conversationId = null) {
   return [
     "--input-format", "stream-json", "--output-format", "stream-json",
-    "--agent", AGENT_ID,
+    "--agent", agentProfile.id,
+    "--mode", agentProfile.mode,
     "--model", selectedModel.id,
     ...(selectedModel.effort ? ["--effort", selectedModel.effort] : []),
     ...(conversationId ? ["--conversation", conversationId] : []),
     "--dangerously-skip-permissions", "--disable-slash-commands",
+    ...(agentProfile.boundary.shell === "disabled" ? ["--sandbox"] : []),
     "--print-timeout", "30m",
   ];
 }
 
 class AntigravitySession {
-  constructor(key, workingDirectory, activeTaskHash, selectedModel, onClose, conversationId = null) {
+  constructor(
+    key,
+    threadId,
+    workingDirectory,
+    activeTaskHash,
+    selectedModel,
+    policy,
+    agentProfile,
+    onClose,
+    retained = null,
+  ) {
     this.key = key;
+    this.threadId = threadId;
     this.workingDirectory = workingDirectory;
     this.activeTaskHash = activeTaskHash;
     this.model = selectedModel.id;
     this.modelLabel = selectedModel.label;
     this.modelEffort = selectedModel.effort;
-    this.resumeConversationId = conversationId;
+    this.policy = policy;
+    this.agentProfile = agentProfile;
+    this.resumeConversationId = retained?.conversationId || null;
     this.onClose = onClose;
-    this.seenMessageKeys = new Set();
+    this.seenMessageKeys = new Set(retained?.seenMessageKeys || []);
+    this.lastDeliveredTaskHash = retained?.lastDeliveredTaskHash || null;
+    this.promptDelivered = retained?.promptDelivered === true;
+    this.providerWorkStarted = retained?.providerWorkStarted === true;
+    this.mutationWorkStarted = retained?.mutationWorkStarted === true;
+    this.released = false;
     this.child = null;
     this.buffer = "";
     this.stderr = "";
@@ -891,11 +1027,12 @@ class AntigravitySession {
     if (this.child) return this.initPromise;
     const args = sessionArguments(
       { id: this.model, effort: this.modelEffort },
+      this.agentProfile,
       this.resumeConversationId,
     );
     this.child = spawn(AGY_EXE, args, {
       cwd: this.workingDirectory,
-      env: sanitizedEnvironment(),
+      env: sanitizedEnvironment(this.policy),
       windowsHide: true,
       stdio: ["pipe", "pipe", "pipe"],
     });
@@ -947,7 +1084,7 @@ class AntigravitySession {
         this.fail(new BridgeError(`Antigravity initialized unexpected model ${json(init.model)}`, 502));
         return;
       }
-      if (init.agent !== AGENT_ID) {
+      if (init.agent !== this.agentProfile.id) {
         this.fail(new BridgeError(`Antigravity initialized unexpected agent ${json(init.agent)}`, 502));
         return;
       }
@@ -986,8 +1123,25 @@ class AntigravitySession {
         const stepKey = `${step.conversation_id || this.init?.conversationId || "unknown"}:${stepIndex}`;
         const firstObservation = !this.turn.toolStepKeys.has(stepKey);
         this.turn.toolStepKeys.add(stepKey);
+        this.providerWorkStarted = true;
+        this.turn.mutationToolStartedKeys ||= new Set();
+        if (firstObservation && MUTATION_TOOLS.has(name)) {
+          this.turn.mutationToolStartedKeys.add(stepKey);
+          this.mutationWorkStarted = true;
+        }
+        if (firstObservation) {
+          this.turn.onProgress?.({
+            kind: "tool_started",
+            name: typeof name === "string" ? name : "unknown_tool",
+          });
+        }
         this.turn.completedToolStepKeys ||= new Set();
-        const completed = ["DONE", "COMPLETED", "SUCCESS"].includes(String(step.state || "").toUpperCase());
+        const completed = ["DONE", "COMPLETED", "SUCCESS", "ERROR", "FAILED"].includes(String(step.state || "").toUpperCase());
+        const successful = completed
+          && !["ERROR", "FAILED"].includes(String(step.state || "").toUpperCase())
+          && !step.error
+          && step.is_error !== true
+          && step.tool_info?.is_error !== true;
         const firstCompletedObservation = completed && !this.turn.completedToolStepKeys.has(stepKey);
         if (completed) this.turn.completedToolStepKeys.add(stepKey);
         if (typeof name === "string") this.turn.toolNames.add(name);
@@ -1000,7 +1154,7 @@ class AntigravitySession {
             input: parameters,
           });
         }
-        if (firstCompletedObservation && MUTATION_TOOLS.has(name)) {
+        if (firstCompletedObservation && successful && MUTATION_TOOLS.has(name)) {
           this.turn.mutationToolStepKeys.add(stepKey);
         }
         const invalidBoundedWait = name === BOUNDED_WAIT_TOOL
@@ -1018,7 +1172,15 @@ class AntigravitySession {
         if (name === "call_mcp_tool") {
           const server = parameters.ServerName || parameters.server_name || parameters.server || parameters.mcp_server;
           const tool = parameters.ToolName || parameters.tool_name || parameters.name;
-          if (server === LAZY_MCP_SERVER && typeof tool === "string") {
+          if (server !== LAZY_MCP_SERVER) {
+            this.turn.forbiddenToolName = `call_mcp_tool:${String(server || "unknown")}`;
+            this.fail(attachTurnProgress(
+              new BridgeError(`Antigravity attempted non-isolated MCP server ${json(server)}`, 502, "provider_state_changed"),
+              this.turn,
+            ));
+            return;
+          }
+          if (typeof tool === "string") {
             this.turn.rzMcpTools.add(tool);
             clearUncommittedRouteTimer(this.turn);
           }
@@ -1037,7 +1199,14 @@ class AntigravitySession {
     if (event?.event === "result" && this.turn) this.finishTurn(event.result);
   }
 
-  run(prompt, signal, onProgress = () => {}, timeoutMs = REQUEST_TIMEOUT_MS, uncommittedTimeoutMs = null) {
+  run(
+    prompt,
+    signal,
+    onProgress = () => {},
+    timeoutMs = REQUEST_TIMEOUT_MS,
+    uncommittedTimeoutMs = null,
+    delivery = null,
+  ) {
     if (!this.init) throw new BridgeError("Antigravity session is not initialized", 500);
     if (this.turn) throw new BridgeError("Antigravity session already has an active turn", 409);
     if (signal?.aborted) throw new BridgeError("Client disconnected before Antigravity started", 499);
@@ -1055,6 +1224,7 @@ class AntigravitySession {
         toolNames: new Set(),
         toolStepKeys: new Set(),
         completedToolStepKeys: new Set(),
+        mutationToolStartedKeys: new Set(),
         mutationToolStepKeys: new Set(),
         rzMcpTools: new Set(),
         subagentActivity: false,
@@ -1077,7 +1247,13 @@ class AntigravitySession {
       };
       this.turn = turn;
       this.child.stdin.write(`${json({ event: "user", message: { content: prompt } })}\n`, (error) => {
-        if (error) this.fail(new BridgeError(`Cannot deliver the task to Antigravity: ${error.message}`, 502));
+        if (error) {
+          this.fail(new BridgeError(`Cannot deliver the task to Antigravity: ${error.message}`, 502));
+          return;
+        }
+        this.promptDelivered = true;
+        if (delivery?.taskHash) this.lastDeliveredTaskHash = delivery.taskHash;
+        for (const key of delivery?.messageKeys || []) this.seenMessageKeys.add(key);
       });
     });
   }
@@ -1163,11 +1339,26 @@ class AntigravitySession {
     if (this.child && !this.child.killed) this.child.kill();
     this.onClose(this);
   }
+
+  release() {
+    this.released = true;
+    this.close();
+  }
 }
 
 function writeSse(response, type, payload) {
   if (response.destroyed || response.writableEnded) return;
   response.write(`event: ${type}\ndata: ${json({ type, ...payload })}\n\n`);
+}
+
+function providerWorkStartedMetadata(nativeToolName) {
+  const boundedToolName = typeof nativeToolName === "string"
+    ? nativeToolName.slice(0, 128)
+    : null;
+  return {
+    provider_work_started: true,
+    ...(boundedToolName ? { native_tool_name: boundedToolName } : {}),
+  };
 }
 
 function writeHeartbeat(response, responseId, modelAlias = MODEL_ALIAS) {
@@ -1303,20 +1494,27 @@ function readRequestBody(request) {
   });
 }
 
-const route = centralRoute();
-if (!existsSync(AGY_EXE)) throw new BridgeError(`Antigravity CLI is missing at ${AGY_EXE}`, 500);
-const agentDefinitionHash = ensureAgentDefinition();
+const SELF_TEST_MODE = process.argv.includes("--self-test");
+const route = SELF_TEST_MODE
+  ? { primaryModel: "self-test-primary", quotaFallbackModel: "self-test-fallback", inputModalities: ["text"] }
+  : centralRoute();
+if (!SELF_TEST_MODE && !existsSync(AGY_EXE)) throw new BridgeError(`Antigravity CLI is missing at ${AGY_EXE}`, 500);
+const agentDefinitionHashes = SELF_TEST_MODE
+  ? Object.fromEntries([...AGENT_DEFINITIONS].map(([id, definition]) => [id, sha256(definition)]))
+  : ensureIsolatedRuntimeFiles();
 const models = {
-  primary: { id: route.primaryModel, label: verifyModelAvailable(route.primaryModel), effort: null },
+  primary: { id: route.primaryModel, label: SELF_TEST_MODE ? route.primaryModel : verifyModelAvailable(route.primaryModel), effort: null },
   fallback: {
     id: route.quotaFallbackModel,
-    label: verifyModelAvailable(route.quotaFallbackModel),
+    label: SELF_TEST_MODE ? route.quotaFallbackModel : verifyModelAvailable(route.quotaFallbackModel),
     effort: REQUIRED_EFFORT,
   },
 };
-const mcpConfig = verifyLazyMcpConfig();
+const mcpConfig = SELF_TEST_MODE
+  ? { path: MCP_CONFIG, command: process.execPath, argumentCount: 1, isolated: true }
+  : verifyLazyMcpConfig();
 const quotaRouter = new AntigravityQuotaRouter();
-quotaRouter.snapshot(true);
+if (!SELF_TEST_MODE) quotaRouter.snapshot(true);
 const sessions = new Map();
 const retainedConversations = new Map();
 const runtime = {
@@ -1361,20 +1559,53 @@ const runtime = {
 
 function removeSession(session) {
   if (session.key && sessions.get(session.key) === session) sessions.delete(session.key);
+  if (session.released && session.key) retainedConversations.delete(session.key);
+  const conversationId = session.init?.conversationId;
+  if (session.key && conversationId && !session.released) {
+    retainedConversations.set(session.key, {
+      conversationId,
+      model: session.model,
+      taskHash: session.activeTaskHash,
+      workingDirectory: session.workingDirectory,
+      policy: session.policy,
+      agentProfileId: session.agentProfile.id,
+      seenMessageKeys: [...session.seenMessageKeys],
+      lastDeliveredTaskHash: session.lastDeliveredTaskHash,
+      promptDelivered: session.promptDelivered,
+      providerWorkStarted: session.providerWorkStarted,
+      mutationWorkStarted: session.mutationWorkStarted,
+    });
+  }
 }
 
 function evictIdleSession() {
-  const idle = [...sessions.values()].filter((session) => !session.busy)
+  const idle = [...sessions.values()].filter((session) => !session.busy && session.released)
     .sort((left, right) => left.lastUsedAt - right.lastUsedAt)[0];
-  if (!idle) throw new BridgeError(`All ${MAX_SESSIONS} Antigravity sessions are busy`, 429);
+  if (!idle) {
+    throw new BridgeError(
+      `Antigravity session capacity ${MAX_SESSIONS} is occupied by owned conversations; none will be evicted`,
+      429,
+    );
+  }
   idle.close();
 }
 
 async function sessionFor(context) {
+  const busyForThread = [...sessions.values()].find((candidate) => (
+    context.threadId && candidate.threadId === context.threadId && candidate.busy
+  ));
+  if (busyForThread) {
+    throw new BridgeError("Antigravity already has an active turn for this thread", 409);
+  }
   let session = context.sessionKey ? sessions.get(context.sessionKey) : null;
   const taskHash = taskOwnershipHash(context.taskState);
   let retained = context.sessionKey ? retainedConversations.get(context.sessionKey) : null;
-  if (retained && retained.taskHash !== taskHash) {
+  if (retained && (
+    retained.taskHash !== taskHash
+    || retained.workingDirectory !== context.workingDirectory
+    || retained.agentProfileId !== context.agentProfile.id
+    || json(retained.policy) !== json(context.policy)
+  )) {
     retainedConversations.delete(context.sessionKey);
     retained = null;
   }
@@ -1385,11 +1616,6 @@ async function sessionFor(context) {
   );
   if (taskIncompatible) {
     session.close();
-    session = null;
-  }
-  if (session?.busy) {
-    runtime.supersededTurns += 1;
-    session.close(new BridgeError("Antigravity turn superseded by a newer turn for the same worker", 409));
     session = null;
   }
   const selectedModel = quotaRouter.select(session?.model || null);
@@ -1410,19 +1636,29 @@ async function sessionFor(context) {
     retained = null;
   }
   if (sessions.size >= MAX_SESSIONS) evictIdleSession();
+  if (!retained && retainedConversations.size + sessions.size >= MAX_OWNED_SESSION_STATES) {
+    throw new BridgeError(
+      `Antigravity owned-session capacity ${MAX_OWNED_SESSION_STATES} is exhausted; retained state will not be deleted`,
+      429,
+    );
+  }
   const key = context.sessionKey || `ephemeral:${context.requestId}`;
   session = new AntigravitySession(
     key,
+    context.threadId,
     context.workingDirectory,
     taskHash,
     selectedModel,
+    context.policy,
+    context.agentProfile,
     removeSession,
-    resumeConversationId,
+    resumeConversationId ? retained : null,
   );
   sessions.set(key, session);
   runtime.sessionsCreated += 1;
   await session.start();
-  return { session, reused: false };
+  if (retained && context.sessionKey) retainedConversations.delete(context.sessionKey);
+  return { session, reused: Boolean(resumeConversationId) };
 }
 
 async function handleResponses(request, response) {
@@ -1448,20 +1684,9 @@ async function handleResponses(request, response) {
   const progress = createProgressEmitter(response);
   const controller = new AbortController();
   let selectedSession;
+  let providerWorkStartReported = false;
   response.once("close", () => {
     if (response.writableEnded) return;
-    const conversationId = selectedSession?.init?.conversationId;
-    if (
-      context.sessionKey
-      && conversationId
-      && selectedSession?.turn?.completedToolStepKeys?.size > 0
-    ) {
-      retainedConversations.set(context.sessionKey, {
-        conversationId,
-        model: selectedSession.model,
-        taskHash: selectedSession.activeTaskHash,
-      });
-    }
     controller.abort();
   });
   const heartbeat = setInterval(() => writeHeartbeat(response, responseId, context.modelAlias), SSE_HEARTBEAT_MS);
@@ -1470,29 +1695,46 @@ async function handleResponses(request, response) {
     selectedSession = session;
     progress.emit(`${context.mainAgent ? "Antigravity main agent" : "Antigravity native worker"} started with ${session.modelLabel}.\n`);
     let prompt = reused ? resumePrompt(context, session) : fullPrompt(context);
-    const diagnosticsFor = (currentPrompt, currentReused) => {
+    const diagnosticsFor = (currentPrompt, currentSession) => {
       if (context.mainAgent) {
-        return { taskId: null, taskName: null, taskHash: null, taskIntent: null, taskDeliveryMode: null, taskPartTypes: [], taskPartLengths: [], completeTaskDelivered: true, activeTaskIncludedThisTurn: true, retainedInProviderSession: currentReused };
+        return { taskId: null, taskName: null, taskHash: null, taskIntent: null, taskDeliveryMode: null, taskPartTypes: [], taskPartLengths: [], completeTaskDelivered: true, activeTaskIncludedThisTurn: true, retainedInProviderSession: Boolean(currentSession?.promptDelivered) };
       }
+      const activeTaskIncludedThisTurn = currentPrompt.includes(context.taskState.activeTask.text);
       try {
         return taskDeliveryDiagnostics(context.taskState, currentPrompt, {
-          activeTaskIncludedThisTurn: !currentReused,
-          retainedInProviderSession: currentReused,
+          activeTaskIncludedThisTurn,
+          retainedInProviderSession: !activeTaskIncludedThisTurn
+            && currentSession.lastDeliveredTaskHash === context.taskState.activeTask.hash,
         });
       } catch (error) {
         if (error instanceof TaskStateError) throw new BridgeError(error.message, 500);
         throw error;
       }
     };
-    let diagnostics = diagnosticsFor(prompt, reused);
+    let diagnostics = diagnosticsFor(prompt, session);
     runtime.lastCompleteTaskDelivered = diagnostics.completeTaskDelivered;
     let result;
     const deadline = Date.now() + REQUEST_TIMEOUT_MS;
-    const runSession = (currentSession, currentPrompt) => runWithInterruptedStreamRecovery(
+    const runSession = (currentSession, currentPrompt, currentDiagnostics) => runWithInterruptedStreamRecovery(
       currentSession,
       currentPrompt,
       controller.signal,
-      ({ index, name, input }) => {
+      ({ kind, index, name, input }) => {
+        if (kind === "tool_started") {
+          if (!providerWorkStartReported) {
+            providerWorkStartReported = true;
+            writeSse(response, "response.in_progress", {
+              response: {
+                id: responseId,
+                object: "response",
+                model: context.modelAlias,
+                status: "in_progress",
+                metadata: providerWorkStartedMetadata(name),
+              },
+            });
+          }
+          return;
+        }
         progress.emit(formatNativeToolProgress("Antigravity", index, name, input));
       },
       ({ backoffMs, conversationId }) => {
@@ -1501,10 +1743,19 @@ async function handleResponses(request, response) {
         runtime.lastStreamContinuationConversationId = conversationId;
         progress.emit(`Antigravity upstream stream interrupted; continuing the same conversation after ${backoffMs}ms.\n`);
       },
-      { deadline, uncommittedRouteDeadline },
+      {
+        deadline,
+        uncommittedRouteDeadline,
+        delivery: {
+          taskHash: currentDiagnostics.activeTaskIncludedThisTurn
+            ? context.taskState.activeTask?.hash || null
+            : null,
+          messageKeys: context.messageKeys,
+        },
+      },
     );
     try {
-      result = await runSession(session, prompt);
+      result = await runSession(session, prompt, diagnostics);
     } catch (error) {
       const modelQuotaFailure = error?.modelQuotaFailure === true;
       if (modelQuotaFailure) quotaRouter.markDepleted(session.model);
@@ -1517,8 +1768,8 @@ async function handleResponses(request, response) {
       selectedSession = session;
       progress.emit(`Antigravity quota route switched to ${session.modelLabel}.\n`);
       prompt = fullPrompt(context);
-      diagnostics = diagnosticsFor(prompt, false);
-      result = await runSession(session, prompt);
+      diagnostics = diagnosticsFor(prompt, session);
+      result = await runSession(session, prompt, diagnostics);
     }
     for (const key of context.messageKeys) session.seenMessageKeys.add(key);
     runtime.completed += 1;
@@ -1569,7 +1820,7 @@ async function handleResponses(request, response) {
       complete_active_task_delivered: diagnostics.completeTaskDelivered,
     }, progressItems, context.modelAlias);
     response.end();
-    if (!context.sessionKey) session.close();
+    if (!context.sessionKey || !context.taskState.checkpointRequested) session.release();
   } catch (error) {
     runtime.failed += 1;
     progress.finish();
@@ -1595,7 +1846,7 @@ async function handleResponses(request, response) {
       },
     });
     response.end();
-    if (selectedSession?.closed === false && !context.sessionKey) selectedSession.close();
+    if (selectedSession?.closed === false && !context.sessionKey) selectedSession.release();
   } finally {
     clearInterval(heartbeat);
   }
@@ -1663,10 +1914,14 @@ function health() {
     configuredModel: route.primaryModel,
     configuredModelLabel: models.primary.label,
     agent: {
-      id: AGENT_ID,
-      definitionPath: AGENT_DEFINITION_PATH,
-      definitionHash: agentDefinitionHash,
-      declarativeToolAllowlist: AGENT_DEFINITION.match(/^  - .+$/gm)?.map((line) => line.slice(4)) || [],
+      ids: AGENT_IDS,
+      definitionRoot: join(ISOLATED_CONFIG_DIRECTORY, "agents"),
+      definitionHashes: agentDefinitionHashes,
+      declarativeToolAllowlists: Object.fromEntries([
+        [AGENT_IDS.main, MAIN_TOOLS],
+        [AGENT_IDS.readOnly, READ_TOOLS],
+        [AGENT_IDS.noValidation, [...READ_TOOLS, ...WRITE_TOOLS]],
+      ]),
       forceDisableFundamentalComponents: true,
       forbiddenToolPolicy: "terminate_committed_turn",
       forbiddenTools: [...FORBIDDEN_AGENT_TOOLS],
@@ -1703,6 +1958,7 @@ function health() {
       idleMilliseconds: SESSION_IDLE_MS,
       maximumSessions: MAX_SESSIONS,
       maximumConcurrentTurns: MAX_SESSIONS,
+      maximumOwnedSessionStates: MAX_OWNED_SESSION_STATES,
       uncommittedRouteTimeoutMs: UNCOMMITTED_ROUTE_TIMEOUT_MS,
     },
     activeSessions: sessions.size,
@@ -1712,9 +1968,19 @@ function health() {
 }
 
 async function selfTest() {
-  const primaryArgs = sessionArguments(models.primary);
-  const fallbackArgs = sessionArguments(models.fallback);
-  if (primaryArgs[primaryArgs.indexOf("--agent") + 1] !== AGENT_ID) {
+  const testPolicy = createExecutionPolicy();
+  const testProfile = agentProfileFor(true, testPolicy);
+  const workStartedMetadata = providerWorkStartedMetadata("replace_file_content");
+  if (
+    workStartedMetadata.provider_work_started !== true
+    || workStartedMetadata.native_tool_name !== "replace_file_content"
+    || providerWorkStartedMetadata("x".repeat(129)).native_tool_name.length !== 128
+  ) {
+    throw new Error("provider work-start metadata contract failed");
+  }
+  const primaryArgs = sessionArguments(models.primary, testProfile);
+  const fallbackArgs = sessionArguments(models.fallback, testProfile);
+  if (primaryArgs[primaryArgs.indexOf("--agent") + 1] !== AGENT_IDS.main) {
     throw new Error("restricted Antigravity agent was not selected");
   }
   if (primaryArgs.includes("--effort")) throw new Error("Opus Thinking received an unsupported effort flag");
@@ -1795,7 +2061,7 @@ async function selfTest() {
     if (!(error instanceof BridgeError) || error.status !== 429) throw error;
   }
   const quotaFailureFor = (toolNames, generatedTokens = 0, message = "Individual quota reached. Resets in 1h.") => {
-    const session = new AntigravitySession("quota-fixture", process.cwd(), "task", models.primary, () => {});
+    const session = new AntigravitySession("quota-fixture", null, process.cwd(), "task", models.primary, testPolicy, testProfile, () => {});
     session.close = () => {};
     session.init = { conversationId: "quota-fixture" };
     let rejected;
@@ -1805,6 +2071,7 @@ async function selfTest() {
       generatedTokens,
       toolNames: new Set(),
       toolStepKeys: new Set(),
+      mutationToolStartedKeys: new Set(),
       mutationToolStepKeys: new Set(),
       rzMcpTools: new Set(),
       subagentActivity: false,
@@ -1851,15 +2118,43 @@ async function selfTest() {
   });
   const uncommittedTimeoutSession = new AntigravitySession(
     "uncommitted-timeout-fixture",
+    null,
     process.cwd(),
     "mutation-task",
     models.fallback,
+    testPolicy,
+    testProfile,
     () => {},
   );
   uncommittedTimeoutSession.init = { conversationId: "uncommitted-timeout-fixture" };
   uncommittedTimeoutSession.initSettled = true;
   uncommittedTimeoutSession.child = fakeChild();
-  const uncommittedTimeoutPromise = uncommittedTimeoutSession.run("task", null, () => {}, 1_000, 5);
+  const toolLifecycleEvents = [];
+  const uncommittedTimeoutPromise = uncommittedTimeoutSession.run(
+    "task",
+    null,
+    (event) => toolLifecycleEvents.push(event),
+    1_000,
+    5,
+  );
+  uncommittedTimeoutSession.consumeEvent({
+    event: "step_update",
+    step_update: {
+      conversation_id: "uncommitted-timeout-fixture",
+      step_index: 0,
+      state: "RUNNING",
+      step_type: "tool",
+      tool_name: "grep_search",
+      tool_info: { name: "grep_search", parameters: {} },
+    },
+  });
+  if (
+    toolLifecycleEvents.length !== 1
+    || toolLifecycleEvents[0].kind !== "tool_started"
+    || toolLifecycleEvents[0].name !== "grep_search"
+  ) {
+    throw new Error("Antigravity native tool start was not reported before completion");
+  }
   uncommittedTimeoutSession.consumeEvent({
     event: "step_update",
     step_update: {
@@ -1871,6 +2166,12 @@ async function selfTest() {
       tool_info: { name: "grep_search", parameters: {} },
     },
   });
+  if (
+    toolLifecycleEvents.length !== 2
+    || toolLifecycleEvents[1].kind !== "tool"
+  ) {
+    throw new Error("Antigravity native tool completion progress was not reported after work start");
+  }
   await new Promise((resolve) => setTimeout(resolve, 15));
   uncommittedTimeoutSession.finishTurn({
     status: "SUCCESS",
@@ -1890,9 +2191,12 @@ async function selfTest() {
   uncommittedTimeoutSession.close();
   const committedTimeoutSession = new AntigravitySession(
     "committed-timeout-fixture",
+    null,
     process.cwd(),
     "mutation-task",
     models.fallback,
+    testPolicy,
+    testProfile,
     () => {},
   );
   committedTimeoutSession.init = { conversationId: "committed-timeout-fixture" };
@@ -1925,9 +2229,12 @@ async function selfTest() {
   committedTimeoutSession.close();
   const interruptionSession = new AntigravitySession(
     "interruption-fixture",
+    null,
     process.cwd(),
     "stream-task",
     models.fallback,
+    testPolicy,
+    testProfile,
     () => {},
   );
   interruptionSession.init = { conversationId: "interruption-conversation" };
@@ -2160,7 +2467,7 @@ async function selfTest() {
   if (!abortedRecoveryClosed || abortedRecoveryFailure?.status !== 499) {
     throw new Error("aborted interrupted-stream recovery did not release its provider session");
   }
-  const initSession = new AntigravitySession("init-fixture", process.cwd(), "task", models.primary, () => {});
+  const initSession = new AntigravitySession("init-fixture", null, process.cwd(), "task", models.primary, testPolicy, testProfile, () => {});
   let initResolved = false;
   let initRejected = false;
   initSession.resolveInit = () => { initResolved = true; };
@@ -2170,7 +2477,7 @@ async function selfTest() {
     conversation_id: "init-fixture",
     init: {
       model: models.primary.id,
-      agent: AGENT_ID,
+      agent: AGENT_IDS.main,
       permission_mode: "always-proceed",
       tools: [...REQUIRED_AGENT_TOOLS, ...FORBIDDEN_AGENT_TOOLS],
     },
@@ -2178,7 +2485,7 @@ async function selfTest() {
   if (!initResolved || initRejected || runtime.lastInitializedForbiddenTools.length !== FORBIDDEN_AGENT_TOOLS.size) {
     throw new Error("provider base-tool init surface was mistaken for the effective agent allowlist");
   }
-  const boundedWaitSession = new AntigravitySession("bounded-wait-fixture", process.cwd(), "task", models.primary, () => {});
+  const boundedWaitSession = new AntigravitySession("bounded-wait-fixture", null, process.cwd(), "task", models.primary, testPolicy, testProfile, () => {});
   boundedWaitSession.close = () => {};
   boundedWaitSession.init = { conversationId: "bounded-wait-fixture" };
   boundedWaitSession.initSettled = true;
@@ -2251,7 +2558,7 @@ async function selfTest() {
   }, "bounded-wait-fixture")) {
     throw new Error("unbounded Antigravity command wait was accepted");
   }
-  const forbiddenSession = new AntigravitySession("forbidden-fixture", process.cwd(), "task", models.primary, () => {});
+  const forbiddenSession = new AntigravitySession("forbidden-fixture", null, process.cwd(), "task", models.primary, testPolicy, testProfile, () => {});
   forbiddenSession.close = () => {};
   forbiddenSession.init = { conversationId: "forbidden-fixture" };
   forbiddenSession.initSettled = true;
@@ -2282,12 +2589,14 @@ async function selfTest() {
   if (!forbiddenFailure?.routeCommitted || forbiddenFailure.code !== "provider_state_changed" || forbiddenFailure.forbiddenToolName !== "invoke_subagent") {
     throw new Error("forbidden Antigravity orchestration tool did not fail closed");
   }
-  if (/^model\s*:/m.test(AGENT_DEFINITION)) throw new Error("agent definition pinned a model");
-  for (const name of FORBIDDEN_AGENT_TOOLS) {
-    if (AGENT_DEFINITION.includes(`  - ${name}\n`)) throw new Error(`agent definition exposed ${name}`);
-  }
-  if (!AGENT_DEFINITION.includes("subagent: false\n") || !AGENT_DEFINITION.includes("forceDisableFundamentalComponents: true\n")) {
-    throw new Error("agent definition did not disable provider-side nesting");
+  for (const definition of AGENT_DEFINITIONS.values()) {
+    if (/^model\s*:/m.test(definition)) throw new Error("agent definition pinned a model");
+    for (const name of FORBIDDEN_AGENT_TOOLS) {
+      if (definition.includes(`  - ${name}\n`)) throw new Error(`agent definition exposed ${name}`);
+    }
+    if (!definition.includes("subagent: false\n") || !definition.includes("forceDisableFundamentalComponents: true\n")) {
+      throw new Error("agent definition did not disable provider-side nesting");
+    }
   }
   const mainContext = requestContext({
     stream: true,
@@ -2303,7 +2612,7 @@ async function selfTest() {
   if (
     !mainContext.mainAgent
     || mainContext.modelAlias !== MAIN_MODEL_ALIAS
-    || mainContext.sessionKey !== "thread-agy-main:main"
+    || !mainContext.sessionKey.startsWith("thread-agy-main:main:")
     || mainContext.taskState.activeTask !== null
     || !mainPrompt.includes("[RzCodex main-agent contract]")
     || !mainPrompt.includes("MAIN_AGENT_INSTRUCTIONS")
@@ -2342,7 +2651,6 @@ async function selfTest() {
   const firstDiagnostics = taskDeliveryDiagnostics(context.taskState, first);
   if (
     first.length > MAX_PROMPT_CHARS
-    || first.length < MAX_PROMPT_CHARS - 100
     || firstDiagnostics.completeTaskOccurrences !== 1
   ) {
     throw new Error("bounded encrypted task delivery failed");
@@ -2372,7 +2680,10 @@ async function selfTest() {
   ) {
     throw new Error("bridge progress re-entered the Antigravity provider prompt");
   }
-  const retainedSession = { seenMessageKeys: new Set(context.messageKeys) };
+  const retainedSession = {
+    seenMessageKeys: new Set(context.messageKeys),
+    lastDeliveredTaskHash: context.taskState.activeTask.hash,
+  };
   const resumed = resumePrompt(context, retainedSession);
   const resumedDiagnostics = taskDeliveryDiagnostics(context.taskState, resumed, {
     activeTaskIncludedThisTurn: false,
@@ -2402,8 +2713,30 @@ async function selfTest() {
     ||
     !analysisFirst.includes("[Analysis convergence contract]")
     || analysisFirst.includes("[Immediate terminal report required]")
+    || analysisContext.agentProfile.id !== AGENT_IDS.readOnly
+    || analysisContext.agentProfile.tools.some((tool) => WRITE_TOOLS.includes(tool) || tool === "run_command")
   ) {
     throw new Error("Antigravity analysis convergence control failed");
+  }
+  const mutationPolicyContext = requestContext({
+    stream: true,
+    model: MODEL_ALIAS,
+    reasoning: { effort: REQUIRED_EFFORT },
+    client_metadata: { cwd: homedir(), thread_id: "thread-agy-mutation-policy" },
+    input: [{
+      type: "agent_message",
+      id: "agy-mutation-policy",
+      author: "Codex",
+      recipient: "/root/agy_mutation_policy",
+      content: "Message Type: NEW_TASK\nTask name: /root/agy_mutation_policy\nPayload:\nFix the bounded source file without builds or tests.",
+    }],
+  });
+  if (
+    mutationPolicyContext.agentProfile.id !== AGENT_IDS.noValidation
+    || !mutationPolicyContext.agentProfile.tools.includes("replace_file_content")
+    || mutationPolicyContext.agentProfile.tools.includes("run_command")
+  ) {
+    throw new Error("Antigravity mutation policy did not enforce the no-validation provider boundary");
   }
   const priorResumeTaskText = "Message Type: NEW_TASK\nTask name: /root/agy_resume\nPayload:\nInspect the original bounded fixture under its exact ownership constraints.";
   const activeResumeTaskText = "Message Type: NEW_TASK\nTask name: /root/agy_resume\nPayload:\nBridge repaired. Resume the same bounded audit from your preserved state; keep the original scope and finish.";
@@ -2440,6 +2773,16 @@ async function selfTest() {
   ) {
     throw new Error("Antigravity bridge restart lost referenced prior task context");
   }
+  const changedResumePrompt = resumePrompt(afterBridgeRestartResume, {
+    seenMessageKeys: new Set(priorResumeContext.messageKeys),
+    lastDeliveredTaskHash: priorResumeContext.taskState.activeTask.hash,
+  });
+  if (
+    changedResumePrompt.split(activeResumeTaskText).length - 1 !== 1
+    || changedResumePrompt.includes(priorResumeTaskText)
+  ) {
+    throw new Error("Antigravity retained continuation did not deliver the changed NEW_TASK exactly once");
+  }
   const immediateContext = requestContext({
     stream: true,
     model: MODEL_ALIAS,
@@ -2464,11 +2807,12 @@ async function selfTest() {
   });
   const immediateResume = resumePrompt(immediateContext, {
     seenMessageKeys: new Set(analysisContext.messageKeys),
+    lastDeliveredTaskHash: analysisContext.taskState.activeTask.hash,
   });
   if (!immediateResume.includes("[Immediate terminal report required]")) {
     throw new Error("Antigravity resumed immediate terminal report control failed");
   }
-  const isolated = sanitizedEnvironment({
+  const isolated = sanitizedEnvironment(createExecutionPolicy(), {
     GEMINI_API_KEY: "secret",
     GOOGLE_API_KEY: "secret",
     OPENAI_API_KEY: "secret",
@@ -2512,12 +2856,14 @@ if (process.argv.includes("--self-test")) {
   process.exit(0);
 }
 
+exitWhenParentStops();
 const portValue = Number.parseInt(process.env.RZCODEX_ANTIGRAVITY_BRIDGE_PORT || `${DEFAULT_PORT}`, 10);
 if (!Number.isInteger(portValue) || portValue < 1 || portValue > 65535) {
   throw new BridgeError("Invalid Antigravity bridge port", 500);
 }
 const port = portValue;
-const server = createServer(async (request, response) => {
+const bearerToken = loadBridgeBearerToken();
+const server = createAuthenticatedBridgeServer(async (request, response) => {
   runtime.incomingRequests += 1;
   try {
     const url = new URL(request.url || "/", `http://${request.headers.host || "127.0.0.1"}`);
@@ -2534,7 +2880,7 @@ const server = createServer(async (request, response) => {
     if (!response.headersSent) jsonResponse(response, error.status || 500, { error: { message: runtime.lastError } });
     else if (!response.writableEnded) response.end();
   }
-});
+}, { token: bearerToken });
 
 server.listen(port, "127.0.0.1");
 

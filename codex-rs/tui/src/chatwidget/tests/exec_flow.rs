@@ -1243,6 +1243,7 @@ async fn bang_shell_enter_while_task_running_submits_run_user_shell_command() {
         thread_name: None,
         model: "test-model".to_string(),
         model_provider_id: "test-provider".to_string(),
+        model_input_modalities: None,
         service_tier: None,
         approval_policy: AskForApproval::Never,
         approvals_reviewer: ApprovalsReviewer::User,

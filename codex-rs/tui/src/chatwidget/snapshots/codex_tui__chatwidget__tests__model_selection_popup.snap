@@ -14,5 +14,7 @@ expression: popup
                             real-world work.
 › 6. gpt-5.2 (current)      Optimized for professional work and long-running
                             agents.
+  7. Provider routes…       Use Native OpenAI or a configured external
+                            provider as the main agent
 
   Press enter to confirm or esc to go back

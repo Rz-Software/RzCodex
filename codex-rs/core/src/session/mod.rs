@@ -280,6 +280,7 @@ mod rollout_reconstruction_tests;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PreviousTurnSettings {
     pub(crate) model: String,
+    pub(crate) model_provider_id: Option<String>,
     pub(crate) comp_hash: Option<String>,
     pub(crate) realtime_active: Option<bool>,
 }
@@ -411,6 +412,12 @@ pub(crate) enum ForkPersistence {
         history_base: Option<HistoryPosition>,
         inherited_item_count: usize,
     },
+}
+
+enum AgentStatusDelivery {
+    FromEvent,
+    Override(AgentStatus),
+    Suppress,
 }
 
 pub(crate) struct SessionSpawnArgs {
@@ -731,6 +738,7 @@ impl Session {
                 config.model_provider.clone(),
                 Some(Arc::clone(&auth_manager)),
             ),
+            models_manager: Arc::clone(&models_manager),
             step_settings: Arc::new(StepSettings {
                 collaboration_mode,
                 reasoning_summary: config.model_reasoning_summary,
@@ -1474,6 +1482,14 @@ impl Session {
             InitialHistory::Forked(mut rollout_items) => {
                 let turn_context = self.new_default_turn().await;
                 Self::assign_missing_rollout_response_item_ids(&mut rollout_items);
+                let copied_checkpoint_response_item_ids =
+                    if matches!(&self.fork_persistence, ForkPersistence::Copied)
+                        && !is_paginated_subagent
+                    {
+                        Self::compacted_response_item_ids(&rollout_items)
+                    } else {
+                        HashSet::new()
+                    };
                 self.apply_rollout_reconstruction(&turn_context, &rollout_items)
                     .await;
 
@@ -1510,7 +1526,14 @@ impl Session {
                         rollout_items.push(thread_settings_applied);
                     }
                 }
-                self.persist_rollout_items(&rollout_items).await;
+                let persisted = self.persist_rollout_items(&rollout_items).await;
+                if persisted && !copied_checkpoint_response_item_ids.is_empty() {
+                    self.state
+                        .lock()
+                        .await
+                        .history
+                        .mark_inline_images_persisted(&copied_checkpoint_response_item_ids);
+                }
 
                 // Forked threads should remain file-backed immediately after startup.
                 self.ensure_rollout_materialized(PersistContext::Standard)
@@ -1810,6 +1833,26 @@ impl Session {
             .thread_settings_snapshot(&self.services.turn_environments.selections())
     }
 
+    pub(crate) async fn list_models(
+        &self,
+        include_hidden: bool,
+        http_client_factory: codex_http_client::HttpClientFactory,
+    ) -> Vec<codex_protocol::openai_models::ModelPreset> {
+        let models_manager = {
+            let state = self.state.lock().await;
+            Arc::clone(&state.session_configuration.models_manager)
+        };
+        models_manager
+            .list_models(
+                codex_models_manager::manager::RefreshStrategy::OnlineIfUncached,
+                http_client_factory,
+            )
+            .await
+            .into_iter()
+            .filter(|preset| include_hidden || preset.show_in_picker)
+            .collect()
+    }
+
     pub(crate) async fn restorable_thread_settings(&self) -> CodexThreadSettingsOverrides {
         let state = self.state.lock().await;
         state
@@ -2081,10 +2124,7 @@ impl Session {
     pub(crate) async fn send_event(&self, turn_context: &TurnContext, msg: EventMsg) {
         let legacy_source = msg.clone();
         if let EventMsg::Error(error) = &legacy_source
-            && error
-                .codex_error_info
-                .as_ref()
-                .is_some_and(CodexErrorInfo::affects_turn_status)
+            && error.affects_turn_status()
         {
             turn_context
                 .terminal_error
@@ -2120,9 +2160,31 @@ impl Session {
                 .analytics_events_client
                 .track_guardian_session_event(self.thread_id, &event);
         }
-        self.send_event_raw(event).await;
-        self.maybe_notify_parent_of_terminal_turn(turn_context, &legacy_source)
+        let spawned_terminal_status = self
+            .spawned_agent_terminal_status(turn_context, &legacy_source)
             .await;
+        let status_delivery = match spawned_terminal_status.clone() {
+            Some(status) => AgentStatusDelivery::Override(status),
+            None if turn_context.multi_agent_version == MultiAgentVersion::V2
+                && matches!(legacy_source, EventMsg::Error(_))
+                && matches!(
+                    &turn_context.session_source,
+                    SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                        agent_path: Some(_),
+                        ..
+                    })
+                ) =>
+            {
+                AgentStatusDelivery::Suppress
+            }
+            None => AgentStatusDelivery::FromEvent,
+        };
+        self.send_event_raw_with_status(event, status_delivery)
+            .await;
+        if let Some(status) = spawned_terminal_status {
+            self.notify_parent_of_terminal_turn(turn_context, status)
+                .await;
+        }
         self.maybe_mirror_event_text_to_realtime(&legacy_source)
             .await;
         self.maybe_clear_realtime_handoff_for_event(&legacy_source)
@@ -2141,20 +2203,40 @@ impl Session {
         }
     }
 
-    /// Forwards terminal turn events from spawned MultiAgentV2 children to their direct parent.
-    async fn maybe_notify_parent_of_terminal_turn(
+    async fn spawned_agent_terminal_status(
         &self,
         turn_context: &TurnContext,
         msg: &EventMsg,
-    ) {
+    ) -> Option<AgentStatus> {
         if turn_context.multi_agent_version != MultiAgentVersion::V2 {
-            return;
+            return None;
         }
 
         if !matches!(msg, EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_)) {
-            return;
+            return None;
         }
 
+        let SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            agent_path: Some(_),
+            ..
+        }) = &turn_context.session_source
+        else {
+            return None;
+        };
+
+        let status = match turn_context.terminal_error.lock().await.take() {
+            Some(error) => AgentStatus::Errored(error.message),
+            None => crate::agent::status::spawned_agent_terminal_status_from_event(msg)?,
+        };
+        is_final(&status).then_some(status)
+    }
+
+    /// Forwards the canonical terminal status from a spawned MultiAgentV2 child to its parent.
+    async fn notify_parent_of_terminal_turn(
+        &self,
+        turn_context: &TurnContext,
+        status: AgentStatus,
+    ) {
         let SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
             parent_thread_id,
             agent_path: Some(child_agent_path),
@@ -2163,27 +2245,6 @@ impl Session {
         else {
             return;
         };
-
-        let status = match turn_context.terminal_error.lock().await.take() {
-            Some(error) => {
-                let status = AgentStatus::Errored(error.message);
-                self.agent_status.send_replace(status.clone());
-                status
-            }
-            None => {
-                let Some(status) =
-                    crate::agent::status::spawned_agent_terminal_status_from_event(msg)
-                else {
-                    return;
-                };
-                self.agent_status.send_replace(status.clone());
-                status
-            }
-        };
-        if !is_final(&status) {
-            return;
-        }
-
         self.forward_child_completion_to_parent(
             turn_context,
             *parent_thread_id,
@@ -2366,6 +2427,11 @@ impl Session {
             .await;
     }
 
+    async fn send_event_raw_with_status(&self, event: Event, status: AgentStatusDelivery) {
+        self.send_event_raw_with_persistence_and_status(event, /*persist*/ true, status)
+            .await;
+    }
+
     /// Delivers an event without creating a local rollout for a thread that has not materialized.
     pub(crate) async fn send_event_raw_without_materializing_rollout(&self, event: Event) {
         let persist = match self.current_rollout_path().await {
@@ -2380,6 +2446,20 @@ impl Session {
     }
 
     async fn send_event_raw_with_persistence(&self, event: Event, persist: bool) {
+        self.send_event_raw_with_persistence_and_status(
+            event,
+            persist,
+            AgentStatusDelivery::FromEvent,
+        )
+        .await;
+    }
+
+    async fn send_event_raw_with_persistence_and_status(
+        &self,
+        event: Event,
+        persist: bool,
+        status: AgentStatusDelivery,
+    ) {
         // Keep realtime reduction, canonical append, and delivery in the same order.
         // This lock must not acquire SessionState or ActiveTurn: event producers can
         // already hold those locks. Host presentation policies are synchronous.
@@ -2419,12 +2499,22 @@ impl Session {
         {
             warn!("failed to persist realtime history: {error}");
         }
-        self.deliver_event_raw(event).await;
+        self.deliver_event_raw_with_status(event, status).await;
     }
 
     async fn deliver_event_raw(&self, event: Event) {
+        self.deliver_event_raw_with_status(event, AgentStatusDelivery::FromEvent)
+            .await;
+    }
+
+    async fn deliver_event_raw_with_status(&self, event: Event, status: AgentStatusDelivery) {
         // Record the last known agent status.
-        if let Some(status) = agent_status_from_event(&event.msg) {
+        let status = match status {
+            AgentStatusDelivery::FromEvent => agent_status_from_event(&event.msg),
+            AgentStatusDelivery::Override(status) => Some(status),
+            AgentStatusDelivery::Suppress => None,
+        };
+        if let Some(status) = status {
             self.agent_status.send_replace(status);
         }
         if let Err(e) = self.tx_event.send(event).await {
@@ -3411,6 +3501,48 @@ impl Session {
         }
     }
 
+    fn reset_copied_checkpoint_inline_image_persistence(items: &mut [RolloutItem]) {
+        for item in items {
+            let RolloutItem::Compacted(compacted) = item else {
+                continue;
+            };
+            let Some(replacement_history) = compacted.replacement_history.as_mut() else {
+                continue;
+            };
+            codex_history::reset_inline_images_persisted(replacement_history);
+        }
+    }
+
+    fn mark_copied_checkpoint_inline_images_persisted(items: &mut [RolloutItem]) {
+        for item in items {
+            let RolloutItem::Compacted(compacted) = item else {
+                continue;
+            };
+            let Some(replacement_history) = compacted.replacement_history.as_mut() else {
+                continue;
+            };
+            codex_history::mark_inline_images_persisted(replacement_history);
+        }
+    }
+
+    fn compacted_response_item_ids(items: &[RolloutItem]) -> HashSet<ResponseItemId> {
+        let mut response_item_ids = HashSet::new();
+        for item in items {
+            let RolloutItem::Compacted(compacted) = item else {
+                continue;
+            };
+            let Some(replacement_history) = compacted.replacement_history.as_ref() else {
+                continue;
+            };
+            response_item_ids.extend(
+                replacement_history
+                    .iter()
+                    .filter_map(|envelope| envelope.item.id().cloned()),
+            );
+        }
+        response_item_ids
+    }
+
     pub(crate) fn response_item_from_user_input(&self, input: Vec<UserInput>) -> ResponseItem {
         let mut item = ResponseItem::from(ResponseInputItem::from_user_input(
             input,
@@ -3859,6 +3991,10 @@ impl Session {
         for envelope in &mut items {
             Self::assign_missing_response_item_id(&mut envelope.item);
         }
+        let checkpoint_response_item_ids = items
+            .iter()
+            .filter_map(|envelope| envelope.item.id().cloned())
+            .collect::<HashSet<_>>();
         let mut compacted_item = CompactedItem {
             message: metadata.message,
             replacement_history: Some(items.clone()),
@@ -3906,9 +4042,14 @@ impl Session {
         rollout_items.push(RolloutItem::EventMsg(
             thread_settings::applied_event(self).await,
         ));
-        self.persist_rollout_items(&rollout_items).await;
+        let persisted = self.persist_rollout_items(&rollout_items).await;
         {
             let mut state = self.state.lock().await;
+            if persisted {
+                state
+                    .history
+                    .mark_inline_images_persisted(&checkpoint_response_item_ids);
+            }
             state.queue_pending_session_start_source(codex_hooks::SessionStartSource::Compact);
         }
     }
@@ -4229,11 +4370,16 @@ impl Session {
     }
 
     #[tracing::instrument(level = "trace", skip_all, fields(item_count = items.len()))]
-    pub(crate) async fn persist_rollout_items(&self, items: &[RolloutItem]) {
-        if let Some(live_thread) = self.live_thread()
-            && let Err(e) = live_thread.append_items(items).await
-        {
-            error!("failed to record rollout items: {e:#}");
+    pub(crate) async fn persist_rollout_items(&self, items: &[RolloutItem]) -> bool {
+        let Some(live_thread) = self.live_thread() else {
+            return false;
+        };
+        match live_thread.append_items(items).await {
+            Ok(()) => true,
+            Err(e) => {
+                error!("failed to record rollout items: {e:#}");
+                false
+            }
         }
     }
 

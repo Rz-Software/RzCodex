@@ -2,7 +2,6 @@
 
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { createServer } from "node:http";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -30,10 +29,20 @@ import {
   rzMcpModeForTask,
   taskControlPromptSections,
   taskDeliveryDiagnostics,
+  taskOwnershipHash,
   taskStateFromInput,
 } from "./codebuddy-subagent-task-state.mjs";
 import { projectInstructionsPromptSection } from "./native-project-instructions.mjs";
 import { providerFailureDiagnostics } from "./native-subagent-provider-router.mjs";
+import { exitWhenParentStops } from "./bridge-lifecycle.mjs";
+import {
+  assertProviderBoundaryEnforceable,
+  codexHome,
+  createAuthenticatedBridgeServer,
+  executionPolicy as createExecutionPolicy,
+  loadBridgeBearerToken,
+  sanitizeChildEnvironment,
+} from "./bridge-security.mjs";
 
 const PROVIDER_ID = "codebuddy";
 const MODEL_ALIAS = "@preset/codex-subagents";
@@ -47,9 +56,10 @@ const MAX_ACTIVE_TASK_CHARS = 40_000;
 const STDERR_LIMIT = 16 * 1024;
 const REQUEST_TIMEOUT_MS = 30 * 60 * 1000;
 const ROUTE_OWNERSHIP_TIMEOUT_MS = 45_000;
+const MAX_PROVIDER_CONVERSATIONS = 128;
 const TEXT_TOOL_NAME = "tool_search";
 const WIRE_TEXT_TOOL_NAME = "search_tools";
-const CODEX_HOME = process.env.CODEX_HOME || join(homedir(), ".codex");
+const CODEX_HOME = codexHome();
 const MODEL_ROUTES_FILE = join(CODEX_HOME, "subagent-models.json");
 const REQUEST_DIRECTORY = join(CODEX_HOME, "codebuddy-bridge", "requests");
 const SESSION_MARKER_DIRECTORY = join(CODEX_HOME, "codebuddy-bridge", "sessions");
@@ -64,6 +74,7 @@ const CODEBUDDY_SCRIPT = join(
   "npm", "node_modules", "@tencent-ai", "codebuddy-code", "bin", "codebuddy",
 );
 const MAIN_AGENT_CONTRACT = "[RzCodex main-agent contract]\nAct as the primary coding agent for this conversation. Use CodeBuddy's own Read, Write, Edit, Bash, Glob, and Grep tools directly. Follow the complete RzCodex, project, and user instructions supplied this turn, preserve unrelated work, verify changes in proportion to risk, and return only after the current user request is complete or concretely blocked. RzMCP is exposed lazily as only search_rzmcp_tools and call_rzmcp_tool through the rzmcp MCP server; search first, then call the selected tool.";
+const SELF_TEST_MODE = process.argv.includes("--self-test");
 
 class BridgeError extends Error {
   constructor(message, status = 400) {
@@ -73,13 +84,14 @@ class BridgeError extends Error {
   }
 }
 
-function executionPolicy(taskState) {
+function executionPolicyForTask(taskState) {
   const task = taskState.activeTask?.text || "";
   const readOnly = taskState.activeTask?.intent === "analysis" || isExplicitReadOnlyTask(task);
-  return {
+  return createExecutionPolicy({
     readOnly,
+    validationRestricted: !readOnly,
     rzMcpMode: rzMcpModeForTask(task, readOnly),
-  };
+  });
 }
 
 function providerToolIsMutation(name, input, policy) {
@@ -182,10 +194,13 @@ function configuredPort() {
   return port;
 }
 
+let selfTestRoute = null;
+
 function resolveRoute(requested) {
   if (requested !== MODEL_ALIAS && requested !== MAIN_MODEL_ALIAS) {
     throw new BridgeError(`CodeBuddy bridge must use the centrally managed ${MODEL_ALIAS} or ${MAIN_MODEL_ALIAS} alias`);
   }
+  if (selfTestRoute) return selfTestRoute;
   let routes;
   try {
     routes = JSON.parse(readFileSync(MODEL_ROUTES_FILE, "utf8"));
@@ -350,8 +365,19 @@ function writeManagedSessionMarker(sessionId, threadId) {
   writeFileSync(marker, jsonString({
     sessionId,
     threadHash: sha256(threadId),
+    ownerPid: process.pid,
     createdAt: new Date().toISOString(),
   }), { encoding: "utf8", flag: "wx" });
+}
+
+function processIsAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
 }
 
 function cleanupOrphanedManagedSessions() {
@@ -361,6 +387,7 @@ function cleanupOrphanedManagedSessions() {
     const markerPath = join(SESSION_MARKER_DIRECTORY, entry.name);
     try {
       const marker = JSON.parse(readFileSync(markerPath, "utf8"));
+      if (processIsAlive(marker.ownerPid)) continue;
       cleanupManagedSessionArtifacts(marker.sessionId);
     } catch (error) {
       process.stderr.write(`CodeBuddy orphan cleanup failed for ${entry.name}: ${redactSecrets(error.message)}\n`);
@@ -407,8 +434,18 @@ function inputShouldReachResumedProvider(item, message) {
 
 class ProviderConversationRegistry {
   #states = new Map();
+  #persistArtifacts;
 
-  prepare(threadId, input, incomingTaskState, { mainAgent = false } = {}) {
+  constructor({ persistArtifacts = !SELF_TEST_MODE } = {}) {
+    this.#persistArtifacts = persistArtifacts;
+  }
+
+  prepare(
+    threadId,
+    input,
+    incomingTaskState,
+    { mainAgent = false, workingDirectory, executionPolicy: policy } = {},
+  ) {
     if (typeof threadId !== "string" || threadId.length === 0) {
       throw new BridgeError("client_metadata.thread_id must be a non-empty string");
     }
@@ -423,8 +460,18 @@ class ProviderConversationRegistry {
           "CodeBuddy received a subagent turn without an active NEW_TASK and has no retained provider session",
         );
       }
+      if (this.#states.size >= MAX_PROVIDER_CONVERSATIONS) {
+        throw new BridgeError(
+          `CodeBuddy retained-conversation capacity ${MAX_PROVIDER_CONVERSATIONS} is exhausted; owned sessions will not be evicted`,
+          429,
+        );
+      }
       state = {
         threadId,
+        workingDirectory,
+        mainAgent,
+        executionPolicy: policy,
+        policyKey: sha256(jsonString(policy)),
         sessionId: providerSessionId(threadId),
         providerStarted: false,
         inFlight: false,
@@ -439,8 +486,22 @@ class ProviderConversationRegistry {
         countedOutputs: new Set(),
         seenInputKeys: new Set(),
         toolInfo: null,
+        taskOwnershipHash: null,
+        providerWorkStarted: false,
+        mutationWorkStarted: false,
       };
       this.#states.set(threadId, state);
+    } else {
+      const incompatibilities = [];
+      if (state.workingDirectory !== workingDirectory) incompatibilities.push("working directory");
+      if (state.mainAgent !== mainAgent) incompatibilities.push("main/subagent mode");
+      if (policy && state.policyKey !== sha256(jsonString(policy))) incompatibilities.push("execution policy");
+      if (incompatibilities.length > 0) {
+        throw new BridgeError(
+          `CodeBuddy thread ${sha256(threadId)} cannot reuse its retained session with a different ${incompatibilities.join(", ")}`,
+          409,
+        );
+      }
     }
 
     const continuesRetainedTask = Boolean(
@@ -454,6 +515,17 @@ class ProviderConversationRegistry {
       if (!incomingTask) {
         throw new BridgeError("CodeBuddy provider state has no active task to retain", 500);
       }
+      const incomingTaskOwnershipHash = taskOwnershipHash(incomingTaskState);
+      // Continuation NEW_TASK controls change the active hash while retaining the originating task ownership hash.
+      const taskOwnershipChanged = Boolean(
+        state.taskOwnershipHash
+        && incomingTaskOwnershipHash !== state.taskOwnershipHash,
+      );
+      if (taskOwnershipChanged) {
+        state.providerWorkStarted = false;
+        state.mutationWorkStarted = false;
+      }
+      state.taskOwnershipHash = incomingTaskOwnershipHash;
       state.activeTask = {
         ...incomingTask,
         partTypes: [...incomingTask.partTypes],
@@ -531,6 +603,7 @@ class ProviderConversationRegistry {
       threadId,
       providerSessionId: state.sessionId,
       providerSessionStarted,
+      executionPolicy: state.executionPolicy,
       activeTaskIncludedThisTurn,
       retainedInProviderSession: providerSessionStarted && !taskChanged,
       inputIndexes,
@@ -558,8 +631,21 @@ class ProviderConversationRegistry {
     if (state.inFlight) throw new BridgeError("CodeBuddy provider session is already active", 409);
     state.inFlight = true;
     state.inFlightDone = new Promise((resolve) => { state.finishInFlight = resolve; });
-    writeManagedSessionMarker(state.sessionId, state.threadId);
+    if (this.#persistArtifacts) writeManagedSessionMarker(state.sessionId, state.threadId);
     runtime.activeProviderSessions = this.#states.size;
+  }
+
+  delivered(context) {
+    const conversation = context.conversation;
+    const { state } = conversation;
+    for (const key of conversation.inputKeys) state.seenInputKeys.add(key);
+  }
+
+  noteProviderWork(context, { mutation = false } = {}) {
+    const { state } = context.conversation;
+    state.providerStarted = true;
+    state.providerWorkStarted = true;
+    state.mutationWorkStarted ||= mutation;
   }
 
   commit(context) {
@@ -575,24 +661,37 @@ class ProviderConversationRegistry {
     runtime.activeProviderSessions = this.#states.size;
   }
 
-  resetProvider(context) {
+  fail(context) {
     const { state } = context.conversation;
-    try { cleanupManagedSessionArtifacts(state.sessionId); } catch (error) {
-      process.stderr.write(`CodeBuddy provider reset cleanup failed: ${redactSecrets(error.message)}\n`);
-    }
-    state.sessionId = providerSessionId(state.threadId);
-    state.providerStarted = false;
     state.inFlight = false;
     state.finishInFlight?.();
     state.finishInFlight = null;
+    if (state.providerWorkStarted) {
+      state.providerStarted = true;
+      runtime.activeProviderSessions = this.#states.size;
+      return;
+    }
+    if (this.#persistArtifacts) {
+      try { cleanupManagedSessionArtifacts(state.sessionId); } catch (error) {
+        process.stderr.write(`CodeBuddy provider reset cleanup failed: ${redactSecrets(error.message)}\n`);
+      }
+    }
+    state.sessionId = providerSessionId(state.threadId);
+    state.providerStarted = false;
     state.seenInputKeys.clear();
     runtime.activeProviderSessions = this.#states.size;
   }
 
+  ownsProviderState(context) {
+    return context.conversation.state.providerWorkStarted;
+  }
+
   release(context) {
     const { state } = context.conversation;
-    try { cleanupManagedSessionArtifacts(state.sessionId); } catch (error) {
-      process.stderr.write(`CodeBuddy terminal session cleanup failed: ${redactSecrets(error.message)}\n`);
+    if (this.#persistArtifacts) {
+      try { cleanupManagedSessionArtifacts(state.sessionId); } catch (error) {
+        process.stderr.write(`CodeBuddy terminal session cleanup failed: ${redactSecrets(error.message)}\n`);
+      }
     }
     state.inFlight = false;
     state.finishInFlight?.();
@@ -822,7 +921,21 @@ function promptFrom(body, registry = providerConversations) {
     throw error;
   }
   const threadId = requireString(body.client_metadata?.thread_id, "client_metadata.thread_id");
-  const conversation = registry.prepare(threadId, input, incomingTaskState, { mainAgent });
+  const workingDirectory = resolve(workingDirectoryFrom(body));
+  if (!isAbsolute(workingDirectory) || !existsSync(workingDirectory)) {
+    throw new BridgeError(`CodeBuddy working directory does not exist: ${JSON.stringify(workingDirectory)}`);
+  }
+  const incomingPolicy = mainAgent
+    ? createExecutionPolicy()
+    : incomingTaskState.activeTask
+      ? executionPolicyForTask(incomingTaskState)
+      : null;
+  const conversation = registry.prepare(threadId, input, incomingTaskState, {
+    mainAgent,
+    workingDirectory,
+    executionPolicy: incomingPolicy,
+  });
+  const effectivePolicy = conversation.executionPolicy;
   const taskState = conversation.taskState;
   const incomingToolInfo = codexToolsFrom(body, route.inputModalities);
   const incomingManagedSurface = Array.isArray(body.tools) && body.tools.length > 0;
@@ -834,10 +947,6 @@ function promptFrom(body, registry = providerConversations) {
   runtime.lastRetainedToolSurfaceUsed = retainedToolSurfaceUsed;
   conversation.state.toolInfo = toolInfo;
   if (retainedToolSurfaceUsed) runtime.retainedToolSurfaceUses += 1;
-  const workingDirectory = workingDirectoryFrom(body);
-  if (!isAbsolute(workingDirectory) || !existsSync(workingDirectory)) {
-    throw new BridgeError(`CodeBuddy working directory does not exist: ${JSON.stringify(workingDirectory)}`);
-  }
   const sections = [
     mainAgent
       ? (conversation.providerSessionStarted
@@ -845,7 +954,7 @@ function promptFrom(body, registry = providerConversations) {
         : MAIN_AGENT_CONTRACT)
       : (conversation.providerSessionStarted
         ? "[Native delegation continuation]\nContinue the same delegated task in this retained CodeBuddy conversation. Use your own local tools directly and return only when the bounded task is complete, the requested checkpoint is ready, or a concrete blocker requires parent input. Never delegate to another agent, teammate, swarm, or background worker."
-        : "[Single native-agent execution contract]\nWork as the delegated CodeBuddy sub-agent in the current workspace and complete this bounded task in this one CLI execution. Use CodeBuddy's own Read, Write, Edit, Bash, Glob, and Grep tools directly. Never delegate to another agent, teammate, swarm, or background worker. Do not ask the parent to execute an ordinary file or shell operation. Honor project AGENTS.md ownership boundaries exactly; when builds, tests, editor control, PIE, runtime validation, or RzMCP execution are reserved to the parent, do not invoke them and instead report the exact checks the parent should run. On Windows, use PowerShell-native commands and never assume Unix-only commands such as head are installed. RzMCP is exposed lazily as only search_rzmcp_tools and call_rzmcp_tool through the rzmcp MCP server; search first, then call the selected tool only when the task allows RzMCP."),
+        : "[Single native-agent execution contract]\nWork as the delegated CodeBuddy sub-agent in the current workspace and complete this bounded task in this one CLI execution. Use only the native file/search tools exposed for this task; mutation tasks also receive file-edit tools, while shell, builds, tests, editor control, PIE, and runtime validation are disabled. Never delegate to another agent, teammate, swarm, or background worker. Do not ask the parent to execute an ordinary allowed file operation. Honor project AGENTS.md ownership boundaries exactly and report the exact checks the parent should run. RzMCP is exposed lazily as only search_rzmcp_tools and call_rzmcp_tool through the rzmcp MCP server; search first, then call the selected tool only when the task allows RzMCP."),
   ];
   if (!conversation.providerSessionStarted) {
     sections.push(projectInstructionsPromptSection(workingDirectory));
@@ -869,6 +978,11 @@ function promptFrom(body, registry = providerConversations) {
   if (referencedPriorTaskSection) sections.push(referencedPriorTaskSection);
   if (activeTaskSection) sections.push(activeTaskSection);
   if (!mainAgent) sections.push(...taskControlPromptSections(taskState));
+  if (!mainAgent && conversation.state.mutationWorkStarted) {
+    sections.push(
+      "[Retained provider ownership - authoritative]\nMutation work already started in this exact retained CodeBuddy conversation. Continue from provider state; never replay the task or repeat an edit merely because the prior transport ended.",
+    );
+  }
   if (toolInfo.definitions.length > 0) {
     sections.push(
       `[Codex client tool surface intentionally internalized]\n${toolInfo.definitions.length} parent tool schemas were not forwarded. ` +
@@ -880,8 +994,11 @@ function promptFrom(body, registry = providerConversations) {
   }
   const history = [];
   const agentMessages = new Map(taskState.messages.map((message) => [message.index, message]));
-  const pushHistory = (text, images = []) => {
-    if (text || images.length > 0) history.push({ text, images });
+  const latestInputIndex = conversation.inputIndexes.at(-1) ?? -1;
+  const historyEntryIsRequired = (index) => conversation.providerSessionStarted
+    || (mainAgent ? index === latestInputIndex : index > (taskState.activeTask?.index ?? -1));
+  const pushHistory = (text, images = [], required = false) => {
+    if (text || images.length > 0) history.push({ text, images, required });
   };
   for (const index of conversation.inputIndexes) {
     const item = assertObject(input[index], `input[${index}]`);
@@ -892,7 +1009,7 @@ function promptFrom(body, registry = providerConversations) {
         rejectUnsupportedAudio(item.content, `${label}.content`);
         const text = contentText(item.content, `${label}.content`);
         const images = contentImages(item.content, `${label}.content`);
-        pushHistory(`[${role}]\n${text || "[Image input]"}`, images);
+        pushHistory(`[${role}]\n${text || "[Image input]"}`, images, historyEntryIsRequired(index));
       }
     } else if (item.type === "agent_message") {
       const message = agentMessages.get(index) ?? {
@@ -904,28 +1021,32 @@ function promptFrom(body, registry = providerConversations) {
       };
       if (message.newTask) continue;
       if (referencedPriorTaskSection && message.index === taskState.referencedPriorControl?.index) continue;
-      pushHistory(`[Inter-agent message ${message.author} -> ${message.recipient}]\n${message.text}`);
+      pushHistory(
+        `[Inter-agent message ${message.author} -> ${message.recipient}]\n${message.text}`,
+        [],
+        historyEntryIsRequired(index),
+      );
     } else if (item.type === "reasoning") {
       if (isBridgeProgressReasoning(item)) continue;
       const summary = Array.isArray(item.summary)
         ? item.summary.filter((part) => part?.type === "summary_text" && typeof part.text === "string")
           .map((part) => part.text).join("") : "";
-      if (summary) pushHistory(`[Prior reasoning summary]\n${summary}`);
+      if (summary) pushHistory(`[Prior reasoning summary]\n${summary}`, [], historyEntryIsRequired(index));
     } else if (item.type === "function_call" || item.type === "custom_tool_call") {
       const namespace = typeof item.namespace === "string" ? `${item.namespace}.` : "";
       const name = requireString(item.name, `${label}.name`);
       const callId = requireString(item.call_id, `${label}.call_id`);
       const inputValue = item.type === "custom_tool_call" ? item.input : item.arguments;
-      pushHistory(`[Assistant requested client tool ${namespace}${name}; call_id=${callId}]\n${typeof inputValue === "string" ? inputValue : jsonString(inputValue)}`);
+      pushHistory(`[Assistant requested client tool ${namespace}${name}; call_id=${callId}]\n${typeof inputValue === "string" ? inputValue : jsonString(inputValue)}`, [], historyEntryIsRequired(index));
     } else if (item.type === "tool_search_call") {
       const callId = requireString(item.call_id, `${label}.call_id`);
-      pushHistory(`[Assistant requested Codex tool search; call_id=${callId}]\n${jsonString(item.arguments ?? {})}`);
+      pushHistory(`[Assistant requested Codex tool search; call_id=${callId}]\n${jsonString(item.arguments ?? {})}`, [], historyEntryIsRequired(index));
     } else if (item.type === "function_call_output" || item.type === "custom_tool_call_output") {
       const callId = requireString(item.call_id, `${label}.call_id`);
       rejectUnsupportedAudio(item.output, `${label}.output`);
       const text = outputText(item.output, `${label}.output`);
       const images = contentImages(item.output, `${label}.output`);
-      pushHistory(`[Codex client tool result; call_id=${callId}]\n${text || "[Image output]"}`, images);
+      pushHistory(`[Codex client tool result; call_id=${callId}]\n${text || "[Image output]"}`, images, historyEntryIsRequired(index));
     } else if (item.type === "tool_search_output") {
       const callId = requireString(item.call_id, `${label}.call_id`);
       const names = [];
@@ -941,7 +1062,7 @@ function promptFrom(body, registry = providerConversations) {
           }
         }
       }
-      pushHistory(`[Codex tool search result; call_id=${callId}]\n${names.length} tools discovered: ${names.join(", ")}`);
+      pushHistory(`[Codex tool search result; call_id=${callId}]\n${names.length} tools discovered: ${names.join(", ")}`, [], historyEntryIsRequired(index));
     } else if (["compaction", "context_compaction", "compaction_trigger"].includes(item.type)) {
       // Codex compaction payloads are provider-opaque. The portable history remains authoritative.
     } else {
@@ -960,14 +1081,18 @@ function promptFrom(body, registry = providerConversations) {
     const section = history[index];
     const separatorChars = sections.length > 0 || retained.length > 0 ? 2 : 0;
     const textBudget = remainingChars - separatorChars;
-    if (textBudget <= 0) break;
-    const retainedText = section.text.length > textBudget
-      ? section.text.slice(-textBudget)
-      : section.text;
-    retained.unshift(retainedText);
+    if (textBudget < section.text.length) {
+      if (section.required) {
+        throw new BridgeError(
+          `CodeBuddy current control/history entry requires ${section.text.length} characters but only ${Math.max(0, textBudget)} remain`,
+          400,
+        );
+      }
+      continue;
+    }
+    retained.unshift(section.text);
     images.unshift(...section.images);
-    remainingChars -= retainedText.length + separatorChars;
-    if (retainedText.length < section.text.length) break;
+    remainingChars -= section.text.length + separatorChars;
   }
   sections.push(...retained);
   const prompt = sections.join("\n\n");
@@ -1014,9 +1139,7 @@ function promptFrom(body, registry = providerConversations) {
     providerSessionStarted: conversation.providerSessionStarted,
     incomingCodexToolCount: incomingToolInfo.definitions.length,
     retainedToolSurfaceUsed,
-    executionPolicy: mainAgent
-      ? { readOnly: false, rzMcpMode: "full" }
-      : executionPolicy(taskState),
+    executionPolicy: effectivePolicy,
   };
 }
 
@@ -1056,15 +1179,12 @@ function cleanupStaleRequestArtifacts() {
 }
 
 function sanitizedEnvironment(context) {
-  const env = { ...process.env };
-  for (const key of [
-    "OPENROUTER_API_KEY", "TENCENT_API_KEY", "TENCENTCLOUD_SECRET_ID",
-    "TENCENTCLOUD_SECRET_KEY", "CODEBUDDY_API_KEY",
-  ]) delete env[key];
-  if (context?.executionPolicy?.rzMcpMode) {
-    env.RZCODEX_SUBAGENT_RZMCP_MODE = context.executionPolicy.rzMcpMode;
-  }
-  return env;
+  return sanitizeChildEnvironment(process.env, {
+    credentialScope: "none",
+    overrides: context?.executionPolicy?.rzMcpMode
+      ? { RZCODEX_SUBAGENT_RZMCP_MODE: context.executionPolicy.rzMcpMode }
+      : {},
+  });
 }
 
 function validateInit(context, initEvent) {
@@ -1126,9 +1246,28 @@ function providerToolCallKey(call) {
   return `${toolLookupKey(call.entry.namespace, call.entry.originalName)}\u0000${jsonString(call.args)}`;
 }
 
-function codeBuddyArguments(context, mcpConfig) {
-  const tools = ["Read", "Write", "Edit", "Bash", "Glob", "Grep", "ToolSearch", "DeferExecuteTool"];
+function codeBuddyToolPolicy(context) {
+  const policy = context.executionPolicy;
+  const tools = ["Read", "Glob", "Grep", "ToolSearch"];
+  if (!policy.readOnly) tools.push("Write", "Edit");
+  if (!policy.validationRestricted && !policy.readOnly) tools.push("Bash");
+  if (policy.rzMcpMode !== "disabled") tools.push("DeferExecuteTool");
   if (context.toolInfo.hosted.has("web_search")) tools.push("WebSearch");
+  const disallowed = ["Agent", "Task", "TaskCreate", "TaskUpdate", "TaskList", "SendMessage"];
+  if (!tools.includes("Bash")) disallowed.push("Bash");
+  if (!tools.includes("Write")) disallowed.push("Write", "Edit", "NotebookEdit");
+  const boundary = {
+    fileWrites: tools.includes("Write") || tools.includes("Edit") ? "unrestricted" : "disabled",
+    shell: tools.includes("Bash") ? "unrestricted" : "disabled",
+    validationTools: tools.includes("Bash") ? "unrestricted" : "disabled",
+    editorControl: tools.includes("Bash") ? "unrestricted" : "disabled",
+  };
+  assertProviderBoundaryEnforceable("CodeBuddy", boundary, policy);
+  return { tools, disallowed, boundary };
+}
+
+function codeBuddyArguments(context, mcpConfig) {
+  const { tools, disallowed } = codeBuddyToolPolicy(context);
   const sessionArguments = context.providerSessionStarted
     ? ["--resume", context.providerSessionId]
     : ["--session-id", context.providerSessionId];
@@ -1136,7 +1275,7 @@ function codeBuddyArguments(context, mcpConfig) {
     CODEBUDDY_SCRIPT,
     "--print", "--input-format", "stream-json", "--output-format", "stream-json", "--include-partial-messages",
     "--dangerously-skip-permissions", "--tools", tools.join(","),
-    "--disallowedTools", "Agent", "Task", "TaskCreate", "TaskUpdate", "TaskList", "SendMessage",
+    "--disallowedTools", ...disallowed,
     "--model", context.model, "--effort", REQUIRED_EFFORT,
     "--mcp-config", mcpConfig, "--strict-mcp-config", ...sessionArguments,
   ];
@@ -1169,7 +1308,48 @@ function providerResponseErrorCode(error) {
     : "external_provider_error";
 }
 
-function runCodeBuddy(context, onSpawn, onProviderEvent = () => {}) {
+function createNativeMutationTracker(policy) {
+  const records = new Map();
+  const successfulPaths = new Set();
+  let started = 0;
+  let successful = 0;
+  return {
+    observeUse(id, name, input) {
+      if (records.has(id)) return records.get(id);
+      const mutation = providerToolIsMutation(name, input, policy);
+      const changedPath = input?.file_path ?? input?.filePath ?? input?.path;
+      const record = {
+        mutation,
+        changedPath: typeof changedPath === "string" && changedPath ? changedPath : null,
+        resultObserved: false,
+      };
+      records.set(id, record);
+      if (mutation) started += 1;
+      return record;
+    },
+    observeResult(result) {
+      const id = result?.tool_use_id ?? result?.toolUseId ?? result?.call_id ?? result?.callId;
+      if (typeof id !== "string") return false;
+      const record = records.get(id);
+      if (!record || record.resultObserved) return false;
+      record.resultObserved = true;
+      const succeeded = result.is_error !== true && result.isError !== true;
+      if (!succeeded || !record.mutation) return false;
+      successful += 1;
+      if (record.changedPath) successfulPaths.add(record.changedPath);
+      return true;
+    },
+    snapshot() {
+      return {
+        started,
+        successful,
+        successfulPaths: [...successfulPaths],
+      };
+    },
+  };
+}
+
+function runCodeBuddy(context, onSpawn, onProviderEvent = () => {}, onDelivered = () => {}) {
   if (!existsSync(CODEBUDDY_SCRIPT)) throw new BridgeError(`CodeBuddy CLI is not installed at ${CODEBUDDY_SCRIPT}`, 502);
   if (!existsSync(MCP_SERVER_SCRIPT)) throw new BridgeError(`Codex tool MCP adapter is missing at ${MCP_SERVER_SCRIPT}`, 502);
   const artifacts = requestArtifacts(context);
@@ -1195,9 +1375,8 @@ function runCodeBuddy(context, onSpawn, onProviderEvent = () => {}) {
     const calls = new Map();
     const nativeToolNames = [];
     const nativeRzMcpTools = [];
-    const nativeChangedPaths = [];
     const nativeToolIds = new Set();
-    let nativeMutationCount = 0;
+    const mutationTracker = createNativeMutationTracker(context.executionPolicy);
     let providerActivityObserved = false;
     const finish = (error, value) => {
       if (settled) return;
@@ -1206,9 +1385,15 @@ function runCodeBuddy(context, onSpawn, onProviderEvent = () => {}) {
       clearInterval(silenceTimer);
       artifacts.cleanup();
       if (error) {
+        const mutation = mutationTracker.snapshot();
         error.nativeToolNames = [...nativeToolNames];
         error.nativeRzMcpTools = [...new Set(nativeRzMcpTools)];
-        error.providerMutationCount = nativeMutationCount;
+        error.providerMutationCount = mutation.successful;
+        error.mutationToolCalls = mutation.started;
+        if (providerToolWorkStarted(nativeToolNames)) {
+          error.routeCommitted = true;
+          error.safeToRetry = false;
+        }
       }
       error ? reject(error) : resolve(value);
     };
@@ -1248,11 +1433,7 @@ function runCodeBuddy(context, onSpawn, onProviderEvent = () => {}) {
             nativeToolNames.push(part.name);
             const rzMcpTool = rzMcpToolNameFromNativeProgress(part.name, part.input);
             if (rzMcpTool) nativeRzMcpTools.push(rzMcpTool);
-            if (providerToolIsMutation(part.name, part.input, context.executionPolicy)) {
-              nativeMutationCount += 1;
-              const changedPath = part.input?.file_path ?? part.input?.filePath ?? part.input?.path;
-              if (typeof changedPath === "string" && changedPath) nativeChangedPaths.push(changedPath);
-            }
+            mutationTracker.observeUse(nativeToolId, part.name, part.input);
           }
           const call = providerToolCall(part, context);
           if (call) {
@@ -1260,6 +1441,13 @@ function runCodeBuddy(context, onSpawn, onProviderEvent = () => {}) {
             if (!calls.has(callKey)) calls.set(callKey, call);
           }
         }
+      }
+      if (event.type === "user" && Array.isArray(event.message?.content)) {
+        for (const result of event.message.content.filter((part) => part?.type === "tool_result")) {
+          mutationTracker.observeResult(result);
+        }
+      } else if (event.type === "tool_result") {
+        mutationTracker.observeResult(event);
       }
       if (event.type === "result") resultEvent = event;
     };
@@ -1321,11 +1509,18 @@ function runCodeBuddy(context, onSpawn, onProviderEvent = () => {}) {
         maxTurnInputTokens,
         nativeToolNames,
         nativeRzMcpTools: [...new Set(nativeRzMcpTools)],
-        nativeChangedPaths: [...new Set(nativeChangedPaths)],
-        mutationCount: nativeMutationCount,
+        nativeChangedPaths: mutationTracker.snapshot().successfulPaths,
+        mutationCount: mutationTracker.snapshot().successful,
+        mutationStartedCount: mutationTracker.snapshot().started,
       });
     });
-    child.stdin.end(codeBuddyInput(context.prompt, context.images));
+    child.stdin.end(codeBuddyInput(context.prompt, context.images), (error) => {
+      if (error) {
+        if (error?.code !== "EPIPE") finish(new BridgeError(`CodeBuddy stdin failed: ${error.message}`, 502));
+        return;
+      }
+      onDelivered();
+    });
   });
 }
 
@@ -1375,6 +1570,16 @@ function writeSse(response, type, payload) {
   if (response.destroyed || response.writableEnded) return false;
   response.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...payload })}\n\n`);
   return true;
+}
+
+function providerWorkStartedMetadata(nativeToolName) {
+  const boundedToolName = typeof nativeToolName === "string"
+    ? nativeToolName.slice(0, 128)
+    : null;
+  return {
+    provider_work_started: true,
+    ...(boundedToolName ? { native_tool_name: boundedToolName } : {}),
+  };
 }
 
 async function readJsonRequest(request) {
@@ -1498,14 +1703,16 @@ async function handleResponses(request, response) {
   });
   const responseId = `resp_${randomUUID()}`;
   writeSse(response, "response.created", { response: { id: responseId, object: "response", model: context.model, status: "in_progress" } });
-  const progressItems = [];
+  const completedOutputItems = new Map();
+  let nextOutputIndex = 0;
   let nativeProgressTools = 0;
   const pendingNativeProgressTools = new Map();
   const completedNativeProgressToolIds = new Set();
   const emitProgress = (delta) => {
     if (!delta || clientGone) return;
     const progressItemId = `progress_${randomUUID()}`;
-    const outputIndex = progressItems.length;
+    const outputIndex = nextOutputIndex;
+    nextOutputIndex += 1;
     writeSse(response, "response.output_item.added", {
       output_index: outputIndex,
       item: { type: "reasoning", id: progressItemId, status: "in_progress", summary: [] },
@@ -1529,23 +1736,26 @@ async function handleResponses(request, response) {
       text: delta,
     });
     writeSse(response, "response.output_item.done", { output_index: outputIndex, item });
-    progressItems.push(item);
+    completedOutputItems.set(outputIndex, item);
   };
-  const finishProgress = () => [...progressItems];
   let streamedMessageId = null;
+  let streamedOutputIndex = null;
   let streamedText = "";
   let lastProgressAt = 0;
+  let providerWorkStartReported = false;
   const emitText = (text) => {
     if (!text || clientGone) return;
     if (!streamedMessageId) {
       streamedMessageId = `msg_${randomUUID()}`;
+      streamedOutputIndex = nextOutputIndex;
+      nextOutputIndex += 1;
       writeSse(response, "response.output_item.added", {
-        output_index: 0,
+        output_index: streamedOutputIndex,
         item: responseMessageItem(streamedMessageId, ""),
       });
       writeSse(response, "response.content_part.added", {
         item_id: streamedMessageId,
-        output_index: 0,
+        output_index: streamedOutputIndex,
         content_index: 0,
         part: { type: "output_text", text: "", annotations: [] },
       });
@@ -1554,7 +1764,7 @@ async function handleResponses(request, response) {
     runtime.lastStreamedTextChars = streamedText.length;
     writeSse(response, "response.output_text.delta", {
       item_id: streamedMessageId,
-      output_index: 0,
+      output_index: streamedOutputIndex,
       content_index: 0,
       delta: text,
     });
@@ -1583,16 +1793,26 @@ async function handleResponses(request, response) {
           if (!completedNativeProgressToolIds.has(toolId)) {
             pendingNativeProgressTools.set(toolId, { name: tool.name, input: tool.input });
           }
+          providerConversations.noteProviderWork(context, {
+            mutation: providerToolIsMutation(tool.name, tool.input, context.executionPolicy),
+          });
         }
-        writeSse(response, "response.in_progress", {
+        const workStartMetadata = providerWorkStartReported
+          ? {}
+          : providerWorkStartedMetadata(nativeTools.at(-1).name);
+        const reported = writeSse(response, "response.in_progress", {
           response: {
             id: responseId,
             object: "response",
             model: context.model,
             status: "in_progress",
-            metadata: { provider_activity: runtime.lastProviderActivity },
+            metadata: {
+              provider_activity: runtime.lastProviderActivity,
+              ...workStartMetadata,
+            },
           },
         });
+        providerWorkStartReported ||= reported;
       }
       return;
     }
@@ -1616,6 +1836,7 @@ async function handleResponses(request, response) {
       const visibleText = providerVisibleTextDelta(event);
       if (visibleText !== null) {
         activity = "writing";
+        emitText(visibleText);
       } else if (providerEvent.delta?.type === "thinking_delta") {
         activity = "reasoning";
       } else if (providerEvent.delta?.type === "input_json_delta") {
@@ -1639,7 +1860,12 @@ async function handleResponses(request, response) {
     });
   };
   try {
-    const result = await runCodeBuddy(context, (spawned) => { child = spawned; }, onProviderEvent);
+    const result = await runCodeBuddy(
+      context,
+      (spawned) => { child = spawned; },
+      onProviderEvent,
+      () => providerConversations.delivered(context),
+    );
     if (clientGone) return;
     providerConversations.commit(context);
     runtime.lastModel = result.initEvent.model;
@@ -1661,11 +1887,9 @@ async function handleResponses(request, response) {
       ? `${providerFinalText}\n\n${progressReport}`
       : providerFinalText;
     runtime.completed += 1;
-    const output = [];
-    output.push(...finishProgress());
-    let outputIndex = output.length;
     if (finalText) {
       const itemId = streamedMessageId || `msg_${randomUUID()}`;
+      const outputIndex = streamedMessageId ? streamedOutputIndex : nextOutputIndex++;
       if (!streamedMessageId) {
         writeSse(response, "response.output_item.added", { output_index: outputIndex, item: responseMessageItem(itemId, "") });
         writeSse(response, "response.content_part.added", { item_id: itemId, output_index: outputIndex, content_index: 0, part: { type: "output_text", text: "", annotations: [] } });
@@ -1683,15 +1907,18 @@ async function handleResponses(request, response) {
       writeSse(response, "response.content_part.done", { item_id: itemId, output_index: outputIndex, content_index: 0, part: { type: "output_text", text: finalText, annotations: [] } });
       const item = responseMessageItem(itemId, finalText, "completed");
       writeSse(response, "response.output_item.done", { output_index: outputIndex, item });
-      output.push(item);
-      outputIndex += 1;
+      completedOutputItems.set(outputIndex, item);
     }
     for (const call of result.calls) {
+      const outputIndex = nextOutputIndex;
+      nextOutputIndex += 1;
       const item = callItem(call);
       writeSse(response, "response.output_item.done", { output_index: outputIndex, item });
-      output.push(item);
-      outputIndex += 1;
+      completedOutputItems.set(outputIndex, item);
     }
+    const output = [...completedOutputItems.entries()]
+      .sort(([left], [right]) => left - right)
+      .map(([, item]) => item);
     writeSse(response, "response.completed", {
       response: {
         id: responseId, object: "response", model: context.model, status: "completed",
@@ -1747,7 +1974,7 @@ async function handleResponses(request, response) {
     }
   } catch (error) {
     if (clientGone) return;
-    providerConversations.resetProvider(context);
+    providerConversations.fail(context);
     runtime.failed += 1;
     runtime.lastFailure = redactSecrets(error.message);
     writeSse(response, "response.failed", {
@@ -1766,7 +1993,7 @@ async function handleResponses(request, response) {
     response.end();
   } finally {
     if (clientGone && !conversationReleased) {
-      if (nativeProgressTools > 0) {
+      if (providerConversations.ownsProviderState(context)) {
         // A completed progress item is a Codex mailbox/preemption boundary. Preserve the provider
         // conversation so the next request for this thread can deliver the parent's checkpoint or
         // follow-up without discarding the native tool results that preceded that boundary.
@@ -1782,6 +2009,8 @@ async function handleResponses(request, response) {
 }
 
 function selfTest() {
+  selfTestRoute = Object.freeze({ model: "self-test-model", inputModalities: ["text"] });
+  const workStartedMetadata = providerWorkStartedMetadata("Edit");
   const safeProgress = formatNativeToolProgress("CodeBuddy", 2, "Bash", {
     command: "rg -n 'SetInteractText' G:/QANGA --api-key=or-secretsecretsecret",
   });
@@ -1800,7 +2029,10 @@ function selfTest() {
     server_name: "rzmcp",
   });
   if (
-    !safeProgress.includes("rg -n 'SetInteractText' G:/QANGA")
+    workStartedMetadata.provider_work_started !== true
+    || workStartedMetadata.native_tool_name !== "Edit"
+    || providerWorkStartedMetadata("x".repeat(129)).native_tool_name.length !== 128
+    || !safeProgress.includes("rg -n 'SetInteractText' G:/QANGA")
     || safeProgress.includes("secretsecretsecret")
     || !lazyProgress.includes("RzMCP inspect_graph_by_path")
     || !deferredLazyProgress.includes("mcp__rzmcp__call_rzmcp_tool - RzMCP find_blueprint_nodes")
@@ -1821,6 +2053,26 @@ function selfTest() {
     || !providerToolIsMutation("Edit", { file_path: "fixture.cpp" }, { rzMcpMode: "read-only" })
   ) {
     throw new Error("self-test failed: CodeBuddy lazy RzMCP mutation accounting");
+  }
+  const mutationTracker = createNativeMutationTracker(createExecutionPolicy({
+    validationRestricted: true,
+    rzMcpMode: "no-validation",
+  }));
+  mutationTracker.observeUse("edit-failed", "Edit", { file_path: "failed.cpp" });
+  if (mutationTracker.snapshot().started !== 1 || mutationTracker.snapshot().successful !== 0) {
+    throw new Error("self-test failed: started CodeBuddy mutation was counted as successful before its result");
+  }
+  mutationTracker.observeResult({ type: "tool_result", tool_use_id: "edit-failed", is_error: true });
+  mutationTracker.observeUse("edit-success", "Edit", { file_path: "success.cpp" });
+  mutationTracker.observeResult({ type: "tool_result", tool_use_id: "edit-success", is_error: false });
+  mutationTracker.observeResult({ type: "tool_result", tool_use_id: "edit-success", is_error: false });
+  const mutationSnapshot = mutationTracker.snapshot();
+  if (
+    mutationSnapshot.started !== 2
+    || mutationSnapshot.successful !== 1
+    || mutationSnapshot.successfulPaths.join(",") !== "success.cpp"
+  ) {
+    throw new Error("self-test failed: CodeBuddy mutation result accounting is not monotonic and result-backed");
   }
   const toolServingMetadata = codexToolServingMetadata(2);
   if (
@@ -1929,6 +2181,41 @@ function selfTest() {
   }
   mainRegistry.begin(firstMainTurn);
   mainRegistry.commit(firstMainTurn);
+  for (const incompatibleRequest of [
+    {
+      model: MAIN_MODEL_ALIAS,
+      cwd: dirname(homedir()),
+      input: [{ type: "message", role: "user", content: "DIFFERENT_WORKSPACE" }],
+      expected: "working directory",
+    },
+    {
+      model: MODEL_ALIAS,
+      cwd: homedir(),
+      input: [{
+        type: "agent_message",
+        id: "mode-switch-task",
+        author: "Codex",
+        recipient: "/root/mode_switch",
+        content: "Message Type: NEW_TASK\nTask name: /root/mode_switch\nPayload:\nInspect this task read-only.",
+      }],
+      expected: "main/subagent mode",
+    },
+  ]) {
+    try {
+      promptFrom({
+        model: incompatibleRequest.model,
+        stream: true,
+        reasoning: { effort: REQUIRED_EFFORT },
+        client_metadata: { cwd: incompatibleRequest.cwd, thread_id: "codebuddy-main-fixture" },
+        instructions: "MAIN_AGENT_INSTRUCTIONS",
+        input: incompatibleRequest.input,
+        tools: selfTestTools,
+      }, mainRegistry);
+      throw new Error("self-test failed: incompatible CodeBuddy session reuse was accepted");
+    } catch (error) {
+      if (!String(error.message).includes(incompatibleRequest.expected)) throw error;
+    }
+  }
   const resumedMainTurn = mainRequest([
     { type: "message", id: "main-user-1", role: "user", content: "MAIN_AGENT_REQUEST_ONE" },
     { type: "message", id: "main-assistant-1", role: "assistant", content: "MAIN_AGENT_RESPONSE_ONE" },
@@ -2006,6 +2293,16 @@ function selfTest() {
       `self-test failed: negated mutation intent classification read_only=${readOnlyTask.taskState.activeTask.intent} bounded_mutation=${boundedMutationTask.taskState.activeTask.intent}`,
     );
   }
+  const readOnlyTools = codeBuddyArguments(readOnlyTask, "mcp-config.json");
+  const mutationTools = codeBuddyArguments(boundedMutationTask, "mcp-config.json");
+  if (
+    readOnlyTools[readOnlyTools.indexOf("--tools") + 1].includes("Write")
+    || readOnlyTools[readOnlyTools.indexOf("--tools") + 1].includes("Bash")
+    || !mutationTools[mutationTools.indexOf("--tools") + 1].includes("Write")
+    || mutationTools[mutationTools.indexOf("--tools") + 1].includes("Bash")
+  ) {
+    throw new Error("self-test failed: CodeBuddy provider tool boundary did not enforce task policy");
+  }
   if (
     !readOnlyTask.prompt.includes("[Analysis convergence contract]")
     || readOnlyTask.prompt.includes("[Immediate terminal report required]")
@@ -2070,7 +2367,7 @@ function selfTest() {
     recipient: "/root/test",
     content: [{
       type: "input_text",
-      text: `${taskHeader}Read-only RzCodex checkpoint smoke test. Do not edit files. Inspect the bounded files in order. Return concise evidence when complete or immediately if the parent requests a checkpoint.`,
+      text: `${taskHeader}Read-only RzCodex checkpoint smoke test. Do not edit files. Finish the bounded inspection, then return a checkpoint report.`,
     }],
   }], MAX_ACTIVE_TASK_CHARS);
   if (
@@ -2078,6 +2375,28 @@ function selfTest() {
     || conditionalCheckpointTask.immediateReturnRequested
   ) {
     throw new Error("self-test failed: a conditional checkpoint mention became a terminal control request");
+  }
+  const budgetTask = {
+    type: "agent_message",
+    id: "budget-task",
+    author: "Codex",
+    recipient: "/root/budget",
+    content: "Message Type: NEW_TASK\nTask name: /root/budget\nPayload:\nInspect the bounded fixture read-only.",
+  };
+  try {
+    normalizeSelfTestRequest([
+      budgetTask,
+      {
+        type: "agent_message",
+        id: "oversized-current-control",
+        author: "Codex",
+        recipient: "/root/budget",
+        content: `Message Type: MESSAGE\nTask name: /root/budget\nPayload:\n${"x".repeat(MAX_PROMPT_CHARS)}`,
+      },
+    ]);
+    throw new Error("self-test failed: oversized current control was silently tail-sliced");
+  } catch (error) {
+    if (!String(error.message).includes("current control/history entry")) throw error;
   }
   const encryptedPayload = "implement encrypted delivery fixture";
   const encryptedTask = normalizeSelfTestRequest([{
@@ -2201,11 +2520,12 @@ function selfTest() {
     || !postCompaction.prompt.includes(postCompactionResult)
     || postCompaction.taskState.progress.toolCallsSinceTask !== 2
     || !postCompaction.retainedToolSurfaceUsed
+    || jsonString(postCompaction.executionPolicy) !== jsonString(resumeFirst.executionPolicy)
   ) {
     throw new Error("self-test failed: compaction removed retained task or cumulative progress");
   }
   resumeRegistry.commit(postCompaction);
-  const replacementResumePayload = "replace the active retained task";
+  const replacementResumePayload = "inspect the newly assigned retained task";
   const replacementResumeText = `${taskHeader}${replacementResumePayload}`;
   const replacementResume = normalizeSelfTestRequest([{
     id: "amsg-resume-replacement",
@@ -2251,7 +2571,7 @@ function selfTest() {
     type: "agent_message",
     author: "/root",
     recipient: "/root/test",
-    content: [{ type: "input_text", text: `${taskHeader}replace the task without repeating unchanged tools` }],
+    content: [{ type: "input_text", text: `${taskHeader}inspect a different task without repeating unchanged tools` }],
   }], { registry: taskChangeRegistry, threadId: taskChangeThread, omitTools: true });
   if (
     !taskChange.retainedToolSurfaceUsed
@@ -2261,26 +2581,23 @@ function selfTest() {
     throw new Error("self-test failed: a follow-up task lost the retained provider tool surface");
   }
   const inheritedHistory = "h".repeat(MAX_PROMPT_CHARS + 10_000);
-  const longFork = normalizeSelfTestRequest([
-    plaintextTaskItem,
-    { type: "message", role: "user", content: inheritedHistory },
-  ]);
-  if (
-    !longFork.taskDiagnostics.completeTaskDelivered
-    || longFork.prompt.split(plaintextTaskText).length - 1 !== 1
-  ) {
-    throw new Error("self-test failed: long inherited history removed the active task");
-  }
-  const afterLargeToolOutput = normalizeSelfTestRequest([
-    plaintextTaskItem,
-    { type: "function_call", name: "exec_command", call_id: "large-read", arguments: "{}" },
-    { type: "function_call_output", call_id: "large-read", output: "r".repeat(MAX_PROMPT_CHARS + 10_000) },
-  ]);
-  if (
-    !afterLargeToolOutput.taskDiagnostics.completeTaskDelivered
-    || afterLargeToolOutput.prompt.split(plaintextTaskText).length - 1 !== 1
-  ) {
-    throw new Error("self-test failed: large tool output removed the resumed active task");
+  for (const [label, input] of [
+    ["user message", [
+      plaintextTaskItem,
+      { type: "message", role: "user", content: inheritedHistory },
+    ]],
+    ["tool output", [
+      plaintextTaskItem,
+      { type: "function_call", name: "exec_command", call_id: "large-read", arguments: "{}" },
+      { type: "function_call_output", call_id: "large-read", output: "r".repeat(MAX_PROMPT_CHARS + 10_000) },
+    ]],
+  ]) {
+    try {
+      normalizeSelfTestRequest(input);
+      throw new Error(`self-test failed: oversized current ${label} was silently truncated`);
+    } catch (error) {
+      if (!String(error.message).includes("current control/history entry")) throw error;
+    }
   }
   const replacementPayload = "fix replacement task fixture";
   const replacementTaskText = `${taskHeader}${replacementPayload}`;
@@ -2447,6 +2764,91 @@ function selfTest() {
     { registry: mutationRegistry, threadId: mutationThread },
   );
   mutationRegistry.commit(mutationFirstTurn);
+  const failedMutationRegistry = new ProviderConversationRegistry();
+  const failedMutationThread = "self-test-failed-mutation-resume";
+  const failedMutationFirstTurn = normalizeSelfTestRequest([mutationTaskItem], {
+    registry: failedMutationRegistry,
+    threadId: failedMutationThread,
+  });
+  failedMutationRegistry.begin(failedMutationFirstTurn);
+  failedMutationRegistry.delivered(failedMutationFirstTurn);
+  failedMutationRegistry.noteProviderWork(failedMutationFirstTurn, { mutation: true });
+  failedMutationRegistry.fail(failedMutationFirstTurn);
+  const failedMutationResume = normalizeSelfTestRequest([
+    mutationTaskItem,
+    {
+      type: "agent_message",
+      id: "resume-after-provider-error",
+      author: "Codex",
+      recipient: "/root/test",
+      content: "Message Type: MESSAGE\nTask name: /root/test\nPayload:\nContinue from the retained provider state and do not repeat the edit.",
+    },
+  ], { registry: failedMutationRegistry, threadId: failedMutationThread });
+  if (
+    !failedMutationResume.providerSessionStarted
+    || failedMutationResume.providerSessionId !== failedMutationFirstTurn.providerSessionId
+    || failedMutationResume.conversation.inputIndexes.includes(0)
+  ) {
+    throw new Error("self-test failed: CodeBuddy provider error discarded committed conversation ownership");
+  }
+  const failedMutationContinuation = normalizeSelfTestRequest([
+    mutationTaskItem,
+    checkpointResumeNewTask,
+  ], { registry: failedMutationRegistry, threadId: failedMutationThread });
+  if (
+    !failedMutationContinuation.conversation.state.providerWorkStarted
+    || !failedMutationContinuation.conversation.state.mutationWorkStarted
+    || !failedMutationContinuation.prompt.includes("[Retained provider ownership - authoritative]")
+  ) {
+    throw new Error("self-test failed: continuation NEW_TASK reset retained task ownership");
+  }
+  const independentTaskText = `${taskHeader}Implement an independent fixture after the retained task.`;
+  const independentTaskItem = {
+    id: "amsg-independent-task",
+    type: "agent_message",
+    author: "/root",
+    recipient: "/root/test",
+    content: [{ type: "input_text", text: independentTaskText }],
+  };
+  const taskBoundaryRegistry = new ProviderConversationRegistry();
+  const taskBoundaryThread = "self-test-independent-task-prework-failure";
+  const retainedPriorTask = normalizeSelfTestRequest([mutationTaskItem], {
+    registry: taskBoundaryRegistry,
+    threadId: taskBoundaryThread,
+  });
+  taskBoundaryRegistry.begin(retainedPriorTask);
+  taskBoundaryRegistry.delivered(retainedPriorTask);
+  taskBoundaryRegistry.noteProviderWork(retainedPriorTask, { mutation: true });
+  taskBoundaryRegistry.commit(retainedPriorTask);
+  const independentTaskFirstAttempt = normalizeSelfTestRequest([
+    mutationTaskItem,
+    independentTaskItem,
+  ], { registry: taskBoundaryRegistry, threadId: taskBoundaryThread });
+  if (
+    !independentTaskFirstAttempt.providerSessionStarted
+    || independentTaskFirstAttempt.taskState.activeTask.id !== independentTaskItem.id
+    || independentTaskFirstAttempt.conversation.state.providerWorkStarted
+    || independentTaskFirstAttempt.conversation.state.mutationWorkStarted
+    || independentTaskFirstAttempt.prompt.includes("[Retained provider ownership - authoritative]")
+  ) {
+    throw new Error("self-test failed: independent NEW_TASK inherited prior task ownership");
+  }
+  taskBoundaryRegistry.begin(independentTaskFirstAttempt);
+  taskBoundaryRegistry.delivered(independentTaskFirstAttempt);
+  taskBoundaryRegistry.fail(independentTaskFirstAttempt);
+  const independentTaskRetry = normalizeSelfTestRequest([
+    mutationTaskItem,
+    independentTaskItem,
+  ], { registry: taskBoundaryRegistry, threadId: taskBoundaryThread });
+  if (
+    independentTaskRetry.providerSessionStarted
+    || independentTaskRetry.providerSessionId === independentTaskFirstAttempt.providerSessionId
+    || !independentTaskRetry.conversation.inputIndexes.includes(1)
+    || !independentTaskRetry.taskDiagnostics.completeTaskDelivered
+    || !independentTaskRetry.prompt.includes(independentTaskText)
+  ) {
+    throw new Error("self-test failed: pre-work failure suppressed independent NEW_TASK retry delivery");
+  }
   const mutationAfterFirstPatch = normalizeSelfTestRequest(firstPatchHistory, {
     registry: mutationRegistry,
     threadId: mutationThread,
@@ -2564,7 +2966,7 @@ function selfTest() {
   if (
     !longPromptArgs.includes("--input-format") ||
     !longPromptArgs.includes("stream-json") ||
-    !longPromptArgs.includes("Read,Write,Edit,Bash,Glob,Grep,ToolSearch,DeferExecuteTool,WebSearch") ||
+    longPromptArgs[longPromptArgs.indexOf("--tools") + 1] !== "Read,Glob,Grep,ToolSearch,DeferExecuteTool,WebSearch" ||
     !longPromptArgs.includes("Agent") ||
     longPromptArgs.some((argument) => argument.includes(longPrompt)) ||
     longPromptInput.message?.content?.[0]?.text !== longPrompt
@@ -2622,9 +3024,10 @@ function selfTest() {
 
 function start() {
   const port = configuredPort();
+  const bearerToken = loadBridgeBearerToken();
   cleanupOrphanedManagedSessions();
   cleanupStaleRequestArtifacts();
-  const server = createServer(async (request, response) => {
+  const server = createAuthenticatedBridgeServer(async (request, response) => {
     try {
       if (request.method === "GET" && request.url === "/health") {
         jsonResponse(response, 200, {
@@ -2662,7 +3065,7 @@ function start() {
       }
       jsonResponse(response, status, { error: { type: "bridge_error", message: redactedMessage } });
     }
-  });
+  }, { token: bearerToken });
   server.on("error", (error) => {
     process.stderr.write(`codebuddy-subagent-bridge: ${error.message}\n`);
     process.exitCode = 1;
@@ -2672,7 +3075,10 @@ function start() {
 
 try {
   if (process.argv.includes("--self-test")) selfTest();
-  else start();
+  else {
+    exitWhenParentStops();
+    start();
+  }
 } catch (error) {
   process.stderr.write(`codebuddy-subagent-bridge startup failed: ${redactSecrets(error.message)}\n`);
   process.exitCode = 1;

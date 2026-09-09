@@ -20,6 +20,7 @@ use pretty_assertions::assert_eq;
 use std::collections::HashMap;
 use std::fs;
 use std::fs::OpenOptions;
+use std::io::Read;
 use std::io::Seek;
 use std::io::SeekFrom;
 use std::os::windows::io::AsRawHandle;
@@ -49,6 +50,10 @@ use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
 static TEST_HOME_COUNTER: AtomicU64 = AtomicU64::new(0);
 static LEGACY_PROCESS_TEST_LOCK: Mutex<()> = Mutex::new(());
+const MAX_TEST_DIAGNOSTIC_BYTES: usize = 4096;
+const LARGE_CAPTURE_CHUNK_BYTES: usize = 4096;
+const LARGE_CAPTURE_CHUNKS: usize = 2048;
+const LARGE_CAPTURE_BYTES: usize = LARGE_CAPTURE_CHUNK_BYTES * LARGE_CAPTURE_CHUNKS;
 
 fn legacy_process_test_guard() -> MutexGuard<'static, ()> {
     LEGACY_PROCESS_TEST_LOCK
@@ -88,10 +93,60 @@ fn sandbox_home(name: &str) -> TempDir {
     tempfile::TempDir::new_in(&path).expect("create sandbox home tempdir")
 }
 
+fn isolated_legacy_cwd() -> TempDir {
+    TempDir::new_in(sandbox_cwd()).expect("create isolated legacy process cwd")
+}
+
+fn sandbox_temp_env(codex_home: &Path) -> HashMap<String, String> {
+    let temp_root = codex_home
+        .parent()
+        .expect("sandbox home should have a fixture parent")
+        .to_string_lossy()
+        .into_owned();
+    HashMap::from([
+        ("TEMP".to_string(), temp_root.clone()),
+        ("TMP".to_string(), temp_root),
+    ])
+}
+
+fn bounded_file_text(path: &Path) -> String {
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(err) => return format!("failed to read {}: {err}", path.display()),
+    };
+    let mut bytes = Vec::new();
+    if let Err(err) = file
+        .take((MAX_TEST_DIAGNOSTIC_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+    {
+        return format!("failed to read {}: {err}", path.display());
+    }
+    let truncated = bytes.len() > MAX_TEST_DIAGNOSTIC_BYTES;
+    let mut text =
+        String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_TEST_DIAGNOSTIC_BYTES)]).into_owned();
+    if truncated {
+        text.push_str("...<truncated>");
+    }
+    text
+}
+
+fn assert_exact_binary_output(name: &str, actual: &[u8], expected: &[u8]) {
+    let first_mismatch = actual.iter().zip(expected).enumerate().find_map(
+        |(index, (&actual_byte, &expected_byte))| {
+            (actual_byte != expected_byte).then_some((index, actual_byte, expected_byte))
+        },
+    );
+    assert!(
+        actual.len() == expected.len() && first_mismatch.is_none(),
+        "{name} mismatch: actual_len={}, expected_len={}, first_mismatch={first_mismatch:?}",
+        actual.len(),
+        expected.len(),
+    );
+}
+
 fn sandbox_log(codex_home: &Path) -> String {
     let log_path = crate::current_log_file_path(&codex_home.join(".sandbox"));
-    fs::read_to_string(&log_path)
-        .unwrap_or_else(|err| format!("failed to read {}: {err}", log_path.display()))
+    bounded_file_text(&log_path)
 }
 
 fn workspace_roots_for(root: &Path) -> Vec<AbsolutePathBuf> {
@@ -131,6 +186,23 @@ fn wait_for_path(path: &Path, timeout: Duration) -> bool {
         std::thread::sleep(Duration::from_millis(25));
     }
     path.exists()
+}
+
+fn wait_for_pid(path: &Path, timeout: Duration) -> Option<u32> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Ok(pid) = fs::read_to_string(path).and_then(|pid| {
+            pid.trim()
+                .parse()
+                .map_err(|err| std::io::Error::other(format!("invalid process id: {err}")))
+        }) {
+            return Some(pid);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }
 
 fn open_process_for_wait(pid: u32) -> std::io::Result<OwnedHandle> {
@@ -266,7 +338,8 @@ fn legacy_non_tty_cmd_emits_output() {
     let _guard = legacy_process_test_guard();
     let runtime = current_thread_runtime();
     runtime.block_on(async move {
-        let cwd = sandbox_cwd();
+        let cwd_fixture = isolated_legacy_cwd();
+        let cwd = cwd_fixture.path().to_path_buf();
         let codex_home = sandbox_home("legacy-non-tty-cmd");
         println!("cmd codex_home={}", codex_home.path().display());
         let permission_profile = PermissionProfile::workspace_write();
@@ -280,7 +353,7 @@ fn legacy_non_tty_cmd_emits_output() {
                 "echo LEGACY-NONTTY-CMD".to_string(),
             ],
             cwd.as_path(),
-            HashMap::new(),
+            sandbox_temp_env(codex_home.path()),
             Some(5_000),
             &[],
             &[],
@@ -305,13 +378,15 @@ fn elevated_non_tty_cmd_forwards_env_output_and_exit() {
     let _guard = legacy_process_test_guard();
     let runtime = current_thread_runtime();
     runtime.block_on(async move {
-        let cwd = sandbox_cwd();
+        let cwd_fixture = isolated_legacy_cwd();
+        let cwd = cwd_fixture.path().to_path_buf();
         let codex_home = sandbox_home("elevated-non-tty-cmd");
         let permission_profile = PermissionProfile::workspace_write();
-        let env_map = HashMap::from([(
+        let mut env_map = sandbox_temp_env(codex_home.path());
+        env_map.insert(
             "CODEX_ELEVATED_TEST".to_string(),
             "ELEVATED-ENV-OK".to_string(),
-        )]);
+        );
         let spawned = spawn_windows_sandbox_session_elevated_for_permission_profile(
             &permission_profile,
             workspace_roots_for(cwd.as_path()).as_slice(),
@@ -393,7 +468,8 @@ fn legacy_non_tty_powershell_interrupt_terminates_process() {
     let _guard = legacy_process_test_guard();
     let runtime = current_thread_runtime();
     runtime.block_on(async move {
-        let cwd = sandbox_cwd();
+        let cwd_fixture = isolated_legacy_cwd();
+        let cwd = cwd_fixture.path().to_path_buf();
         let codex_home = sandbox_home("legacy-non-tty-pwsh");
         println!("pwsh codex_home={}", codex_home.path().display());
         let permission_profile = PermissionProfile::workspace_write();
@@ -408,7 +484,7 @@ fn legacy_non_tty_powershell_interrupt_terminates_process() {
                 "Write-Output LEGACY-NONTTY-DIRECT; [System.Threading.ManualResetEvent]::new($false).WaitOne()".to_string(),
             ],
             cwd.as_path(),
-            HashMap::new(),
+            sandbox_temp_env(codex_home.path()),
             /*timeout_ms*/ None,
             &[],
             &[],
@@ -610,7 +686,8 @@ fn legacy_capture_emits_output_and_preserves_descendant_after_normal_exit() {
         return;
     };
     let _guard = legacy_process_test_guard();
-    let cwd = sandbox_cwd();
+    let cwd_fixture = isolated_legacy_cwd();
+    let cwd = cwd_fixture.path().to_path_buf();
     let codex_home = sandbox_home("legacy-capture-pwsh");
     println!("capture pwsh codex_home={}", codex_home.path().display());
     let ready_marker = codex_home.path().join("descendant-started");
@@ -642,17 +719,14 @@ fn legacy_capture_emits_output_and_preserves_descendant_after_normal_exit() {
             parent_command,
         ],
         cwd.as_path(),
-        HashMap::new(),
+        sandbox_temp_env(codex_home.path()),
         Some(10_000),
         /*cancellation*/ None,
         /*use_private_desktop*/ true,
     )
     .expect("run legacy capture powershell");
-    let descendant_pid = fs::read_to_string(&ready_marker)
-        .expect("read descendant pid")
-        .trim()
-        .parse()
-        .expect("parse descendant pid");
+    let descendant_pid = wait_for_pid(&ready_marker, Duration::from_secs(10))
+        .expect("descendant did not publish a valid pid");
     let descendant_process = open_process_for_wait(descendant_pid);
     fs::write(&release_marker, "release").expect("release descendant after root exit");
     let descendant_process = descendant_process.expect("open descendant after normal capture exit");
@@ -676,113 +750,75 @@ fn legacy_capture_emits_output_and_preserves_descendant_after_normal_exit() {
 }
 
 #[test]
-fn legacy_workspace_write_delete_is_limited_to_writable_roots() {
+fn legacy_capture_preserves_large_binary_stdout_and_stderr() {
+    let Some(pwsh) = pwsh_path() else {
+        eprintln!("skipping large capture regression test: PowerShell 7 is not installed");
+        return;
+    };
     let _guard = legacy_process_test_guard();
-    let runtime = current_thread_runtime();
-    runtime.block_on(async move {
-        // Keep writable roots out of USERPROFILE exclusions such as AppData.
-        let test_root = TempDir::new_in(sandbox_cwd()).expect("create legacy delete test root");
-        let codex_home = sandbox_home("legacy-delete-writable-roots");
-        let workspace = test_root.path().join("workspace");
-        let temp_root = test_root.path().join("temp");
-        let tmp_root = test_root.path().join("tmp");
-        let outside_root = test_root.path().join("outside");
-        for directory in [&workspace, &temp_root, &tmp_root, &outside_root] {
-            fs::create_dir_all(directory).expect("create legacy delete test directory");
-        }
-        let protected_git_dir = workspace.join(".git");
-        fs::create_dir(&protected_git_dir).expect("create protected .git directory");
+    let cwd_fixture = isolated_legacy_cwd();
+    let cwd = cwd_fixture.path().to_path_buf();
+    let codex_home = sandbox_home("legacy-capture-large-output");
+    let parent_command = format!(
+        "$stdout=[Console]::OpenStandardOutput(); $stderr=[Console]::OpenStandardError(); \
+         $stdout_chunk=[byte[]]::new({LARGE_CAPTURE_CHUNK_BYTES}); $stderr_chunk=[byte[]]::new({LARGE_CAPTURE_CHUNK_BYTES}); \
+         for ($i=0; $i -lt {LARGE_CAPTURE_CHUNK_BYTES}; $i++) {{ \
+             $stdout_chunk[$i]=[byte](($i*17+3)%256); \
+             $stderr_chunk[$i]=[byte](($i*29+11)%256) \
+         }}; \
+         for ($i=0; $i -lt {LARGE_CAPTURE_CHUNKS}; $i++) {{ \
+             $stdout.Write($stdout_chunk,0,$stdout_chunk.Length); \
+             $stderr.Write($stderr_chunk,0,$stderr_chunk.Length) \
+         }}; $stdout.Dispose(); $stderr.Dispose()",
+    );
+    let permission_profile = PermissionProfile::workspace_write();
+    let result = run_windows_sandbox_capture(
+        &permission_profile,
+        workspace_roots_for(cwd.as_path()).as_slice(),
+        codex_home.path(),
+        vec![
+            pwsh.display().to_string(),
+            "-NoProfile".to_string(),
+            "-NonInteractive".to_string(),
+            "-Command".to_string(),
+            parent_command,
+        ],
+        cwd.as_path(),
+        sandbox_temp_env(codex_home.path()),
+        // Byte-preservation fixture, not a throughput test: ~4.3s idle, but a
+        // loaded full-gate run exceeded 15s with both streams ~87% drained.
+        Some(60_000),
+        /*cancellation*/ None,
+        /*use_private_desktop*/ true,
+    )
+    .expect("run large binary capture powershell");
 
-        let workspace_file = workspace.join("workspace-delete.txt");
-        let temp_file = temp_root.join("temp-delete.txt");
-        let tmp_file = tmp_root.join("tmp-delete.txt");
-        let outside_file = outside_root.join("outside-delete.txt");
-        fs::write(&workspace_file, "workspace").expect("seed workspace file");
-        fs::write(&temp_file, "temp").expect("seed TEMP file");
-        fs::write(&tmp_file, "tmp").expect("seed TMP file");
-        fs::write(&outside_file, "outside").expect("seed outside file");
+    let expected_stdout_chunk = (0..LARGE_CAPTURE_CHUNK_BYTES)
+        .map(|index| ((index * 17 + 3) % 256) as u8)
+        .collect::<Vec<_>>();
+    let expected_stdout = expected_stdout_chunk.repeat(LARGE_CAPTURE_CHUNKS);
+    let expected_stderr_chunk = (0..LARGE_CAPTURE_CHUNK_BYTES)
+        .map(|index| ((index * 29 + 11) % 256) as u8)
+        .collect::<Vec<_>>();
+    let expected_stderr = expected_stderr_chunk.repeat(LARGE_CAPTURE_CHUNKS);
 
-        let script = workspace.join("delete-fixtures.cmd");
-        fs::write(
-            &script,
-            concat!(
-                "@echo off\r\n",
-                "del /f /q \"%WORKSPACE_DELETE%\"\r\n",
-                "del /f /q \"%TEMP_DELETE%\"\r\n",
-                "del /f /q \"%TMP_DELETE%\"\r\n",
-                "del /f /q \"%OUTSIDE_DELETE%\"\r\n",
-                "rmdir \"%PROTECTED_GIT_DIR%\"\r\n",
-                "exit /b 0\r\n",
-            ),
-        )
-        .expect("write delete script");
-
-        let env_map = HashMap::from([
-            ("TEMP".to_string(), temp_root.to_string_lossy().into_owned()),
-            ("TMP".to_string(), tmp_root.to_string_lossy().into_owned()),
-            (
-                "WORKSPACE_DELETE".to_string(),
-                workspace_file.to_string_lossy().into_owned(),
-            ),
-            (
-                "TEMP_DELETE".to_string(),
-                temp_file.to_string_lossy().into_owned(),
-            ),
-            (
-                "TMP_DELETE".to_string(),
-                tmp_file.to_string_lossy().into_owned(),
-            ),
-            (
-                "OUTSIDE_DELETE".to_string(),
-                outside_file.to_string_lossy().into_owned(),
-            ),
-            (
-                "PROTECTED_GIT_DIR".to_string(),
-                protected_git_dir.to_string_lossy().into_owned(),
-            ),
-        ]);
-
-        let permission_profile = PermissionProfile::workspace_write();
-        let spawned = spawn_windows_sandbox_session_legacy(
-            &permission_profile,
-            workspace_roots_for(workspace.as_path()).as_slice(),
-            codex_home.path(),
-            vec![
-                "C:\\Windows\\System32\\cmd.exe".to_string(),
-                "/d".to_string(),
-                "/c".to_string(),
-                script.display().to_string(),
-            ],
-            workspace.as_path(),
-            env_map,
-            /*timeout_ms*/ Some(5_000),
-            &[],
-            &[],
-            /*tty*/ false,
-            /*stdin_open*/ false,
-            /*use_private_desktop*/ true,
-        )
-        .await
-        .expect("spawn legacy delete session");
-        let (stdout, exit_code) =
-            collect_stdout_and_exit(spawned, codex_home.path(), Duration::from_secs(/*secs*/ 10))
-                .await;
-        let stdout = String::from_utf8_lossy(&stdout);
-
-        assert_eq!(
-            (
-                exit_code,
-                workspace_file.exists(),
-                temp_file.exists(),
-                tmp_file.exists(),
-                fs::read_to_string(&outside_file).ok(),
-                protected_git_dir.is_dir(),
-            ),
-            (0, false, false, false, Some("outside".to_string()), true),
-            "stdout={stdout:?}\n{}",
-            sandbox_log(codex_home.path())
-        );
-    });
+    assert!(
+        !result.timed_out,
+        "large binary capture timed out: stdout_len={} stderr_len={}",
+        result.stdout.len(),
+        result.stderr.len()
+    );
+    assert_eq!(
+        result.exit_code,
+        0,
+        "large binary capture exit code with stdout_len={} stderr_len={}",
+        result.stdout.len(),
+        result.stderr.len()
+    );
+    assert_eq!(result.stdout.len(), LARGE_CAPTURE_BYTES);
+    assert_eq!(result.stderr.len(), LARGE_CAPTURE_BYTES);
+    assert_exact_binary_output("stdout", &result.stdout, &expected_stdout);
+    assert_exact_binary_output("stderr", &result.stderr, &expected_stderr);
 }
 
 #[test]
@@ -792,7 +828,8 @@ fn legacy_capture_cancellation_terminates_descendants_without_timeout() {
         return;
     };
     let _guard = legacy_process_test_guard();
-    let cwd = sandbox_cwd();
+    let cwd_fixture = isolated_legacy_cwd();
+    let cwd = cwd_fixture.path().to_path_buf();
     let codex_home = sandbox_home("legacy-capture-cancel");
     let descendant_marker = codex_home.path().join("descendant-survived");
     let ready_marker = codex_home.path().join("descendant-started");
@@ -839,7 +876,7 @@ fn legacy_capture_cancellation_terminates_descendants_without_timeout() {
             parent_command,
         ],
         cwd.as_path(),
-        HashMap::new(),
+        sandbox_temp_env(codex_home.path()),
         Some(30_000),
         /*cancellation*/ Some(cancellation),
         /*use_private_desktop*/ true,
@@ -878,7 +915,8 @@ async fn assert_legacy_tty_descendant_lifecycle(
     pwsh: &Path,
     lifecycle: LegacyTtyDescendantLifecycle,
 ) {
-    let cwd = sandbox_cwd();
+    let cwd_fixture = isolated_legacy_cwd();
+    let cwd = cwd_fixture.path().to_path_buf();
     let codex_home = sandbox_home(match lifecycle {
         LegacyTtyDescendantLifecycle::Terminate => "legacy-tty-descendant-terminate",
         LegacyTtyDescendantLifecycle::Preserve => "legacy-tty-descendant-preserve",
@@ -919,25 +957,31 @@ async fn assert_legacy_tty_descendant_lifecycle(
             parent_command,
         ],
         cwd.as_path(),
-        HashMap::new(),
+        sandbox_temp_env(codex_home.path()),
         Some(30_000),
         &[],
         &[],
         /*tty*/ true,
-        /*stdin_open*/ false,
+        // ConPTY input is a terminal stream: closing its write handle during
+        // spawn delivers a control event to the attached root process. Keep
+        // it open until the lifecycle operation under test owns termination.
+        /*stdin_open*/
+        true,
         /*use_private_desktop*/ true,
     )
     .await
     .expect("spawn legacy sandbox ConPTY lifecycle test");
-    assert!(
-        wait_for_path(&ready_marker, Duration::from_secs(10)),
-        "{lifecycle:?} descendant did not start"
-    );
-    let descendant_pid = fs::read_to_string(&ready_marker)
-        .expect("read descendant pid")
-        .trim()
-        .parse()
-        .expect("parse descendant pid");
+    let Some(descendant_pid) = wait_for_pid(&ready_marker, Duration::from_secs(10)) else {
+        let root_exited = spawned.session.has_exited();
+        let root_exit_code = spawned.session.exit_code();
+        let descendant_stdout = bounded_file_text(&codex_home.path().join("descendant.stdout"));
+        let descendant_stderr = bounded_file_text(&codex_home.path().join("descendant.stderr"));
+        let log = sandbox_log(codex_home.path());
+        spawned.session.request_terminate();
+        panic!(
+            "{lifecycle:?} descendant did not start; root_exited={root_exited} root_exit_code={root_exit_code:?}; descendant.stdout={descendant_stdout:?}; descendant.stderr={descendant_stderr:?}; sandbox_log={log}"
+        );
+    };
     let descendant_process = open_process_for_wait(descendant_pid);
 
     if matches!(lifecycle, LegacyTtyDescendantLifecycle::Terminate) {
@@ -986,7 +1030,8 @@ fn legacy_tty_powershell_emits_output_and_accepts_input() {
     let _guard = legacy_process_test_guard();
     let runtime = current_thread_runtime();
     runtime.block_on(async move {
-        let cwd = sandbox_cwd();
+        let cwd_fixture = isolated_legacy_cwd();
+        let cwd = cwd_fixture.path().to_path_buf();
         let codex_home = sandbox_home("legacy-tty-pwsh");
         println!("tty pwsh codex_home={}", codex_home.path().display());
         let permission_profile = PermissionProfile::workspace_write();
@@ -1003,7 +1048,7 @@ fn legacy_tty_powershell_emits_output_and_accepts_input() {
                 "$PID; Write-Output ready".to_string(),
             ],
             cwd.as_path(),
-            HashMap::new(),
+            sandbox_temp_env(codex_home.path()),
             Some(10_000),
             &[],
             &[],

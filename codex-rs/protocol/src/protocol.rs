@@ -52,6 +52,7 @@ use crate::models::ResponseItem;
 use crate::models::SandboxEnforcement;
 use crate::models::WebSearchAction;
 use crate::num_format::format_with_separators;
+use crate::openai_models::InputModality;
 use crate::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use crate::parse_command::ParsedCommand;
 use crate::plan_tool::UpdatePlanArgs;
@@ -551,6 +552,11 @@ pub struct ThreadSettingsOverrides {
     /// Updated model-provider id. When set, future turns use the corresponding configured
     /// provider. Clients should update this atomically with `model`.
     pub model_provider: Option<String>,
+
+    /// Updated model input capabilities. Use `Some(Some(_))` to set an explicit provider route
+    /// contract, `Some(None)` to resolve capabilities from the target provider catalog, or `None`
+    /// to leave the existing override unchanged.
+    pub model_input_modalities: Option<Option<Vec<InputModality>>>,
 
     /// Updated reasoning effort (honored only for reasoning-capable models).
     ///
@@ -2198,6 +2204,9 @@ pub struct ThreadSettingsAppliedEvent {
 pub struct ThreadSettingsSnapshot {
     pub model: String,
     pub model_provider_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub model_input_modalities: Option<Vec<InputModality>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<String>,
     pub approval_policy: AskForApproval,
@@ -3231,6 +3240,9 @@ pub struct TurnContextItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_system_sandbox_policy: Option<RawFileSystemSandboxPolicy>,
     pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub model_provider_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comp_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -6069,6 +6081,7 @@ mod tests {
                 .expect("serializable split policy"),
             ),
             model: "gpt-5".to_string(),
+            model_provider_id: None,
             comp_hash: None,
             personality: None,
             collaboration_mode: None,

@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["openrouter", "opencode", "opencodeFallback", "commandcode", "cursor", "autoProviderOrder", "codebuddy", "devin", "antigravity", "ollama", "routes"],
+  "properties": {
+    "$schema": { "type": "string" },
+    "openrouter": { "type": "string", "minLength": 1 },
+    "opencode": { "type": "string", "minLength": 1 },
+    "opencodeFallback": { "type": "string", "minLength": 1 },
+    "commandcode": { "type": "string", "minLength": 1 },
+    "cursor": { "type": "string", "minLength": 1 },
+    "autoProviderOrder": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "enum": ["antigravity", "devin", "ollama", "opencode", "codebuddy", "devin-free"] } },
+    "codebuddy": { "$ref": "#/$defs/modelConfig" },
+    "devin": {
+      "type": "object",
+      "required": ["primaryModel", "terminalFallbackModel", "inputModalities"],
+      "properties": { "primaryModel": { "type": "string", "minLength": 1 }, "terminalFallbackModel": { "type": "string", "minLength": 1 }, "inputModalities": { "$ref": "#/$defs/modalities" } },
+      "additionalProperties": false
+    },
+    "antigravity": {
+      "type": "object",
+      "required": ["primaryModel", "quotaFallbackModel", "inputModalities"],
+      "properties": { "primaryModel": { "type": "string", "minLength": 1 }, "quotaFallbackModel": { "type": "string", "minLength": 1 }, "inputModalities": { "$ref": "#/$defs/modalities" } },
+      "additionalProperties": false
+    },
+    "ollama": {
+      "type": "object",
+      "required": ["model", "label", "maxConcurrency", "responseModels", "reasoningEffort", "inputModalities"],
+      "properties": {
+        "model": { "type": "string", "minLength": 1 }, "label": { "type": "string", "minLength": 1 }, "maxConcurrency": { "type": "integer", "minimum": 1 },
+        "responseModels": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string", "minLength": 1 } },
+        "reasoningEffort": { "$ref": "#/$defs/reasoningEffort" }, "inputModalities": { "$ref": "#/$defs/modalities" }
+      },
+      "additionalProperties": false
+    },
+    "routes": {
+      "type": "object",
+      "required": ["auto", "native", "native-sol", "codebuddy", "devin-free", "ollama", "opencode", "commandcode", "cursor", "antigravity", "openrouter"],
+      "additionalProperties": { "$ref": "#/$defs/route" }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "modalities": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "enum": ["text", "image"] } },
+    "reasoningEffort": { "enum": ["low", "medium", "high", "xhigh", "max", "ultra"] },
+    "modelConfig": {
+      "type": "object",
+      "required": ["model", "inputModalities"],
+      "properties": { "model": { "type": "string", "minLength": 1 }, "inputModalities": { "$ref": "#/$defs/modalities" } },
+      "additionalProperties": false
+    },
+    "route": {
+      "type": "object",
+      "required": ["label", "modelProvider", "model", "reasoningEffort", "inputModalities"],
+      "properties": {
+        "label": { "type": "string", "minLength": 1 }, "modelProvider": { "type": "string", "minLength": 1 }, "model": { "type": "string", "minLength": 1 },
+        "mainModel": { "type": "string", "minLength": 1 }, "reasoningEffort": { "$ref": "#/$defs/reasoningEffort" }, "fallbackReasoningEffort": { "$ref": "#/$defs/reasoningEffort" },
+        "inputModalities": { "$ref": "#/$defs/modalities" }, "healthUrl": { "type": "string", "pattern": "^http://127\\.0\\.0\\.1:" }, "healthAuth": { "enum": ["bridgeBearer", "none"] },
+        "nativeFallbackRoute": { "type": "string", "minLength": 1 }, "description": { "type": "string" }
+      },
+      "additionalProperties": false
+    }
+  }
+}

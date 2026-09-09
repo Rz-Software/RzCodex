@@ -4,6 +4,10 @@
 
 export type ModelListParams = {
 /**
+ * Optional loaded thread whose active provider catalog should own the result.
+ */
+threadId?: string | null,
+/**
  * Opaque pagination cursor returned by a previous call.
  */
 cursor?: string | null,

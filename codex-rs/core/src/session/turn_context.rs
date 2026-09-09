@@ -213,6 +213,7 @@ pub struct TurnContext {
     /// Turn-wide telemetry; model-attributed step work should use `StepContext::session_telemetry`.
     pub(crate) session_telemetry: SessionTelemetry,
     pub(crate) provider: SharedModelProvider,
+    pub(crate) models_manager: SharedModelsManager,
     pub(crate) session_source: SessionSource,
     pub(crate) history_mode: ThreadHistoryMode,
     pub(crate) parent_thread_id: Option<ThreadId>,
@@ -506,6 +507,11 @@ impl TurnContext {
             model_info,
             config.features.enabled(Feature::FastMode),
         ));
+        config.token_budget = resolve_token_budget(
+            self.configured_token_budget.as_ref(),
+            self.use_model_token_budget_defaults,
+            &step_settings.model_info,
+        );
         config.service_tier = step_settings.service_tier.clone();
         let session_telemetry = step_settings.telemetry(&self.session_telemetry);
 
@@ -522,6 +528,7 @@ impl TurnContext {
             current_settings: ArcSwap::from(step_settings),
             session_telemetry,
             provider: self.provider.clone(),
+            models_manager: Arc::clone(models_manager),
             session_source: self.session_source.clone(),
             history_mode: self.history_mode,
             parent_thread_id: self.parent_thread_id,
@@ -557,7 +564,6 @@ impl TurnContext {
     pub(crate) async fn with_native_subagent_route(
         &self,
         resolved: &ResolvedSubagentRoute,
-        models_manager: &SharedModelsManager,
     ) -> CodexResult<Self> {
         if resolved.route.model_provider != codex_model_provider_info::OPENAI_PROVIDER_ID {
             return Err(CodexErr::InvalidRequest(format!(
@@ -588,6 +594,11 @@ impl TurnContext {
             .model_input_modalities
             .clone_from(&resolved.route.input_modalities);
 
+        let provider = create_model_provider(provider_info, self.auth_manager.clone());
+        let models_manager = provider.models_manager(
+            config.codex_home.to_path_buf(),
+            config.model_catalog.clone(),
+        );
         let model_info = models_manager
             .get_model_info(
                 resolved.route.model.as_str(),
@@ -617,9 +628,15 @@ impl TurnContext {
             Arc::new(model_info),
             config.features.enabled(Feature::FastMode),
         ));
+        config.token_budget = resolve_token_budget(
+            self.configured_token_budget.as_ref(),
+            self.use_model_token_budget_defaults,
+            &step_settings.model_info,
+        );
         config.service_tier = step_settings.service_tier.clone();
         let session_telemetry = step_settings.telemetry(&self.session_telemetry);
-        let provider = create_model_provider(provider_info, self.auth_manager.clone());
+        self.turn_metadata_state
+            .update_model_capabilities(&step_settings.model_info);
 
         Ok(Self {
             sub_id: self.sub_id.clone(),
@@ -634,6 +651,7 @@ impl TurnContext {
             current_settings: ArcSwap::from(step_settings),
             session_telemetry,
             provider,
+            models_manager: Arc::clone(&models_manager),
             session_source: self.session_source.clone(),
             history_mode: self.history_mode,
             parent_thread_id: self.parent_thread_id,
@@ -707,6 +725,7 @@ impl TurnContext {
             network: self.turn_context_network_item(),
             file_system_sandbox_policy: self.non_legacy_file_system_sandbox_policy(),
             model: self.model_info().slug.clone(),
+            model_provider_id: Some(self.config.model_provider_id.clone()),
             comp_hash: self.model_info().comp_hash.clone(),
             personality: self.personality(),
             collaboration_mode: Some(self.collaboration_mode()),
@@ -906,6 +925,7 @@ impl Session {
             current_settings: ArcSwap::from(step_settings),
             session_telemetry: session_telemetry_for_context,
             provider,
+            models_manager: Arc::clone(models_manager),
             session_source,
             history_mode: session_configuration.history_mode,
             parent_thread_id: session_configuration.parent_thread_id,
@@ -1048,7 +1068,7 @@ impl Session {
         let model_info = session_configuration
             .step_settings
             .resolve_model_info(
-                self.services.models_manager.as_ref(),
+                session_configuration.models_manager.as_ref(),
                 &session_configuration.model_info_overrides,
                 self.features.enabled(Feature::Personality),
             )
@@ -1117,7 +1137,7 @@ impl Session {
             self.services.main_execve_wrapper_exe.as_ref(),
             per_turn_config,
             step_settings,
-            &self.services.models_manager,
+            &session_configuration.models_manager,
             self.services
                 .network_proxy
                 .load_full()

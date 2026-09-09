@@ -73,6 +73,7 @@ fn response_item_envelope_stores_metadata_beside_rollout_payload() -> Result<()>
             metadata: Some(CodexHarnessMetadata {
                 client_authored: true,
                 fallback_token_limit_override: Some(20_000),
+                ..Default::default()
             }),
         }),
     };
@@ -99,6 +100,7 @@ fn response_item_envelope_stores_metadata_beside_rollout_payload() -> Result<()>
         Some(CodexHarnessMetadata {
             client_authored: true,
             fallback_token_limit_override: Some(20_000),
+            ..Default::default()
         })
     );
     Ok(())
@@ -528,11 +530,12 @@ fn compacted_item_serializes_window_number_and_id() -> Result<()> {
 }
 
 #[test]
-fn repeated_compaction_prunes_persisted_inline_images_only() -> Result<()> {
+fn repeated_compaction_prunes_only_images_with_persisted_provenance() -> Result<()> {
     let inline_message_image = "data:image/png;base64,MESSAGE_PAYLOAD";
     let inline_tool_image = "DATA:image/jpeg;BASE64,TOOL_PAYLOAD";
+    let fresh_inline_image = "data:image/webp;base64,FRESH_PAYLOAD";
     let remote_image = "https://example.com/retained.png";
-    let history = vec![
+    let mut persisted_history = vec![
         ResponseItemEnvelope {
             item: ResponseItem::Message {
                 id: None,
@@ -552,6 +555,7 @@ fn repeated_compaction_prunes_persisted_inline_images_only() -> Result<()> {
             },
             metadata: Some(CodexHarnessMetadata {
                 client_authored: true,
+                ..Default::default()
             }),
         },
         ResponseItemEnvelope::new(ResponseItem::CustomToolCallOutput {
@@ -567,26 +571,36 @@ fn repeated_compaction_prunes_persisted_inline_images_only() -> Result<()> {
             internal_chat_message_metadata_passthrough: None,
         }),
     ];
-    let first = CompactedItem {
+    mark_inline_images_persisted(&mut persisted_history);
+    let mut history = persisted_history;
+    history.push(ResponseItemEnvelope::new(ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![ContentItem::InputImage {
+            image_url: fresh_inline_image.to_string(),
+            detail: None,
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    }));
+    let repeated = CompactedItem {
         message: "summary".to_string(),
         replacement_history: Some(history.clone()),
+        guardian_history: None,
         mcp_resource_origins: None,
-        window_number: Some(1),
+        window_number: Some(7),
         first_window_id: None,
         previous_window_id: None,
         window_id: None,
+        compaction_response_id: None,
+        latest_token_usage_record: None,
     };
-    let mut repeated = first.clone();
-    repeated.window_number = Some(2);
-
-    let first_json = serde_json::to_string(&first)?;
-    assert!(first_json.contains(inline_message_image));
-    assert!(first_json.contains(inline_tool_image));
 
     let repeated_json = serde_json::to_value(&repeated)?;
     let repeated_text = serde_json::to_string(&repeated_json)?;
     assert!(!repeated_text.contains("MESSAGE_PAYLOAD"));
     assert!(!repeated_text.contains("TOOL_PAYLOAD"));
+    assert!(repeated_text.contains("FRESH_PAYLOAD"));
     assert!(repeated_text.contains(remote_image));
     assert_eq!(
         repeated_json["replacement_history_metadata"]
@@ -608,6 +622,62 @@ fn repeated_compaction_prunes_persisted_inline_images_only() -> Result<()> {
             "type": "input_text",
             "text": "[inline base64 image payload pruned after repeated context compaction]",
         })
+    );
+    assert_eq!(
+        repeated_json["replacement_history"][2]["content"][0],
+        json!({
+            "type": "input_image",
+            "image_url": fresh_inline_image,
+        })
+    );
+    Ok(())
+}
+
+#[test]
+fn compacted_image_roundtrip_marks_only_later_persistence_for_pruning() -> Result<()> {
+    let image_url = "data:image/png;base64,FIRST_PERSISTENCE";
+    let image_item = ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![ContentItem::InputImage {
+            image_url: image_url.to_string(),
+            detail: None,
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let first = CompactedItem {
+        message: "summary".to_string(),
+        replacement_history: Some(vec![ResponseItemEnvelope::new(image_item.clone())]),
+        guardian_history: None,
+        mcp_resource_origins: None,
+        window_number: Some(9),
+        first_window_id: None,
+        previous_window_id: None,
+        window_id: None,
+        compaction_response_id: None,
+        latest_token_usage_record: None,
+    };
+
+    let first_json = serde_json::to_string(&first)?;
+    assert!(first_json.contains("FIRST_PERSISTENCE"));
+
+    let restored = serde_json::from_str::<CompactedItem>(&first_json)?;
+    assert_eq!(
+        restored.replacement_history,
+        Some(vec![ResponseItemEnvelope {
+            item: image_item,
+            metadata: Some(CodexHarnessMetadata {
+                inline_images_persisted: true,
+                ..Default::default()
+            }),
+        }])
+    );
+    let repeated_json = serde_json::to_string(&restored)?;
+    assert!(!repeated_json.contains("FIRST_PERSISTENCE"));
+    assert!(
+        repeated_json
+            .contains("[inline base64 image payload pruned after repeated context compaction]")
     );
     Ok(())
 }

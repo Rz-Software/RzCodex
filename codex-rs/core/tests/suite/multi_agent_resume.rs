@@ -11,7 +11,7 @@ use core_test_support::responses::assert_parent_turn;
 use core_test_support::responses::assert_root_turn;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
-use core_test_support::responses::ev_function_call_with_namespace;
+use core_test_support::responses::ev_plaintext_function_call_with_namespace;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_once_match;
 use core_test_support::responses::sse;
@@ -25,7 +25,7 @@ use std::time::Duration;
 use tokio::time::Instant;
 use tokio::time::sleep;
 
-const COLLABORATION_NAMESPACE: &str = "collaboration";
+const COLLABORATION_NAMESPACE: &str = "rz_collaboration";
 const SPAWN_CALL_ID: &str = "spawn-worker";
 const NESTED_CALL_ID: &str = "spawn-grandchild";
 const QUEUE_CALL_ID: &str = "queue-worker-message";
@@ -107,7 +107,12 @@ async fn mount_root_collaboration_call(
         },
         sse(vec![
             ev_response_created(&first_response_id),
-            ev_function_call_with_namespace(call_id, COLLABORATION_NAMESPACE, tool_name, arguments),
+            ev_plaintext_function_call_with_namespace(
+                call_id,
+                COLLABORATION_NAMESPACE,
+                tool_name,
+                arguments,
+            ),
             ev_completed(&first_response_id),
         ]),
     )
@@ -143,7 +148,9 @@ fn configure_multi_agent_v2_with_role(
         .expect("test config should allow feature update");
     config.multi_agent_v2.subagent_developer_instructions =
         Some(SUBAGENT_DEVELOPER_INSTRUCTIONS.to_string());
-    config.multi_agent_v2.max_concurrent_threads_per_session = 3;
+    // Keep the worker, its grandchild, and the sibling resident while this test explicitly
+    // controls their shutdown and cold-reload boundaries.
+    config.multi_agent_v2.max_concurrent_threads_per_session = 4;
     let role_path = config.codex_home.join("durable-worker-role.toml");
     std::fs::write(
         &role_path,
@@ -176,7 +183,7 @@ async fn cold_root_resume_restores_agent_identity_and_role_on_followup() -> Resu
         |request: &wiremock::Request| body_contains(request, INITIAL_PROMPT),
         sse(vec![
             ev_response_created("resp-spawn-1"),
-            ev_function_call_with_namespace(
+            ev_plaintext_function_call_with_namespace(
                 SPAWN_CALL_ID,
                 COLLABORATION_NAMESPACE,
                 "spawn_agent",
@@ -195,7 +202,7 @@ async fn cold_root_resume_restores_agent_identity_and_role_on_followup() -> Resu
         },
         sse(vec![
             ev_response_created("resp-worker-1"),
-            ev_function_call_with_namespace(
+            ev_plaintext_function_call_with_namespace(
                 NESTED_CALL_ID,
                 COLLABORATION_NAMESPACE,
                 "spawn_agent",
@@ -212,7 +219,10 @@ async fn cold_root_resume_restores_agent_identity_and_role_on_followup() -> Resu
                 && request_has_input_type(request, "agent_message")
                 && !body_contains(request, NESTED_CALL_ID)
         },
-        sse(vec![ev_completed("resp-parent-turn-assistant")]),
+        sse(vec![
+            ev_assistant_message("msg-nested-complete", "nested task complete"),
+            ev_completed("resp-parent-turn-assistant"),
+        ]),
     )
     .await;
     for (text, is_subagent) in [(NESTED_CALL_ID, true), (QUEUE_CALL_ID, false)] {
@@ -222,7 +232,13 @@ async fn cold_root_resume_restores_agent_identity_and_role_on_followup() -> Resu
                 body_contains(request, text)
                     && request_has_input_type(request, "agent_message") == is_subagent
             },
-            sse(vec![ev_completed("resp-parent-turn-assistant")]),
+            sse(vec![
+                ev_assistant_message(
+                    &format!("msg-parent-turn-assistant-{text}"),
+                    "turn complete",
+                ),
+                ev_completed("resp-parent-turn-assistant"),
+            ]),
         )
         .await;
     }
@@ -379,7 +395,7 @@ async fn cold_root_resume_restores_agent_identity_and_role_on_followup() -> Resu
         |request: &wiremock::Request| body_contains(request, FOLLOWUP_PROMPT),
         sse(vec![
             ev_response_created("resp-followup-1"),
-            ev_function_call_with_namespace(
+            ev_plaintext_function_call_with_namespace(
                 FOLLOWUP_CALL_ID,
                 COLLABORATION_NAMESPACE,
                 "followup_task",
@@ -461,7 +477,7 @@ openai_base_url = "{redirected_base_url}"
         |request: &wiremock::Request| body_contains(request, QUEUE_PROMPT),
         sse(vec![
             ev_response_created("resp-queue"),
-            ev_function_call_with_namespace(
+            ev_plaintext_function_call_with_namespace(
                 QUEUE_CALL_ID,
                 COLLABORATION_NAMESPACE,
                 "send_message",

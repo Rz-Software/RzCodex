@@ -424,11 +424,15 @@ pub fn process_responses_event(
                     } else if is_usage_not_included(&error) {
                         response_error = ApiError::UsageNotIncluded;
                     } else if error.code.as_deref() == Some("native_subagent_fallback") {
+                        let message = error.message.unwrap_or_else(|| {
+                            "External provider requested a native fallback without a provider message."
+                                .to_string()
+                        });
                         response_error = match error
                             .fallback_route
                             .filter(|route| !route.trim().is_empty())
                         {
-                            Some(route) => ApiError::NativeSubagentFallback { route },
+                            Some(route) => ApiError::NativeSubagentFallback { route, message },
                             None => ApiError::InvalidRequest {
                                 message: "External provider requested a native fallback without a route identifier."
                                     .to_string(),
@@ -535,13 +539,23 @@ pub fn process_responses_event(
                 }));
             }
         }
+        "response.in_progress" => {
+            if event
+                .response
+                .as_ref()
+                .and_then(|response| response.get("metadata"))
+                .and_then(|metadata| metadata.get("provider_work_started"))
+                == Some(&Value::Bool(true))
+            {
+                return Ok(Some(ResponseEvent::ProviderWorkStarted));
+            }
+        }
         "codex.response.metadata"
         | "response.content_part.added"
         | "response.content_part.done"
         | "response.custom_tool_call_input.done"
         | "response.function_call_arguments.delta"
         | "response.function_call_arguments.done"
-        | "response.in_progress"
         | "response.metadata"
         | "response.output_text.done"
         | "response.reasoning_summary_part.done"
@@ -834,6 +848,87 @@ mod tests {
 
     fn idle_timeout() -> Duration {
         Duration::from_millis(1000)
+    }
+
+    #[test]
+    fn process_responses_event_emits_provider_work_started_only_for_boolean_true() {
+        for (provider_work_started, should_emit) in [
+            (Some(json!(true)), true),
+            (Some(json!(false)), false),
+            (Some(json!("true")), false),
+            (None, false),
+        ] {
+            let mut event = json!({
+                "type": "response.in_progress",
+                "response": {
+                    "metadata": {}
+                }
+            });
+            if let Some(provider_work_started) = provider_work_started {
+                event["response"]["metadata"]["provider_work_started"] = provider_work_started;
+            }
+
+            let event: ResponsesStreamEvent =
+                serde_json::from_value(event).expect("deserialize response.in_progress event");
+            let parsed =
+                process_responses_event(event).expect("process response.in_progress event");
+
+            if should_emit {
+                assert_matches!(parsed, Some(ResponseEvent::ProviderWorkStarted));
+            } else {
+                assert_matches!(parsed, None);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn process_sse_emits_provider_work_started_only_for_boolean_true() {
+        let events = run_sse(vec![
+            json!({
+                "type": "response.in_progress",
+                "response": {
+                    "metadata": {
+                        "provider_work_started": false
+                    }
+                }
+            }),
+            json!({
+                "type": "response.in_progress",
+                "response": {
+                    "metadata": {
+                        "provider_work_started": "true"
+                    }
+                }
+            }),
+            json!({
+                "type": "response.in_progress",
+                "response": {
+                    "metadata": {}
+                }
+            }),
+            json!({
+                "type": "response.in_progress",
+                "response": {
+                    "metadata": {
+                        "provider_work_started": true
+                    }
+                }
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp-1"
+                }
+            }),
+        ])
+        .await;
+
+        assert_eq!(events.len(), 2);
+        assert_matches!(&events[0], ResponseEvent::ProviderWorkStarted);
+        assert_matches!(
+            &events[1],
+            ResponseEvent::Completed { response_id, .. } if response_id == "resp-1"
+        );
     }
 
     #[tokio::test]
@@ -1188,7 +1283,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_subagent_fallback_preserves_route() {
+    async fn native_subagent_fallback_preserves_route_and_message() {
         let event = json!({
             "type": "response.failed",
             "response": {
@@ -1204,7 +1299,8 @@ mod tests {
 
         assert_matches!(
             events.as_slice(),
-            [Err(ApiError::NativeSubagentFallback { route })] if route == "native"
+            [Err(ApiError::NativeSubagentFallback { route, message })]
+                if route == "native" && message == "External providers are unavailable."
         );
     }
 

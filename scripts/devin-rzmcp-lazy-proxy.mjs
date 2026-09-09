@@ -3,18 +3,23 @@
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 
+import {
+  assertToolCallAllowed,
+  executionPolicy,
+  toolVisibleUnderPolicy,
+} from "./bridge-security.mjs";
+
 const RZMCP_BRIDGE = "G:/QANGA/Plugins/RzDirectMCP/Source/RzMCP/rzmcp-bridge.mjs";
 const MAX_SEARCH_RESULTS = 5;
 const MAX_SEARCH_OUTPUT_BYTES = 96 * 1024;
 const STDERR_LIMIT = 8 * 1024;
 const RZMCP_MODE = process.env.RZCODEX_SUBAGENT_RZMCP_MODE || "full";
 const VALID_RZMCP_MODES = new Set(["full", "no-validation", "read-only", "disabled"]);
-const READ_ONLY_TOOL_NAME = /^(?:analyze|check|count|describe|discover|does|enumerate|find|get|has|inspect|is|list|locate|query|read|resolve|search|validate)_/i;
-const VALIDATION_TOOL_NAME = /(?:^|_)(?:automation|build|close_editor|compile|cook|launch|open_level|package|pie|play|restart|shutdown|sie|test)(?:_|$)/i;
 
 if (!VALID_RZMCP_MODES.has(RZMCP_MODE)) {
   throw new Error(`Invalid RzMCP subagent mode ${json(RZMCP_MODE)}`);
 }
+const RZMCP_POLICY = executionPolicy({ rzMcpMode: RZMCP_MODE });
 
 class ProxyError extends Error {}
 
@@ -67,6 +72,7 @@ export function searchCatalog(tools, query, requestedLimit = 3) {
       name: exact.name,
       description: typeof exact.description === "string" ? exact.description : "",
       inputSchema: exact.inputSchema ?? { type: "object", additionalProperties: true },
+      ...(exact._meta ? { _meta: exact._meta } : {}),
     }];
   }
   return tools
@@ -78,19 +84,16 @@ export function searchCatalog(tools, query, requestedLimit = 3) {
       name: tool.name,
       description: typeof tool.description === "string" ? tool.description : "",
       inputSchema: tool.inputSchema ?? { type: "object", additionalProperties: true },
+      ...(tool._meta ? { _meta: tool._meta } : {}),
     }));
 }
 
 export function catalogForMode(tools, mode) {
   if (mode === "full") return tools;
   if (mode === "disabled") return [];
-  if (mode === "no-validation") {
-    return tools.filter((tool) => !VALIDATION_TOOL_NAME.test(tool.name));
-  }
-  if (mode === "read-only") {
-    return tools.filter((tool) => READ_ONLY_TOOL_NAME.test(tool.name));
-  }
-  throw new ProxyError(`Unknown RzMCP mode ${json(mode)}`);
+  if (!VALID_RZMCP_MODES.has(mode)) throw new ProxyError(`Unknown RzMCP mode ${json(mode)}`);
+  const policy = executionPolicy({ rzMcpMode: mode });
+  return tools.filter((tool) => toolVisibleUnderPolicy(policy, tool));
 }
 
 class RzMcpClient {
@@ -104,6 +107,7 @@ class RzMcpClient {
     this.stdout = "";
     this.stderr = "";
     this.tools = null;
+    this.toolByName = null;
   }
 
   async start() {
@@ -186,11 +190,16 @@ class RzMcpClient {
       cursor = typeof page.nextCursor === "string" && page.nextCursor ? page.nextCursor : null;
     } while (cursor);
     this.tools = tools;
+    this.toolByName = new Map(tools.map((tool) => [tool.name, tool]));
     return tools;
   }
 
   async call(name, args) {
     await this.start();
+    await this.catalog();
+    const tool = this.toolByName.get(name);
+    if (!tool) throw new ProxyError(`RzMCP tool ${json(name)} is not present in the live catalog`);
+    assertToolCallAllowed(RZMCP_POLICY, tool, args);
     return this.request("tools/call", { name, arguments: args });
   }
 
@@ -229,10 +238,19 @@ const PROXY_TOOLS = [
 ];
 
 function selfTest() {
+  const executionMetadata = (defaultEffects, argumentRules) => ({
+    _meta: {
+      "rzcodex/execution": {
+        version: 1,
+        defaultEffects,
+        ...(argumentRules ? { argumentRules } : {}),
+      },
+    },
+  });
   const tools = [
-    { name: "get_project_info", description: "Get project info", inputSchema: { type: "object" } },
-    { name: "search_project_index", description: "Search the project asset index", inputSchema: { type: "object" } },
-    { name: "spawn_actor", description: "Spawn an actor", inputSchema: { type: "object" } },
+    { name: "get_project_info", description: "Get project info", inputSchema: { type: "object" }, ...executionMetadata(["read"]) },
+    { name: "search_project_index", description: "Search the project asset index", inputSchema: { type: "object" }, ...executionMetadata(["read"]) },
+    { name: "spawn_actor", description: "Spawn an actor", inputSchema: { type: "object" }, ...executionMetadata(["write"]) },
   ];
   const exact = searchCatalog(tools, "get_project_info", 5);
   if (exact.length !== 1 || exact[0].name !== "get_project_info") throw new Error("exact search failed");
@@ -240,9 +258,9 @@ function selfTest() {
   if (focused.length !== 1 || focused[0].name !== "search_project_index") throw new Error("focused search failed");
   const permissionTools = [
     ...tools,
-    { name: "compile_project", description: "Compile", inputSchema: { type: "object" } },
-    { name: "save_asset", description: "Save", inputSchema: { type: "object" } },
-    { name: "inspect_graph_by_path", description: "Inspect", inputSchema: { type: "object" } },
+    { name: "compile_project", description: "Compile", inputSchema: { type: "object" }, ...executionMetadata(["validation"]) },
+    { name: "save_asset", description: "Save", inputSchema: { type: "object" }, ...executionMetadata(["write"]) },
+    { name: "inspect_graph_by_path", description: "Inspect", inputSchema: { type: "object" }, ...executionMetadata(["read"]) },
   ];
   const readOnlyNames = catalogForMode(permissionTools, "read-only").map((tool) => tool.name);
   const noValidationNames = catalogForMode(permissionTools, "no-validation").map((tool) => tool.name);

@@ -191,6 +191,7 @@ pub use state::ConfigLoadOptions;
 pub use state::LoaderOverrides;
 pub use strict_config::config_error_from_ignored_toml_fields;
 pub use subagent_routes::ResolvedSubagentRoute;
+pub use subagent_routes::RouteHealthAuth;
 pub use subagent_routes::SUBAGENT_ROUTE_CATALOG_FILE;
 pub use subagent_routes::SUBAGENT_ROUTE_STATE_FILE;
 pub use subagent_routes::SubagentRoute;

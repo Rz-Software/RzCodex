@@ -18,6 +18,7 @@ use crate::session::tests::update_turn_settings_for_test;
 use crate::session::turn_context::TurnContext;
 use crate::test_support;
 use codex_analytics::GuardianApprovalRequestSource;
+use codex_async_utils::THREAD_STACK_SIZE_BYTES;
 use codex_config::ConfigLayerStack;
 use codex_config::FeatureRequirementsToml;
 use codex_config::NetworkConstraints;
@@ -3356,11 +3357,9 @@ async fn escalated_retry_bypasses_extension_approval_and_runs_guardian() -> anyh
 #[tokio::test]
 async fn guardian_ephemeral_retry_preserves_parallel_trunk_and_fork_history() -> anyhow::Result<()>
 {
-    const TEST_STACK_SIZE_BYTES: usize = 4 * 1024 * 1024;
-
     let handle = std::thread::Builder::new()
         .name("guardian_ephemeral_retry_preserves_parallel_trunk_and_fork_history".to_string())
-        .stack_size(TEST_STACK_SIZE_BYTES)
+        .stack_size(THREAD_STACK_SIZE_BYTES)
         .spawn(|| -> anyhow::Result<()> {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()

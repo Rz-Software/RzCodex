@@ -960,6 +960,19 @@ pub fn ev_function_call_with_namespace(
     })
 }
 
+/// Mark a namespaced collaboration call as plaintext; omission selects the encrypted/default path
+/// for new namespaces.
+pub fn ev_plaintext_function_call_with_namespace(
+    call_id: &str,
+    namespace: &str,
+    name: &str,
+    arguments: &str,
+) -> Value {
+    let mut event = ev_function_call_with_namespace(call_id, namespace, name, arguments);
+    event["item"]["encrypted_function_args"] = serde_json::json!([]);
+    event
+}
+
 pub fn ev_tool_search_call(call_id: &str, arguments: &serde_json::Value) -> Value {
     serde_json::json!({
         "type": "response.output_item.done",

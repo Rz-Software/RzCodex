@@ -23,6 +23,10 @@ pub(super) fn fallback_response() -> GetAccountRateLimitsResponse {
 }
 
 fn configure_fallback_model(app: &mut App) {
+    // The session fixture uses an intentionally unknown provider. This test exercises the
+    // ChatGPT usage-recovery banner, so restore the configured OpenAI provider before enabling
+    // the account fixture; provider identity gates whether that banner is applicable.
+    app.chat_widget.set_model_provider("openai");
     set_chatgpt_auth(&mut app.chat_widget);
     set_fast_mode_test_catalog(&mut app.chat_widget);
     app.model_catalog = app.chat_widget.model_catalog();

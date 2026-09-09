@@ -9,6 +9,7 @@ use codex_config::resolve_subagent_route;
 use codex_core::config::ConfigBuilder;
 use codex_core::config::find_codex_home;
 use codex_utils_cli::CliConfigOverrides;
+use std::path::Path;
 
 #[derive(Debug, Args)]
 pub(crate) struct SubagentsCommand {
@@ -54,7 +55,7 @@ pub(crate) async fn run(
                 return Ok(());
             };
             ensure_provider_exists(&config, &active.id, &active.route.model_provider)?;
-            print_route(&active.id, &active.route, /*active*/ true);
+            print_route(&codex_home, &active.id, &active.route, /*active*/ true);
         }
         SubagentsSubcommand::List => {
             let catalog = load_subagent_route_catalog(&codex_home)?;
@@ -62,6 +63,7 @@ pub(crate) async fn run(
             for (id, route) in catalog.routes {
                 let active = active_id.as_deref() == Some(id.as_str());
                 print_route_with_provider_state(
+                    &codex_home,
                     &id,
                     &route,
                     active,
@@ -73,7 +75,7 @@ pub(crate) async fn run(
             let route_id = route.trim().to_ascii_lowercase();
             let selected = resolve_subagent_route(&codex_home, &route_id)?;
             ensure_provider_exists(&config, &selected.id, &selected.route.model_provider)?;
-            let probe = probe_subagent_route(&selected.route).with_context(|| {
+            let probe = probe_subagent_route(&codex_home, &selected.route).with_context(|| {
                 format!(
                     "subagent route `{}` is unavailable; previous selection was preserved",
                     selected.id
@@ -103,11 +105,12 @@ fn ensure_provider_exists(
     )
 }
 
-fn print_route(id: &str, route: &codex_config::SubagentRoute, active: bool) {
-    print_route_with_provider_state(id, route, active, /*provider_exists*/ true);
+fn print_route(codex_home: &Path, id: &str, route: &codex_config::SubagentRoute, active: bool) {
+    print_route_with_provider_state(codex_home, id, route, active, /*provider_exists*/ true);
 }
 
 fn print_route_with_provider_state(
+    codex_home: &Path,
     id: &str,
     route: &codex_config::SubagentRoute,
     active: bool,
@@ -118,7 +121,7 @@ fn print_route_with_provider_state(
         println!("    health=invalid: provider is not configured");
         return;
     }
-    match probe_subagent_route(route) {
+    match probe_subagent_route(codex_home, route) {
         Ok(probe) => println!("    health={}", probe.summary),
         Err(err) => println!("    health=unavailable: {err:#}"),
     }

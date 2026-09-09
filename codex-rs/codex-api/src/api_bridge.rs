@@ -23,8 +23,8 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
         ApiError::ContextWindowExceeded => CodexErr::ContextWindowExceeded,
         ApiError::QuotaExceeded => CodexErr::QuotaExceeded,
         ApiError::UsageNotIncluded => CodexErr::UsageNotIncluded,
-        ApiError::NativeSubagentFallback { route } => {
-            CodexErr::new(CodexErrorDetails::NativeSubagentFallback { route })
+        ApiError::NativeSubagentFallback { route, message } => {
+            CodexErr::new(CodexErrorDetails::NativeSubagentFallback { route, message })
         }
         ApiError::Retryable { message, delay } => {
             let error = CodexErr::Stream(message);

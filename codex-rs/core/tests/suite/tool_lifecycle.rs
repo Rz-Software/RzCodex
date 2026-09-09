@@ -31,6 +31,7 @@ use core_test_support::apps_test_server::SEARCH_CALENDAR_LIST_TOOL;
 use core_test_support::apps_test_server::SEARCH_CALENDAR_NAMESPACE;
 use core_test_support::apps_test_server::apps_enabled_builder;
 use core_test_support::apps_test_server::recorded_apps_tool_call_by_call_id;
+use core_test_support::hooks::python_hook_command;
 use core_test_support::hooks::trust_discovered_hooks;
 use core_test_support::responses;
 use core_test_support::skip_if_no_network;
@@ -728,7 +729,7 @@ fn write_pre_tool_hook(home: &Path, matcher: &str, output: &serde_json::Value) -
                 "matcher": matcher,
                 "hooks": [{
                     "type": "command",
-                    "command": format!("python3 {}", script_path.display()),
+                    "command": python_hook_command(&script_path),
                 }]
             }]
         }

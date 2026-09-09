@@ -287,6 +287,16 @@ pub(crate) enum AppEvent {
     SetMainAgentRoute {
         route_id: String,
     },
+    /// Merge background health results into the main-agent route picker.
+    MainAgentRouteHealthLoaded {
+        request_id: uuid::Uuid,
+        health: std::collections::HashMap<String, Result<String, String>>,
+    },
+    /// Merge background health results into the subagent route picker.
+    SubagentRouteHealthLoaded {
+        request_id: uuid::Uuid,
+        health: std::collections::HashMap<String, Result<String, String>>,
+    },
     /// Merge a completed root-scoped agent-picker refresh without blocking terminal input.
     AgentPickerThreadsLoaded {
         primary_thread_id: ThreadId,

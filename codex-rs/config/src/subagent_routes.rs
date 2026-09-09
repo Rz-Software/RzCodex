@@ -19,6 +19,8 @@ use std::time::Duration;
 
 pub const SUBAGENT_ROUTE_CATALOG_FILE: &str = "subagent-models.json";
 pub const SUBAGENT_ROUTE_STATE_FILE: &str = "subagent-route.json";
+const BRIDGE_BEARER_TOKEN_FILE: &str = "bridge-security/bearer-token";
+const BRIDGE_BEARER_TOKEN_LEN: usize = 43;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -38,7 +40,17 @@ pub struct SubagentRoute {
     #[serde(default)]
     pub health_url: Option<String>,
     #[serde(default)]
+    pub health_auth: RouteHealthAuth,
+    #[serde(default)]
     pub native_fallback_route: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum RouteHealthAuth {
+    #[default]
+    None,
+    BridgeBearer,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -161,13 +173,20 @@ pub fn persist_active_subagent_route(codex_home: &Path, route_id: &str) -> Resul
         .with_context(|| format!("failed to write subagent route state {}", path.display()))
 }
 
-pub fn probe_subagent_route(route: &SubagentRoute) -> Result<SubagentRouteProbe> {
+pub fn probe_subagent_route(
+    codex_home: &Path,
+    route: &SubagentRoute,
+) -> Result<SubagentRouteProbe> {
     let Some(url) = route.health_url.as_deref() else {
         return Ok(SubagentRouteProbe {
             summary: "configured; no health endpoint".to_string(),
         });
     };
-    let response = http_get_json(url)?;
+    let bearer_token = match route.health_auth {
+        RouteHealthAuth::None => None,
+        RouteHealthAuth::BridgeBearer => Some(load_bridge_bearer_token(codex_home)?),
+    };
+    let response = http_get_json(url, bearer_token.as_deref())?;
     if response.get("ok").and_then(Value::as_bool) == Some(false) {
         let reason = first_string(&response, &["error", "message"])
             .unwrap_or_else(|| "bridge reported failure".to_string());
@@ -239,6 +258,9 @@ fn validate_route(id: &str, route: &SubagentRoute) -> Result<()> {
     {
         bail!("subagent route `{id}` has an empty `mainModel`");
     }
+    if route.health_auth != RouteHealthAuth::None && route.health_url.is_none() {
+        bail!("subagent route `{id}` declares health authentication without a health URL");
+    }
     Ok(())
 }
 
@@ -276,7 +298,21 @@ fn find_value<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
     }
 }
 
-fn http_get_json(url: &str) -> Result<Value> {
+fn load_bridge_bearer_token(codex_home: &Path) -> Result<String> {
+    let token = std::fs::read_to_string(codex_home.join(BRIDGE_BEARER_TOKEN_FILE))
+        .context("bridge authentication is unavailable")?;
+    let token = token.trim();
+    let is_valid = token.len() == BRIDGE_BEARER_TOKEN_LEN
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'));
+    if !is_valid {
+        bail!("bridge authentication is invalid");
+    }
+    Ok(token.to_string())
+}
+
+fn http_get_json(url: &str, bearer_token: Option<&str>) -> Result<Value> {
     let target = HttpTarget::parse(url)?;
     let address = (target.host.as_str(), target.port)
         .to_socket_addrs()
@@ -290,9 +326,13 @@ fn http_get_json(url: &str) -> Result<Value> {
     stream.set_write_timeout(Some(timeout))?;
     write!(
         stream,
-        "GET {} HTTP/1.1\r\nHost: {}:{}\r\nAccept: application/json\r\nConnection: close\r\n\r\n",
+        "GET {} HTTP/1.1\r\nHost: {}:{}\r\nAccept: application/json\r\n",
         target.path, target.host, target.port
     )?;
+    if let Some(bearer_token) = bearer_token {
+        write!(stream, "Authorization: Bearer {bearer_token}\r\n")?;
+    }
+    write!(stream, "Connection: close\r\n\r\n")?;
     let mut bytes = Vec::new();
     let mut buffer = [0_u8; 4096];
     while bytes.len() < 64 * 1024 {
@@ -383,6 +423,26 @@ mod tests {
     use pretty_assertions::assert_eq;
     use tempfile::TempDir;
 
+    const TEST_BEARER_TOKEN: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGH012345678";
+
+    fn read_http_request_headers(stream: &mut TcpStream) -> String {
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 512];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let chunk_len = stream.read(&mut chunk).unwrap();
+            assert!(
+                chunk_len > 0,
+                "client closed before completing HTTP headers"
+            );
+            request.extend_from_slice(&chunk[..chunk_len]);
+            assert!(
+                request.len() <= 8192,
+                "HTTP request headers exceeded test limit"
+            );
+        }
+        String::from_utf8(request).unwrap()
+    }
+
     fn write_catalog(home: &Path) {
         std::fs::write(
             home.join(SUBAGENT_ROUTE_CATALOG_FILE),
@@ -467,6 +527,122 @@ mod tests {
             "/health"
         );
         assert!(HttpTarget::parse("http://example.com/health").is_err());
+    }
+
+    #[test]
+    fn health_probe_authenticates_without_exposing_the_token() {
+        let home = TempDir::new().unwrap();
+        std::fs::create_dir_all(home.path().join("bridge-security")).unwrap();
+        std::fs::write(
+            home.path().join(BRIDGE_BEARER_TOKEN_FILE),
+            format!("{TEST_BEARER_TOKEN}\n"),
+        )
+        .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_http_request_headers(&mut stream);
+            assert!(request.contains(&format!(
+                "\r\nAuthorization: Bearer {TEST_BEARER_TOKEN}\r\n"
+            )));
+            let body = r#"{"ok":true,"status":"healthy"}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        let route = SubagentRoute {
+            label: "Authenticated bridge".to_string(),
+            model_provider: "bridge".to_string(),
+            model: "bridge-model".to_string(),
+            main_model: None,
+            reasoning_effort: ReasoningEffort::High,
+            input_modalities: None,
+            description: None,
+            health_url: Some(format!("http://{address}/health")),
+            health_auth: RouteHealthAuth::BridgeBearer,
+            native_fallback_route: None,
+        };
+
+        assert_eq!(
+            probe_subagent_route(home.path(), &route).unwrap(),
+            SubagentRouteProbe {
+                summary: "healthy".to_string()
+            }
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn health_probe_rejects_missing_or_invalid_authentication_before_connecting() {
+        let home = TempDir::new().unwrap();
+        let route = SubagentRoute {
+            label: "Authenticated bridge".to_string(),
+            model_provider: "bridge".to_string(),
+            model: "bridge-model".to_string(),
+            main_model: None,
+            reasoning_effort: ReasoningEffort::High,
+            input_modalities: None,
+            description: None,
+            health_url: Some("http://127.0.0.1:1/health".to_string()),
+            health_auth: RouteHealthAuth::BridgeBearer,
+            native_fallback_route: None,
+        };
+
+        let missing = probe_subagent_route(home.path(), &route)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(missing, "bridge authentication is unavailable");
+        std::fs::create_dir_all(home.path().join("bridge-security")).unwrap();
+        std::fs::write(home.path().join(BRIDGE_BEARER_TOKEN_FILE), "not-valid").unwrap();
+        let invalid = probe_subagent_route(home.path(), &route)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(invalid, "bridge authentication is invalid");
+        assert!(!missing.contains("bearer-token"));
+        assert!(!invalid.contains("not-valid"));
+    }
+
+    #[test]
+    fn unmanaged_health_probe_does_not_load_or_send_bridge_authentication() {
+        let home = TempDir::new().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_http_request_headers(&mut stream);
+            assert!(!request.contains("\r\nAuthorization:"));
+            let body = r#"{"version":"0.12.0"}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        let route = SubagentRoute {
+            label: "Local Ollama".to_string(),
+            model_provider: "ollama".to_string(),
+            model: "local-model".to_string(),
+            main_model: None,
+            reasoning_effort: ReasoningEffort::High,
+            input_modalities: None,
+            description: None,
+            health_url: Some(format!("http://{address}/api/version")),
+            health_auth: RouteHealthAuth::None,
+            native_fallback_route: None,
+        };
+
+        assert_eq!(
+            probe_subagent_route(home.path(), &route).unwrap(),
+            SubagentRouteProbe {
+                summary: "healthy".to_string()
+            }
+        );
+        server.join().unwrap();
     }
 
     #[test]

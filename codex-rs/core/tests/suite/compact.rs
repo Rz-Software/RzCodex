@@ -40,6 +40,7 @@ use core_test_support::PathBufExt;
 use core_test_support::context_snapshot;
 use core_test_support::context_snapshot::ContextSnapshotOptions;
 use core_test_support::context_snapshot::ContextSnapshotRenderMode;
+use core_test_support::hooks::python_hook_command;
 use core_test_support::hooks::trust_discovered_hooks;
 use core_test_support::responses;
 use core_test_support::responses::ev_reasoning_item;
@@ -195,10 +196,6 @@ fn read_hook_inputs(path: &Path) -> Vec<Value> {
         .filter(|line| !line.trim().is_empty())
         .map(|line| serde_json::from_str(line).expect("failed to parse hook input log line"))
         .collect()
-}
-
-fn python_hook_command(script_path: &Path) -> String {
-    format!("python3 \"{}\"", script_path.display())
 }
 
 fn write_unsupported_blocking_pre_compact_hook(home: &Path) {

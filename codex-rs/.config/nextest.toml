@@ -11,6 +11,11 @@ path = "junit.xml"
 [profile.local]
 inherits = "default"
 
+[profile.validation]
+inherits = "default"
+retries = 0
+test-threads = 1
+
 [test-groups.app_server_protocol_codegen]
 max-threads = 1
 
@@ -25,7 +30,7 @@ max-threads = 4
 [test-groups.core_apply_patch_cli_integration]
 max-threads = 1
 
-[test-groups.windows_sandbox_legacy_sessions]
+[test-groups.windows_sandbox_sessions]
 max-threads = 1
 
 [test-groups.windows_process_heavy]
@@ -63,10 +68,20 @@ filter = 'package(codex-core) & kind(test) & test(apply_patch_cli)'
 test-group = 'core_apply_patch_cli_integration'
 
 [[profile.default.overrides]]
-# These tests create restricted-token Windows child processes and private desktops.
-# Serialize them to avoid exhausting Windows session/global desktop resources in CI.
-filter = 'package(codex-windows-sandbox) & test(legacy_)'
-test-group = 'windows_sandbox_legacy_sessions'
+# Each matrix runs 64 process-backed MCP/turn cases. Isolated runs completed in 27-29s, but
+# full-gate contention exhausted the default 30s period on both attempts. Keep the extra budget
+# scoped to these exhaustive matrices.
+filter = 'package(codex-core) & (test(suite::code_mode::code_mode_excludes_mcp_servers_using_their_configured_identity) | test(suite::code_mode::mcp_code_mode_exclusion_does_not_change_direct_mode_tool_exposure))'
+slow-timeout = { period = "1m", terminate-after = 2 }
+
+[[profile.default.overrides]]
+# These tests create restricted-token Windows child processes, private desktops, or elevated
+# sandbox sessions. They also stage helpers under the shared test executable resources directory.
+# Serialize them across packages so session/global desktop resources and staged helpers cannot
+# contend across nextest processes.
+platform = 'cfg(windows)'
+filter = '(package(codex-windows-sandbox) & (test(unified_exec) | test(desktop))) | (package(codex-core) & (test(suite::windows_sandbox::) | test(suite::workspace_roots::) | test(suite::unified_exec_process_events::))) | (package(codex-cli) & test(sandbox_cloud_config))'
+test-group = 'windows_sandbox_sessions'
 
 [[profile.default.overrides]]
 # This Codex-home startup path still exceeded the broader Windows-heavy ceiling

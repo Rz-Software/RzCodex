@@ -22,6 +22,7 @@ use codex_guardian_context::TranscriptHistory;
 use codex_history::CodexHarnessMetadata;
 use codex_history::GuardianHistoryCheckpoint;
 use codex_history::ResponseItemEnvelope;
+use codex_protocol::ResponseItemId;
 use codex_protocol::models::AgentMessageInputContent;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
@@ -43,6 +44,7 @@ use codex_utils_output_truncation::approx_bytes_for_tokens;
 use codex_utils_output_truncation::approx_token_count;
 use codex_utils_output_truncation::approx_tokens_from_byte_count_i64;
 use codex_utils_output_truncation::truncate_function_output_payload;
+use std::collections::HashSet;
 use std::num::NonZeroUsize;
 use std::ops::Deref;
 use std::sync::Arc;
@@ -182,6 +184,22 @@ impl ContextManager {
 
     pub(crate) fn set_reference_context_item(&mut self, item: Option<TurnContextItem>) {
         self.reference_context_item = item;
+    }
+
+    /// Marks image payloads from one successfully appended checkpoint as durable.
+    pub(crate) fn mark_inline_images_persisted(
+        &mut self,
+        checkpoint_response_item_ids: &HashSet<ResponseItemId>,
+    ) {
+        for envelope in Arc::make_mut(&mut self.items) {
+            if envelope
+                .item
+                .id()
+                .is_some_and(|id| checkpoint_response_item_ids.contains(id))
+            {
+                codex_history::mark_inline_images_persisted(std::slice::from_mut(envelope));
+            }
+        }
     }
 
     pub(crate) fn reference_context_item(&self) -> Option<TurnContextItem> {

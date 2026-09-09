@@ -901,7 +901,7 @@ mod tests {
         let raw_history = raw(history);
         let retained_tasks = raw_history
             .iter()
-            .filter(|item| crate::compact::is_new_task_agent_message(item))
+            .filter(|item| crate::compact::is_delegated_task_agent_message(item))
             .collect::<Vec<_>>();
 
         assert_eq!(retained_tasks, vec![&latest_task]);

@@ -9,6 +9,7 @@ use crate::agents_md_manager::AgentsMdManager;
 use crate::compact::InitialContextInjection;
 use crate::config::ConfigBuilder;
 use crate::config::ConfigOverrides;
+use crate::config::TokenBudgetConfig;
 use crate::config::test_config;
 use crate::context::ContextualUserFragment;
 use crate::context::DeveloperInstructions;
@@ -152,6 +153,7 @@ use codex_protocol::protocol::HistoryPosition;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::NetworkApprovalProtocol;
+use codex_protocol::protocol::NonSteerableTurnKind;
 use codex_protocol::protocol::RateLimitSnapshot;
 use codex_protocol::protocol::RateLimitWindow;
 use codex_protocol::protocol::RealtimeAudioFrame;
@@ -3791,6 +3793,7 @@ async fn record_initial_history_forked_hydrates_previous_turn_settings() {
         network: None,
         file_system_sandbox_policy: None,
         model: previous_model.to_string(),
+        model_provider_id: None,
         comp_hash: None,
         personality: turn_context.personality(),
         collaboration_mode: Some(turn_context.collaboration_mode()),
@@ -3848,6 +3851,7 @@ async fn record_initial_history_forked_hydrates_previous_turn_settings() {
         session.previous_turn_settings().await,
         Some(PreviousTurnSettings {
             model: previous_model.to_string(),
+            model_provider_id: None,
             comp_hash: None,
             realtime_active: Some(turn_context.realtime_active),
         })
@@ -3892,6 +3896,7 @@ async fn thread_rollback_drops_last_turn_from_history() {
     sess.persist_rollout_items(&rollout_items).await;
     sess.set_previous_turn_settings(Some(PreviousTurnSettings {
         model: "stale-model".to_string(),
+        model_provider_id: None,
         comp_hash: None,
         realtime_active: Some(tc.realtime_active),
     }))
@@ -4084,6 +4089,7 @@ async fn thread_rollback_recomputes_previous_turn_settings_and_reference_context
     .await;
     sess.set_previous_turn_settings(Some(PreviousTurnSettings {
         model: "stale-model".to_string(),
+        model_provider_id: None,
         comp_hash: None,
         realtime_active: None,
     }))
@@ -4101,6 +4107,7 @@ async fn thread_rollback_recomputes_previous_turn_settings_and_reference_context
         sess.previous_turn_settings().await,
         Some(PreviousTurnSettings {
             model: tc.model_info().slug.clone(),
+            model_provider_id: Some(tc.config.model_provider_id.clone()),
             comp_hash: None,
             realtime_active: Some(tc.realtime_active),
         })
@@ -4473,6 +4480,14 @@ async fn set_rate_limits_retains_previous_credits() {
     };
     let session_configuration = SessionConfiguration {
         provider: create_model_provider(config.model_provider.clone(), /*auth_manager*/ None),
+        models_manager: create_model_provider(
+            config.model_provider.clone(),
+            /*auth_manager*/ None,
+        )
+        .models_manager(
+            config.codex_home.to_path_buf(),
+            config.model_catalog.clone(),
+        ),
         step_settings: Arc::new(StepSettings {
             collaboration_mode,
             reasoning_summary: config.model_reasoning_summary,
@@ -4589,6 +4604,14 @@ async fn set_rate_limits_updates_plan_type_when_present() {
     };
     let session_configuration = SessionConfiguration {
         provider: create_model_provider(config.model_provider.clone(), /*auth_manager*/ None),
+        models_manager: create_model_provider(
+            config.model_provider.clone(),
+            /*auth_manager*/ None,
+        )
+        .models_manager(
+            config.codex_home.to_path_buf(),
+            config.model_catalog.clone(),
+        ),
         step_settings: Arc::new(StepSettings {
             collaboration_mode,
             reasoning_summary: config.model_reasoning_summary,
@@ -4737,10 +4760,19 @@ async fn includes_timed_out_message() {
 #[tokio::test]
 async fn turn_context_with_model_updates_model_fields() {
     let (session, mut turn_context) = make_session_and_context().await;
+    turn_context.configured_token_budget = Some(TokenBudgetConfig {
+        reminder_threshold_tokens: Some(123),
+        ..TokenBudgetConfig::default()
+    });
+    turn_context.use_model_token_budget_defaults = false;
     let config = Arc::make_mut(&mut turn_context.config);
     config.features.enable(Feature::FastMode).unwrap();
     config.model_reasoning_effort = Some(ReasoningEffortConfig::Minimal);
     config.model_reasoning_summary = Some(ReasoningSummaryConfig::Detailed);
+    config.token_budget = Some(TokenBudgetConfig {
+        reminder_threshold_tokens: Some(456),
+        ..TokenBudgetConfig::default()
+    });
     update_turn_settings_for_test(&mut turn_context, |settings| {
         let mut selected = settings.selected().clone();
         selected.collaboration_mode.settings.reasoning_effort =
@@ -4796,11 +4828,17 @@ async fn turn_context_with_model_updates_model_fields() {
     assert_eq!(
         (
             updated.config.model_reasoning_summary,
-            updated.config.service_tier.as_deref()
+            updated.config.service_tier.as_deref(),
+            updated
+                .config
+                .token_budget
+                .as_ref()
+                .and_then(|budget| budget.reminder_threshold_tokens),
         ),
         (
             Some(ReasoningSummaryConfig::Detailed),
-            Some(ServiceTier::Fast.request_value())
+            Some(ServiceTier::Fast.request_value()),
+            Some(123),
         ),
     );
     assert!(Arc::ptr_eq(&captured, &turn_context.initial_settings));
@@ -5230,6 +5268,14 @@ pub(crate) async fn make_session_configuration_for_tests() -> SessionConfigurati
 
     SessionConfiguration {
         provider: create_model_provider(config.model_provider.clone(), /*auth_manager*/ None),
+        models_manager: create_model_provider(
+            config.model_provider.clone(),
+            /*auth_manager*/ None,
+        )
+        .models_manager(
+            config.codex_home.to_path_buf(),
+            config.model_catalog.clone(),
+        ),
         step_settings: Arc::new(StepSettings {
             collaboration_mode,
             reasoning_summary: config.model_reasoning_summary,
@@ -6284,6 +6330,7 @@ async fn session_new_fails_when_zsh_fork_enabled_without_packaged_zsh() {
             config.model_provider.clone(),
             Some(Arc::clone(&auth_manager)),
         ),
+        models_manager: Arc::clone(&models_manager),
         step_settings: Arc::new(StepSettings {
             collaboration_mode,
             reasoning_summary: config.model_reasoning_summary,
@@ -6438,6 +6485,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
             config.model_provider.clone(),
             Some(Arc::clone(&auth_manager)),
         ),
+        models_manager: Arc::clone(&models_manager),
         step_settings: Arc::new(StepSettings {
             collaboration_mode,
             reasoning_summary: config.model_reasoning_summary,
@@ -6693,6 +6741,36 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
     (session, turn_context)
 }
 
+#[tokio::test]
+async fn send_event_captures_only_errors_that_affect_turn_status() {
+    let cases = [
+        (None, true),
+        (Some(CodexErrorInfo::ThreadRollbackFailed), false),
+        (
+            Some(CodexErrorInfo::ActiveTurnNotSteerable {
+                turn_kind: NonSteerableTurnKind::Review,
+            }),
+            false,
+        ),
+    ];
+
+    for (codex_error_info, should_capture) in cases {
+        let (session, turn_context) = make_session_and_context().await;
+        let error = ErrorEvent {
+            message: "test error".to_string(),
+            codex_error_info,
+            misalignment: None,
+        };
+
+        session
+            .send_event(&turn_context, EventMsg::Error(error.clone()))
+            .await;
+
+        let captured = turn_context.terminal_error.lock().await.clone();
+        assert_eq!(captured, should_capture.then_some(error));
+    }
+}
+
 async fn make_session_with_config(
     mutator: impl FnOnce(&mut Config),
 ) -> anyhow::Result<Arc<Session>> {
@@ -6740,6 +6818,7 @@ async fn make_session_with_config_and_rx(
             config.model_provider.clone(),
             Some(Arc::clone(&auth_manager)),
         ),
+        models_manager: Arc::clone(&models_manager),
         step_settings: Arc::new(StepSettings {
             collaboration_mode,
             reasoning_summary: config.model_reasoning_summary,
@@ -6867,6 +6946,7 @@ async fn make_session_with_history_source_and_agent_control_and_rx(
             config.model_provider.clone(),
             Some(Arc::clone(&auth_manager)),
         ),
+        models_manager: Arc::clone(&models_manager),
         step_settings: Arc::new(StepSettings {
             collaboration_mode,
             reasoning_summary: config.model_reasoning_summary,
@@ -8773,6 +8853,7 @@ where
             config.model_provider.clone(),
             Some(Arc::clone(&auth_manager)),
         ),
+        models_manager: Arc::clone(&models_manager),
         step_settings: Arc::new(StepSettings {
             collaboration_mode,
             reasoning_summary: config.model_reasoning_summary,
@@ -10478,6 +10559,7 @@ async fn build_initial_context_restates_realtime_start_when_reference_context_is
     turn_context.realtime_active = true;
     let previous_turn_settings = PreviousTurnSettings {
         model: turn_context.model_info().slug.clone(),
+        model_provider_id: None,
         comp_hash: None,
         realtime_active: Some(true),
     };
@@ -10804,6 +10886,7 @@ async fn build_initial_context_prepends_model_switch_message() {
     let (session, turn_context) = make_session_and_context().await;
     let previous_turn_settings = PreviousTurnSettings {
         model: "previous-regular-model".to_string(),
+        model_provider_id: None,
         comp_hash: None,
         realtime_active: None,
     };
@@ -10858,6 +10941,7 @@ async fn record_context_updates_and_set_reference_context_item_persists_full_rei
     session
         .set_previous_turn_settings(Some(PreviousTurnSettings {
             model: previous_context.model_info().slug.clone(),
+            model_provider_id: None,
             comp_hash: None,
             realtime_active: Some(previous_context.realtime_active),
         }))
@@ -11403,6 +11487,7 @@ async fn interrupting_compaction_fallback_retains_last_known_step_context() {
     session
         .set_previous_turn_settings(Some(PreviousTurnSettings {
             model: "gpt-5.4".to_string(),
+            model_provider_id: Some(turn.config.model_provider_id.clone()),
             comp_hash: Some("old".to_string()),
             realtime_active: Some(turn.realtime_active),
         }))

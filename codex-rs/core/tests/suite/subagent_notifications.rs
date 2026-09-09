@@ -1,3 +1,4 @@
+use anyhow::Context;
 use anyhow::Result;
 use codex_core::StartThreadOptions;
 use codex_core::ThreadConfigSnapshot;
@@ -27,6 +28,7 @@ use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
+use core_test_support::hooks::python_hook_command;
 use core_test_support::hooks::trust_discovered_hooks;
 use core_test_support::responses::ResponsesRequest;
 use core_test_support::responses::assert_parent_turn;
@@ -36,6 +38,7 @@ use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_completed_with_tokens;
 use core_test_support::responses::ev_function_call;
 use core_test_support::responses::ev_function_call_with_namespace;
+use core_test_support::responses::ev_plaintext_function_call_with_namespace;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::ev_tool_search_call;
 use core_test_support::responses::mount_response_once_match;
@@ -71,7 +74,7 @@ use wiremock::MockServer;
 
 const SPAWN_CALL_ID: &str = "spawn-call-1";
 const MULTI_AGENT_V1_NAMESPACE: &str = "multi_agent_v1";
-const MULTI_AGENT_V2_NAMESPACE: &str = "collaboration";
+const MULTI_AGENT_V2_NAMESPACE: &str = "rz_collaboration";
 const TURN_0_FORK_PROMPT: &str = "seed fork context";
 const TURN_1_PROMPT: &str = "spawn a child and continue";
 const TURN_2_NO_WAIT_PROMPT: &str = "follow up without wait";
@@ -272,33 +275,33 @@ print(json.dumps({{"systemMessage": "root stop complete"}}))
                 "matcher": "startup",
                 "hooks": [{
                     "type": "command",
-                    "command": format!("python3 {}", session_start_script_path.display()),
+                    "command": python_hook_command(&session_start_script_path),
                 }]
             }],
             "SubagentStart": [{
                 "matcher": "worker",
                 "hooks": [{
                     "type": "command",
-                    "command": format!("python3 {}", start_script_path.display()),
+                    "command": python_hook_command(&start_script_path),
                 }]
             }],
             "UserPromptSubmit": [{
                 "hooks": [{
                     "type": "command",
-                    "command": format!("python3 {}", user_prompt_submit_script_path.display()),
+                    "command": python_hook_command(&user_prompt_submit_script_path),
                 }]
             }],
             "SubagentStop": [{
                 "matcher": subagent_stop_matcher,
                 "hooks": [{
                     "type": "command",
-                    "command": format!("python3 {}", subagent_stop_script_path.display()),
+                    "command": python_hook_command(&subagent_stop_script_path),
                 }]
             }],
             "Stop": [{
                 "hooks": [{
                     "type": "command",
-                    "command": format!("python3 {}", stop_script_path.display()),
+                    "command": python_hook_command(&stop_script_path),
                 }]
             }]
         }
@@ -1179,7 +1182,7 @@ async fn grandchild_full_fork_preserves_context_baseline(
         },
         sse(vec![
             ev_response_created("baseline-root"),
-            ev_function_call_with_namespace(
+            ev_plaintext_function_call_with_namespace(
                 ROOT_CALL,
                 MULTI_AGENT_V2_NAMESPACE,
                 "spawn_agent",
@@ -1228,21 +1231,30 @@ async fn grandchild_full_fork_preserves_context_baseline(
     let child_log = mount_sse_once_match(
         &server,
         move |req: &wiremock::Request| {
-            body_contains(
-                req,
-                if compact_parent {
-                    COMPACT_SUMMARY
-                } else {
-                    CHILD_TASK
-                },
-            ) && !body_contains(req, GRANDCHILD_TASK)
+            req.body_json::<Value>()
+                .ok()
+                .and_then(|body| {
+                    body["client_metadata"]["x-codex-turn-metadata"]
+                        .as_str()
+                        .map(str::to_owned)
+                })
+                .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+                .is_some_and(|metadata| metadata["agent_name"] == "/root/child")
+                && body_contains(
+                    req,
+                    if compact_parent {
+                        COMPACT_SUMMARY
+                    } else {
+                        CHILD_TASK
+                    },
+                )
                 && !body_contains(req, ROOT_CALL)
                 && !body_contains(req, CHILD_CALL)
                 && !body_contains(req, COMPACT_PROMPT)
         },
         sse(vec![
             ev_response_created("baseline-child"),
-            ev_function_call_with_namespace(
+            ev_plaintext_function_call_with_namespace(
                 CHILD_CALL,
                 MULTI_AGENT_V2_NAMESPACE,
                 "spawn_agent",
@@ -1255,7 +1267,17 @@ async fn grandchild_full_fork_preserves_context_baseline(
     let grandchild_log = mount_sse_once_match(
         &server,
         |req: &wiremock::Request| {
-            body_contains(req, GRANDCHILD_TASK) && !body_contains(req, CHILD_CALL)
+            req.body_json::<Value>()
+                .ok()
+                .and_then(|body| {
+                    body["client_metadata"]["x-codex-turn-metadata"]
+                        .as_str()
+                        .map(str::to_owned)
+                })
+                .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+                .is_some_and(|metadata| metadata["agent_name"] == "/root/child/grandchild")
+                && body_contains(req, GRANDCHILD_TASK)
+                && !body_contains(req, CHILD_CALL)
         },
         sse(vec![
             ev_response_created("baseline-grandchild"),
@@ -1264,11 +1286,17 @@ async fn grandchild_full_fork_preserves_context_baseline(
         ]),
     )
     .await;
-    let _parent_followups = mount_sse_sequence(
+    let parent_followups = mount_sse_sequence(
         &server,
         vec![
-            sse(vec![ev_completed("baseline-parent-finished-1")]),
-            sse(vec![ev_completed("baseline-parent-finished-2")]),
+            sse(vec![
+                ev_assistant_message("baseline-parent-answer-1", "done"),
+                ev_completed("baseline-parent-finished-1"),
+            ]),
+            sse(vec![
+                ev_assistant_message("baseline-parent-answer-2", "done"),
+                ev_completed("baseline-parent-finished-2"),
+            ]),
         ],
     )
     .await;
@@ -1324,19 +1352,30 @@ async fn grandchild_full_fork_preserves_context_baseline(
                 sleep(Duration::from_millis(/*millis*/ 10)).await;
             }
         })
-        .await?;
+        .await
+        .with_context(|| format!("timed out waiting for {agent_name} request"))?;
         let thread_id = ThreadId::from_string(
             request.body_json()["client_metadata"]["thread_id"]
                 .as_str()
                 .expect("descendant thread id"),
         )?;
         let thread = test.thread_manager.get_thread(thread_id).await?;
-        timeout(Duration::from_secs(/*secs*/ 10), async {
+        let completion = timeout(Duration::from_secs(/*secs*/ 10), async {
             while !matches!(thread.agent_status().await, AgentStatus::Completed(_)) {
                 sleep(Duration::from_millis(/*millis*/ 10)).await;
             }
         })
-        .await?;
+        .await;
+        if let Err(err) = completion {
+            anyhow::bail!(
+                "timed out waiting for {agent_name} completion: status={:?}, root_requests={}, child_requests={}, grandchild_requests={}, followup_requests={}: {err}",
+                thread.agent_status().await,
+                root_log.requests().len(),
+                child_log.requests().len(),
+                grandchild_log.requests().len(),
+                parent_followups.requests().len(),
+            );
+        }
         descendant_requests.push(request);
     }
     let context_counts = [
@@ -1460,7 +1499,7 @@ async fn spawned_full_history_v2_child_uses_model_precedence_without_dropping_co
         |req: &wiremock::Request| body_contains(req, TURN_1_PROMPT),
         sse(vec![
             ev_response_created("resp-turn1-1"),
-            ev_function_call_with_namespace(
+            ev_plaintext_function_call_with_namespace(
                 SPAWN_CALL_ID,
                 MULTI_AGENT_V2_NAMESPACE,
                 "spawn_agent",
@@ -2231,7 +2270,7 @@ async fn multi_agent_v2_spawn_sends_agent_message_to_child(
             !child_request
                 .body_json()
                 .to_string()
-                .contains("\"name\":\"collaboration\""),
+                .contains("\"name\":\"rz_collaboration\""),
             "leaf workers must not receive collaboration tools",
         );
     }
@@ -2289,6 +2328,7 @@ async fn multi_agent_v2_spawn_sends_agent_message_to_child(
 #[derive(Clone, Copy)]
 enum CompletionScenario {
     Completed,
+    Empty,
     TerminalError,
 }
 
@@ -2301,6 +2341,11 @@ enum CompletionScenario {
     CompletionScenario::Completed,
     ThreadHistoryMode::Legacy;
     "completed_legacy"
+)]
+#[test_case(
+    CompletionScenario::Empty,
+    ThreadHistoryMode::Paginated;
+    "empty_paginated"
 )]
 #[test_case(
     CompletionScenario::TerminalError,
@@ -2322,7 +2367,7 @@ async fn plaintext_multi_agent_v2_completion_sends_agent_message(
         |req: &wiremock::Request| body_contains(req, TURN_1_PROMPT),
         sse(vec![
             ev_response_created("resp-parent-1"),
-            ev_function_call_with_namespace(
+            ev_plaintext_function_call_with_namespace(
                 SPAWN_CALL_ID,
                 MULTI_AGENT_V2_NAMESPACE,
                 "spawn_agent",
@@ -2336,6 +2381,10 @@ async fn plaintext_multi_agent_v2_completion_sends_agent_message(
         CompletionScenario::Completed => vec![
             ev_response_created("resp-child-1"),
             ev_assistant_message("msg-child-1", "child done"),
+            ev_completed("resp-child-1"),
+        ],
+        CompletionScenario::Empty => vec![
+            ev_response_created("resp-child-1"),
             ev_completed("resp-child-1"),
         ],
         CompletionScenario::TerminalError => vec![ev_response_created("resp-child-1")],
@@ -2375,6 +2424,10 @@ async fn plaintext_multi_agent_v2_completion_sends_agent_message(
     let error = "stream disconnected before completion: stream closed before response.completed";
     let (payload, expected_text) = match scenario {
         CompletionScenario::Completed => ("child done".to_string(), "child done"),
+        CompletionScenario::Empty => (
+            "Agent errored: subagent turn completed without a terminal assistant response\n\nThis agent's turn failed. If you still need this agent, use the available collaboration tools to give it another task.".to_string(),
+            "subagent turn completed without a terminal assistant response",
+        ),
         CompletionScenario::TerminalError => (
             format!(
                 "Agent errored: {error}\n\nThis agent's turn failed. If you still need this agent, use the available collaboration tools to give it another task."
@@ -2395,7 +2448,7 @@ async fn plaintext_multi_agent_v2_completion_sends_agent_message(
         },
         sse(vec![
             ev_response_created("resp-parent-3"),
-            ev_function_call_with_namespace(
+            ev_plaintext_function_call_with_namespace(
                 "wait-agent-call",
                 MULTI_AGENT_V2_NAMESPACE,
                 "wait_agent",
@@ -2678,7 +2731,7 @@ async fn multi_agent_v2_peer_followup_completion_notifies_initiating_turn() -> R
         },
         sse(vec![
             ev_response_created("resp-spawn-routing-worker"),
-            ev_function_call_with_namespace(
+            ev_plaintext_function_call_with_namespace(
                 WORKER_CALL_ID,
                 MULTI_AGENT_V2_NAMESPACE,
                 "spawn_agent",
@@ -2738,7 +2791,7 @@ async fn multi_agent_v2_peer_followup_completion_notifies_initiating_turn() -> R
         },
         sse(vec![
             ev_response_created("resp-spawn-routing-requester"),
-            ev_function_call_with_namespace(
+            ev_plaintext_function_call_with_namespace(
                 REQUESTER_CALL_ID,
                 MULTI_AGENT_V2_NAMESPACE,
                 "spawn_agent",
@@ -2762,7 +2815,7 @@ async fn multi_agent_v2_peer_followup_completion_notifies_initiating_turn() -> R
         },
         sse(vec![
             ev_response_created("resp-routing-requester"),
-            ev_function_call_with_namespace(
+            ev_plaintext_function_call_with_namespace(
                 FOLLOWUP_CALL_ID,
                 MULTI_AGENT_V2_NAMESPACE,
                 "followup_task",

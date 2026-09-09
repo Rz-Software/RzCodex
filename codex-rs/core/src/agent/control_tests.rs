@@ -46,11 +46,13 @@ use codex_protocol::models::MessagePhase;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::EnvironmentConfigState;
 use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::ItemCompletedEvent;
+use codex_protocol::protocol::NonSteerableTurnKind;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::ThreadHistoryMode;
@@ -587,6 +589,19 @@ async fn on_event_updates_status_from_error() {
 
     let expected = AgentStatus::Errored("boom".to_string());
     assert_eq!(status, Some(expected));
+}
+
+#[tokio::test]
+async fn on_event_ignores_non_terminal_error() {
+    let status = agent_status_from_event(&EventMsg::Error(ErrorEvent {
+        misalignment: None,
+        message: "steer rejected".to_string(),
+        codex_error_info: Some(CodexErrorInfo::ActiveTurnNotSteerable {
+            turn_kind: NonSteerableTurnKind::Review,
+        }),
+    }));
+
+    assert_eq!(status, None);
 }
 
 #[tokio::test]
@@ -1272,6 +1287,7 @@ async fn spawn_agent_fork_from_paginated_parent_uses_model_context_prefix() {
                     thread_settings: ThreadSettingsSnapshot {
                         model: "parent-only-model".to_string(),
                         model_provider_id: "parent-only-provider".to_string(),
+                        model_input_modalities: None,
                         service_tier: None,
                         approval_policy: AskForApproval::Never,
                         approvals_reviewer: ApprovalsReviewer::User,
@@ -3386,7 +3402,7 @@ async fn multi_agent_v2_completion_ignores_dead_direct_parent() {
 }
 
 #[tokio::test]
-async fn multi_agent_v2_completion_queues_message_for_direct_parent() {
+async fn multi_agent_v2_completion_watcher_defers_direct_parent_notification() {
     let harness = AgentControlHarness::new().await;
     let (_root_thread_id, root_thread) = harness.start_thread().await;
     let (worker_thread_id, _worker_thread) = harness.start_thread().await;
@@ -3454,21 +3470,14 @@ async fn multi_agent_v2_completion_queues_message_for_direct_parent() {
         },
     );
 
-    timeout(Duration::from_secs(5), async {
-        loop {
-            let captured = harness
-                .manager
-                .captured_ops()
-                .into_iter()
-                .find(|entry| captured_op_matches(entry, &expected));
-            if captured.is_some() {
-                break;
-            }
-            sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("completion watcher should queue a direct-parent message");
+    sleep(Duration::from_millis(100)).await;
+    assert!(
+        !harness
+            .manager
+            .captured_ops()
+            .into_iter()
+            .any(|entry| captured_op_matches(&entry, &expected))
+    );
 
     let root_history = root_thread.session.clone_history().await;
     assert!(!history_contains_assistant_inter_agent_communication(

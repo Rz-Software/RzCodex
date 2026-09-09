@@ -8,11 +8,219 @@ use std::borrow::Cow;
 
 use super::STATE_MIGRATOR;
 use super::THREAD_HISTORY_MIGRATOR;
+use super::migration_with_sql;
+use super::migrator_for_database;
 use super::repair_legacy_recency_migration_version;
 use crate::PINNED_THREAD_SECTION_ID;
 use crate::PINNED_THREAD_SECTION_NAME;
 
 const CUSTOM_THREAD_SECTION_ID: &str = "01984de2-8f74-7c91-a3b2-5c5e937cf317";
+
+#[tokio::test]
+async fn line_ending_compatibility_preserves_journals_and_canonicalizes_new_migrations() {
+    for (database_index, base) in [
+        &STATE_MIGRATOR,
+        &super::LOGS_MIGRATOR,
+        &super::GOALS_MIGRATOR,
+        &super::MEMORIES_MIGRATOR,
+        &super::QUEUE_MIGRATOR,
+        &THREAD_HISTORY_MIGRATOR,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for embedded_newline in ["\n", "\r\n"] {
+            let sqlite_home = crate::runtime::test_support::unique_temp_dir();
+            tokio::fs::create_dir_all(&sqlite_home)
+                .await
+                .expect("sqlite home should be created");
+            let _cleanup = scopeguard::guard(sqlite_home.clone(), |sqlite_home| {
+                let _ = std::fs::remove_dir_all(sqlite_home);
+            });
+            let sqlite = crate::SqliteConfig::new_for_testing(sqlite_home.as_path().abs());
+            let pool = sqlite
+                .open_read_write_pool(&sqlite.runtime_db_paths()[database_index].path)
+                .await
+                .expect("temporary database should open");
+            let embedded = Migrator::with_migrations(
+                base.iter()
+                    .map(|migration| {
+                        migration_with_sql(
+                            migration,
+                            migration
+                                .sql
+                                .as_str()
+                                .replace("\r\n", "\n")
+                                .replace('\n', embedded_newline),
+                        )
+                    })
+                    .collect(),
+            );
+            let legacy = Migrator::with_migrations(
+                base.iter()
+                    .take(2)
+                    .enumerate()
+                    .map(|(index, migration)| {
+                        let newline = if index == 0 { "\r\n" } else { "\n" };
+                        migration_with_sql(
+                            migration,
+                            migration
+                                .sql
+                                .as_str()
+                                .replace("\r\n", "\n")
+                                .replace('\n', newline),
+                        )
+                    })
+                    .collect(),
+            );
+            legacy
+                .run(&pool)
+                .await
+                .expect("legacy migrations should apply");
+            let expected = base
+                .iter()
+                .enumerate()
+                .map(|(index, migration)| {
+                    let checksum = if let Some(legacy) = legacy.migrations.get(index) {
+                        legacy.checksum.to_vec()
+                    } else {
+                        migration_with_sql(migration, migration.sql.as_str().replace("\r\n", "\n"))
+                            .checksum
+                            .to_vec()
+                    };
+                    (migration.version, checksum)
+                })
+                .collect::<Vec<_>>();
+            pool.close().await;
+            let pool = match database_index {
+                0 => {
+                    sqlite
+                        .open_state_db(&embedded, /*telemetry_override*/ None)
+                        .await
+                }
+                1 => {
+                    sqlite
+                        .open_logs_db(&embedded, /*telemetry_override*/ None)
+                        .await
+                }
+                2 => {
+                    sqlite
+                        .open_goals_db(&embedded, /*telemetry_override*/ None)
+                        .await
+                }
+                3 => {
+                    sqlite
+                        .open_memories_db(&embedded, /*telemetry_override*/ None)
+                        .await
+                }
+                4 => {
+                    sqlite
+                        .open_queue_db(&embedded, /*telemetry_override*/ None)
+                        .await
+                }
+                5 => {
+                    sqlite
+                        .open_thread_history_db(&embedded, /*telemetry_override*/ None)
+                        .await
+                }
+                _ => unreachable!("all runtime databases are covered"),
+            }
+            .expect("legacy database should upgrade through its runtime opener");
+            migrator_for_database(&pool, &embedded)
+                .await
+                .expect("journal should resolve after upgrade")
+                .run(&pool)
+                .await
+                .expect("reopening should succeed");
+            let recorded = sqlx::query_as::<_, (i64, Vec<u8>)>(
+                "SELECT version, checksum FROM _sqlx_migrations ORDER BY version",
+            )
+            .fetch_all(&pool)
+            .await
+            .expect("migration history should remain readable");
+            assert_eq!(recorded, expected);
+            pool.close().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn line_ending_compatibility_rejects_changed_sql() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("temporary database should open");
+    let original = migration_with_sql(
+        &STATE_MIGRATOR.migrations[0],
+        "CREATE TABLE original (id INTEGER PRIMARY KEY);\r\n".to_owned(),
+    );
+    let changed = migration_with_sql(
+        &original,
+        "CREATE TABLE changed (id INTEGER PRIMARY KEY);\n".to_owned(),
+    );
+    Migrator::with_migrations(vec![original.clone()])
+        .run(&pool)
+        .await
+        .expect("original migration should apply");
+    let changed = Migrator::with_migrations(vec![changed]);
+    let compatible = migrator_for_database(&pool, &changed)
+        .await
+        .expect("journal should resolve");
+    let error = compatible
+        .run(&pool)
+        .await
+        .expect_err("changed SQL must fail");
+    assert!(matches!(
+        error,
+        sqlx::migrate::MigrateError::VersionMismatch(1)
+    ));
+    let recorded =
+        sqlx::query_scalar::<_, Vec<u8>>("SELECT checksum FROM _sqlx_migrations WHERE version = 1")
+            .fetch_one(&pool)
+            .await
+            .expect("journal should remain readable");
+    assert_eq!(recorded, original.checksum.as_ref());
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn line_ending_compatibility_preserves_legacy_recency_version_repair() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("temporary database should open");
+    let mut recency = migration_with_sql(
+        &STATE_MIGRATOR.migrations[0],
+        "CREATE TABLE recency (id INTEGER PRIMARY KEY);\n".to_owned(),
+    );
+    recency.version = 39;
+    let mut legacy = migration_with_sql(&recency, recency.sql.as_str().replace('\n', "\r\n"));
+    legacy.version = 38;
+    Migrator::with_migrations(vec![legacy.clone()])
+        .run(&pool)
+        .await
+        .expect("legacy recency migration should apply");
+    let current = Migrator::with_migrations(vec![recency]);
+    repair_legacy_recency_migration_version(&pool, &current)
+        .await
+        .expect("CRLF legacy version should repair against an LF build");
+    migrator_for_database(&pool, &current)
+        .await
+        .expect("journal should resolve")
+        .run(&pool)
+        .await
+        .expect("repaired migration should not run again");
+    let recorded = sqlx::query_as::<_, (i64, Vec<u8>)>(
+        "SELECT version, checksum FROM _sqlx_migrations ORDER BY version",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("journal should remain readable");
+    assert_eq!(recorded, vec![(39, legacy.checksum.to_vec())]);
+    pool.close().await;
+}
 
 fn migrator_through(version: i64) -> Migrator {
     Migrator {
