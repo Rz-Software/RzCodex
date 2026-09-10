@@ -19,6 +19,17 @@ use std::path::Path;
 use std::path::PathBuf;
 use uuid::Uuid;
 
+/// Keep historical fixtures available while tests exercise unrelated thread operations.
+pub fn preserve_historical_rollout_fixtures(codex_home: &Path) -> Result<()> {
+    let marker_directory = codex_home.join(".tmp");
+    fs::create_dir_all(&marker_directory)?;
+    fs::write(
+        marker_directory.join("rollout-retention.last-run"),
+        b"test fixture setup\n",
+    )?;
+    Ok(())
+}
+
 pub fn rollout_path(codex_home: &Path, filename_ts: &str, thread_id: &str) -> PathBuf {
     let year = &filename_ts[0..4];
     let month = &filename_ts[5..7];

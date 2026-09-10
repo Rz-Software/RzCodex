@@ -14,6 +14,7 @@ use app_test_support::MockResponsesConfig;
 use app_test_support::TestAppServer;
 use app_test_support::create_fake_rollout;
 use app_test_support::create_mock_responses_server_repeating_assistant;
+use app_test_support::preserve_historical_rollout_fixtures;
 use app_test_support::rollout_path;
 use app_test_support::write_chatgpt_auth;
 use axum::Router;
@@ -1323,6 +1324,7 @@ async fn start_resource_in_process_client(
     codex_home: &Path,
     thread_config_loader: Arc<dyn ThreadConfigLoader>,
 ) -> Result<in_process::InProcessClientHandle> {
+    preserve_historical_rollout_fixtures(codex_home)?;
     let loader_overrides = LoaderOverrides::without_managed_config_for_tests();
     // Keep unrelated plugin repository syncs out of these in-process RPC tests.
     let cli_overrides = vec![("features.plugins".to_string(), toml::Value::Boolean(false))];

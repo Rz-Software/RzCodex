@@ -201,6 +201,48 @@ fn resolves_cur_project_names_with_common_separators() {
 }
 
 #[test]
+fn resolves_cur_project_with_multiple_punctuated_ancestors() {
+    let root = TempDir::new().expect("tempdir");
+    let project = root
+        .path()
+        .join("parent-with-dashes")
+        .join("nested.with_spaces")
+        .join("my-project");
+    fs::create_dir_all(&project).expect("project root");
+
+    for encoded in [
+        encode_project_path(&project),
+        format!(
+            "{}-parent-with-dashes-nested-with-spaces-my-project",
+            encode_project_path(root.path())
+        ),
+    ] {
+        assert_eq!(decode_cur_project_path(&encoded), Some(project.clone()));
+        #[cfg(windows)]
+        assert_eq!(
+            decode_cur_project_path(&encoded.to_ascii_lowercase())
+                .map(|path| fs::canonicalize(path).expect("resolved project")),
+            Some(fs::canonicalize(&project).expect("project root"))
+        );
+    }
+}
+
+#[test]
+fn resolves_cur_project_among_many_unrelated_entries() {
+    let root = TempDir::new().expect("tempdir");
+    let project = root.path().join("project");
+    fs::create_dir_all(&project).expect("project root");
+    for index in 0..5_000 {
+        fs::write(root.path().join(format!("unrelated{index}")), "").expect("unrelated entry");
+    }
+
+    assert_eq!(
+        decode_cur_project_path(&encode_project_path(&project)),
+        Some(project)
+    );
+}
+
+#[test]
 fn rejects_ambiguous_cur_project_without_a_direct_match() {
     let root = TempDir::new().expect("tempdir");
     for project_name in ["my-project", "my project", "my+project"] {

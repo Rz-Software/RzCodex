@@ -50,6 +50,7 @@ pub use rollout::create_fake_rollout_with_session_and_thread_source;
 pub use rollout::create_fake_rollout_with_source;
 pub use rollout::create_fake_rollout_with_text_elements;
 pub use rollout::create_fake_rollout_with_token_usage;
+pub use rollout::preserve_historical_rollout_fixtures;
 pub use rollout::rollout_path;
 use serde::de::DeserializeOwned;
 pub use test_app_server::DEFAULT_CLIENT_NAME;

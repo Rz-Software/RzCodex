@@ -276,6 +276,8 @@ fn clear_sixel_area(writer: &mut impl Write, area: SixelClearArea) -> std::io::R
 
 #[cfg(test)]
 mod tests {
+    use base64::Engine as _;
+    use pretty_assertions::assert_eq;
     use std::error::Error as _;
     use std::io;
     use std::path::PathBuf;
@@ -349,6 +351,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let frame = dir.path().join("frame.png");
         std::fs::write(&frame, b"png").unwrap();
+        let expected_path = frame.canonicalize().unwrap();
         let request = AmbientPetDraw {
             frame,
             protocol: ImageProtocol::KittyLocalFile,
@@ -368,8 +371,16 @@ mod tests {
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("a=d,d=I,i=49374,q=2;"));
         assert!(output.contains("\x1b[4;3H"));
-        assert!(output.contains("a=T,t=f,f=100,c=4,r=2,q=2,i=49374;"));
-        assert!(!output.contains("cG5n"));
+        let (_, payload) = output
+            .split_once("a=T,t=f,f=100,c=4,r=2,q=2,i=49374;")
+            .expect("transmits a file reference");
+        let (payload, _) = payload.split_once('\x1b').expect("terminates the payload");
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(payload)
+                .expect("base64 file reference"),
+            expected_path.to_string_lossy().as_bytes()
+        );
         assert!(output.contains("\x1b8"));
     }
 
