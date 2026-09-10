@@ -36,7 +36,11 @@ $StateRoot = [IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables($M
 $LogRoot = Join-Path $StateRoot "Logs\Updates"
 $SnapshotParent = [IO.Path]::GetFullPath($env:USERPROFILE)
 $SnapshotRoot = [IO.Path]::GetFullPath((Join-Path $SnapshotParent "rzc"))
-$SharedTargetRoot = Join-Path $CodexRustRoot "target"
+$SharedTargetRoot = if ([string]::IsNullOrEmpty($env:CARGO_TARGET_DIR)) {
+    Join-Path $CodexRustRoot "target"
+} else {
+    [IO.Path]::GetFullPath($env:CARGO_TARGET_DIR)
+}
 $StatusPath = Join-Path $StateRoot "last-update.json"
 $BranchName = "rz-main"
 $LockPath = Join-Path $StateRoot "update.lock"

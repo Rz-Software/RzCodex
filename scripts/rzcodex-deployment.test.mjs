@@ -609,6 +609,35 @@ test("isolated validation output reads while an inherited descendant survives", 
   assert.equal(result.status, 0, `${result.stderr}\n${result.stdout}`);
 });
 
+test("updater shared target root honors an explicit CARGO_TARGET_DIR and retains the repo target default", () => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "rzcodex-shared-target-"));
+  try {
+    const result = invokePowerShellFile([
+      "$source = Get-Content -LiteralPath $args[0] -Raw",
+      "$tokens = $null; $parseErrors = $null",
+      "$ast = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$parseErrors)",
+      "if (@($parseErrors).Count -ne 0) { throw 'updater parse failed' }",
+      "$assignmentAst = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.AssignmentStatementAst] -and $node.Left.VariablePath.UserPath -eq 'SharedTargetRoot' }, $true)",
+      "if ($null -eq $assignmentAst) { throw 'missing updater SharedTargetRoot assignment' }",
+      "$resolveSharedTarget = [scriptblock]::Create($assignmentAst.Extent.Text)",
+      "$CodexRustRoot = $args[1]",
+      "$env:CARGO_TARGET_DIR = $null",
+      ". $resolveSharedTarget",
+      "if ([IO.Path]::GetFullPath($SharedTargetRoot) -ne [IO.Path]::GetFullPath((Join-Path $args[1] 'target'))) { throw \"updater lost the repo target default without CARGO_TARGET_DIR: $SharedTargetRoot\" }",
+      "$env:CARGO_TARGET_DIR = $args[2]",
+      ". $resolveSharedTarget",
+      "if ([IO.Path]::GetFullPath($SharedTargetRoot) -ne [IO.Path]::GetFullPath($args[2])) { throw \"updater overwrote an explicit CARGO_TARGET_DIR: $SharedTargetRoot\" }",
+      "$relativeTarget = 'rzcodex-relative-target'",
+      "$env:CARGO_TARGET_DIR = $relativeTarget",
+      ". $resolveSharedTarget",
+      "if ([IO.Path]::GetFullPath($SharedTargetRoot) -ne [IO.Path]::GetFullPath($relativeTarget)) { throw \"updater did not resolve a relative CARGO_TARGET_DIR to a full path: $SharedTargetRoot\" }",
+    ].join("\n"), [updaterPath, join(fixtureRoot, "codex-rs"), join(fixtureRoot, "explicit-target")]);
+    assert.equal(result.status, 0, `${result.stderr}\n${result.stdout}`);
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
 test("bridge supervisor accepts an intentionally empty argument list", () => {
   const fixtureRoot = mkdtempSync(join(tmpdir(), "rzcodex-bridge-supervisor-"));
   try {

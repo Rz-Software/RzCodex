@@ -19,6 +19,8 @@ use serde::Deserialize;
 #[cfg(windows)]
 use std::path::Path;
 #[cfg(windows)]
+use std::path::PathBuf;
+#[cfg(windows)]
 use std::process::Stdio;
 #[cfg(windows)]
 use tokio::process::Command;
@@ -77,7 +79,7 @@ fn rzcodex_update_result_cell(
 
 #[cfg(windows)]
 async fn run_rzcodex_update(repo_root: &Path) -> Result<RzCodexUpdateStatus, String> {
-    let update_script = repo_root.join("scripts").join("rzcodex-update.ps1");
+    let update_script = rzcodex_update_script_path(repo_root);
     if !update_script.is_file() {
         return Err(format!(
             "managed updater not found at {}",
@@ -86,21 +88,7 @@ async fn run_rzcodex_update(repo_root: &Path) -> Result<RzCodexUpdateStatus, Str
     }
 
     let invocation_id = uuid::Uuid::new_v4().to_string();
-    let process_status = Command::new("pwsh.exe")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-        ])
-        .arg(&update_script)
-        .args(["-InvocationId", &invocation_id])
-        .current_dir(repo_root)
-        .creation_flags(CREATE_NO_WINDOW)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+    let process_status = rzcodex_update_command(repo_root, &invocation_id)
         .status()
         .await
         .map_err(|err| format!("could not start the managed updater: {err}"))?;
@@ -127,6 +115,42 @@ async fn run_rzcodex_update(repo_root: &Path) -> Result<RzCodexUpdateStatus, Str
     } else {
         Err(update_status.message)
     }
+}
+
+/// Source-path contract for the managed updater: `<repo_root>/scripts/rzcodex-update.ps1`.
+#[cfg(windows)]
+fn rzcodex_update_script_path(repo_root: &Path) -> PathBuf {
+    repo_root.join("scripts").join("rzcodex-update.ps1")
+}
+
+/// Constructs the hidden updater process with explicit scheduled-publication authorization.
+#[cfg(windows)]
+fn rzcodex_update_command(repo_root: &Path, invocation_id: &str) -> Command {
+    let mut command = Command::new("pwsh.exe");
+    command
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+        ])
+        .arg(rzcodex_update_script_path(repo_root))
+        // The updater refuses ScheduledUpdate without explicit -Publish
+        // authorization; mirror scripts/rzcodex-launch.ps1 -Update.
+        .args([
+            "-InvocationId",
+            invocation_id,
+            "-Mode",
+            "ScheduledUpdate",
+            "-Publish",
+        ])
+        .current_dir(repo_root)
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command
 }
 
 impl ChatWidget {
@@ -1378,6 +1402,7 @@ impl ChatWidget {
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
 
     fn render_cell(cell: &history_cell::PlainHistoryCell) -> String {
         cell.display_lines(/*width*/ 120)
@@ -1410,6 +1435,69 @@ mod tests {
         failed:
         ■ RzCodex update failed: working tree is dirty
         "
+        );
+    }
+
+    /// Stub updater that validates parameter binding and echoes what it received.
+    /// It writes its status fixture next to itself, never to the real
+    /// %LOCALAPPDATA%\RzCodex\last-update.json, and never updates anything.
+    const RZCODEX_UPDATE_STUB_PS1: &str = r#"
+param(
+    [Parameter(Mandatory = $true)]
+    [string]$InvocationId,
+    [string]$Mode,
+    [switch]$Publish
+)
+$ErrorActionPreference = 'Stop'
+$ok = ($Mode -eq 'ScheduledUpdate') -and $Publish.IsPresent -and (-not [string]::IsNullOrWhiteSpace($InvocationId))
+$result = if ($ok) { 'updated' } else { 'rejected' }
+$message = if ($ok) { 'stub updater finished' } else { "stub rejected InvocationId='$InvocationId' Mode='$Mode' Publish=$($Publish.IsPresent)" }
+@{
+    result = $result
+    message = $message
+    invocationId = $InvocationId
+    mode = $Mode
+    publish = [bool]$Publish.IsPresent
+} | ConvertTo-Json -Compress | Set-Content -LiteralPath (Join-Path $PSScriptRoot 'last-update.json')
+if (-not $ok) { exit 2 }
+"#;
+
+    #[tokio::test]
+    async fn rzcodex_update_command_binds_scheduled_publish_args() {
+        let repo_root = tempfile::tempdir().expect("create temporary repo root");
+        std::fs::create_dir(repo_root.path().join("scripts")).expect("create scripts directory");
+        std::fs::write(
+            rzcodex_update_script_path(repo_root.path()),
+            RZCODEX_UPDATE_STUB_PS1,
+        )
+        .expect("write updater stub");
+
+        let invocation_id = uuid::Uuid::new_v4().to_string();
+        let process_status = rzcodex_update_command(repo_root.path(), &invocation_id)
+            .status()
+            .await
+            .expect("pwsh.exe should start");
+
+        let fixture_path = repo_root.path().join("scripts").join("last-update.json");
+        let fixture: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&fixture_path)
+                .unwrap_or_else(|err| panic!("stub updater should write {fixture_path:?}: {err}")),
+        )
+        .expect("stub updater status should be valid JSON");
+        assert_eq!(
+            fixture,
+            serde_json::json!({
+                "result": "updated",
+                "message": "stub updater finished",
+                "invocationId": invocation_id,
+                "mode": "ScheduledUpdate",
+                "publish": true,
+            }),
+            "stub updater bound unexpected updater arguments"
+        );
+        assert!(
+            process_status.success(),
+            "stub updater exited with {process_status}"
         );
     }
 }
