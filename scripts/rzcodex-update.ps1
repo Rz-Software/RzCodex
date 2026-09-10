@@ -307,7 +307,7 @@ function Resolve-OwnedFiles {
 }
 
 function Get-OwnedFileState {
-    param([Parameter(Mandatory)][object[]]$Files)
+    param([Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Files)
 
     $entries = @(foreach ($file in $Files) {
         if (Test-Path -LiteralPath $file.AbsolutePath -PathType Leaf) {
@@ -357,7 +357,7 @@ function New-DetachedSnapshot {
 
 function Copy-OwnedFilesToSnapshot {
     param(
-        [Parameter(Mandatory)][object[]]$Files,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Files,
         [Parameter(Mandatory)][string]$SnapshotPath
     )
 
@@ -803,7 +803,7 @@ try {
         }
         $sourceCommit = Get-GitText -WorkingDirectory $snapshotPath -ArgumentList @("rev-parse", "HEAD")
     } elseif ($Mode -ne "ScheduledUpdate") {
-        $ownedFiles = Resolve-OwnedFiles
+        $ownedFiles = @(Resolve-OwnedFiles)
         $beforeState = Get-OwnedFileState -Files $ownedFiles
         Copy-OwnedFilesToSnapshot -Files $ownedFiles -SnapshotPath $snapshotPath
         $afterState = Get-OwnedFileState -Files $ownedFiles

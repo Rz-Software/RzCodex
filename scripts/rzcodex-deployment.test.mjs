@@ -559,6 +559,31 @@ test("immutable snapshot preserves owned changes, fingerprints mutations, and cl
   }
 });
 
+test("validation snapshot helpers accept an empty owned-file set", () => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "rzcodex-empty-owned-files-"));
+  try {
+    const invocationSource = [
+      "$source = Get-Content -LiteralPath $args[0] -Raw",
+      "$tokens = $null; $parseErrors = $null",
+      "$ast = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$parseErrors)",
+      "if (@($parseErrors).Count -ne 0) { throw 'updater parse failed' }",
+      "$functionNames = @('Get-StringHash','Resolve-OwnedFiles','Get-OwnedFileState','Copy-OwnedFilesToSnapshot')",
+      "foreach ($functionName in $functionNames) { $functionAst = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $functionName }, $true); if ($null -eq $functionAst) { throw \"missing updater function: $functionName\" }; . ([scriptblock]::Create($functionAst.Extent.Text)) }",
+      "$RepoRoot = $args[1]; $OwnedPath = @(); $Mode = 'ValidateOnly'",
+      "$files = @(Resolve-OwnedFiles)",
+      "if ($files.Count -ne 0) { throw 'empty owned paths resolved to files' }",
+      "$state = Get-OwnedFileState -Files $files",
+      "if ($state.Entries.Count -ne 0) { throw 'empty owned-file state contains entries' }",
+      "$copyOutput = @(Copy-OwnedFilesToSnapshot -Files $files -SnapshotPath $RepoRoot)",
+      "if ($copyOutput.Count -ne 0) { throw 'empty owned-file copy leaked command output' }",
+    ].join("\n");
+    const result = invokePowerShellFile(invocationSource, [updaterPath, fixtureRoot]);
+    assert.equal(result.status, 0, `${result.stderr}\n${result.stdout}`);
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
 test("validation command failure does not wait on descendant output pipes", () => {
   const childLifetimeMs = 3000;
   const validationCommandSource = [
