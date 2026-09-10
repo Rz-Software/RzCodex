@@ -29,6 +29,8 @@ use codex_analytics::TurnAnalyticsMetadata;
 use codex_models_manager::model_info::model_info_from_slug;
 use codex_protocol::AgentPath;
 use codex_protocol::models::PermissionProfile;
+use codex_protocol::openai_models::GuardianModelPolicy;
+use codex_protocol::openai_models::GuardianReviewMode;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
@@ -140,7 +142,7 @@ async fn wait_for_git_enrichment(state: &TurnMetadataState) -> Value {
 }
 
 #[tokio::test]
-async fn detached_memory_responses_metadata_omits_turn_identity() {
+async fn detached_memory_responses_metadata_starts_an_independent_root_turn() {
     let (_temp_dir, repo_path) = create_clean_git_repo("repo-東京").await;
 
     let thread_manager = crate::ThreadManager::with_models_provider_for_tests(
@@ -148,7 +150,7 @@ async fn detached_memory_responses_metadata_omits_turn_identity() {
         crate::config::test_config().await.model_provider,
     );
 
-    let header = detached_memory_responses_metadata(
+    let metadata = detached_memory_responses_metadata(
         &thread_manager,
         String::new(),
         String::new(),
@@ -159,9 +161,8 @@ async fn detached_memory_responses_metadata_omits_turn_identity() {
         &PermissionProfile::read_only(),
         Some("none"),
     )
-    .await
-    .turn_metadata_json()
-    .expect("header");
+    .await;
+    let header = metadata.turn_metadata_json().expect("header");
     assert!(header.is_ascii());
     assert!(!header.contains("東京"));
     let parsed: Value = serde_json::from_str(&header).expect("valid json");
@@ -174,8 +175,18 @@ async fn detached_memory_responses_metadata_omits_turn_identity() {
     assert!(parsed.get("session_id").is_none());
     assert!(parsed.get("thread_id").is_none());
     assert!(parsed.get("forked_from_thread_id").is_none());
-    assert!(parsed.get("turn_id").is_none());
-    assert!(parsed.get(ROOT_TURN_ID_KEY).is_none());
+    let turn_id = parsed["turn_id"].as_str().expect("memory turn ID");
+    uuid::Uuid::parse_str(turn_id).expect("memory turn ID is a UUID");
+    assert_eq!(parsed[ROOT_TURN_ID_KEY], parsed["turn_id"]);
+    let client_metadata = metadata.client_metadata();
+    assert_eq!(
+        client_metadata.get("turn_id").map(String::as_str),
+        Some(turn_id)
+    );
+    assert_eq!(
+        client_metadata.get(ROOT_TURN_ID_KEY).map(String::as_str),
+        Some(turn_id)
+    );
     assert!(parsed.get(WINDOW_ID_KEY).is_none());
 
     let expected_repo_path = repo_path.to_string_lossy().into_owned();
@@ -222,10 +233,14 @@ async fn detached_memory_responses_metadata_omits_empty_workspace_metadata() {
     .turn_metadata_json()
     .expect("detached memory should emit its request kind");
     let parsed: Value = serde_json::from_str(&header).expect("valid json");
+    let turn_id = parsed["turn_id"].as_str().expect("memory turn ID");
+    uuid::Uuid::parse_str(turn_id).expect("memory turn ID is a UUID");
 
     assert_eq!(
         parsed,
         serde_json::json!({
+            "turn_id": turn_id,
+            "root_turn_id": turn_id,
             "request_kind": "memory",
             "sandbox_mode": "read-only",
             "thread_source": "memory_consolidation",
@@ -292,6 +307,46 @@ fn turn_metadata_state_includes_sandbox_metadata() {
     assert!(json.get("parent_thread_id").is_none());
     assert!(json.get("subagent_kind").is_none());
     assert!(json.get("session_source").is_none());
+}
+
+#[test]
+fn turn_metadata_refresh_honors_explicit_guardian_policy_over_legacy_flag() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let permission_profile = PermissionProfile::read_only();
+    let mut model = model_info_from_slug("gpt-5.4");
+    let state = TurnMetadataState::new(
+        "session-a".to_string(),
+        "thread-a".to_string(),
+        /*forked_from_thread_id*/ None,
+        /*parent_thread_id*/ None,
+        &SessionSource::Exec,
+        /*thread_source*/ None,
+        "turn-a".to_string(),
+        temp_dir.path().abs(),
+        &permission_profile,
+        WindowsSandboxLevel::Disabled,
+        /*enforce_managed_network*/ false,
+        /*auto_review_enabled*/ true,
+        &model,
+    );
+    let mut expected: Value =
+        serde_json::from_str(&test_turn_metadata_header(&state)).expect("json");
+
+    for (mode, legacy_required, expected_required) in [
+        (GuardianReviewMode::Synchronous, false, true),
+        (GuardianReviewMode::Disabled, true, false),
+    ] {
+        model.guardian = Some(GuardianModelPolicy {
+            computer_use: Some(mode),
+            ..Default::default()
+        });
+        model.node_repl_auto_review_required = legacy_required;
+        state.update_model_capabilities(&model);
+        expected[NODE_REPL_AUTO_REVIEW_REQUIRED_KEY] = expected_required.into();
+
+        let actual: Value = serde_json::from_str(&test_turn_metadata_header(&state)).expect("json");
+        assert_eq!(actual, expected);
+    }
 }
 
 #[test]
@@ -741,6 +796,7 @@ fn turn_metadata_state_merges_client_metadata_without_replacing_reserved_fields(
         ("workspace_kind".to_string(), "projectless".to_string()),
         ("source".to_string(), "client-source".to_string()),
         ("model".to_string(), "client-supplied".to_string()),
+        ("codex_version".to_string(), "client-supplied".to_string()),
         (
             "reasoning_effort".to_string(),
             "client-supplied".to_string(),
@@ -946,6 +1002,7 @@ fn turn_metadata_state_merges_client_metadata_without_replacing_reserved_fields(
         .current_meta_value_for_mcp_request(test_mcp_turn_metadata_context())
         .expect("turn metadata should be present");
     assert_eq!(meta["model"].as_str(), Some("gpt-5.4"));
+    assert_eq!(meta["codex_version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(meta["reasoning_effort"].as_str(), Some("high"));
     assert!(meta.get(LEGACY_CODE_MODE_TOOL_NAMES_KEY).is_none());
     assert!(meta.get(TOOL_NAMESPACES_INFO_KEY).is_none());

@@ -10,7 +10,6 @@ use codex_history::InitialHistory;
 use codex_history::ResponseItemEnvelope;
 use codex_history::ResumedHistory;
 use codex_history::RolloutItem;
-use codex_history::RolloutLine;
 use codex_protocol::ResponseItemId;
 use codex_protocol::ThreadId;
 use codex_protocol::items::TurnItem;
@@ -249,6 +248,7 @@ async fn assert_copied_fork_cold_resume_preserves_inherited_compacted_inline_ima
                     ..Default::default()
                 }),
             }]),
+            retained_context: None,
             guardian_history: None,
             mcp_resource_origins: None,
             window_number: Some(1),
@@ -449,7 +449,7 @@ fn read_rollout_items(path: &std::path::Path) -> Vec<RolloutItem> {
         let parse_json_message = format!("failed to parse rollout JSON line `{line}`");
         let v: serde_json::Value = serde_json::from_str(line).expect(&parse_json_message);
         let parse_line_message = format!("failed to parse rollout line `{line}`");
-        let rl: RolloutLine = serde_json::from_value(v).expect(&parse_line_message);
+        let rl = codex_rollout::decode_rollout_line(v).expect(&parse_line_message);
         match rl.item {
             RolloutItem::SessionMeta(_) => {}
             other => items.push(other),

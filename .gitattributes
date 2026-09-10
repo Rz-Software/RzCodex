@@ -2,3 +2,4 @@ codex-rs/app-server-protocol/schema/** linguist-generated
 codex-rs/hooks/schema/generated/** linguist-generated
 # SQLx hashes migration bytes; checkouts must embed the same line endings.
 codex-rs/state/**/*.sql text eol=lf
+third_party/voice/sources.json text eol=lf

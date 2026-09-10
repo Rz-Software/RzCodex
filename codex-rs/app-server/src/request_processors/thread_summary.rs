@@ -260,6 +260,8 @@ pub(crate) fn summary_to_thread(
 
     let thread_id = conversation_id.to_string();
     Thread {
+        originator: None,
+        environments: None,
         id: thread_id.clone(),
         extra: None,
         session_id: thread_id,
@@ -288,6 +290,7 @@ pub(crate) fn summary_to_thread(
         thread_source: None,
         git_info,
         name: None,
+        daybreak_enabled: None,
         turns: Vec::new(),
     }
 }

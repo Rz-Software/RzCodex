@@ -407,8 +407,12 @@ pub fn process_responses_event(
             }
         }
         "response.created" => {
-            if event.response.is_some() {
-                return Ok(Some(ResponseEvent::Created {}));
+            if let Some(response) = event.response {
+                let response_id = response
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                return Ok(Some(ResponseEvent::Created { response_id }));
             }
         }
         "response.failed" => {
@@ -606,7 +610,11 @@ async fn process_sse_with_treatment(
 
     loop {
         let start = Instant::now();
-        let response = timeout(idle_timeout, stream.next()).await;
+        let response = tokio::select! {
+            biased;
+            _ = tx_event.closed() => return,
+            response = timeout(idle_timeout, stream.next()) => response,
+        };
         if let Some(t) = telemetry.as_ref() {
             t.on_sse_poll(&response, start.elapsed());
         }
@@ -1574,7 +1582,7 @@ mod tests {
         }
 
         fn is_created(ev: &ResponseEvent) -> bool {
-            matches!(ev, ResponseEvent::Created)
+            matches!(ev, ResponseEvent::Created { .. })
         }
         fn is_output(ev: &ResponseEvent) -> bool {
             matches!(ev, ResponseEvent::OutputItemDone(_))
@@ -1756,7 +1764,7 @@ mod tests {
         .await;
 
         assert_eq!(events.len(), 2);
-        assert_matches!(&events[0], ResponseEvent::Created);
+        assert_matches!(&events[0], ResponseEvent::Created { .. });
         assert_matches!(
             &events[1],
             ResponseEvent::Completed {
@@ -1794,7 +1802,10 @@ mod tests {
             &events[0],
             ResponseEvent::ServerModel(model) if model == CYBER_RESTRICTED_MODEL_FOR_TESTS
         );
-        assert_matches!(&events[1], ResponseEvent::Created);
+        assert_matches!(
+            &events[1],
+            ResponseEvent::Created { response_id: Some(id) } if id == "resp-1"
+        );
         assert_matches!(
             &events[2],
             ResponseEvent::Completed {
@@ -1916,7 +1927,7 @@ mod tests {
         .await;
 
         assert_eq!(events.len(), 7);
-        assert_matches!(&events[0], ResponseEvent::Created);
+        assert_matches!(&events[0], ResponseEvent::Created { .. });
         assert_matches!(
             &events[1],
             ResponseEvent::SafetyBuffering(buffering)
